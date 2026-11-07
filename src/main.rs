@@ -86,12 +86,12 @@ mod cli;
 mod config_file;
 mod config_manager;
 mod locations;
-mod wafred;
 mod plugin;
 mod process;
 mod quick_start;
 mod server_locations;
 mod upstreams;
+mod wafred;
 mod webhook;
 
 // Default allocator: mimalloc on every platform.

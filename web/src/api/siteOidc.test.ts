@@ -123,6 +123,7 @@ describe('site OIDC API contract', () => {
       // local accounts existed — so a site that never touches this field
       // keeps working exactly as it did.
       auth_mode: 'oidc',
+      auth_scope: 'site',
       // The default admits every signed-in user, which is what the gate did
       // before access rules existed.
       access_mode: 'allow_all',

@@ -48,8 +48,9 @@ use pingwaf_server::models::{
 
 use crate::cli::{
     AddAdminOpts, AllowlistOpts, ConfigCommand, ConfigHistoryOpts,
-    ConfigRollbackOpts, ConfigShowOpts, DbOpts, ModeCommand, OnOff, WafredCli,
-    WafredCommand, ResetPasswordOpts, SecurityCommand, UserSubcommand,
+    ConfigRollbackOpts, ConfigShowOpts, DbOpts, ModeCommand, OnOff,
+    ResetPasswordOpts, SecurityCommand, UserSubcommand, WafredCli,
+    WafredCommand,
 };
 
 /// Runs a maintenance subcommand.
