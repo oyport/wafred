@@ -11,7 +11,7 @@ the backlog so the next sync starts from evidence instead of guesswork.
 | Component | WAFred | Upstream | Note |
 |---|---|---|---|
 | Pingora | `0.9.1` (this branch) | `0.9.1` (2026-11-03) | patch bump; see the changelog entry |
-| pingap crates | `0.32.17` (workspace version) | `0.16.1` / `main@cfdf5f76` | upstream keeps its own version line |
+| pingap crates | `1.0.0` (workspace version) | `0.16.1` / `main@cfdf5f76` | upstream keeps its own version line |
 
 `git merge-base HEAD upstream/main` returns no commit: the histories are
 unrelated (the workspace was re-imported, not forked). `git merge upstream/main`

@@ -9,7 +9,7 @@
 | 组件 | WAFred | 上游 | 说明 |
 |---|---|---|---|
 | Pingora | `0.9.1`（本分支） | `0.9.1`（2026-11-03） | 补丁升级，见 CHANGELOG |
-| pingap crates | `0.32.17`（工作区版本） | `0.16.1` / `main@cfdf5f76` | 上游有自己的版本线 |
+| pingap crates | `1.0.0`（工作区版本） | `0.16.1` / `main@cfdf5f76` | 上游有自己的版本线 |
 
 `git merge-base HEAD upstream/main` 返回空：两条历史无关（本工作区是重新导入，
 不是 fork）。`git merge upstream/main` 会重放约 2000 个无关提交，**永远不是

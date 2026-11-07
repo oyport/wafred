@@ -53,6 +53,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Verify the tag matches the workspace version
         run: |
@@ -92,10 +94,13 @@ jobs:
             echo "the CHANGELOG section for ${VERSION} is empty" >&2
             exit 1
           fi
+          PREVIOUS_TAG="$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)"
           {
             cat /tmp/notes.md
-            echo
-            echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo v0.0.0)...${GITHUB_REF_NAME}"
+            if [ -n "$PREVIOUS_TAG" ]; then
+              echo
+              echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${PREVIOUS_TAG}...${GITHUB_REF_NAME}"
+            fi
           } > /tmp/body.md
           echo "--- body ---"
           cat /tmp/body.md
@@ -159,14 +164,14 @@ jobs:
             arch: amd64
             runs-on: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            features: "--features tracing"
+            features: "--features full"
           - plat: linux
             arch: arm64
             # ubuntu-22.04-arm ships protoc 3.12, which rejects proto3 optional
             # fields used by control_plane.proto; 24.04 has protoc >= 3.15.
             runs-on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            features: "--features tracing"
+            features: "--features full"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
