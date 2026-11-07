@@ -1,0 +1,395 @@
+name: Release
+
+# Tag-triggered release pipeline.
+#
+#   trigger: push of a `v*` tag (e.g. v0.14.3)
+#
+# It produces the tarballs install.sh downloads, named EXACTLY:
+#   wafred-linux-amd64.tar.xz  wafred-linux-amd64.tar.gz
+#   wafred-linux-arm64.tar.xz  wafred-linux-arm64.tar.gz
+# install.sh prefers the .tar.xz asset (smaller) and falls back to the legacy
+# .tar.gz when xz(1) is missing locally or the download 404s, resolving
+# `wafred-${OS}-${ARCH}.tar.{xz,gz}` from
+#   https://github.com/oyport/wafred/releases/download/v${VERSION}/<asset>
+# so these names must not drift. Each tarball ships a matching `.sha256`.
+#
+# The dashboard bundle is built ONCE by the `web-dist` job and embedded by
+# rust-embed in both matrix legs (they read ../web/dist at compile time).
+#
+# Releases are Linux-only (server deployments). Both matrix legs use the
+# default OpenSSL backend, matching the Dockerfile.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Never cancel a half-finished release: a partial asset set is worse than a slow
+# complete one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The release body comes from CHANGELOG.md, and it is created by exactly one
+  # job. It used to be `generate_release_notes: true` on the upload step of
+  # every `binaries` leg: two jobs writing the same release concurrently, each
+  # with GitHub's own generated body, which is why v0.29.3 was published with
+  # the same "Full Changelog" line twice and none of the notes. Creating the
+  # release here, before the legs run, also means the legs only ever upload
+  # assets.
+  release-notes:
+    name: Create release from CHANGELOG
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Verify the tag matches the workspace version
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          MANIFEST="$(awk -F'"' '
+            /^\[workspace.package\]/ { in_section = 1; next }
+            /^\[/ { in_section = 0 }
+            in_section && /^version *=/ { print $2; exit }
+          ' Cargo.toml)"
+          if [ "$VERSION" != "$MANIFEST" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match the workspace version ${MANIFEST}" >&2
+            exit 1
+          fi
+
+      - name: Extract the CHANGELOG section for this tag
+        id: notes
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          # From the `## [WAFred <version>]` heading up to the next `## `
+          # heading. The version is taken from the tag, so a section that does
+          # not exist is a hard failure: a release whose notes were never
+          # written must not publish (same contract as `make version`).
+          awk -v v="$VERSION" '
+            index($0, "## [WAFred " v "]") == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > /tmp/notes.md
+          if ! grep -q "^## \[WAFred ${VERSION}\]" CHANGELOG.md; then
+            echo "CHANGELOG.md has no section for ${VERSION}; write it before tagging." >&2
+            exit 1
+          fi
+          # `-s` alone would accept a section that holds only whitespace: a
+          # heading followed immediately by the next `## ` leaves a newline.
+          if [ -z "$(tr -d '[:space:]' < /tmp/notes.md)" ]; then
+            echo "the CHANGELOG section for ${VERSION} is empty" >&2
+            exit 1
+          fi
+          {
+            cat /tmp/notes.md
+            echo
+            echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo v0.0.0)...${GITHUB_REF_NAME}"
+          } > /tmp/body.md
+          echo "--- body ---"
+          cat /tmp/body.md
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body_path: /tmp/body.md
+          # A `-rc.1` / `-beta.2` tag is a test build: mark it a pre-release
+          # so GitHub's `/releases/latest` keeps pointing at the newest
+          # stable one. `install.sh` resolves its version from that endpoint,
+          # so a pre-release that took the flag would be installed by anyone
+          # running the installer without asking for a specific version.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  # Build the dashboard bundle once; both binaries legs embed it via rust-embed
+  # (which reads ../web/dist at compile time), replacing the per-leg Node setup
+  # + frontend build that used to duplicate the npm critical path.
+  web-dist:
+    name: Build frontend dist
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 26.12.1
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build frontend
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 1
+
+  binaries:
+    name: Build ${{ matrix.plat }}/${{ matrix.arch }}
+    # `release-notes` first: the release must exist (and its notes must have
+    # been found in CHANGELOG.md) before any asset is uploaded into it.
+    needs: [release-notes, web-dist]
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 120
+    permissions:
+      contents: write # upload assets into the release created above
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - plat: linux
+            arch: amd64
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: "--features tracing"
+          - plat: linux
+            arch: arm64
+            # ubuntu-22.04-arm ships protoc 3.12, which rejects proto3 optional
+            # fields used by control_plane.proto; 24.04 has protoc >= 3.15.
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            features: "--features tracing"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The released binary embeds the dashboard built by the web-dist job;
+      # rust-embed reads ../web/dist at compile time, so unpack it there.
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          # SYNC: keep this list in lockstep with Dockerfile / ci.yml
+          # NOTE: these binaries enable mimalloc unconditionally (see
+          # src/main.rs). The Dockerfiles pin MIMALLOC_* defaults as ENV —
+          # if you change them there, mirror the change in the tarball README
+          # so bare-process deployments don't silently diverge.
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler \
+            libprotobuf-dev \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            libssl-dev \
+            nasm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # build.rs needs protoc; resolve whatever the package manager put on PATH.
+      - name: Export PROTOC
+        shell: bash
+        run: echo "PROTOC=$(command -v protoc)" >> "$GITHUB_ENV"
+
+      # Build and package in one step. On run 39534691893 (v0.29.0) the
+      # separate `Package` step reported success but executed nothing — the
+      # archive never appeared, so the release shipped with zero assets and
+      # the upload action logged "Pattern ... does not match any files".
+      # Keeping the packaging inside the step whose output proves it ran
+      # (the cargo build) removes that failure mode.
+      - name: Build and package WAFred
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --bin wafred ${{ matrix.features }} --target ${{ matrix.target }}
+          ls -lh "target/${{ matrix.target }}/release/wafred"
+
+          ASSET="wafred-${{ matrix.plat }}-${{ matrix.arch }}"
+          rm -rf "$ASSET" "$ASSET.tar.xz" "$ASSET.tar.gz" \
+                 "$ASSET.tar.xz.sha256" "$ASSET.tar.gz.sha256"
+          mkdir -p "$ASSET"
+          cp "target/${{ matrix.target }}/release/wafred" "$ASSET/wafred"
+          cp LICENSE README.md "$ASSET/"
+          # Optional extras: shipped when present, never fatal when absent.
+          cp wafred.toml "$ASSET/" 2>/dev/null || true
+          cp wafred.service "$ASSET/" 2>/dev/null || true
+          chmod +x "$ASSET/wafred"
+          # .tar.xz is the primary format (smaller); the legacy .tar.gz is
+          # kept as the install.sh fallback for hosts without xz(1) and for
+          # tooling pinned to the old asset names.
+          tar -cJf "$ASSET.tar.xz" "$ASSET"
+          tar -czf "$ASSET.tar.gz" "$ASSET"
+          # `shasum` is a Perl script that is absent on minimal images;
+          # `sha256sum` is the GNU coreutils one that is always present.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ASSET.tar.xz" > "$ASSET.tar.xz.sha256"
+            sha256sum "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256"
+          else
+            shasum -a 256 "$ASSET.tar.xz" > "$ASSET.tar.xz.sha256"
+            shasum -a 256 "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256"
+          fi
+          ls -lh "$ASSET.tar.xz" "$ASSET.tar.gz" \
+                 "$ASSET.tar.xz.sha256" "$ASSET.tar.gz.sha256"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wafred-binary-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/wafred
+          retention-days: 1
+
+      # Only assets: the release (and its body, from CHANGELOG.md) was created
+      # once by `release-notes`. Both legs upload here, concurrently, and each
+      # used to carry `generate_release_notes: true` — two writers for one
+      # body, which is how v0.29.3 got the same line twice and no notes.
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          files: |
+            wafred-${{ matrix.plat }}-${{ matrix.arch }}.tar.xz
+            wafred-${{ matrix.plat }}-${{ matrix.arch }}.tar.xz.sha256
+            wafred-${{ matrix.plat }}-${{ matrix.arch }}.tar.gz
+            wafred-${{ matrix.plat }}-${{ matrix.arch }}.tar.gz.sha256
+
+  docker:
+    name: Docker image (${{ matrix.arch }})
+    needs: binaries
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-latest
+            platform: linux/amd64
+          - arch: arm64
+            # Keep this runner aligned with the binaries matrix leg above:
+            # ubuntu-24.04-arm ships the same protoc (>= 3.15, proto3 optional
+            # works) and the same glibc, so runtime-embedded binaries and
+            # from-source builds stay reproducible across jobs.
+            runs-on: ubuntu-24.04-arm
+            platform: linux/arm64
+    steps:
+      - name: Derive version
+        id: version
+        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wafred-binary-${{ matrix.arch }}
+          path: docker-context/
+
+      - name: Prepare build context
+        run: |
+          chmod +x docker-context/wafred
+          cp wafred.toml docker-context/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          # GHA runners intermittently time out pulling moby/buildkit from
+          # Docker Hub; mirror.gcr.io serves the identical image anonymously.
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-context/
+          file: ./Dockerfile.runtime
+          platforms: ${{ matrix.platform }}
+          push: true
+          # Disable provenance/SBOM so each per-arch tag is a plain image
+          # manifest (not a manifest list), which docker manifest create requires.
+          provenance: false
+          sbom: false
+          tags: ghcr.io/oyport/wafred:${{ steps.version.outputs.value }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.value }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+  docker-manifest:
+    name: Merge multi-arch Docker manifest
+    needs: docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifests
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          IMAGE="ghcr.io/oyport/wafred"
+          # Derive major.minor from version (e.g. 0.14.3 -> 0.14)
+          MAJOR_MINOR=$(echo "$VERSION" | cut -d. -f1,2)
+
+          # A pre-release (`-rc.1`, `-beta.2`, …) gets its own immutable tag
+          # and nothing else. `latest` and `0.30` must keep pointing at the
+          # newest *stable* release: a test build that moved them would hand
+          # `docker compose pull` and `install.sh` an unreleased binary with
+          # no way for the operator to tell. The per-arch tags it is built
+          # from are already version-pinned and safe to share.
+          #
+          # `[[` and `${VERSION%%-*}` are bash; the step's shell is bash by
+          # default on ubuntu runners, and the alternation stays portable
+          # rather than reaching for grep -E.
+          if [[ "$VERSION" == *-* ]]; then
+            echo "::notice::pre-release $VERSION: publishing :$VERSION only"
+            docker manifest create "${IMAGE}:${VERSION}" \
+              "${IMAGE}:${VERSION}-amd64" \
+              "${IMAGE}:${VERSION}-arm64" \
+              --amend
+            docker manifest push "${IMAGE}:${VERSION}"
+            exit 0
+          fi
+
+          for tag in "$VERSION" "$MAJOR_MINOR" "latest"; do
+            docker manifest create "${IMAGE}:${tag}" \
+              "${IMAGE}:${VERSION}-amd64" \
+              "${IMAGE}:${VERSION}-arm64" \
+              --amend
+            docker manifest push "${IMAGE}:${tag}"
+          done

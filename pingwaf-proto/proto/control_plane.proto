@@ -1,0 +1,1406 @@
+syntax = "proto3";
+package wafred;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
+// ============================================================
+// Service Definition
+// ============================================================
+
+service ControlPlane {
+  // Agent lifecycle
+  rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);
+  rpc Heartbeat(stream AgentHeartbeat) returns (stream ServerCommand);
+
+  // Rule synchronization (server pushes rules to agent)
+  rpc SyncRules(SyncRulesRequest) returns (stream RuleBundle);
+
+  // Log shipping (agent streams logs to server)
+  rpc ShipLogs(stream LogEntry) returns (LogAck);
+
+  // Certificate event shipping (raw ACME issuance logs from the agent)
+  rpc ShipCertEvents(stream CertEventEntry) returns (CertEventAck);
+
+  // Metrics shipping
+  rpc ShipMetrics(stream MetricBatch) returns (MetricAck);
+
+  // Configuration sync (agent pulls full site config)
+  rpc GetSiteConfig(GetSiteConfigRequest) returns (SiteConfig);
+
+  // Visitor authentication.
+  //
+  // A protected site's visitors are signed in by the data plane, but their
+  // accounts live in the control plane's database — the data plane has no
+  // database of its own and must not be given one. These RPCs are the
+  // bridge, and they are the reason a local login works on a deployment with
+  // several data-plane instances behind a load balancer: the challenge is
+  // created and consumed in one shared place rather than in whichever
+  // process happened to receive the two requests.
+  //
+  // All of them authenticate with the agent token, like every other RPC
+  // here. The data plane treats an unreachable control plane as a refusal,
+  // never as a pass: a login that cannot be checked is not a login.
+  rpc VisitorLoginChallenge(VisitorChallengeRequest) returns (VisitorChallengeResponse);
+  rpc VisitorLogin(VisitorLoginRequest) returns (VisitorLoginResponse);
+  rpc VisitorLogout(VisitorLogoutRequest) returns (VisitorLogoutResponse);
+  rpc VisitorChangePassword(VisitorChangePasswordRequest) returns (VisitorChangePasswordResponse);
+  rpc VisitorGrants(VisitorGrantsRequest) returns (VisitorGrantsResponse);
+  rpc VisitorSetSiteVisible(VisitorSetVisibleRequest) returns (VisitorSetVisibleResponse);
+
+  // Passkeys. The ceremony runs in the control plane (it holds the credential
+  // store and the `passkey-server` crate); the data plane only relays the two
+  // halves, so a visitor's authenticator is enrolled against the same
+  // implementation the console uses.
+  rpc VisitorPasskeyRegisterBegin(VisitorPasskeyBeginRequest) returns (VisitorPasskeyOptionsResponse);
+  rpc VisitorPasskeyRegisterFinish(VisitorPasskeyFinishRequest) returns (VisitorPasskeyFinishResponse);
+  rpc VisitorPasskeyLoginBegin(VisitorPasskeyBeginRequest) returns (VisitorPasskeyOptionsResponse);
+  rpc VisitorPasskeyLoginFinish(VisitorPasskeyFinishRequest) returns (VisitorLoginResponse);
+  rpc VisitorPasskeyList(VisitorGrantsRequest) returns (VisitorPasskeyListResponse);
+
+  // Checks that a session is still valid.
+  //
+  // The session cookie is self-contained — the data plane verifies its
+  // signature locally, so a page view costs no round trip — but a signature
+  // says nothing about whether the account still exists, was disabled, or had
+  // its password changed since. That is what this answers, and the data plane
+  // caches the answer briefly rather than asking on every request.
+  rpc VisitorValidateSession(VisitorValidateRequest) returns (VisitorValidateResponse);
+}
+
+// A session as the data plane holds it.
+message VisitorValidateRequest {
+  string agent_id = 1;
+  string agent_token = 2;
+  string site_id = 3;
+  string visitor_id = 4;
+  // The version the session was issued with. A mismatch means a password
+  // change (or an operator's reset) happened after it was minted.
+  int64 token_version = 5;
+}
+
+message VisitorValidateResponse {
+  // False when the account is gone, disabled, or its version moved on. The
+  // data plane clears the cookie and sends the visitor back to the login page.
+  bool valid = 1;
+  // Why, for the log: "disabled", "version_changed", "unknown".
+  string reason = 2;
+}
+
+// ============================================================
+// Agent Registration & Heartbeat
+// ============================================================
+
+message RegisterAgentRequest {
+  string api_key = 1;
+  string hostname = 2;
+  string ip_address = 3;   // Primary address the control plane should dial
+  string version = 4;
+  string os_info = 5;
+  uint32 cpu_cores = 6;
+  uint64 memory_bytes = 7;
+  // Egress address as seen by the public internet, empty when unknown.
+  string public_ip = 8;
+  // First non-virtual LAN address (docker/veth/bridge and loopback excluded).
+  string private_ip = 9;
+}
+
+message RegisterAgentResponse {
+  string agent_id = 1;
+  string agent_token = 2;  // JWT for subsequent communication
+  int64 heartbeat_interval_seconds = 3;
+  SiteConfig initial_config = 4;
+}
+
+message AgentHeartbeat {
+  string agent_id = 1;
+  string agent_token = 2;
+  google.protobuf.Timestamp timestamp = 3;
+
+  // Runtime metrics
+  double cpu_usage_percent = 4;
+  uint64 memory_usage_bytes = 5;
+  uint64 active_connections = 6;
+  uint64 requests_per_second = 7;
+  uint64 blocked_requests_total = 8;
+
+  // Status
+  AgentHealthStatus health = 9;
+  string config_hash = 10;  // Current running config hash
+  repeated SiteStatus site_statuses = 11;
+
+  // Host probe samples collected since the previous heartbeat (oldest first).
+  repeated HostSample host_samples = 12;
+  string public_ip = 13;
+  string private_ip = 14;
+
+  // Dynamic IP blocks currently enforced by this agent: server-issued
+  // block commands plus auto-blocks triggered by WAF/rate-limit verdicts.
+  // The control plane reconciles its copy of the list against this report.
+  repeated BlockedIp blocked_ips = 15;
+
+  // When the agent last applied a full site config / a per-site rule
+  // bundle from the control plane. Absent = never synced.
+  google.protobuf.Timestamp last_config_sync_at = 16;
+  google.protobuf.Timestamp last_policy_sync_at = 17;
+
+  // Rule-cache disk health: false = no usable snapshot could be loaded, so
+  // the agent runs on empty rules until the next sync; true with a non-empty
+  // `cache_status_reason` = the backup snapshot was restored. Absent on
+  // older agents — the control plane treats that as healthy.
+  optional bool cache_persist_healthy = 18;
+  string cache_status_reason = 19;
+
+  // Per-upstream backend health as seen by this agent's load balancer
+  // (circuit-breaker state, not an active probe). The control plane turns
+  // sustained all-backends-down into `site.upstream_offline` alerts and
+  // partial loss into `site.upstream_abnormal`. Absent on older agents.
+  repeated UpstreamHealth upstream_health = 20;
+
+  // True when `blocked_ips` is a bounded prefix of the agent's list rather
+  // than the full set. The control plane must then keep the rows it did not
+  // see instead of treating them as revoked.
+  bool blocked_ips_truncated = 21;
+}
+
+// Backend health of one upstream, reported per heartbeat.
+message UpstreamHealth {
+  string upstream_name = 1;      // Upstream name as configured
+  uint32 healthy_backends = 2;    // Backends currently passing health checks
+  uint32 total_backends = 3;     // All configured backends
+  repeated string unhealthy_backends = 4;  // Backend addresses currently failing
+}
+
+// One dynamically blocked IP as enforced at the edge.
+message BlockedIp {
+  string ip = 1;
+  string site_id = 2;
+  string reason = 3;
+  google.protobuf.Timestamp blocked_at = 4;
+  // Absent = permanent block (no automatic expiry).
+  google.protobuf.Timestamp expires_at = 5;
+}
+
+enum AgentHealthStatus {
+  AGENT_HEALTH_UNKNOWN = 0;
+  AGENT_HEALTH_HEALTHY = 1;
+  AGENT_HEALTH_DEGRADED = 2;
+  AGENT_HEALTH_UNHEALTHY = 3;
+}
+
+message SiteStatus {
+  string site_id = 1;
+  string domain = 2;
+  uint64 requests_total = 3;
+  uint64 requests_blocked = 4;
+  uint64 cache_hits = 5;
+  uint64 cache_misses = 6;
+  string ssl_status = 7;  // "valid", "expiring_soon", "expired", "none"
+  google.protobuf.Timestamp ssl_expires_at = 8;
+
+  // Edge cache disk accounting, reported by the agent's quota ledger.
+  uint64 cache_disk_bytes = 9;    // Current on-disk usage for this site
+  uint64 cache_items = 10;        // Tracked cache entries
+  uint64 cache_evictions = 11;    // Entries evicted to stay under quota
+  uint64 cache_quota_bytes = 12;  // Configured ceiling, 0 = unlimited
+
+  // `site_certificates.id` the site's TLS posture selected, empty when the
+  // site is self-signed or has no certificate. Lets the control plane update
+  // the right ACME row when one certificate is shared by several sites.
+  string certificate_id = 13;
+}
+
+// One host probe sample, taken every few seconds by the agent's probe thread.
+// Cumulative counters (net/disk) are shipped raw and differenced by consumers.
+message HostSample {
+  int64 ts_millis = 1;                 // Unix epoch milliseconds
+  double cpu_usage_percent = 2;
+  double load1 = 3;
+  double load5 = 4;
+  double load15 = 5;
+  uint64 memory_total_bytes = 6;
+  uint64 memory_used_bytes = 7;
+  uint64 memory_available_bytes = 8;
+  uint64 swap_total_bytes = 9;
+  uint64 swap_used_bytes = 10;
+  uint64 disk_total_bytes = 11;        // Filesystem holding the probe path
+  uint64 disk_used_bytes = 12;
+  uint64 net_rx_bytes = 13;
+  uint64 net_tx_bytes = 14;
+  uint64 disk_read_bytes = 15;
+  uint64 disk_write_bytes = 16;
+  uint32 process_count = 17;
+  uint32 tcp_connections = 18;
+  uint64 uptime_secs = 19;
+}
+
+message ServerCommand {
+  string command_id = 1;
+  CommandType type = 2;
+  google.protobuf.Timestamp issued_at = 3;
+
+  oneof payload {
+    RuleUpdateCommand rule_update = 10;
+    ConfigReloadCommand config_reload = 11;
+    BlockIpCommand block_ip = 12;
+    UnblockIpCommand unblock_ip = 13;
+    PurgeCacheCommand purge_cache = 14;
+    UpdateSiteCommand update_site = 15;
+    RestartAgentCommand restart_agent = 16;
+    FlushLogsCommand flush_logs = 17;
+  }
+}
+
+enum CommandType {
+  COMMAND_UNKNOWN = 0;
+  COMMAND_RULE_UPDATE = 1;
+  COMMAND_CONFIG_RELOAD = 2;
+  COMMAND_BLOCK_IP = 3;
+  COMMAND_UNBLOCK_IP = 4;
+  COMMAND_PURGE_CACHE = 5;
+  COMMAND_UPDATE_SITE = 6;
+  COMMAND_RESTART_AGENT = 7;
+  COMMAND_FLUSH_LOGS = 8;
+}
+
+message RuleUpdateCommand {
+  string site_id = 1;
+  RuleBundle rules = 2;
+}
+
+message ConfigReloadCommand {
+  SiteConfig config = 1;
+}
+
+message BlockIpCommand {
+  string site_id = 1;
+  repeated string ip_addresses = 2;
+  int64 duration_seconds = 3;  // 0 = permanent
+  string reason = 4;
+}
+
+message UnblockIpCommand {
+  string site_id = 1;
+  repeated string ip_addresses = 2;
+}
+
+message PurgeCacheCommand {
+  string site_id = 1;
+  repeated string urls = 2;      // Empty = purge all
+  repeated string tags = 3;
+}
+
+message UpdateSiteCommand {
+  SiteConfig site_config = 1;
+}
+
+message RestartAgentCommand {
+  string reason = 1;
+  bool graceful = 2;
+}
+
+// Ask the agent to flush its in-memory log buffer now instead of waiting for
+// the batch/interval trigger. One-way: the command channel has no ack frame,
+// the effect shows up in the next heartbeat's pending-log counters.
+message FlushLogsCommand {
+  string reason = 1;
+}
+
+// ============================================================
+// Rule Synchronization
+// ============================================================
+
+message SyncRulesRequest {
+  string agent_id = 1;
+  string agent_token = 2;
+  string site_id = 3;           // Empty = all sites
+  string current_config_hash = 4; // For delta sync
+}
+
+message RuleBundle {
+  string site_id = 1;
+  string config_hash = 2;
+  google.protobuf.Timestamp updated_at = 3;
+
+  // WAF Rules
+  WafConfig waf = 10;
+
+  // Rate Limiting
+  repeated RateLimitRule rate_limit_rules = 11;
+
+  // IP Access Rules
+  repeated IpAccessRule ip_access_rules = 12;
+
+  // Geo Restrictions
+  GeoConfig geo = 13;
+
+  // Cache Rules
+  repeated CacheRule cache_rules = 14;
+
+  // Challenge Config
+  ChallengeConfig challenge = 15;
+
+  // Rewrite Rules
+  repeated RewriteRule rewrite_rules = 16;
+
+  // Custom Error Pages
+  repeated CustomErrorPage error_pages = 17;
+
+  // SSL Config
+  SslConfig ssl = 18;
+
+  // Upstream Config
+  repeated UpstreamConfig upstreams = 19;
+
+  // Origin pools and routes
+  repeated RouteConfig routes = 20;
+
+  // Bot protection (UA classification)
+  BotProtectionConfig bot_protection = 21;
+
+  // Site-wide basic authentication gate
+  BasicAuthConfig basic_auth = 22;
+
+  // Observation mode: every protection (WAF, IP/geo rules, bot protection,
+  // rate limiting) keeps detecting but only records; the request proceeds.
+  bool observation_mode = 23;
+
+  // Per-site failover policy registry: every bundle carries the complete
+  // domain → policy map for ALL sites, so the agent can resolve a site's
+  // disconnected behaviour even for hosts whose rule bundle was never
+  // synced (the only situation in which the policy is consulted).
+  repeated SitePolicy site_policies = 24;
+
+  // Control-plane-wide default for hosts absent from `site_policies`.
+  // Explicit presence (`optional`): an old server leaves the field unset,
+  // which the agent must distinguish from an explicit `false`.
+  optional bool default_fail_open = 25;
+
+  // Deployment-wide cache ceiling (single-file cap, total disk budget,
+  // master switch, default edge TTL). Absent = old server: the agent falls
+  // back to its built-in defaults.
+  optional GlobalCacheSettings global_cache = 26;
+
+  // Site-level cache limits (single-file cap + per-content-type caps).
+  // Absent = no site-level override.
+  optional SiteCacheSettings cache_settings = 27;
+
+  // Deployment-wide default for verifying the TLS certificate of an origin
+  // reached over HTTPS. Fills in the pools that carry no `verify_cert` of
+  // their own (i.e. those that follow the default); a pool that states its
+  // own value always wins. Explicit presence (`optional`): an old server
+  // leaves it unset, which the agent must distinguish from an explicit
+  // `false` — it then keeps its historical lenient behaviour, because
+  // falling through to strict validation would 502 every HTTPS origin with
+  // a self-signed certificate. See `BasicConf::origin_verify_cert`.
+  optional bool origin_verify_cert = 28;
+
+  // Site-level response body replacement, compiled into a per-site
+  // `sub_filter` plugin instance. Absent = the site replaces nothing and no
+  // plugin is generated for it (old servers never send it).
+  optional ResponseReplaceConfig response_replace = 29;
+
+  // AI crawler policy: the rendered robots.txt / llms.txt bodies and the
+  // per-family actions. Absent = no AI crawler control on this site (old
+  // servers never send it).
+  optional AiCrawlConfig ai_crawl = 30;
+
+  // Site-level OIDC authentication, compiled into a per-site `oidc` plugin
+  // instance. Absent = the site has no OIDC (old servers never send it), and
+  // the data plane generates no plugin for it.
+  optional OidcConfig oidc = 31;
+
+  // Deployment-wide access-log settings: whether static-asset requests that
+  // triggered no security rule are skipped from `access_logs`. Absent = old
+  // server: the agent never skips logging (fail-open).
+  optional LogSettings log_settings = 32;
+
+  // Path exceptions: request paths that skip selected protection layers. Only
+  // honoured while the site is in observation mode. Absent = no exceptions
+  // (old servers never send them).
+  repeated PathException path_exceptions = 33;
+  // Ordered request path restrictions; evaluated before path exceptions.
+  repeated PathRestriction path_restrictions = 34;
+}
+
+message PathRestriction {
+  string id = 1;
+  string name = 2;
+  string path = 3;
+  PathMatchType match_type = 4;
+  // Optional WAF expression that must also match.
+  string expression = 5;
+  // `block`, `basic_auth`, or `oidc`.
+  string action = 6;
+  // 0 blocks immediately; otherwise allow this many requests per client in the period.
+  uint32 threshold = 7;
+  uint32 period_seconds = 8;
+  // 0 blocks until the rate window ends.
+  uint32 block_duration_seconds = 9;
+  bool schedule_enabled = 10;
+  string schedule_timezone = 11;
+  // ISO weekday numbers, Monday=1 through Sunday=7.
+  repeated int32 schedule_days = 12;
+  string schedule_start = 13;
+  string schedule_end = 14;
+  bool enabled = 15;
+  uint32 priority = 16;
+}
+
+// One whitelisted request path and the protection layers it skips.
+message PathException {
+  string id = 1;
+  string path = 2;
+  PathMatchType match_type = 3;
+  // `*` collapses the list; empty means every layer (old-server shape).
+  repeated string skip_layers = 4;
+  bool enabled = 5;
+  // Write a `security_events` row on every hit. Off by default: a health
+  // probe would otherwise flood the event table.
+  bool log_hits = 6;
+  // Operator-facing label (`rule_name` in the event log).
+  string note = 7;
+}
+
+enum PathMatchType {
+  PATH_MATCH_PREFIX = 0;    // `path` or `path/…`, never `/apix`
+  PATH_MATCH_EXACT = 1;     // request path equals `path`
+  PATH_MATCH_WILDCARD = 2;  // single trailing `*`, otherwise a prefix match
+  // Rust `regex` syntax, unanchored (`is_match`) and case-sensitive; anchor
+  // with `^…$` when the whole path must match. Agents that predate this value
+  // fall back to prefix semantics, so the exception simply stops applying
+  // (fail-safe) until the agent is upgraded.
+  PATH_MATCH_REGEX = 3;
+}
+
+// Global access-log filtering configuration. Carried on every `RuleBundle`
+// because the data plane consults it at request completion, when the only
+// handle it has is the bundle already resolved for the request host.
+message LogSettings {
+  // Skip the access-log entry for static-asset paths (see
+  // `static_suffixes`) when the request triggered no WAF verdict.
+  optional bool skip_static_access_logs = 1;
+  // Path suffixes classified as static assets, lowercase, no leading dot.
+  // An empty list with the switch on skips nothing.
+  repeated string static_suffixes = 2;
+}
+
+// AI crawler control. The control plane renders the file bodies (they are
+// served by a `mock` plugin on an exact-path location) and sends the family
+// patterns the data plane matches user agents against.
+message AiCrawlConfig {
+  bool enabled = 1;
+  // `allow` / `monitor` / `block`, applied to a family with no override.
+  string default_action = 2;
+  // Rendered bodies; empty means the file is not served.
+  string robots_body = 3;
+  string llms_body = 4;
+  // `Cache-Control: max-age` for both files.
+  uint32 cache_max_age = 5;
+  repeated AiBotPolicy policies = 6;
+}
+
+message AiBotPolicy {
+  // Stable family id (matches the control plane catalogue).
+  string id = 1;
+  // Lowercase UA substrings identifying the family.
+  repeated string ua_substrings = 2;
+  // `training` / `search` / `agent` / `other`.
+  string category = 3;
+  // `allow` / `monitor` / `block` after inheritance is resolved.
+  string action = 4;
+}
+
+// One literal or regex replacement inside a ResponseReplaceConfig. The pair
+// becomes `sub_filter '<pattern>' '<replacement>' g` (literal) or
+// `subs_filter '...' '...' g` (regex) in pingap's sub_filter plugin.
+message ResponseReplaceRule {
+  // Text (or regex when `is_regex`) searched for in the response body;
+  // non-empty, at most 512 bytes, no single quote (`'` delimits the plugin's
+  // rule syntax).
+  string pattern = 1;
+  // Substituted for every match; non-empty, at most 2048 bytes, no single
+  // quote. With `is_regex` the data plane runs it through the regex crate's
+  // replacement expansion, so `$1` / `$name` are capture references.
+  string replacement = 2;
+  // Compile `pattern` as a regular expression instead of a literal.
+  bool is_regex = 3;
+}
+
+// A site's response body replacement policy (`sites.response_replace`).
+message ResponseReplaceConfig {
+  // Regex the request path must match; empty applies to every path.
+  string path = 1;
+  // Status codes the replacement applies to (100-599); empty applies to all.
+  repeated uint32 status_codes = 2;
+  // Replacements applied in order; empty is a no-op policy.
+  repeated ResponseReplaceRule rules = 3;
+}
+
+// Deployment-wide cache limits, mirrored from the `cache_settings` table.
+message GlobalCacheSettings {
+  // Largest single cacheable object, in megabytes (0 = old-server default
+  // of 16 MiB applies).
+  optional uint32 max_file_size_mb = 1;
+  // Total disk budget across all sites, in megabytes; 0 = unlimited.
+  optional uint32 max_space_mb = 2;
+  // Master switch: false removes the cache plugin from the generated
+  // configuration entirely.
+  optional bool master_enabled = 3;
+  // Edge TTL (seconds) used when a cache rule does not configure one;
+  // 0 = no fallback.
+  optional uint32 default_edge_ttl_seconds = 4;
+}
+
+// One content family of a site's extension-based cache type policy.
+message CacheTypeCategory {
+  // Whether this family's cache rule is active.
+  optional bool enabled = 1;
+  // Edge freshness seconds; an enabled family always carries a value > 0
+  // (validated at write time).
+  optional uint32 edge_ttl_seconds = 2;
+  // Browser-facing Cache-Control max-age override; 0 = leave origin.
+  optional uint32 browser_ttl_seconds = 3;
+  // File extensions (lowercase, no dot) this family covers.
+  repeated string extensions = 4;
+}
+
+// Extension-based cache policy: five fixed content families an
+// administrator tunes per site.
+message CacheTypePolicy {
+  optional CacheTypeCategory web_assets = 1;
+  optional CacheTypeCategory image = 2;
+  optional CacheTypeCategory media = 3;
+  optional CacheTypeCategory other = 4;
+  optional CacheTypeCategory html = 5;
+}
+
+// One site's cache limits. Values the site did not set are absent and the
+// consumer falls back: type limit → site cap → global cap.
+message SiteCacheSettings {
+  // Site-level single-file cap in megabytes; absent = follow the global
+  // ceiling.
+  optional uint32 max_file_size_mb = 1;
+  // Per-content-type single-file caps keyed by
+  // html/css/js/image/font/media/other.
+  map<string, uint32> type_max_file_size_mb = 2;
+  // Extension-based cache policy; absent when unconfigured.
+  optional CacheTypePolicy type_policy = 3;
+}
+
+// How one site behaves while the control plane is unreachable and the host
+// has no synced rule bundle.
+enum FailoverMode {
+  FAILOVER_INHERIT = 0;  // Follow `default_fail_open`
+  FAILOVER_OPEN = 1;     // Keep proxying through the base engine
+  FAILOVER_CLOSED = 2;   // Answer 503
+}
+
+// One site's entry in the failover policy registry.
+message SitePolicy {
+  string domain = 1;
+  repeated string alternate_domains = 2;
+  FailoverMode mode = 3;
+}
+
+// Site-wide HTTP basic authentication. Enforced by the WAF plugin, which sits
+// at the head of the plugin chain, so a cache hit cannot bypass the gate.
+message BasicAuthConfig {
+  bool enabled = 1;
+  // Realm announced in the `WWW-Authenticate` challenge.
+  string realm = 2;
+  // Accepted credentials. `authorization` is the base64 of `user:password`,
+  // ready to compare against the request's Authorization header.
+  repeated BasicAuthCredential credentials = 3;
+  // Seconds to sleep after a failed attempt, slowing down brute force.
+  uint32 delay_seconds = 4;
+  // Strip the Authorization header before forwarding to the origin.
+  bool hide_credentials = 5;
+}
+
+message BasicAuthCredential {
+  string username = 1;
+  string authorization = 2;
+}
+
+// Site-level OpenID Connect authentication (authorization code flow with
+// PKCE). Enforced by a dedicated per-site `oidc` plugin, generated by the data
+// plane from this message. Unlike basic auth it cannot live inside the WAF
+// plugin: it redirects to the provider and handles the callback on its own
+// paths, so it is a plugin of its own, ordered after the rewrite step and
+// before the cache step.
+message OidcConfig {
+  bool enabled = 1;
+  // Provider issuer URL, absolute http(s), without a trailing slash.
+  string issuer = 2;
+  string client_id = 3;
+  // Empty for a public client; masked in the API and never logged.
+  string client_secret = 4;
+  // Key the session cookie is encrypted with; at least 16 characters while
+  // enabled.
+  string cookie_secret = 5;
+  // Path the provider redirects back to; defaults to "/oauth2/callback".
+  string redirect_path = 6;
+  // Empty = the site offers no logout endpoint.
+  string logout_path = 7;
+  // Empty = the callback URL is derived from the request's Host.
+  string redirect_url = 8;
+  // Scopes requested at the provider; always contains "openid".
+  repeated string scopes = 9;
+  // Session cookie name; defaults to "pingap_oidc".
+  string cookie_name = 10;
+  // Session lifetime in seconds (>= 60).
+  uint32 session_ttl_seconds = 11;
+  // Claims of the validated ID token to forward to the origin as headers.
+  repeated OidcHeaderClaim claims_to_headers = 12;
+  // What the site does with a signed-in visitor. One of "allow_all"
+  // (default), "require_any", "require_all". Authenticating proves who
+  // someone is; this is the half that says whether they may enter.
+  string access_mode = 13;
+  // Rules `access_mode` applies. Empty with `require_any` or `require_all`
+  // denies everyone but the site's own operators, which is why the API
+  // refuses to store that combination.
+  repeated OidcAccessRule access_rules = 14;
+  // How a visitor signs in. One of "oidc" (default — the authorization-code
+  // flow, the behaviour before local accounts existed), "local" (a local
+  // account with a proof-of-work challenge) or "both". `access_mode` decides
+  // who may enter *after* signing in; this decides how they sign in at all.
+  string auth_mode = 15;
+  // Absent on old control planes; the data plane treats it as site-wide.
+  optional bool site_wide = 16;
+}
+
+// One `claim -> request header` rule of `OidcConfig`.
+message OidcHeaderClaim {
+  // IdP claim read from the validated ID token, e.g. "email".
+  string claim = 1;
+  // Request header forwarded to the origin, e.g. "X-Auth-Email".
+  string header = 2;
+}
+
+// One access rule of `OidcConfig`: how a claim of the validated ID token is
+// held against `value`.
+message OidcAccessRule {
+  // Claim read from the ID token, e.g. "groups".
+  string claim = 1;
+  // One of "eq", "ne", "contains", "in", "exists".
+  string operator = 2;
+  // What to compare against. Unused by "exists".
+  string value = 3;
+}
+
+message WafConfig {
+  bool enabled = 1;
+  WafMode mode = 2;
+  uint32 paranoia_level = 3;  // 1-4
+  bool sqli_detection = 4;
+  bool xss_detection = 5;
+  bool rce_detection = 6;
+  bool lfi_detection = 7;
+  bool ssrf_detection = 8;
+  bool bot_detection = 9;
+
+  // Custom rules
+  repeated WafRule custom_rules = 20;
+
+  // Managed ruleset overrides
+  repeated RuleOverride managed_overrides = 21;
+
+  // ML config
+  bool ml_enabled = 30;
+  string ml_model_path = 31;
+  double ml_threshold = 32;
+
+  // Anomaly scoring
+  uint32 anomaly_threshold = 40;
+
+  // Site-level posture merged from the `waf_settings` row: advanced mode
+  // (strict level + body deep inspection) and monitor-only downgrades.
+  // Empty/false = enforce everything at the normal level (the default).
+  bool advanced_mode = 41;
+  repeated string monitor_categories = 42;  // "sqli"…"ssti"; unknown ignored
+  repeated string monitor_stacks = 43;      // "java"|"php"|"python"|"node"
+  // Individual managed rule ids (e.g. "WAFRED-1010") downgraded to
+  // monitor-only at this site. Unknown ids are ignored by the data plane.
+  repeated string monitor_managed_rules = 44;
+
+  // How long the data plane may withhold a request body while inspecting it
+  // (seconds, 1-30). 0/unset means "use the data-plane default" (30). This is
+  // a per-site WAF setting, not a downstream connection timeout: downstream
+  // timeouts belong to the listener and cannot vary per host.
+  uint32 body_stage_timeout_secs = 45;
+}
+
+enum WafMode {
+  WAF_MODE_OFF = 0;
+  WAF_MODE_MONITOR = 1;  // Log only
+  WAF_MODE_BLOCK = 2;    // Block threats
+}
+
+message WafRule {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  string expression = 4;       // Rules language expression
+  WafAction action = 5;
+  uint32 severity = 6;         // 1-5
+  repeated string tags = 7;
+  bool enabled = 8;
+  WafMode mode = 9;
+  uint32 priority = 10;
+}
+
+enum WafAction {
+  WAF_ACTION_BLOCK = 0;
+  WAF_ACTION_LOG = 1;
+  WAF_ACTION_CHALLENGE = 2;
+  WAF_ACTION_JS_CHALLENGE = 3;
+  WAF_ACTION_ALLOW = 4;
+  // Require basic authentication for the matched request. Only meaningful in
+  // the geo rule's action: custom WAF rules cannot express it.
+  WAF_ACTION_BASIC_AUTH = 5;
+}
+
+message RuleOverride {
+  string rule_id = 1;
+  string tag = 2;              // Override by tag (if rule_id empty)
+  WafAction action = 3;
+  bool enabled = 4;
+}
+
+message RateLimitRule {
+  string id = 1;
+  string name = 2;
+  string expression = 3;       // Match condition
+  repeated RateLimitCharacteristics characteristics = 4;
+  uint32 period_seconds = 5;
+  uint32 threshold = 6;
+  WafAction action = 7;
+  uint32 mitigation_timeout_seconds = 8;
+  bool enabled = 9;
+  uint32 priority = 10;
+  // Parameter name (header name, cookie name or query parameter name) for the
+  // characteristic at the matching index; only HEADER/COOKIE/QUERY carry one
+  // (e.g. "X-Api-Key", "session", "token"), every other index stays empty.
+  repeated string characteristic_params = 11;
+  // Requests matching this filter are excluded from the rule entirely. Empty
+  // means no exception; `expression` remains an inclusion filter.
+  string exception_expression = 12;
+}
+
+enum RateLimitCharacteristics {
+  RATE_LIMIT_CHAR_IP = 0;
+  RATE_LIMIT_CHAR_IP_NAT = 1;
+  RATE_LIMIT_CHAR_HOST = 2;
+  RATE_LIMIT_CHAR_PATH = 3;
+  RATE_LIMIT_CHAR_HEADER = 4;
+  RATE_LIMIT_CHAR_COOKIE = 5;
+  RATE_LIMIT_CHAR_QUERY = 6;
+  RATE_LIMIT_CHAR_ASN = 7;
+  RATE_LIMIT_CHAR_COUNTRY = 8;
+  RATE_LIMIT_CHAR_JA3 = 9;
+}
+
+message IpAccessRule {
+  string id = 1;
+  string name = 2;
+  repeated string ip_ranges = 3;   // CIDR notation
+  IpAccessAction action = 4;
+  string note = 5;
+  bool enabled = 6;
+}
+
+enum IpAccessAction {
+  IP_ACCESS_BLOCK = 0;
+  IP_ACCESS_CHALLENGE = 1;
+  IP_ACCESS_JS_CHALLENGE = 2;
+  IP_ACCESS_ALLOW = 3;
+  // Require basic authentication for the matched client.
+  IP_ACCESS_BASIC_AUTH = 4;
+}
+
+message GeoConfig {
+  bool enabled = 1;
+  repeated string blocked_countries = 2;    // ISO 3166-1 alpha-2
+  repeated string allowed_countries = 3;    // Whitelist mode
+  repeated string blocked_asns = 4;
+  bool block_unknown = 5;
+  WafAction action = 6;
+}
+
+message CacheRule {
+  string id = 1;
+  string name = 2;
+  string match_expression = 3;
+  uint32 edge_ttl_seconds = 4;
+  uint32 browser_ttl_seconds = 5;
+  uint32 disk_quota_mb = 6;       // Per-domain disk cache limit
+  bool cache_eligible = 7;
+  repeated string cache_key_headers = 8;
+  bool respect_origin_headers = 9;
+  uint32 stale_while_revalidate_seconds = 10;
+  bool enabled = 11;
+}
+
+message ChallengeConfig {
+  bool enabled = 1;
+  bool under_attack_mode = 2;
+  ChallengeLevel default_level = 3;
+  uint32 clearance_duration_seconds = 4;  // Cookie validity
+  repeated string exempt_paths = 5;       // Paths that skip challenge
+
+  // Trigger conditions
+  uint32 request_threshold = 10;         // Requests per minute to trigger
+  bool browser_integrity_check = 11;
+  bool tls_fingerprint_check = 12;
+}
+
+enum ChallengeLevel {
+  CHALLENGE_NONE = 0;
+  CHALLENGE_NON_INTERACTIVE = 1;  // JS Challenge (5s shield)
+  CHALLENGE_MANAGED = 2;          // System decides
+  CHALLENGE_INTERACTIVE = 3;      // Full CAPTCHA
+}
+
+// User-agent based bot classification. Verified bots on the whitelist pass,
+// real browsers pass, everything else receives the configured action.
+message BotProtectionConfig {
+  bool enabled = 1;
+  WafAction action = 2;                      // Applied to non-browser user agents
+  repeated string known_bots_whitelist = 3;  // Case-insensitive UA substrings of verified bots
+  // Verify claiming bots by their client IP: a request whose IP falls inside
+  // `verified_bot_ranges` is treated as a verified bot regardless of its UA.
+  bool ip_verification_enabled = 4;
+  // Confirm whitelisted bot user agents via reverse DNS (PTR must resolve
+  // back to a known bot domain that also points at the client IP).
+  bool dns_verification_enabled = 5;
+  // CIDR ranges of verified bot networks, expanded by the control plane from
+  // the IP group the site's bot protection references (the agent never sees
+  // group identities).
+  repeated string verified_bot_ranges = 6;
+}
+
+message RewriteRule {
+  string id = 1;
+  string name = 2;
+  string match_expression = 3;
+  RewriteDirection direction = 4;
+  reserved 5, 6, 7, 8, 9, 10;
+  reserved "header_operations", "path_rewrite", "path_rewrite_to",
+            "query_rewrite", "body_search", "body_replace";
+  bool enabled = 11;
+  uint32 priority = 12;
+  repeated RewriteOperation operations = 13;
+}
+
+enum RewriteDirection {
+  REWRITE_REQUEST = 0;
+  REWRITE_RESPONSE = 1;
+}
+
+// One declarative rewrite operation, mirroring the console's operations JSON:
+// type is one of set_header | add_header | remove_header | set_path |
+// regex_replace_path | set_query_param | remove_query_param | replace_body.
+// name/value semantics depend on the type (pattern/replacement for
+// regex_replace_path and replace_body, header name/value for header ops).
+message RewriteOperation {
+  string type = 1;
+  string name = 2;
+  string value = 3;
+  // `replace_body` only: treat `name` as a regular expression and support
+  // `$1` / `${name}` capture-group references in `value`. Unset = literal
+  // match (old agents / old servers).
+  optional bool is_regex = 4;
+  // `replace_body` only: true = replace every match (default), false =
+  // replace only the first occurrence. Unset = replace all (old behaviour).
+  optional bool greedy = 5;
+}
+
+message CustomErrorPage {
+  string id = 1;
+  uint32 status_code = 2;         // 403, 429, 502, etc.
+  string content_type = 3;        // "text/html", "application/json", "text/plain"
+  string body_template = 4;       // Tera template
+  string name = 5;
+  bool enabled = 6;
+  // "site" (default, replaces error responses for matched sites) or
+  // "unmatched_host" (served when no location matches the Host). Empty on
+  // the wire means "site" — old agents keep the old behaviour.
+  string scope = 7;
+}
+
+message SslConfig {
+  string cert_pem = 1;
+  string key_pem = 2;
+  bool acme_enabled = 3;
+  string acme_email = 4;
+  AcmeChallengeType acme_challenge_type = 5;
+  string acme_dns_provider = 6;
+  map<string, string> acme_dns_config = 7;
+  string min_tls_version = 8;
+  bool hsts_enabled = 9;
+  uint32 hsts_max_age = 10;
+  bool always_use_https = 11;
+  // Whether the site serves HTTPS at all.
+  bool enabled = 12;
+  string max_tls_version = 13;
+  // When set, the edge issues certificates on the fly instead of using
+  // `cert_pem`/`key_pem`.
+  bool self_signed = 14;
+  bool mtls_enabled = 15;
+  string mtls_client_ca = 16;
+  // Id of the `site_certificates` row this posture selects, when any.
+  string certificate_id = 17;
+  // SHA-256 fingerprints (lowercase hex) of revoked client certificates; the
+  // data plane rejects a handshake identity found here.
+  repeated string mtls_revoked_fingerprints = 18;
+  // Organization every client certificate must carry, so a certificate issued
+  // for another site cannot be replayed here. Empty skips the check.
+  string mtls_organization = 19;
+  // Whether a client certificate is required at all; defaults to
+  // `mtls_enabled` when unset for backward compatibility.
+  bool mtls_require_client_cert = 20;
+  // Downstream protocol switches. Unset means "enabled", so an agent that
+  // predates these fields keeps serving both protocols.
+  optional bool http1_enabled = 21;
+  optional bool http2_enabled = 22;
+}
+
+enum AcmeChallengeType {
+  ACME_HTTP_01 = 0;
+  ACME_DNS_01 = 1;
+}
+
+message UpstreamConfig {
+  string name = 1;
+  repeated UpstreamPeer peers = 2;
+  LoadBalanceAlgorithm algorithm = 3;
+  HealthCheckConfig health_check = 4;
+  uint32 connection_timeout_ms = 5;
+  uint32 read_timeout_ms = 6;
+  uint32 write_timeout_ms = 7;
+
+  // Origin pool identity and pingap-level settings. `algo` carries the
+  // complete pingap LB spec (`round_robin` or `hash:<type>[:<key>]`) and
+  // supersedes `algorithm`, which stays for backward compatibility.
+  string pool_id = 8;
+  string algo = 9;
+  // Non-empty enables TLS to the origin and sets the SNI.
+  string sni = 10;
+  optional bool verify_cert = 11;
+  bool is_default = 12;
+  // Address family the data plane may resolve this pool's origin names to:
+  // "auto" (default, prefer IPv4), "ipv4" (A records only) or "ipv6" (AAAA
+  // records only). Empty is treated as "auto" by the agent, so an older
+  // control plane that never sets it keeps the IPv4-first behaviour.
+  string address_family = 13;
+}
+
+message UpstreamPeer {
+  string address = 1;    // host:port
+  uint32 weight = 2;
+  bool tls = 3;
+}
+
+// A path-based route directing matching requests to an origin pool.
+message RouteConfig {
+  string id = 1;
+  string name = 2;
+  // prefix | exact | regex
+  string match_type = 3;
+  // Raw path, no pingap marker; the data plane adds "=" / "~" as needed.
+  string path = 4;
+  // Manual location weight; unset uses pingap's auto weight.
+  optional int32 priority = 5;
+  bool enabled = 6;
+  string pool_id = 7;
+  // CIDR ranges the client IP must fall into for this route to match; empty
+  // matches every client, entries come from the route's IP group.
+  repeated string ip_ranges = 9;
+  // Strip the matched prefix `path` from the request forwarded upstream, so a
+  // route on `/api` reaches an origin that only serves `/users`. Only a
+  // prefix route strips; false (the default) forwards the path unchanged.
+  bool strip_prefix = 10;
+  // Fixed path replacing the whole request path before proxying; wins over
+  // `strip_prefix`. Empty disables it. The query string is preserved.
+  string rewrite_path = 11;
+  // `Host` header sent to the origin for this route. Empty keeps the client's
+  // Host (the historic behaviour); a bare host name pins the virtual host the
+  // origin answers for. Mirrors `LocationConf.upstream_host`.
+  string upstream_host = 12;
+}
+
+enum LoadBalanceAlgorithm {
+  LB_ROUND_ROBIN = 0;
+  LB_CONSISTENT_HASH = 1;
+  LB_LEAST_CONNECTIONS = 2;
+  LB_RANDOM = 3;
+}
+
+message HealthCheckConfig {
+  bool enabled = 1;
+  string path = 2;
+  uint32 interval_seconds = 3;
+  uint32 timeout_ms = 4;
+  uint32 unhealthy_threshold = 5;
+  uint32 healthy_threshold = 6;
+}
+
+// ============================================================
+// Site Configuration
+// ============================================================
+
+message GetSiteConfigRequest {
+  string agent_id = 1;
+  string agent_token = 2;
+  string site_id = 3;  // Empty = all sites for this agent
+}
+
+message SiteConfig {
+  repeated Site sites = 1;
+  google.protobuf.Timestamp updated_at = 2;
+  string config_hash = 3;
+}
+
+message Site {
+  string id = 1;
+  string name = 2;
+  string domain = 3;
+  repeated string alternate_domains = 4;
+  SiteStatusEnum status = 5;
+  RuleBundle rules = 6;
+  // The site sits behind a CDN / reverse proxy: the real client IP used by
+  // IP access control, rate limiting, challenges and logs is taken from a
+  // forwarded header instead of the direct TCP peer.
+  bool trust_proxy_headers = 7;
+  // Lower-case header the client IP is read from; empty = x-forwarded-for.
+  string trusted_header = 8;
+  // Trust the last XFF entry (appended by the nearest proxy) instead of the
+  // client-supplied first one.
+  bool trust_last_hop = 9;
+  // CIDR ranges of proxies allowed to influence the resolved client IP.
+  // Only a direct peer inside one of these ranges may set the forwarded
+  // header; an empty list means no proxy is trusted.
+  repeated string trusted_proxy_ranges = 10;
+  // Per-site downstream read/write timeout in seconds. 0 means the sender
+  // predates the field; the agent must fall back to 60.
+  uint32 downstream_timeout_secs = 11;
+}
+
+enum SiteStatusEnum {
+  SITE_STATUS_ACTIVE = 0;
+  SITE_STATUS_PAUSED = 1;
+  SITE_STATUS_PENDING = 2;
+}
+
+// ============================================================
+// Logging
+// ============================================================
+
+message LogEntry {
+  string agent_id = 1;
+  string site_id = 2;
+  string request_id = 3;
+  google.protobuf.Timestamp timestamp = 4;
+
+  // Request info
+  string client_ip = 10;
+  string method = 11;
+  string scheme = 12;
+  string host = 13;
+  string path = 14;
+  string query_string = 15;
+  string protocol = 16;
+  map<string, string> request_headers = 17;
+  bytes request_body = 18;          // Truncated per config
+  uint64 request_body_size = 19;    // Original size before truncation
+  bool request_body_truncated = 20;
+
+  // Response info
+  uint32 response_status = 30;
+  map<string, string> response_headers = 31;
+  bytes response_body = 32;          // Truncated per config
+  uint64 response_body_size = 33;
+  bool response_body_truncated = 34;
+
+  // Upstream info
+  string upstream_addr = 40;
+  uint64 upstream_latency_ms = 41;
+
+  // WAF info
+  uint32 waf_score = 50;
+  string waf_action = 51;
+  string waf_rule_id = 52;
+  string waf_details = 53;
+  repeated string waf_matched_tags = 54;
+  string waf_rule_name = 55;        // Display name of the rule that fired
+  // Which protection produced the event: "managed"|"waf"|"ip_geo"|"bot"|
+  // "rate_limit"|"challenge". Drives dashboard deep links; empty on old data.
+  string waf_event_type = 56;
+  // Identifier of the rule that actually enforced the block/challenge
+  // (L3-006), distinct from `waf_rule_id` which keeps recording the
+  // detection signature for compatibility. Empty when no single rule
+  // enforced the verdict (anomaly-score gate, stage-1 critical fast path).
+  string waf_enforced_rule_id = 57;
+  // Who the request was made by, when the site authenticated them: the OIDC
+  // `sub` of the session. Empty for an anonymous request, which is the case
+  // for most traffic. It is an identifier the provider issued — not a name,
+  // an email, or a token — so it is safe to store and to search on, and it
+  // is what makes an event traceable to an account after the fact.
+  string user_identity = 58;
+
+  // Performance
+  uint64 total_latency_ms = 60;
+  string cache_status = 61;         // "hit", "miss", "bypass", "expired"
+
+  // TLS
+  string tls_version = 70;
+  string ja3_hash = 71;
+
+  // Geo
+  string country_code = 80;
+  string city = 81;
+  uint32 asn = 82;
+
+  // User agent
+  string user_agent = 90;
+  string referer = 91;
+}
+
+message LogAck {
+  uint64 received_count = 1;
+  bool success = 2;
+  string error_message = 3;
+}
+
+// A raw certificate lifecycle log line captured on the agent (e.g. ACME
+// issuance progress from the data plane), so admins can follow issuance
+// attempts in the console.
+message CertEventEntry {
+  string agent_id = 1;
+  string site_id = 2;             // Empty when unknown at emit time
+  string certificate_id = 3;      // Empty when unknown at emit time
+  string event_type = 4;          // e.g. "acme_raw"
+  string level = 5;               // "INFO" / "WARN" / "ERROR"
+  string target = 6;              // tracing target, e.g. "pingap::acme"
+  string message = 7;             // Formatted log line
+  google.protobuf.Timestamp timestamp = 8;
+}
+
+message CertEventAck {
+  uint64 received_count = 1;
+  bool success = 2;
+  string error_message = 3;
+}
+
+// ============================================================
+// Metrics
+// ============================================================
+
+message MetricBatch {
+  string agent_id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  repeated Metric metrics = 3;
+}
+
+message Metric {
+  string name = 1;
+  map<string, string> labels = 2;
+  double value = 3;
+  MetricType type = 4;
+}
+
+enum MetricType {
+  METRIC_GAUGE = 0;
+  METRIC_COUNTER = 1;
+  METRIC_HISTOGRAM = 2;
+}
+
+message MetricAck {
+  uint64 received_count = 1;
+  bool success = 2;
+}
+
+// ============================================================
+// Visitor authentication
+// ============================================================
+
+// Asks for a proof-of-work challenge to put in the login form.
+//
+// The reply carries the nonce and the difficulty; the browser hashes until it
+// finds an answer, and the answer is presented back with the credentials. The
+// challenge row is written by the control plane so the instance that receives
+// the POST can verify what another instance handed out.
+message VisitorChallengeRequest {
+  string agent_id = 1;
+  string agent_token = 2;
+  // The host the login was started from. A challenge is only answerable at
+  // the site it was issued for, so a nonce cannot be replayed elsewhere.
+  string site_id = 3;
+}
+
+message VisitorChallengeResponse {
+  // Empty on refusal; `error` then says why.
+  string challenge_id = 1;
+  string nonce = 2;
+  uint32 difficulty = 3;
+  // Seconds the challenge stays answerable.
+  uint32 ttl_seconds = 4;
+  string error = 5;
+}
+
+// Exchanges a proof-of-work answer and credentials for a session.
+message VisitorLoginRequest {
+  string agent_id = 1;
+  string agent_token = 2;
+  string site_id = 3;
+  // The id from `VisitorChallengeResponse`; consumed by this call.
+  string challenge_id = 4;
+  // The proof-of-work counter, hex, as the page computes it.
+  string solution = 5;
+  // Unix seconds the browser submitted at, checked against the challenge TTL.
+  int64 timestamp = 6;
+  string email = 7;
+  // Never logged, never echoed.
+  string password = 8;
+}
+
+message VisitorLoginResponse {
+  bool ok = 1;
+  // Set on success. The data plane seals these into its session cookie; the
+  // password and the hash never leave the control plane.
+  string visitor_id = 2;
+  string email = 3;
+  string name = 4;
+  // Bumped on a password change; the session carries it so a change can
+  // invalidate sessions minted before it.
+  int64 token_version = 5;
+  // A refusal reason the login page can show. Deliberately coarse: "email or
+  // password is wrong" rather than which of the two, so the form cannot be
+  // used to enumerate accounts.
+  string error = 6;
+  // A stable code for the data plane to branch on, e.g. "invalid_credentials",
+  // "challenge_expired", "disabled", "control_plane_unavailable".
+  string error_code = 7;
+}
+
+message VisitorLogoutRequest {
+  string agent_id = 1;
+  string agent_token = 2;
+  string visitor_id = 3;
+  string site_id = 4;
+}
+
+message VisitorLogoutResponse {
+  bool ok = 1;
+}
+
+message VisitorChangePasswordRequest {
+  string agent_id = 1;
+  string agent_token = 2;
+  string visitor_id = 3;
+  string current_password = 4;
+  string new_password = 5;
+  // The host the caller is acting for, so the request can be scoped to a site
+  // this agent serves and one the account is granted.
+  string site_id = 6;
+}
+
+message VisitorChangePasswordResponse {
+  bool ok = 1;
+  // The new version, so the caller can re-issue its session instead of
+  // logging the visitor out of the tab they just changed it in.
+  int64 token_version = 2;
+  string error = 3;
+  string error_code = 4;
+}
+
+// The sites a visitor may enter, for the portal.
+message VisitorGrantsRequest {
+  string agent_id = 1;
+  string agent_token = 2;
+  string visitor_id = 3;
+  // The host the caller is acting for. Used to scope the answer to a site the
+  // agent serves, and to check the visitor's grant to it.
+  string site_id = 4;
+}
+
+message VisitorGrantsResponse {
+  repeated VisitorGrant grants = 1;
+  string error = 2;
+}
+
+message VisitorGrant {
+  string site_id = 1;
+  string name = 2;
+  string domain = 3;
+  // The portal's per-site "show this here" switch. Hiding a site tidies the
+  // portal; it does not revoke access.
+  bool visible = 4;
+  // How this site signs visitors in ("oidc" / "local" / "both"), so the
+  // portal can link to the right entry.
+  string auth_mode = 5;
+}
+
+message VisitorSetVisibleRequest {
+  string agent_id = 1;
+  string agent_token = 2;
+  string visitor_id = 3;
+  string site_id = 4;
+  bool visible = 5;
+}
+
+message VisitorSetVisibleResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+// Starts a passkey ceremony. `site_id` is the host the ceremony runs at, so
+// the relying-party id matches the origin the browser sees.
+message VisitorPasskeyBeginRequest {
+  string agent_id = 1;
+  string agent_token = 2;
+  // Set for a registration (the visitor is signed in); empty for a login
+  // (they are not, and the credential identifies the account).
+  string visitor_id = 3;
+  string site_id = 4;
+}
+
+// The options the browser hands to `navigator.credentials`. Serialised as the
+// crate produced them: the shape is the WebAuthn JSON, and re-encoding it
+// field by field would be a second implementation to keep in step.
+message VisitorPasskeyOptionsResponse {
+  string options_json = 1;
+  // `register:<id>` or `login:<challenge>`, echoed back on finish.
+  string ceremony_id = 2;
+  string error = 3;
+}
+
+message VisitorPasskeyFinishRequest {
+  string agent_id = 1;
+  string agent_token = 2;
+  string site_id = 3;
+  string ceremony_id = 4;
+  // The credential the authenticator produced, as the browser serialised it.
+  string credential_json = 5;
+  // Optional label for a registration.
+  string name = 6;
+}
+
+message VisitorPasskeyFinishResponse {
+  bool ok = 1;
+  string error = 2;
+  string error_code = 3;
+}
+
+message VisitorPasskeyListResponse {
+  repeated VisitorPasskey passkeys = 1;
+  string error = 2;
+}
+
+message VisitorPasskey {
+  string cred_id = 1;
+  string name = 2;
+  string created_at = 3;
+  string last_used_at = 4;
+}

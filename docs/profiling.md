@@ -1,0 +1,396 @@
+# WAFred System Observation & Attribution
+
+WAFred ships read-only self-observation in every binary: two admin endpoints
+that report what the process is doing right now (CPU and memory) and where the
+time goes (module and method attribution). There is no sampling, no stack
+unwinding, no allocator hook, no sidecar and no diagnostic image to deploy —
+everything works on every platform and in every build.
+
+> **Migration from the removed pprof endpoints.** Earlier releases exposed
+> pprof-style CPU sampling (`/api/v1/debug/pprof/*` and the data-plane
+> `/api/pprof/*` routes), a `mem-prof` heap-dump build, the MCP
+> `profile_cpu`/`profile_memory` tools, the `WAFRED_DEBUG_LISTEN_ADDR`
+> loopback listener and the `pprof_enabled` / `WAFRED_PPROF_ENABLED` switches.
+> All of that has been **removed**. The observation half lives on as
+> `/api/v1/system/metrics`; the attribution half is replaced by
+> `/api/v1/system/profile`, whose accounting approach is deliberately different
+> — see [What changed vs. pprof](#what-changed-vs-pprof) for the mapping.
+
+Both endpoints require an admin JWT bearer token (the same `AdminUser`
+authentication as the rest of the API).
+
+## `GET /api/v1/system/metrics`
+
+A point-in-time snapshot of process/host CPU and memory. No capture session,
+no state: the handler reads counters the OS already keeps (`/proc` or the
+platform equivalent, via a blocking task so the async workers are not stalled)
+and answers immediately.
+
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://localhost:9080/api/v1/system/metrics"
+```
+
+**Response (200):**
+
+```json
+{
+  "cpu": {
+    "process_cpu_percent": 12.5,
+    "host_cpu_percent": 8.1,
+    "cores": 4,
+    "collected_at_ms": 1760000000000
+  },
+  "memory": {
+    "rss_bytes": 120258048,
+    "virtual_bytes": 805984256,
+    "total_memory_bytes": 17179869184,
+    "used_memory_bytes": 9663676416,
+    "rss": "121.2 MB",
+    "total_memory": "16.0 GB",
+    "used_memory": "9.0 GB",
+    "collected_at_ms": 1727443200000,
+    "used_memory_scope": "system",
+    "process_memory_scope": "process",
+    "container_memory_used_bytes": 805306368,
+    "container_memory_limit_bytes": 1073741824,
+    "container_memory_used": "805.3 MB",
+    "container_memory_limit": "1.0 GB",
+    "container_memory_scope": "cgroup_v2",
+    "rss_peak_bytes": 154140467,
+    "rss_peak": "154.1 MB",
+    "swap_used_bytes": 0,
+    "swap_total_bytes": 2147483648,
+    "swap_used": "0 B",
+    "swap_total": "2.0 GB",
+    "mem_available_bytes": 6442450944,
+    "mem_available": "6.0 GB",
+    "memory_used_percent": 56.3,
+    "page_faults_minor": 482113,
+    "page_faults_major": 1024,
+    "cached_bytes": 3221225472,
+    "buffers_bytes": 268435456,
+    "cached": "3.0 GB",
+    "buffers": "256.0 MB"
+  }
+}
+```
+
+(Values are illustrative; the shape is what the server returns.)
+
+### `cpu` — process and machine CPU
+
+| Field | Meaning |
+| --- | --- |
+| `process_cpu_percent` | This process's CPU usage in percent of one core (multi-threaded work can exceed 100) |
+| `host_cpu_percent` | Average CPU usage across all machine cores, in percent |
+| `cores` | Number of CPU cores on the machine |
+| `collected_at_ms` | Unix epoch milliseconds at which the snapshot was taken |
+
+### `memory` — process RSS, host RAM and container accounting
+
+| Field | Meaning |
+| --- | --- |
+| `rss_bytes` / `rss` | This process's resident memory (bytes / human-readable) — use this for the process card |
+| `virtual_bytes` | This process's virtual memory, bytes |
+| `total_memory_bytes` / `total_memory` | **Host** RAM total (inside a container this is the host's total, not the container limit) |
+| `used_memory_bytes` / `used_memory` | **Host** RAM in use |
+| `used_memory_scope` / `process_memory_scope` | Scope labels: `"system"` for the host figures, `"process"` for `rss` |
+| `container_memory_used_bytes` / `container_memory_limit_bytes` | cgroup usage and limit, present **only** when a container memory limit applies (`null` otherwise) |
+| `container_memory_used` / `container_memory_limit` | Human-readable container usage and limit |
+| `container_memory_scope` | Which cgroup version produced the container numbers (`"cgroup_v1"` / `"cgroup_v2"`) |
+| `rss_peak_bytes` / `rss_peak` | Peak process RSS since process start, `/proc/self/status` `VmHWM` (bytes / human-readable) — `0` when the counter is unavailable (non-Linux) |
+| `swap_used_bytes` / `swap_used` | Swap in use: `/proc/meminfo` `SwapTotal` − `SwapFree` — `0` on hosts with swap disabled |
+| `swap_total_bytes` / `swap_total` | Configured swap, `/proc/meminfo` `SwapTotal` |
+| `mem_available_bytes` / `mem_available` | Memory the kernel estimates as available for new work without swapping, `/proc/meminfo` `MemAvailable` (kernel 3.14+; `0` before that) |
+| `memory_used_percent` | `used_memory_bytes / total_memory_bytes * 100`, one decimal place; carries the host (`"system"`) scope |
+| `page_faults_minor` | Minor page faults (served without I/O), cumulative for the process — `/proc/self/stat` field 10 |
+| `page_faults_major` | Major page faults (required I/O), cumulative for the process — `/proc/self/stat` field 12 |
+| `cached_bytes` / `cached` | Page cache excluding swap cache, `/proc/meminfo` `Cached` |
+| `buffers_bytes` / `buffers` | Block-device buffers, `/proc/meminfo` `Buffers` |
+
+The fields above are read from `/proc` (or the cgroup equivalent); a counter
+the platform does not expose is reported as `0`.
+
+When the container fields are present they match what `docker stats` reports
+and should be preferred over the host totals.
+
+The cost is one CPU/memory refresh of the system tables — cheap enough for a
+polling dashboard, and there is no enable switch: it is an ordinary admin
+endpoint that works in every build.
+
+## `GET /api/v1/system/profile`
+
+Wall-clock time and memory attribution by module and method. This is **not**
+a sampled profile — it is pure Rust instrumentation (`pingwaf-profiler`): the
+code that knows what it is doing accounts for itself.
+
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://localhost:9080/api/v1/system/profile"
+```
+
+**Response (200):**
+
+```json
+{
+  "collected_at_ms": 1760000000000,
+  "total_cpu_ms": 48213.4,
+  "total_elapsed_ms": 48213.4,
+  "modules": [
+    { "module": "proxy",           "cpu_ms": 30102.1, "cpu_share": 0.62, "elapsed_ms": 30102.1, "elapsed_share": 0.62, "mem_bytes": 41943040, "mem_share": 0.55, "mem_peak_bytes": 41943040, "mem_peak_share": 0.55, "calls": 102341, "avg_us": 294.1 },
+    { "module": "waf",             "cpu_ms": 11101.2, "cpu_share": 0.23, "elapsed_ms": 11101.2, "elapsed_share": 0.23, "mem_bytes": 8388608,  "mem_share": 0.11, "calls": 98111,  "avg_us": 113.1 },
+    { "module": "cache",           "cpu_ms": 4000.8,  "cpu_share": 0.08, "elapsed_ms": 4000.8,  "elapsed_share": 0.08, "mem_bytes": 15728640, "mem_share": 0.21, "calls": 44120,  "avg_us": 90.7 },
+    { "module": "plugin",          "cpu_ms": 1500.1,  "cpu_share": 0.03, "elapsed_ms": 1500.1,  "elapsed_share": 0.03, "mem_bytes": 2097152,  "mem_share": 0.03, "calls": 30112,  "avg_us": 49.8 },
+    { "module": "db",              "cpu_ms": 1000.6,  "cpu_share": 0.02, "elapsed_ms": 1000.6,  "elapsed_share": 0.02, "mem_bytes": 1048576,  "mem_share": 0.01, "calls": 2140,   "avg_us": 467.6 },
+    { "module": "control",         "cpu_ms": 400.2,   "cpu_share": 0.01, "elapsed_ms": 400.2,   "elapsed_share": 0.01, "mem_bytes": 524288,   "mem_share": 0.01, "calls": 980,    "avg_us": 408.4 },
+    { "module": "other",           "cpu_ms": 108.4,   "cpu_share": 0.00, "elapsed_ms": 108.4,   "elapsed_share": 0.00, "mem_bytes": 0,        "mem_share": 0.00, "calls": 210,    "avg_us": 516.2 },
+    { "module": "waf_normalize",   "cpu_ms": 2200.5,  "cpu_share": 0.05, "elapsed_ms": 2200.5,  "elapsed_share": 0.05, "mem_bytes": 1048576,  "mem_share": 0.01, "calls": 98111,  "avg_us": 22.4 },
+    { "module": "waf_signature",   "cpu_ms": 1800.3,  "cpu_share": 0.04, "elapsed_ms": 1800.3,  "elapsed_share": 0.04, "mem_bytes": 0,        "mem_share": 0.00, "calls": 98111,  "avg_us": 18.3 },
+    { "module": "waf_expression",  "cpu_ms": 900.1,   "cpu_share": 0.02, "elapsed_ms": 900.1,   "elapsed_share": 0.02, "mem_bytes": 0,        "mem_share": 0.00, "calls": 40012,  "avg_us": 22.5 },
+    { "module": "waf_body",        "cpu_ms": 700.9,   "cpu_share": 0.01, "elapsed_ms": 700.9,   "elapsed_share": 0.01, "mem_bytes": 2097152,  "mem_share": 0.03, "calls": 12000,  "avg_us": 58.4 },
+    { "module": "log",             "cpu_ms": 300.2,   "cpu_share": 0.01, "elapsed_ms": 300.2,   "elapsed_share": 0.01, "mem_bytes": 524288,   "mem_share": 0.01, "calls": 40012,  "avg_us": 7.5 },
+    { "module": "agent",           "cpu_ms": 200.8,   "cpu_share": 0.00, "elapsed_ms": 200.8,   "elapsed_share": 0.00, "mem_bytes": 262144,   "mem_share": 0.00, "calls": 60,     "avg_us": 3346.7 },
+    { "module": "http_client",     "cpu_ms": 100.4,   "cpu_share": 0.00, "elapsed_ms": 100.4,   "elapsed_share": 0.00, "mem_bytes": 0,        "mem_share": 0.00, "calls": 45,     "avg_us": 2231.1 }
+  ],
+  "methods": [
+    { "method": "waf::handle_request",   "cpu_ms": 9200.4, "cpu_share": 0.19, "elapsed_ms": 9200.4, "elapsed_share": 0.19, "mem_bytes": 0,       "mem_share": 0.00, "calls": 98111, "avg_us": 93.8 },
+    { "method": "proxy::request_filter", "cpu_ms": 7100.9, "cpu_share": 0.15, "elapsed_ms": 7100.9, "elapsed_share": 0.15, "mem_bytes": 0,       "mem_share": 0.00, "calls": 88430, "avg_us": 80.3 },
+    { "method": "waf::body_read",        "cpu_ms": 700.9,  "cpu_share": 0.01, "elapsed_ms": 700.9,  "elapsed_share": 0.01, "mem_bytes": 2097152, "mem_share": 1.00, "mem_peak_bytes": 2097152, "mem_peak_share": 1.00, "calls": 12000, "avg_us": 58.4 }
+  ]
+}
+```
+
+(Values are illustrative.)
+
+### 口径 — what the numbers are, and what they are not
+
+- **Wall time, not CPU time.** Every timer is `Instant`-based, so it
+  measures the elapsed time spent inside the timed scope. A scope that
+  awaits a database query, a lock or the upstream reports that wait too;
+  when the executor deschedules the task the clock keeps running. Treat
+  every share as "of the attributed wall time", not "of the CPU the process
+  burned" — reading `cpu_ms` as CPU seconds is the mistake that once made
+  `control::http` look like 90 % CPU when it was mostly waiting.
+- **`cpu_*` is a deprecated alias of `elapsed_*`.** The snapshot publishes
+  each figure twice: under the historical `cpu_ms` / `cpu_share` names —
+  kept so existing dashboards keep parsing — and under `elapsed_ms` /
+  `elapsed_share`, which say what is measured. Both pairs always carry the
+  same value (`total_cpu_ms` == `total_elapsed_ms`). New consumers should
+  use `elapsed_*`.
+- **Memory is bookkeeping, not a heap profile.** `mem_bytes` is what the
+  instrumented call sites currently hold (cache objects, a request body in
+  staging, a queued log batch); `mem_peak_bytes` is the high-water mark since
+  start or the last reset. Neither is a heap allocation attribution: only
+  instrumented sites report, the denominator is the sum of those sites rather
+  than process RSS, and a buffer shared by nested scopes is counted in each
+  scope that holds it. That is why the dashboard shows bytes and a peak line
+  but no share bar — a "55 %" would invite reading the figure as process
+  memory, and a value of `0` usually means "nothing was held at the sampling
+  instant" rather than "this module uses no memory". Locate a holder by
+  comparing `mem_peak_bytes` across modules, not by adding shares.
+- **Durations scale with magnitude.** The console formats every duration
+  through one helper: sub-millisecond, milliseconds, seconds, `m s`, `h mm`,
+  and `d h` — so a multi-hour timer no longer overflows its column.
+- **Instrumentation scope.** The 14 module rows are fed by timers on
+  instrumented hot paths — the data-plane request pipeline (connection
+  handling, upstream connect), the WAF pipeline split into its stages
+  (`waf_normalize` / `waf_signature` / `waf_expression` / `waf_body`),
+  cache, rewrite and the other plugins, access-log assembly and flush
+  (`log`), agent configuration sync (`agent`), the outbound HTTP client
+  (`http_client`), and two control-plane scopes (the agent heartbeat
+  persistence and `/api/v1` requests). The `/api/v1` timer sits
+  *inside* the CORS, compression, security-header and body-limit layers, so
+  those middleware costs are not part of the `control` row. The same timer
+  fills both the `control` module row and the `control::http` method row.
+  The module row was never recorded twice: before the refactor the module
+  timer and the method timer each wrote their own row, one entry per
+  request. If `control` drops noticeably after upgrading, the real causes
+  are the narrowed instrumentation scope (root listener → `/api/v1`
+  requests only, so MCP, `/healthz` and the SPA fallback are no longer
+  attributed) and the removal of a per-request method-map hash — not a
+  sudden performance change.
+
+  The four `waf_*` stage rows are **nested** inside `waf`: the
+  `waf::handle_request` timer spans them, so their time is also counted in
+  the `waf` row. Read them as a breakdown of `waf`; adding them to it makes
+  the shares exceed 1.
+- **Method names are a compile-time static enumeration.** The instrumented
+  call sites are fixed at build time — 20 named ones (`proxy::request_filter`,
+  `proxy::upstream_connect`, `waf::handle_request`, `waf::normalize`,
+  `waf::signature`, `waf::expression`, `waf::body_read`,
+  `cache::handle_request`, `cache::lookup`, `cache::store`,
+  `plugin::rewrite`, `plugin::sub_filter`, `plugin::challenge`,
+  `db::persist_heartbeat`, `db::persist_logs`, `db::persist_events`,
+  `control::http`, `control::grpc_stream`, `agent::sync`, `log::flush`);
+  recording is array indexing
+  plus four relaxed atomic adds per request (two for the method rows, two
+  for the module row) — no hash lookup, no allocation.
+  A method that never ran gets no row.
+
+### How attribution works
+
+- **Modules** — the process's functional areas are recorded in a fixed array
+  of atomics. Every instrumented scope adds its elapsed time to its module
+  with one `fetch_add`; the 14 modules always appear in the response, in
+  fixed order: `proxy`, `waf`, `cache`, `plugin`, `db`, `control`, `other`
+  (anything not yet instrumented), then the WAF stage split-outs
+  `waf_normalize`, `waf_signature`, `waf_expression`, `waf_body`, and
+  `log`, `agent`, `http_client`. Method rows roll up into their module, so
+  a module's total is the sum of its methods — the `waf` row keeps working
+  for older instrumentation while the stage rows name where inside WAF the
+  time went.
+- **Methods** — named call sites are timed with `timed_method`. The set of
+  call sites is a compile-time static enumeration (see
+  [口径](#口径--what-the-numbers-are-and-what-they-are-not)), so recording
+  is four relaxed atomic adds per request (two for the method rows, two
+  for the module row) — no hash lookup, no allocation.
+- **Memory** — *reported*, not intercepted. Modules and methods that own
+  large structures publish their current byte count, and every method row
+  carries a `mem_bytes` / `mem_share` pair so a dashboard can name the
+  call site behind a module's memory, not just the module. Confirmed
+  reporters today: the cache backend (index + in-flight buffers), WAF
+  request-body staging (`waf::body_read`, which also fills the
+  `waf_body` module row), WAF decoded/normalized values (`waf_normalize`),
+  and the access-log body prefix buffered for the log entry (`log`).
+  Nothing hooks the allocator, so this works with any allocator and on
+  any platform. `mem_bytes` is "bytes currently held **in memory**", not
+  cumulative allocation. Beside the current value the snapshot keeps a
+  **high-water mark**: `mem_peak_bytes` / `mem_peak_share` (updated with a
+  relaxed `fetch_max` on the same hot path — no lock, no allocation) hold
+  the largest value the gauge ever reached since process start or the last
+  reset, and survive a drop back to zero. A released buffer can leave
+  `mem_bytes` at `0` between reports, so a momentary `0` does not mean
+  "no memory" — when hunting the memory-heavy modules or call sites, read
+  the peak fields, not the instantaneous ones.
+- **Disk** — the on-disk gauge is still collected internally by the cache
+  backend (quota accounting uses it), but it is **no longer part of the
+  snapshot**: module and method rows report memory only. The earlier
+  releases' `disk_bytes` / `disk_share` fields were removed because
+  folding the filesystem's bytes into a module table invited the
+  "cache memory ≈ cache disk usage" misreading — see
+  [Memory vs. disk in the cache module](#memory-vs-disk-in-the-cache-module).
+
+### Memory vs. disk in the cache module
+
+The cache backend owns both figures, and the two must not be read as one
+number — which is exactly why the snapshot publishes only the memory one:
+
+- **`mem_bytes` — real memory**: the on-disk index structures **plus**
+  `in_flight_bytes`, the read buffers of objects currently being served out
+  of the cache. A cache that stores everything on disk should not make the
+  process look like it holds every cached byte in RAM.
+- **disk footprint — internal only**: what the cache backend currently
+  occupies on its storage directory. It is still recorded (the quota, if
+  configured, applies to it), but it no longer appears in the
+  `/system/profile` snapshot.
+
+**Why the split exists.** Earlier releases published the backend's
+`current_size` — the **disk** footprint — through the memory gauge, so the
+`cache` module row reported disk usage as memory. A file-backed cache of a
+few GiB read as a few GiB of RSS and the module table misranked the memory
+hotspots. The fix moved the disk figure to its own gauge, and a later
+change removed `disk_bytes` / `disk_share` from the snapshot entirely
+(the gauge is kept internally for cache accounting); `mem_bytes` counts
+index + in-flight buffers only, and the module table cannot report the
+filesystem's bytes as resident memory any more.
+
+**Streaming reads and `in_flight_bytes`.** Objects larger than the inline
+threshold (256 KiB) are never read fully into memory on a hit: the backend
+hands back an open file handle and the body is streamed to the client in
+64 KiB chunks (pingora writes each chunk downstream before the next is
+read). While the hit is being served, `in_flight_bytes` carries the chunk
+budget (plus inline objects being read); when the read finishes — success
+or error — an RAII guard releases it, so `in_flight_bytes` returns to zero
+and does not leak. Small objects stay inline (single buffer, same RAII
+release). A plain miss charges nothing.
+
+### Cache storage directory and its memory impression
+
+The cache plugin's `directory` configuration key decides whether the cache
+is file-backed or in-memory:
+
+- **Unset** now defaults to **`/tmp/wafred-cache`** (a file-backed cache).
+  Earlier releases defaulted to the in-memory backend, so an upgrade changes
+  behaviour for every config that never set the key: the cache's bytes move
+  from the process's memory (`mem_bytes` / RSS) to the storage directory,
+  where the cache backend tracks them in its internal on-disk gauge (kept
+  for quota accounting; no longer part of the snapshot).
+- **`directory = ""` or `memory://`** still selects the in-memory backend —
+  this is how every config written before the default existed keeps its
+  semantics.
+
+> **Containers: `/tmp` is often tmpfs.** Inside a container `/tmp` commonly
+> is a tmpfs mount — a file-backed cache under it then consumes **memory**
+> (it counts against the container's memory limit) and disappears with the
+> container. In production either mount a real volume at the cache directory
+> or point `directory` at a persistent path (e.g.
+> `directory = "/var/lib/wafred/cache"`).
+
+### Response fields
+
+| Field | Meaning |
+| --- | --- |
+| `collected_at_ms` | Unix epoch milliseconds at which the snapshot was taken |
+| `total_cpu_ms` / `total_elapsed_ms` | Total wall-clock time attributed across all modules, in milliseconds (always equal; `total_elapsed_ms` is the name that matches the measurement) |
+| `modules` | Exactly 14 rows, one per module, in fixed order (`proxy`, `waf`, `cache`, `plugin`, `db`, `control`, `other`, `waf_normalize`, `waf_signature`, `waf_expression`, `waf_body`, `log`, `agent`, `http_client`) |
+| `modules[].module` | Module key |
+| `modules[].cpu_ms` / `elapsed_ms` | Cumulative **wall-clock** time attributed to the module (ms); the two fields always carry the same value |
+| `modules[].cpu_share` / `elapsed_share` | Share of the total attributed wall-clock time, 0.0–1.0 |
+| `modules[].mem_bytes` / `mem_share` | Bytes the module currently reports as held in memory, and its share of the total |
+| `modules[].mem_peak_bytes` / `mem_peak_share` | High-water mark of that gauge since process start (or the last reset) — kept even after the current value drops — and its share of the sum of all modules' peaks (`0.0` when no module has reported anything). Prefer the peak when locating memory-heavy modules: a momentary `mem_bytes` of `0` may just mean the buffer was released between reports |
+| `modules[].calls` / `avg_us` | Number of timed operations and average microseconds per operation |
+| `methods` | Method rows, hottest first, capped at 40 |
+| `methods[].method` | Call-site name (from the compile-time static enumeration) |
+| `methods[].cpu_ms` / `elapsed_ms` / `calls` / `avg_us` | Same semantics as the module rows |
+| `methods[].mem_bytes` / `mem_share` | Bytes the call site currently reports as held, and its share of **its module's** memory (not of the process total; `0.0` when the module reports nothing) |
+| `methods[].mem_peak_bytes` / `mem_peak_share` | High-water mark of the call site's gauge (same keep-forever policy as the module peak) and its share of the sum of all modules' peaks |
+
+Counters are **cumulative since process start** (they reset only when the
+process restarts), so read them as "where has the time gone since boot",
+not "what is hot this second". For a live question, take two snapshots some
+seconds apart and compare the deltas of `elapsed_ms` (`cpu_ms` is the same
+number) — the largest positive delta is your current hotspot. Typical
+interesting rows: `waf` (rule evaluation), `proxy` (upstream forwarding),
+`cache` (cache lookups).
+
+### Overhead
+
+Recording is a few relaxed atomic adds per instrumented scope (four per
+request: two for the method rows, two for the module row): no sampling signal, no stack
+unwinding, no symbolisation, no allocation and no hash lookup on the hot
+path — method slots are fixed array entries. The same accounting works in a
+debug build on a
+laptop and a stripped release build in a container, which is why the endpoint
+has no platform restriction, no feature flag and no diagnostic image. The
+endpoint itself is bounded by construction — 14 module rows, at most 40 method
+rows, KB-scale JSON — and computed from atomics, so polling it is cheap.
+
+## What changed vs. pprof
+
+| Removed | Replacement |
+| --- | --- |
+| `GET /api/v1/debug/pprof/{profile,flamegraph,memory,heap}`, `.../cpu/{metrics,dashboard.svg,summary}`, `POST .../cpu/summary/import` | `GET /api/v1/system/metrics` (CPU + memory snapshot) and `GET /api/v1/system/profile` (attribution) |
+| Data-plane admin routes `GET {admin-path}/api/pprof/*` | Same two endpoints on the control plane |
+| MCP tools `profile_cpu` / `profile_memory` | Read the two endpoints directly from any admin client |
+| Loopback diagnostics listener (`WAFRED_DEBUG_LISTEN_ADDR`) | Removed with the endpoints it served |
+| `[basic] pprof_enabled` / `WAFRED_PPROF_ENABLED` switches | No switch exists — the observation endpoints are ordinary admin endpoints |
+| `mem-prof` cargo feature and `Dockerfile.memprof` | No diagnostic image needed; attribution works in the shipped binary. The `release-perf` build and the `Dockerfile.perf` image remain for out-of-band profiling with external tools |
+
+What you lose and where to go instead:
+
+- **Per-function flame graphs / stack samples.** Not available anywhere
+  anymore. Use `/system/profile`'s module and method tables: they answer
+  "which functional area and which instrumented hot path dominates", which is
+  the question the old summary endpoint was reduced to anyway.
+- **jemalloc heap dumps (`mem-prof`).** Not available. Use
+  `memory.rss_bytes` and the per-module `mem_bytes` gauges to see *how much*
+  each subsystem holds; for *which code allocates*, use an external profiler
+  attached out of band (e.g. `valgrind`/`heaptrack` on a non-production
+  replica).
+- **`go tool pprof` files.** The endpoints no longer produce pprof protobufs;
+  there is nothing to import (the old `summary/import` endpoint is gone).
+
+For continuous always-on profiling shipped to a server, the Pyroscope
+integration (`pingap-pyroscope`, `--features=pyro`) still exists — it is
+independent of the removed endpoints.

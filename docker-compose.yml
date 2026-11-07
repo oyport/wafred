@@ -1,0 +1,198 @@
+# WAFred Docker Compose
+# ─────────────────────────────────────────────────────────────────────────────
+# Default: all-in-one mode (control plane + data plane in a single container).
+# For distributed deployments, see the `wafred-agent` service below.
+#
+# Usage:
+#   docker compose up -d
+#   # Dashboard: https://localhost:9080 (self-signed certificate — upload a real
+#   # one under Settings → Control plane HTTPS; set WAFRED_TLS_ENABLED=false to
+#   # serve plain HTTP instead)
+#   # Default credentials: admin@wafred.local / wafred123
+
+name: ${WAFRED_COMPOSE_PROJECT_NAME:-wafred}
+
+services:
+  # ─── WAFred All-in-One (control plane + data plane) ───────────────────────
+  wafred:
+    # Pin a released version for production (e.g. :0.23.0) — :latest tracks
+    # the newest release; :main is the unstable amd64 snapshot of main.
+    image: ghcr.io/oyport/wafred:${WAFRED_TAG:-latest}
+    # To build from source instead of pulling the pre-built image, uncomment:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    container_name: wafred
+    # Stable across container recreation: the control plane re-registration
+    # matches agents by hostname + API key, so a changing container-ID
+    # hostname would register a fresh offline ghost on every redeploy.
+    hostname: wafred
+    # ── Memory ceiling ───────────────────────────────────────────────────────
+    # 768 MiB covers the all-in-one container (control plane + data plane).
+    # On a small host this is not a suggestion: the 2026-11-06 box had 894 MiB
+    # RAM and 1 GiB swap, its allocator reservation alone reached the
+    # Committed_AS ceiling, and the kernel answered by dropping page cache
+    # until the disk was saturated (iowait 88%) and the host stopped
+    # responding. Lower it with WAFRED_MEM_LIMIT on such a host — leave
+    # enough headroom for sshd and postgres.
+    mem_limit: ${WAFRED_MEM_LIMIT:-768m}
+    # Same value as mem_limit = no swap for this container. Swap does not
+    # rescue a runaway allocator, it only converts a fast kill into minutes of
+    # thrashing that drag the whole host down.
+    memswap_limit: ${WAFRED_MEM_LIMIT:-768m}
+    # When the kernel must pick a victim, prefer this container over sshd.
+    # Hitting the limit only costs a restart (`restart: unless-stopped`) and
+    # the host stays reachable.
+    oom_score_adj: 500
+    # ── Networking: bridge + port mapping by default ─────────────────────────
+    # Opt into host networking by uncommenting `network_mode: host` below.
+    # Use it when the proxy must see the real client IP, or when 80/443 cannot
+    # be published on the host (already owned, or mapped elsewhere). Compose
+    # refuses port publishing together with host networking, and refuses
+    # `network_mode: host` together with a `networks:` entry, so comment out
+    # BOTH blocks when switching. 9080/9090 then listen directly on the host —
+    # firewall them accordingly.
+    # network_mode: host
+    ports:
+      # Default (bridge) path. Host-side ports are overridable via .env
+      # without touching the compose file; container-side ports stay fixed.
+      - "${WAFRED_HTTP_PORT:-80}:80"       # HTTP traffic (proxied)
+      - "${WAFRED_HTTPS_PORT:-443}:443"    # HTTPS traffic (proxied)
+      - "${WAFRED_ADMIN_PORT:-9080}:9080"  # Admin dashboard + REST API
+      - "${WAFRED_GRPC_PORT:-9090}:9090"   # gRPC control plane (agents connect here)
+    environment:
+      - WAFRED_DB_URL=postgres://wafred:${POSTGRES_PASSWORD:-wafred}@postgres:5432/wafred
+      - WAFRED_MODE=all-in-one
+      # The placeholder is safe to keep: the control plane detects it and
+      # persists a random JWT secret on first boot. Set WAFRED_JWT_SECRET to pin your
+      # own instead.
+      - WAFRED_JWT_SECRET=${WAFRED_JWT_SECRET:-change-me-in-production-use-32-chars}
+      - WAFRED_ADMIN_ADDR=0.0.0.0:9080
+      - WAFRED_GRPC_ADDR=0.0.0.0:9090
+      - WAFRED_ADMIN_EMAIL=${WAFRED_ADMIN_EMAIL:-admin@wafred.local}
+      - WAFRED_ADMIN_PASSWORD=${WAFRED_ADMIN_PASSWORD:-wafred123}
+      - WAFRED_ALLOW_REGISTRATION=${WAFRED_ALLOW_REGISTRATION:-false}
+      # HTTPS for the dashboard (self-signed until a certificate is uploaded).
+      # Add the hostname you reach the dashboard on so the generated pair covers
+      # it: WAFRED_TLS_SANS=waf.example.com
+      - WAFRED_TLS_ENABLED=${WAFRED_TLS_ENABLED:-true}
+      - WAFRED_TLS_SANS=${WAFRED_TLS_SANS:-}
+      - WAFRED_HEARTBEAT_INTERVAL=${WAFRED_HEARTBEAT_INTERVAL:-15}
+      # Opt into the Let's Encrypt staging CA for tests only. Empty/unset keeps
+      # production; never set this on a real deployment.
+      - PINGAP_ACME_STAGING=${PINGAP_ACME_STAGING:-}
+      - RUST_LOG=${RUST_LOG:-info,sqlx=warn}
+      # ── Allocator reservation (must be in the environment, not the code) ──
+      # mimalloc reserves a 1 GiB arena by default on 64-bit and, on a Linux
+      # overcommit kernel, commits that whole reservation up front — the
+      # `[anon:mimalloc]` mapping with Size 1 GiB / Rss 93 MB in the
+      # 2026-11-06 `smaps`. 67108864 bytes = 64 MiB, sized for the 768 MiB
+      # ceiling above; raise it together with WAFRED_MEM_LIMIT (e.g. 256 MiB
+      # for 2 GiB, 512 MiB for 8 GiB — see src/allocator_tune.rs).
+      # These are parsed by mimalloc before `main`, which is exactly why they
+      # belong here: mi_option_set cannot shrink an arena that already exists.
+      - MIMALLOC_ARENA_RESERVE=${MIMALLOC_ARENA_RESERVE:-67108864}
+      - MIMALLOC_ARENA_EAGER_COMMIT=${MIMALLOC_ARENA_EAGER_COMMIT:-0}
+      # Elasticsearch (optional — uncomment to enable log shipping)
+      # - WAFRED_ES_ENABLED=true
+      # - WAFRED_ES_URLS=http://elasticsearch:9200
+      # - WAFRED_ES_INDEX_PREFIX=wafred
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - wafred-data:/var/lib/wafred
+      - wafred-certs:/etc/wafred/certs
+    cap_add:
+      # The image already carries CAP_NET_BIND_SERVICE as a file capability, so
+      # 80/443 bind without this. Keep it for runtimes that strip file
+      # capabilities: no-new-privileges, rootless Docker, some PodSecurity
+      # defaults. Both paths are complementary, not alternatives.
+      - NET_BIND_SERVICE
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl --connect-timeout 2 --max-time 3 -sf http://localhost:9080/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    # Comment this out together with `ports:` when enabling `network_mode: host`.
+    networks:
+      - wafred-net
+
+  # ─── PostgreSQL ────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: wafred-postgres
+    environment:
+      - POSTGRES_USER=wafred
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-wafred}
+      - POSTGRES_DB=wafred
+    volumes:
+      - wafred-postgres-data:/var/lib/postgresql/data
+    ports:
+      # Loopback by default so the database is unreachable from other hosts;
+      # set POSTGRES_BIND=0.0.0.0 (with a strong POSTGRES_PASSWORD) to expose.
+      - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wafred -d wafred"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - wafred-net
+
+  # ─── WAFred Agent (distributed mode example) ──────────────────────────────
+  # Uncomment this service to run a separate data-plane agent that connects
+  # to the control plane above. In this setup, change the wafred service's
+  # WAFRED_MODE to "server" (control plane only).
+  #
+  # wafred-agent:
+  #   image: ghcr.io/oyport/wafred:${WAFRED_TAG:-latest}
+  #   # build:
+  #   #   context: .
+  #   #   dockerfile: Dockerfile
+  #   container_name: wafred-agent
+  #   entrypoint: ["wafred", "agent"]
+  #   command:
+  #     # The control plane serves gRPC over TLS by default (self-signed on
+  #     # first boot). Use https:// and pin its certificate as the CA:
+  #     - "--server-url=https://wafred:9090"
+  #     # Download the control plane certificate (Settings → Control plane HTTPS
+  #     # → download), mount it, and point this at it. Set grpc_tls_mode = "off"
+  #     # on the control plane to serve plaintext instead (then revert to
+  #     # --server-url=http://wafred:9090).
+  #     - "--server-ca-cert=/etc/wafred/certs/grpc-ca.pem"
+  #     - "--api-key=${WAFRED_API_KEY:-}"
+  #     - "--cache-dir=/var/lib/wafred/cache"
+  #     - "--heartbeat-interval-secs=30"
+  #     - "--fail-open=true"
+  #   ports:
+  #     - "8080:80"
+  #     - "8443:443"
+  #   environment:
+  #     - RUST_LOG=${RUST_LOG:-info,sqlx=warn}
+  #   depends_on:
+  #     wafred:
+  #       condition: service_healthy
+  #   volumes:
+  #     - wafred-agent-data:/var/lib/wafred
+  #   restart: unless-stopped
+  #   networks:
+  #     - wafred-net
+
+volumes:
+  wafred-postgres-data:
+    driver: local
+  wafred-data:
+    driver: local
+  wafred-certs:
+    driver: local
+  # wafred-agent-data:
+  #   driver: local
+
+networks:
+  wafred-net:
+    driver: bridge

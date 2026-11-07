@@ -1,0 +1,331 @@
+<div align="center">
+
+# 🛡️ WAFred
+
+**A distributed, centrally-controlled Web Application Firewall built on [`pingap`](https://github.com/vicanso/pingap) and Cloudflare [`Pingora`](https://github.com/cloudflare/pingora).**
+
+Semantic-grade attack detection · Cloudflare-style rules · CC & Bot defense · Automatic TLS · Embedded i18n dashboard
+
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](https://www.rust-lang.org/)
+[![CI](https://github.com/oyport/wafred/actions/workflows/ci.yml/badge.svg)](https://github.com/oyport/wafred/actions/workflows/ci.yml)
+[![Docker](https://img.shields.io/badge/docker-compose%20ready-2496ED?logo=docker&logoColor=white)](./docker-compose.yml)
+
+**[English](./README.md) | [简体中文](./README_zh.md) | [Español](./README_es.md) | [Français](./README_fr.md)**
+
+[Quick Start](#-quick-start) · [Architecture](#-architecture) · [Features](#-features) · [Documentation](#-documentation) · [Contributing](./CONTRIBUTING.md)
+
+</div>
+
+---
+
+## 📖 What is WAFred?
+
+**WAFred** is a high-performance, open-source **Web Application Firewall (WAF)** that brings edge security to infrastructure you control. It is built on [`pingap`](https://github.com/vicanso/pingap), a production reverse proxy powered by Cloudflare's [`Pingora`](https://github.com/cloudflare/pingora), and adds a **distributed, centrally-controlled** security layer.
+
+A single **control plane** defines sites, rules and policies; one or many **data-plane agents** enforce them at the edge. Rules, logs and metrics flow between the two over persistent **gRPC bidirectional streams**, so a policy change made in the dashboard propagates to every agent in seconds — no reload, no downtime.
+
+- 🎯 **Semantic detection** — SQLi / XSS / RCE / path traversal / command injection via `libinjection` + Aho-Corasick signature matching, anomaly scoring and Cloudflare-style expression rules.
+- 🕸️ **Distributed by design** — run everything in one process (`all-in-one`), or scale the data plane out to many independent edge agents (`server` + `agent`).
+- 🧭 **Batteries included, off by default** — every protection feature ships disabled and is enabled per site, so you stay in full control of your traffic.
+- ⚡ **Rust all the way down** — memory safety, async I/O and a single self-contained binary with the dashboard embedded.
+
+> WAFred is independently developed from the Apache-2.0-licensed [PingWAF codebase](https://github.com/shuaiZend/PingWAF). It is a separate project and is not affiliated with or endorsed by the former PingWAF maintainers, Cloudflare, or the `pingap` maintainers. See [NOTICE](./NOTICE) and [Acknowledgements](#-acknowledgements).
+
+---
+
+## 🏗️ Architecture
+
+<img src="./asset/readme-architecture.svg" alt="WAFred architecture: clients reach edge agents over HTTP/HTTPS; each agent streams rules and telemetry with the control plane over a gRPC bidirectional stream; only clean traffic continues to the origin" width="1000">
+
+The control plane and the data plane talk over the `ControlPlane` gRPC service (defined in [`control_plane.proto`](./pingwaf-proto/proto/control_plane.proto)) with seven RPCs:
+
+| RPC | Kind | Purpose |
+| --- | --- | --- |
+| `RegisterAgent` | Unary | An agent joins the fleet and receives its ID + heartbeat interval |
+| `Heartbeat` | Bidirectional stream | Liveness, stats and per-site certificate status upstream; live commands downstream |
+| `SyncRules` | Server stream | Rule bundles pushed to agents whenever policy changes |
+| `ShipLogs` | Client stream | Batched request/attack logs streamed to the control plane |
+| `ShipCertEvents` | Client stream | ACME issuance events captured on the agent, streamed to the control plane |
+| `ShipMetrics` | Client stream | Batched traffic metrics streamed to the control plane |
+| `GetSiteConfig` | Unary | An agent pulls the full config for a single site |
+
+**Two deployment shapes, one binary:**
+
+- **All-in-One** — control plane + data plane in a single process. Ideal for a single node, small deployments and local evaluation.
+- **Distributed** — one independent `server` (control plane) plus many `agent` processes at the edge. Ideal for fleets, multi-region rollouts and central management.
+
+---
+
+## ✨ Features
+
+### 🛡️ Security Detection
+- **Semantic WAF engine** covering SQL injection, XSS, RCE, path traversal and command injection — powered by `libinjection` heuristics plus Aho-Corasick multi-pattern signature matching.
+- **Four-phase pipeline**: `normalize` (request normalization) → `signatures` (signature / libinjection) → `expression` (rule expressions) → `anomaly score` (weighted scoring).
+- **Cloudflare-style expression rules** — write conditions like `http.request.uri.path contains "/admin" and ip.src in {1.2.3.0/24}`.
+- **Anomaly scoring** with four verdicts: `Pass`, `Monitor`, `Block`, `Challenge`.
+- **Managed rule sets** — curated signatures you can toggle per site.
+
+### 🤖 CC & Bot Defense
+- **CC protection / 5-second shield** — JavaScript challenge, Proof-of-Work and interactive challenges, with HMAC-signed clearance cookies.
+- **Bot protection** — verified-bot whitelist, known-browser pass-through and a configurable action for everything else; TLS fingerprinting and behavioral analysis are on the roadmap.
+
+### 🚦 Access Control
+- **IP access rules** — `block` / `allow` / `challenge` / `js_challenge`, with CIDR ranges, CSV bulk import and named rules.
+- **Global IP groups** — subscription-backed CIDR lists (plain text, JSON or the Cloudflare IP ranges API) synced to every site on a schedule, with sync-error reporting.
+- **Geo restriction** — allow or block by country and by autonomous system number (ASN), with an optional "block unknown countries" policy.
+- **Multi-dimensional rate limiting** — by IP, host, path, ASN, country, or a request header, cookie or query parameter.
+- **Path restrictions** — combine path patterns, WAF expressions and weekly schedules with blocking thresholds, Basic authentication or OIDC sign-in. Ordinary blocks do not add IPs to the blacklist.
+
+### 🌊 Traffic Management
+- **Origin pools & routes** — group upstreams into pools with load balancing (round-robin, least connections, random or consistent hashing by IP/URL/path/header/cookie/query) and route requests by prefix, exact match or regex — optionally restricted to an IP group, so a path can be served differently to office or partner addresses.
+- **Edge caching** with per-site disk quotas and LRU eviction, stale-while-revalidate and browser TTL control.
+- **Request / response rewriting** — headers, paths, query strings, status codes and body search/replace.
+- **Custom error pages** rendered with Tera templates — including edge-generated responses such as WAF blocks and paused sites.
+- **Pause a site** from the console: every request gets a `503` maintenance page while the certificate keeps serving and traffic stays logged.
+
+### 🔐 TLS & Certificates
+- **Automatic ACME / Let's Encrypt** issuance and renewal on the edge (HTTP-01 and DNS-01).
+- **Multiple DNS providers** for DNS-01 (Aliyun, Cloudflare, Tencent Cloud DNSPod, Huawei Cloud, Rainbow DNS Manager, manual).
+- **Per-site certificate status** (`valid` / `expiring soon` / `expired`) reported to the control plane over heartbeats, with a searchable ACME event log.
+- **HSTS and forced HTTPS** applied at the edge, with a 180-day default `max-age`.
+- **Mutual TLS (mTLS)** — generate or import a CA, issue client certificates from the console, and revoke a single certificate with immediate effect at the edge; a certificate is refused when it is revoked or was issued for another site.
+- **HTTPS origin certificate verification is an explicit switch** — a deployment-wide default in **Settings → Origin**, overridable per origin pool. The default accepts any origin certificate so self-signed and internal-PKI origins keep working; turn it on where origins present a trusted certificate.
+
+### 📊 Observability
+- **Full request logging to Elasticsearch** with body truncation and a WAL buffer for reliability.
+- **Raw request and response capture** — headers, body prefixes, real sizes and truncation flags in PostgreSQL, so a log entry can be replayed as a `curl` command from the console. Headers are stored verbatim (cookies included) to make an attack reproducible.
+- **Analytics** dashboards for traffic and attack trends.
+- Agent health, traffic stats and cache hit/eviction metrics reported to the control plane over heartbeats.
+
+### 🎛️ Management Console
+- **JWT + bcrypt authentication** and **multi-tenant** isolation.
+- **Passkey sign-in** (WebAuthn) alongside passwords — bind a platform authenticator or security key from Settings and sign in without a password.
+- **Embedded i18n dashboard** (English / 简体中文 / 日本語), compiled into the binary via `rust-embed`.
+- **Everything is off by default** — enable protections explicitly, per site.
+- **Configuration versioning** — the console lists every configuration snapshot with filters, diffs a version against its predecessor table by table, and rolls back behind a confirmation.
+
+---
+
+## 📊 Historical PingWAF benchmark baseline
+
+<img src="./asset/readme-effectiveness.svg" alt="Historical PingWAF 0.32.4 source baseline on the blazehttp corpus: 93.8 % full-corpus interception (96.6 % effective, 0.06 % benign affected); WAFred has not re-run this benchmark" width="1000">
+
+The figures here were measured by PingWAF 0.32.4 before WAFred became an
+independent project. WAFred has not re-run this benchmark, so these numbers are
+a **historical source-project baseline**, not a WAFred release claim.
+
+Measured on the public [blazehttp](https://github.com/chaitin/blazehttp) corpus
+(33 877 raw HTTP requests: 658 malicious / 33 219 benign), replayed
+byte-for-byte against a release build. Interception counts the WAF verdict
+surface — the 403 block page and the 503 challenge page — and "benign affected"
+counts both, so a challenge is never hidden inside a "blocked" number.
+
+On the requests a reverse-proxy WAF can actually decide, **Strict + body
+inspection intercepts 96.6 % (616/638)**, with **0.06 % (19/33 219)** of benign
+traffic affected and **99.82 % accuracy**. Of the 658 malicious samples, 20
+never reach a detection surface and are excluded from that figure: 19 are
+`POST`/`PUT` requests without `Content-Length` or `Transfer-Encoding` (an empty
+body under RFC 7230), and 1 hides its payload in a URL fragment that the HTTP
+parser strips before the request line is built. Every reverse-proxy WAF passes
+those 20 by construction — counting them as misses understates detection.
+
+| Tier | Attack interception (full corpus) | Benign affected | p95 |
+| --- | --- | --- | --- |
+| Normal (default, no body inspection) | 60.2 % | 0.01 % | 1 ms |
+| Normal + body inspection | 71.9 % | 0.04 % | 1 ms |
+| Strict | 76.0 % | 0.01 % | 1 ms |
+| Strict + body inspection | **93.8 %** | **0.06 %** | 2 ms |
+
+The full-corpus figure (93.8 %, 617/658) is kept for direct comparison with
+other measurements; the effective figure is given above.
+
+### Cross-vendor comparison
+
+| Product / mode | Malicious | Interception | Benign | False positives | Accuracy |
+|---|---|---|---|---|---|
+| **PingWAF 0.32.4 · Strict + body** | 658 | **93.8 %** (617) | 33 219 | **0.06 %** (19) | **99.82 %** |
+| **PingWAF 0.32.4 · Normal** | 658 | **60.2 %** (396) | 33 219 | **0.01 %** (4) | **99.21 %** |
+| SafeLine free · strict | 575 | 76.17 % (438) | 33 094 | 0.22 % (73) | 99.38 % |
+| SafeLine free · balanced | 575 | 71.65 % (412) | 33 094 | 0.07 % (23) | 99.45 % |
+| ModSecurity PL4 | 575 | 94.61 % (544) | 33 094 | 52.46 % (17 362) | 48.34 % |
+| ModSecurity PL1 | 575 | 69.74 % (401) | 33 094 | 17.58 % (5 819) | 82.20 % |
+| Cloudflare free | 570 | 10.70 % (61) | 32 780 | 0.07 % (23) | 98.40 % |
+
+The PingWAF rows are the source project's replay (effective interception
+96.6 %, see above); WAFred has not independently re-run them. The other rows
+are quoted from the blazehttp project README and were not re-run here. The two datasets are close but not identical (33 877 vs
+33 669; 658 vs 570–575 malicious samples), and third-party latency includes
+public-network round trips while PingWAF's p95 is a loopback verdict latency —
+compare detection and false positives, not milliseconds.
+
+The source project's suite definitions, replay harness and raw metrics live in
+[`tools/waf-bench/`](./tools/waf-bench). The
+**[test plan](./docs/waf-test-plan.md)** documents the methodology and the
+**[test report](./docs/waf-test-report.md)** the conclusions, per-category
+tables, the cross-vendor comparison with Cloudflare / SafeLine / ModSecurity
+(quoted from the blazehttp benchmark) and known limits.
+
+## 🧱 Tech Stack
+
+| Layer | Technology |
+| --- | --- |
+| Data plane / proxy | Rust · [`Pingora`](https://github.com/cloudflare/pingora) · [`pingap`](https://github.com/vicanso/pingap) |
+| Control plane API | [`Axum`](https://github.com/tokio-rs/axum) (REST) · [`tonic`](https://github.com/hyperium/tonic) (gRPC) |
+| Persistence | [`SeaORM`](https://www.sea-ql.org/SeaORM/) · PostgreSQL 14+ (16 recommended) |
+| Log storage | Elasticsearch (optional) |
+| Dashboard | React 19 · Vite · Tailwind CSS v4 (embedded with `rust-embed`) |
+| WAF engine | `libinjection` · Aho-Corasick · expression evaluator |
+
+**Core crates:**
+
+| Crate | Responsibility |
+| --- | --- |
+| [`pingwaf-proto`](./pingwaf-proto) | Control-plane gRPC protocol definitions (single source: `control_plane.proto`) |
+| [`pingwaf-server`](./pingwaf-server) | Control plane: Axum REST + tonic gRPC + SeaORM/PostgreSQL + ES logs + embedded frontend + agent health monitoring |
+| [`pingwaf-agent`](./pingwaf-agent) | Data-plane agent: connects to the control plane, caches rules with disk persistence, ships logs/metrics, receives commands |
+| [`pingwaf-waf`](./pingwaf-waf) | Detection engine: normalize → signatures → expression → anomaly score |
+| [`pingwaf-challenge`](./pingwaf-challenge) | Dynamic challenges: JS 5-second shield, interactive challenge, PoW, fingerprinting, HMAC clearance cookies |
+| `pingwaf-profiler` / `pingwaf-system` (no README) | In-process CPU/memory attribution and snapshots served at `/api/v1/system/profile` and `/api/v1/system/metrics` |
+
+The `pingwaf-*` crate names and source paths remain as inherited internal
+structure. Runtime identifiers have moved to WAFred: command and environment
+names, service/account names, configuration and data paths, database/index
+identifiers, and managed rule IDs. Existing PingWAF installations require a
+manual migration; the old runtime identifiers are not read automatically.
+
+---
+
+## 🚀 Quick Start
+
+Two typical paths: **Docker Compose** (one command, `all-in-one` mode with PostgreSQL; prebuilt binaries are published for Linux amd64/arm64 only — see the [releases page](https://github.com/oyport/wafred/releases)), or **build from source** (Rust 1.96+, Node.js 26.12.1+, `protoc`).
+
+```bash
+# Path A — Docker Compose (recommended; no clone, no root)
+curl -fsSL https://raw.githubusercontent.com/oyport/wafred/main/deploy/compose/install.sh | bash
+# …or, after cloning this repository:
+docker compose up -d
+
+# Path B — build from source
+git clone https://github.com/oyport/wafred.git && cd wafred
+cd web && npm ci && npm run build && cd ..
+cargo build --release --bin wafred --features full
+./target/release/wafred all-in-one --db-url "postgres://wafred:wafred@localhost:5432/wafred"
+```
+
+Then open the dashboard at **https://localhost:9080** (HTTPS with a self-signed certificate generated on first boot) and sign in with `admin@wafred.local` / `wafred123` — **change the default password and `WAFRED_JWT_SECRET` before any production use**.
+
+👉 Full install wizard, the interactive installer and TLS / port options: **<https://waf.red/install/>** · step-by-step guide: **<https://waf.red/quickstart/>** · in-repo walkthrough (database setup, first site, distributed agents, systemd): **[docs/quick-start.md](./docs/quick-start.md)**.
+
+---
+
+## 🧭 Run Modes
+
+WAFred is a single binary (`wafred`) that shares its entry point with `pingap`. It selects a mode from the CLI subcommand **or** the `WAFRED_MODE` environment variable. The old `pingwaf` executable and `PINGWAF_*` environment variables are not supported.
+
+| Mode | Command | Role |
+| --- | --- | --- |
+| **Control plane** | `wafred server` | REST API + gRPC server + dashboard + PostgreSQL. Does not proxy traffic. |
+| **Data plane** | `wafred agent` | Connects to a remote control plane, enforces rules, proxies traffic on :80/:443. |
+| **All-in-One** | `wafred all-in-one` | Both of the above in one process (agent talks to the local server over loopback). |
+
+```bash
+# Equivalent to `wafred all-in-one`
+WAFRED_MODE=all-in-one ./wafred
+```
+
+---
+
+## ⚙️ Configuration
+
+WAFred is configured through a **TOML file**, **`WAFRED_*` environment variables**, and **CLI flags**, in that order of precedence (a later channel overrides an earlier one). Only the `WAFRED_*` environment prefix is recognized.
+
+```bash
+wafred all-in-one --config /etc/wafred/wafred.toml
+
+WAFRED_CONFIG=/etc/wafred/wafred.toml wafred all-in-one   # equivalent
+```
+
+> ℹ️ The [`wafred.toml`](./wafred.toml) in the repository root is a working
+> example — pass it with `--config` and its `[server]` / `[agent]` tables are
+> applied (the process logs `wafred: loaded N setting(s)`). Keys are the flag
+> names with underscores (`admin_addr`, `max_body_log_size`); unknown keys are
+> reported and skipped.
+
+### Key environment variables
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `WAFRED_CONFIG` | — | Path to the TOML configuration file |
+| `WAFRED_MODE` | — | `server`, `agent` or `all-in-one` |
+| `WAFRED_DB_URL` | `postgres://wafred:wafred@localhost:5432/wafred` | PostgreSQL DSN |
+| `WAFRED_ADMIN_ADDR` | `0.0.0.0:9080` | REST API + dashboard listen address |
+| `WAFRED_GRPC_ADDR` | `0.0.0.0:9090` | gRPC control-plane listen address |
+| `WAFRED_JWT_SECRET` | `change-me-in-production` | JWT signing secret (**≥ 16 chars**, change in production) |
+| `WAFRED_ADMIN_EMAIL` | `admin@wafred.local` | Seeded administrator email |
+| `WAFRED_ADMIN_PASSWORD` | `wafred123` | Seeded administrator password (**change in production**) |
+| `WAFRED_ALLOW_REGISTRATION` | `true` | Whether `POST /api/v1/auth/register` accepts signups (`docker-compose.yml` sets this to `false`) |
+| `WAFRED_HEARTBEAT_INTERVAL` | `15` | Heartbeat interval the control plane hands to agents at registration (seconds). The agent-side `--heartbeat-interval-secs` flag reads the same variable but falls back to `30`, and only applies when the control plane hands nothing down |
+| `WAFRED_TLS_ENABLED` | `true` | Serve the REST API + dashboard over HTTPS (self-signed until replaced); `false` behind a TLS-terminating proxy |
+| `WAFRED_TLS_SANS` | hostname, `localhost`, `127.0.0.1` | Comma-separated SANs of the generated self-signed certificate |
+| `WAFRED_SERVER_URL` | `http://localhost:9090` | *(agent)* control-plane gRPC URL |
+| `WAFRED_API_KEY` | *(empty)* | *(agent)* API key; empty = auto-register over loopback |
+| `WAFRED_CACHE_DIR` | `./data/cache` | *(agent)* local rule cache directory |
+| `WAFRED_ES_ENABLED` | `false` | Enable Elasticsearch log shipping |
+| `WAFRED_ES_URLS` | *(empty)* | Comma-separated Elasticsearch URLs |
+
+### Default ports
+
+| Port | Purpose |
+| --- | --- |
+| `9080` | REST API + embedded dashboard over HTTPS (health: `GET /healthz`, answered on HTTP too); restrict to admin/VPN sources |
+| `9090` | gRPC control plane (agents connect here) |
+| `80` / `443` | Proxied traffic (bound once the first site exists; `443` opens only after a certificate is issued or uploaded — until then only port `80` serves HTTP) |
+
+👉 Full configuration reference: **[docs/deployment.md](./docs/deployment.md)** and **[docs/api.md](./docs/api.md)**.
+
+---
+
+## 📚 Documentation
+
+| Document | What you'll find |
+| --- | --- |
+| [WAFred 1.0.0 release notes](./CHANGELOG.md) | First-release feature changes and compatibility summary |
+| [docs/quick-start.md](./docs/quick-start.md) | From zero to your first protected site |
+| [docs/deployment.md](./docs/deployment.md) | Docker, binary + systemd, distributed topologies |
+| [docs/cli.md](./docs/cli.md) | Administrator binary CLI — run modes, break-glass maintenance commands, incident runbooks |
+| [docs/user-guide.md](./docs/user-guide.md) | Dashboard walkthrough, sites, rules, policies |
+| [docs/http-lifecycle.md](./docs/http-lifecycle.md) | Where every feature acts in the request pipeline (WAF check order, caching, error pages) and how to debug with it |
+| [docs/waf-test-plan.md](./docs/waf-test-plan.md) | WAF test plan — layers, blazehttp suite selection, calibres and acceptance gates |
+| [docs/waf-test-report.md](./docs/waf-test-report.md) | Measured WAF effectiveness (0.32.4) — interception, false positives, attribution, limits |
+| [docs/waf-benchmark-report.md](./docs/waf-benchmark-report.md) | Per-round benchmark appendix (P0 → P14 iteration history) |
+| [docs/api.md](./docs/api.md) | REST API reference (`https://<host>:9080/api/v1`) |
+| [docs/README.md](./docs/README.md) | Full documentation index |
+| [CONTRIBUTING.md](./CONTRIBUTING.md) | How to contribute |
+| [SECURITY.md](./SECURITY.md) | Vulnerability disclosure policy |
+| [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) | Community guidelines |
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! Please read **[CONTRIBUTING.md](./CONTRIBUTING.md)** before opening a pull request, and **[SECURITY.md](./SECURITY.md)** for how to responsibly report a vulnerability.
+
+---
+
+## 🙏 Acknowledgements
+
+WAFred stands on the shoulders of excellent open-source projects:
+
+- **[PingWAF](https://github.com/shuaiZend/PingWAF)** — the Apache-2.0 codebase from which WAFred's initial implementation is derived.
+- **[pingap](https://github.com/vicanso/pingap)** by Tree Xie — the reverse-proxy foundation (routing, plugins, ACME, caching, hot reload) that WAFred's data plane is built on.
+- **[Pingora](https://github.com/cloudflare/pingora)** by Cloudflare — the async networking framework that powers `pingap`.
+- **[libinjection](https://github.com/client9/libinjection)** — SQLi/XSS detection heuristics used by the WAF engine.
+
+WAFred is an independent derivative project that continues development of the WAF control plane, agents and detection engine. It is distributed under the **[Apache License 2.0](./LICENSE)**, retains the original copyright notices, and credits its source in [NOTICE](./NOTICE). WAFred is not affiliated with or endorsed by PingWAF's former maintainers, Cloudflare or the `pingap` project.
+
+---
+
+## 📄 License
+
+WAFred is released under the **[Apache License 2.0](./LICENSE)**.

@@ -1,0 +1,28 @@
+[package]
+name = "pingwaf-waf"
+version.workspace = true
+edition = "2021"
+description = "WAFred detection engine: normalization, signature matching, rule evaluation and anomaly scoring"
+license = "Apache-2.0"
+
+[dependencies]
+# Self-accounting only (module/method timers and memory gauges); no allocator
+# hook, no sampling, so it is safe on the detection hot path.
+pingwaf-profiler = { path = "../pingwaf-profiler" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+# The workspace declares regex with default-features = false; the detection
+# engine needs the std backend plus Unicode-aware case folding for `(?i)`.
+regex = { workspace = true, features = ["std", "unicode-case", "unicode-perl"] }
+ahash = { workspace = true }
+aho-corasick = "1"
+base64 = { workspace = true }
+# Request bodies arrive `Content-Encoding: gzip` / `deflate` often enough
+# that inspecting the encoded bytes means inspecting nothing. Bounded,
+# in-memory decompression only (see `normalize::body`).
+flate2 = { workspace = true }
+ipnet = { workspace = true }
+bytes = { workspace = true }
+once_cell = "1"

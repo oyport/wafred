@@ -1,0 +1,64 @@
+# WAFred Runtime-only Dockerfile
+# 用于 release workflow：从预编译二进制构建最小运行时镜像
+# 完整源码构建请使用 Dockerfile
+# Must use trixie (glibc 2.40) because binaries job compiles on
+# ubuntu-latest (glibc 2.39); bookworm (glibc 2.36) is too old.
+# mirror.gcr.io = Google's mirror of the same Docker Hub image;
+# GHA runners hit Docker Hub's anonymous pull limit (429) intermittently.
+#
+# Runtime contract — ports and capabilities: identical to Dockerfile. The
+# binary carries CAP_NET_BIND_SERVICE as a file capability so USER wafred can
+# bind 80/443; if a security policy strips it, add `--cap-add=NET_BIND_SERVICE`
+# or use host networking. See docs/deployment.md → "Binding Ports 80/443 in
+# Containers".
+FROM mirror.gcr.io/library/debian:trixie-slim
+
+# SYNC: keep in lockstep with Dockerfile / ci.yml / release.yml
+# procps provides pgrep for the agent branch of the health check below; the
+# source-built images use a single curl probe and do not need it.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    libcap2-bin \
+    procps \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -m -s /usr/sbin/nologin wafred \
+    && mkdir -p /etc/wafred /var/lib/wafred \
+    && chown -R wafred:wafred /var/lib/wafred /etc/wafred
+
+# Allocator retention (purge delay) is now derived at startup from the
+# memory ceiling (cgroup limit → host total): <1GB → 0ms, 1-4GB → 250ms,
+# 4-16GB → 500ms, >16GB → 1000ms. Override with
+# WAFRED_MALLOC_PURGE_DELAY_MS
+# or MIMALLOC_PURGE_DELAY — see
+# src/allocator_tune.rs. No fixed ENV here on purpose: a pinned 1000ms
+# kept freed pages resident on small hosts and fed the OOM incidents.
+
+COPY wafred /usr/local/bin/wafred
+COPY wafred.toml /etc/wafred/wafred.toml
+
+# Same contract as Dockerfile: file capability after the COPY, verified at
+# build time so a stripped image fails here rather than at startup.
+RUN setcap cap_net_bind_service=+ep /usr/local/bin/wafred \
+    && getcap /usr/local/bin/wafred | grep -q cap_net_bind_service
+
+EXPOSE 80 443 9080 9090
+
+VOLUME ["/var/lib/wafred"]
+
+# ./data/cache (WAFRED_CACHE_DIR default)
+# and the ACME state file are
+# relative paths; anchor them in the writable, volume-backed directory.
+WORKDIR /var/lib/wafred
+
+USER wafred
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD sh -c 'if grep -qaE "all-in-one|server" /proc/1/cmdline; then \
+        curl --connect-timeout 2 --max-time 3 -sf http://localhost:9080/healthz || exit 1; \
+    else \
+        pgrep -f "wafred agent" >/dev/null || exit 1; \
+    fi'
+
+ENTRYPOINT ["wafred"]
+CMD ["all-in-one"]

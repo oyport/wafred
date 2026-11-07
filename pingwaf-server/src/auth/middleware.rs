@@ -1,0 +1,588 @@
+//! Axum extractors that turn a `Authorization: Bearer <jwt>` header into an
+//! [`AuthUser`], plus role helpers used by the write endpoints.
+
+use axum::extract::{FromRef, FromRequestParts, OriginalUri, Request, State};
+use axum::http::header::AUTHORIZATION;
+use axum::http::request::Parts;
+use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use uuid::Uuid;
+
+use sea_orm::{DatabaseConnection, EntityTrait};
+
+use crate::api::error::error_response;
+use crate::api::state::AppState;
+use crate::auth::jwt::{verify_user_token, Claims, JwtError};
+use crate::models::{role, user};
+
+/// Scheme prefix accepted in the `Authorization` header.
+const BEARER_PREFIX: &str = "Bearer ";
+
+/// Identity of the caller behind a request.
+///
+/// Resolved against the database on every request: disabled accounts are
+/// refused immediately, and a role change takes effect without waiting for
+/// the access token to expire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthUser {
+    pub id: Uuid,
+    pub email: String,
+    pub role: String,
+    /// The console forces a password (and name) change before any mutation.
+    pub must_change_password: bool,
+}
+
+impl AuthUser {
+    pub fn new(
+        id: Uuid,
+        email: impl Into<String>,
+        role: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            email: email.into(),
+            role: role.into(),
+            must_change_password: false,
+        }
+    }
+
+    pub fn is_admin(&self) -> bool {
+        self.role == role::ADMIN
+    }
+
+    /// Fails with `403` unless the caller is an administrator.
+    pub fn require_admin(&self) -> Result<(), AuthError> {
+        if self.is_admin() {
+            Ok(())
+        } else {
+            Err(AuthError::Forbidden(
+                "administrator role required".to_string(),
+            ))
+        }
+    }
+}
+
+/// Rejection returned by [`AuthUser`]; always renders as `401`/`403`.
+#[derive(Debug)]
+pub enum AuthError {
+    /// No `Authorization` header at all.
+    MissingCredentials,
+    /// Header present but not a `Bearer` token.
+    MalformedCredentials,
+    /// Signature/claims problem.
+    InvalidToken(String),
+    /// `exp` in the past.
+    ExpiredToken,
+    /// Valid identity, insufficient role.
+    Forbidden(String),
+    /// Reading the account back from the database failed.
+    Internal(String),
+}
+
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthError::MissingCredentials => {
+                f.write_str("missing authorization header")
+            },
+            AuthError::MalformedCredentials => {
+                f.write_str("authorization header must use the Bearer scheme")
+            },
+            AuthError::InvalidToken(msg) => write!(f, "invalid token: {msg}"),
+            AuthError::ExpiredToken => f.write_str("token expired"),
+            AuthError::Forbidden(msg) => write!(f, "forbidden: {msg}"),
+            AuthError::Internal(msg) => write!(f, "storage error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for AuthError {}
+
+impl AuthError {
+    fn code(&self) -> &'static str {
+        match self {
+            AuthError::Forbidden(_) => "forbidden",
+            AuthError::ExpiredToken => "token_expired",
+            AuthError::Internal(_) => "internal",
+            _ => "unauthorized",
+        }
+    }
+
+    fn status(&self) -> StatusCode {
+        match self {
+            AuthError::Forbidden(_) => StatusCode::FORBIDDEN,
+            AuthError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            _ => StatusCode::UNAUTHORIZED,
+        }
+    }
+}
+
+impl From<JwtError> for AuthError {
+    fn from(err: JwtError) -> Self {
+        match err {
+            JwtError::Expired => AuthError::ExpiredToken,
+            other => AuthError::InvalidToken(other.to_string()),
+        }
+    }
+}
+
+impl From<AuthError> for crate::api::error::ApiError {
+    fn from(err: AuthError) -> Self {
+        match err {
+            AuthError::Forbidden(msg) => {
+                crate::api::error::ApiError::Forbidden(msg)
+            },
+            other => {
+                crate::api::error::ApiError::Unauthorized(other.to_string())
+            },
+        }
+    }
+}
+
+impl IntoResponse for AuthError {
+    fn into_response(self) -> Response {
+        let status = self.status();
+        let code = self.code();
+        let mut response = error_response(status, code, &self.to_string());
+        // RFC 6750: tell the client which scheme we expect.
+        response.headers_mut().insert(
+            axum::http::header::WWW_AUTHENTICATE,
+            axum::http::HeaderValue::from_static(
+                "Bearer realm=\"wafred\", error=\"invalid_token\"",
+            ),
+        );
+        response
+    }
+}
+
+/// Endpoints a first-login account may still reach (D20).
+///
+/// Everything under `/auth/` that a session needs in order to *become* a
+/// normal session — status probe, login/refresh, the password change itself
+/// and the profile read the console makes on boot — stays reachable. Every
+/// other authenticated endpoint is refused while `must_change_password` is
+/// set.
+///
+/// Relative to [`crate::api::API_PREFIX`]: the table is matched against the
+/// path with the prefix already stripped, so it cannot drift from the routes
+/// it describes (a hard-coded `/api/v1/...` copy is what turned this gate
+/// into a lockout once).
+const PASSWORD_CHANGE_EXEMPT_PREFIX: &str = "/auth/";
+
+/// Paths inside [`PASSWORD_CHANGE_EXEMPT_PREFIX`] that are *not* exempt.
+///
+/// The passkey registry is an ordinary account mutation that has no business
+/// running before the shipped default password is replaced: it would let the
+/// session that holds the public default password add a credential of its own
+/// and keep a foothold after the change.
+///
+/// `PUT /auth/me` is deliberately *not* listed — blocking it would also block
+/// the `GET /auth/me` the console needs on boot, and it already demands the
+/// current password before it can change the login e-mail.
+const PASSWORD_CHANGE_REQUIRES_CHANGE: &[&str] =
+    &["/auth/passkeys", "/auth/passkey"];
+
+/// Whether `path` may be used by a session that still owes a password change.
+///
+/// `path` is the path the client sent, *including* the [`crate::api::API_PREFIX`]
+/// segment — see [`request_path`] for why the request's own URI is not that.
+/// The prefix is stripped here rather than written into the tables above so
+/// the gate cannot disagree with the router about where the API lives.
+fn password_change_exempt(path: &str) -> bool {
+    let Some(inner) = path.strip_prefix(crate::api::API_PREFIX) else {
+        return false;
+    };
+    if !inner.starts_with(PASSWORD_CHANGE_EXEMPT_PREFIX) {
+        return false;
+    }
+    !PASSWORD_CHANGE_REQUIRES_CHANGE.iter().any(|blocked| {
+        inner
+            .strip_prefix(blocked)
+            .is_some_and(|tail| tail.is_empty() || tail.starts_with('/'))
+    })
+}
+
+/// The path the client sent, with the API prefix still on it.
+///
+/// This middleware is layered on the router that is *nested* under
+/// [`crate::api::API_PREFIX`], and axum's `nest` strips that prefix from
+/// `request.uri()` before the nested layers run (it keeps the full URI in the
+/// `OriginalUri` extension). Reading `request.uri()` here therefore yields
+/// `/auth/password` rather than `/api/v1/auth/password`, which never matches
+/// the exemption table below — the forced-change gate then refuses the very
+/// endpoint that clears it and the account can never recover.
+///
+/// Falling back to `request.uri()` keeps this working when the middleware is
+/// mounted outside a nested router (tests, or a future non-nested layout).
+fn request_path(request: &Request) -> String {
+    request
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|uri| uri.0.path().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string())
+}
+
+/// Refuses every authenticated request from an account that still carries the
+/// initial password (D20).
+///
+/// `require_write` already blocks *mutations* for such an account, but the read
+/// surface was wide open: the seeded `admin@wafred.local` / `wafred123` pair
+/// ships in the repository, so until the password changes, anybody who reads
+/// the source can enumerate sites, keys, logs and certificates. This middleware
+/// closes the read side too, leaving only the endpoints the console needs to
+/// finish the forced change.
+///
+/// The check runs *after* the bearer token is resolved, so an unauthenticated
+/// request still gets its 401 and the reply never reveals whether an account
+/// exists. A request without a token is passed through untouched — the
+/// extractors downstream produce the usual rejection.
+pub async fn require_password_change(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request_path(&request);
+    if password_change_exempt(&path) {
+        return next.run(request).await;
+    }
+
+    // Reuse the extractor so the middleware applies exactly the same
+    // signature, revocation and role checks as the handlers behind it.
+    let (mut parts, _body) = request.into_parts();
+    let Ok(user) = AuthUser::from_request_parts(&mut parts, &state).await
+    else {
+        // No usable credential: let the handler answer with its own 401.
+        let request = Request::from_parts(parts, _body);
+        return next.run(request).await;
+    };
+    // The handler extractor runs after this middleware. Reuse the identity
+    // instead of issuing the same users SELECT and JWT verification twice.
+    parts.extensions.insert(user.clone());
+    let request = Request::from_parts(parts, _body);
+    if !user.must_change_password {
+        return next.run(request).await;
+    }
+
+    error_response(
+        StatusCode::FORBIDDEN,
+        "password_change_required",
+        "change the default password first",
+    )
+}
+
+/// Pulls the raw bearer token out of the request headers.
+pub fn bearer_token(parts: &Parts) -> Result<String, AuthError> {
+    let header = parts
+        .headers
+        .get(AUTHORIZATION)
+        .ok_or(AuthError::MissingCredentials)?;
+    let value = header
+        .to_str()
+        .map_err(|_| AuthError::MalformedCredentials)?
+        .trim();
+    let token = value
+        .strip_prefix(BEARER_PREFIX)
+        .or_else(|| value.strip_prefix("bearer "))
+        .ok_or(AuthError::MalformedCredentials)?
+        .trim();
+    if token.is_empty() {
+        return Err(AuthError::MalformedCredentials);
+    }
+    Ok(token.to_string())
+}
+
+/// Resolves verified token claims against the account table: the token only
+/// proves the identity; the account row is the source of truth for
+/// existence, the disabled flag, the current role and the token version.
+/// Shared by the REST extractors and the MCP endpoint so both enforce the
+/// same database-level checks.
+pub async fn authenticate_user(
+    db: &DatabaseConnection,
+    claims: &Claims,
+) -> Result<AuthUser, AuthError> {
+    let id = claims.subject_id().map_err(|err| {
+        AuthError::InvalidToken(format!("subject is not a UUID: {err}"))
+    })?;
+
+    let account = user::Entity::find_by_id(id)
+        .one(db)
+        .await
+        .map_err(|err| AuthError::Internal(err.to_string()))?
+        .ok_or(AuthError::InvalidToken(
+            "account no longer exists".to_string(),
+        ))?;
+    if account.disabled {
+        return Err(AuthError::Forbidden("account is disabled".to_string()));
+    }
+    if !super::token_version_valid(claims.ver, &account) {
+        return Err(AuthError::InvalidToken(
+            "session revoked: credentials changed since this token was issued"
+                .to_string(),
+        ));
+    }
+    if !role::is_valid(&account.role) {
+        return Err(AuthError::InvalidToken(format!(
+            "account has an unknown role '{}'",
+            account.role
+        )));
+    }
+
+    Ok(AuthUser {
+        id,
+        email: account.email,
+        role: account.role,
+        must_change_password: account.must_change_password,
+    })
+}
+
+impl<S> FromRequestParts<S> for AuthUser
+where
+    S: Send + Sync,
+    AppState: FromRef<S>,
+{
+    type Rejection = AuthError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        // `require_password_change` resolved this request already.
+        if let Some(user) = parts.extensions.get::<AuthUser>() {
+            return Ok(user.clone());
+        }
+        let app_state = AppState::from_ref(state);
+        let token = bearer_token(parts)?;
+        let claims = verify_user_token(&token, app_state.jwt_secret())?;
+        authenticate_user(&app_state.db, &claims).await
+    }
+}
+
+/// Extractor that additionally enforces the `admin` role.
+#[derive(Debug, Clone)]
+pub struct AdminUser(pub AuthUser);
+
+impl AdminUser {
+    pub fn id(&self) -> Uuid {
+        self.0.id
+    }
+}
+
+impl<S> FromRequestParts<S> for AdminUser
+where
+    S: Send + Sync,
+    AppState: FromRef<S>,
+{
+    type Rejection = AuthError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let user = AuthUser::from_request_parts(parts, state).await?;
+        user.require_admin()?;
+        Ok(AdminUser(user))
+    }
+}
+
+impl std::ops::Deref for AdminUser {
+    type Target = AuthUser;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_check_rejects_viewers() {
+        let viewer =
+            AuthUser::new(Uuid::new_v4(), "v@example.com", role::VIEWER);
+        assert!(!viewer.is_admin());
+        assert!(viewer.require_admin().is_err());
+
+        let admin = AuthUser::new(Uuid::new_v4(), "a@example.com", role::ADMIN);
+        assert!(admin.is_admin());
+        assert!(admin.require_admin().is_ok());
+    }
+
+    /// The path as the client sends it: the API prefix plus an inner route.
+    ///
+    /// Composed from [`crate::api::API_PREFIX`] so a prefix change moves the
+    /// tests with the router instead of leaving a stale `/api/v1` table here.
+    fn api(path: &str) -> String {
+        format!("{}{path}", crate::api::API_PREFIX)
+    }
+
+    /// D20: only the endpoints a first-login account needs to finish the
+    /// forced change stay reachable; everything else is refused.
+    #[test]
+    fn password_change_exemptions_cover_only_the_login_flow() {
+        for path in [
+            "/auth/status",
+            "/auth/login",
+            "/auth/register",
+            "/auth/refresh",
+            "/auth/password",
+            // Both methods: the console reads the profile on boot, and
+            // blocking `PUT` would take `GET` down with it (see the table's
+            // doc comment).
+            "/auth/me",
+        ] {
+            let path = api(path);
+            assert!(
+                password_change_exempt(&path),
+                "{path} must stay reachable"
+            );
+        }
+
+        for path in [
+            // Read surfaces the shipped default password would otherwise open.
+            "/sites",
+            "/sites/abc",
+            "/keys",
+            "/users",
+            "/logs",
+            "/login-history",
+            "/agents",
+            "/settings",
+            "/system/info",
+            // Not the auth namespace even though it shares the first segment.
+            "/authority",
+            // Ordinary account mutations hidden inside the auth prefix.
+            "/auth/passkeys",
+            "/auth/passkeys/0a1b2c",
+            "/auth/passkey/register/begin",
+        ] {
+            let path = api(path);
+            assert!(!password_change_exempt(&path), "{path} must be refused");
+        }
+
+        // Paths that are not under the API prefix at all are never exempt,
+        // and neither is anything that merely starts with a similar string.
+        for path in [
+            "/mcp",
+            "/",
+            // The bare prefix, with no inner route after it.
+            crate::api::API_PREFIX,
+            // Near misses: a shared leading segment is not the prefix.
+            "/api/v10/auth/password",
+            "/api/auth/password",
+        ] {
+            assert!(!password_change_exempt(path), "{path} must be refused");
+        }
+    }
+
+    /// Regression: the gate is layered on the router *nested* under
+    /// `/api/v1`, and axum strips that prefix from `request.uri()` before the
+    /// layer runs. Reading the raw URI therefore produced `/auth/password`,
+    /// which matched nothing in the exemption table — the forced-change gate
+    /// then refused `PUT /api/v1/auth/password` itself, so the flag could
+    /// never be cleared and the seeded administrator was locked out.
+    ///
+    /// The gate is reproduced with the same predicate the middleware uses, so
+    /// the test asserts the *decision*, not just the resolved string: the
+    /// passable endpoints must stay reachable and everything else must still
+    /// be refused — including the path spellings a caller might use to slip
+    /// past the exemption table.
+    #[tokio::test]
+    async fn the_gate_resolves_the_path_the_client_sent() {
+        use axum::http::Method;
+        use axum::routing::{get, post, put};
+        use tower::ServiceExt;
+
+        let inner = axum::Router::new()
+            .route("/auth/password", put(|| async { "ok" }))
+            .route("/auth/me", get(|| async { "ok" }))
+            .route("/auth/passkeys", post(|| async { "ok" }))
+            .route("/sites", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(
+                |request: Request, _next: Next| async move {
+                    let path = request_path(&request);
+                    let status = if password_change_exempt(&path) {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::FORBIDDEN
+                    };
+                    (status, path).into_response()
+                },
+            ));
+        // Same shape as `api::build_router`: middleware inside, `nest` outside.
+        let app = axum::Router::new().nest(crate::api::API_PREFIX, inner);
+
+        let call = |method: Method, uri: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap();
+                (status, String::from_utf8(body.to_vec()).unwrap())
+            }
+        };
+
+        // The forced change is possible at all: the console's escape hatch and
+        // its boot-time profile read pass, and the request carries the prefix
+        // the exemption table is written against.
+        for (method, uri) in [
+            (Method::PUT, "/api/v1/auth/password"),
+            (Method::GET, "/api/v1/auth/me"),
+        ] {
+            let (status, seen) = call(method, uri).await;
+            assert_eq!(StatusCode::OK, status, "{uri} must stay reachable");
+            assert_eq!(uri, seen, "the middleware must see the full path");
+        }
+
+        // Everything else is still refused while the flag is set.
+        for (method, uri) in [
+            (Method::GET, "/api/v1/sites"),
+            (Method::POST, "/api/v1/auth/passkeys"),
+        ] {
+            let (status, seen) = call(method, uri).await;
+            assert_eq!(StatusCode::FORBIDDEN, status, "{uri} must be refused");
+            assert_eq!(uri, seen);
+        }
+
+        // Path spellings that must never turn into an allowed request: each is
+        // either refused by the gate or unmatched by the router, never `200`.
+        for (method, uri) in [
+            (Method::PUT, "/api/v1/auth/password/"),
+            (Method::PUT, "/api/v1//auth/password"),
+            (Method::GET, "/api/v1/auth/sites"),
+            (Method::GET, "/api/v1/auth/../sites"),
+            (Method::POST, "/api/v1/auth/%70asskeys"),
+            (Method::POST, "/api/v1/auth/passkeys/"),
+            (Method::POST, "/api/v1/auth/passkeys?next=/sites"),
+            (Method::GET, "/API/V1/auth/me"),
+        ] {
+            let (status, _) = call(method, uri).await;
+            assert_ne!(StatusCode::OK, status, "{uri} must not be allowed");
+        }
+    }
+
+    #[test]
+    fn error_statuses() {
+        assert_eq!(
+            AuthError::MissingCredentials.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(AuthError::ExpiredToken.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            AuthError::Forbidden("nope".into()).status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+}

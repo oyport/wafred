@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="400" viewBox="0 0 1000 400" role="img" aria-labelledby="title desc">
+  <title id="title">Historical PingWAF source-project benchmark</title>
+  <desc id="desc">A comparison of the PingWAF 0.32.4 source baseline and other products on the blazehttp corpus. WAFred has not rerun this benchmark.</desc>
+  <defs><pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0H0V40" fill="none" stroke="#171717" stroke-width="1"/></pattern></defs>
+  <rect width="1000" height="400" fill="#101010"/><rect width="1000" height="400" fill="url(#grid)"/>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+    <text x="30" y="40" fill="#e8e8e8" font-size="15" font-weight="700">Historical source baseline · blazehttp corpus</text>
+    <text x="30" y="61" fill="#8d8d8d" font-size="10">PingWAF 0.32.4 · WAFred has not re-run this benchmark</text>
+    <g font-size="11" fill="#8d8d8d">
+      <text x="30" y="115" fill="#ffb9c5" font-weight="700">PingWAF source</text><text x="30" y="163">ModSecurity PL4</text><text x="30" y="211">SafeLine strict</text><text x="30" y="259">ModSecurity PL1</text><text x="30" y="307">Cloudflare free</text>
+    </g>
+    <g fill="#252525"><rect x="220" y="96" width="620" height="20" rx="4"/><rect x="220" y="144" width="620" height="20" rx="4"/><rect x="220" y="192" width="620" height="20" rx="4"/><rect x="220" y="240" width="620" height="20" rx="4"/><rect x="220" y="288" width="620" height="20" rx="4"/></g>
+    <g>
+      <rect x="220" y="96" width="581.6" height="20" rx="4" fill="#d8324f"/><rect x="801.6" y="96" width="17.36" height="20" fill="#d8324f" fill-opacity=".55"/>
+      <rect x="220" y="144" width="586.6" height="20" rx="4" fill="#707070"/><rect x="220" y="192" width="472.3" height="20" rx="4" fill="#707070"/><rect x="220" y="240" width="432.4" height="20" rx="4" fill="#707070"/><rect x="220" y="288" width="66.3" height="20" rx="4" fill="#707070"/>
+    </g>
+    <g fill="#e8e8e8" font-size="11" font-weight="700"><text x="832" y="111">93.8%</text><text x="816" y="159">94.61%</text><text x="702" y="207">76.17%</text><text x="662" y="255">69.74%</text><text x="296" y="303">10.70%</text></g>
+    <text x="220" y="333" fill="#8d8d8d" font-size="9">0%</text><text x="815" y="333" fill="#8d8d8d" font-size="9">100%</text>
+    <text x="30" y="365" fill="#c6b7bd" font-size="10">Source data: PingWAF 0.32.4 · 658 malicious samples · 0.06% benign affected · 96.6% effective interception</text>
+    <text x="30" y="384" fill="#8d8d8d" font-size="9">Historical reference only. These figures are not a WAFred release measurement.</text>
+  </g>
+</svg>

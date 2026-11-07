@@ -1,0 +1,5833 @@
+# WAFred REST API Reference
+
+Base URL: `https://your-server:9080/api/v1`
+
+The control plane serves HTTPS by default (`tls_enabled = true`) with a
+self-signed certificate generated on first boot, so `curl` needs `-k` until the
+certificate is trusted or replaced (see
+[Control-plane certificate](#control-plane-certificate)). When TLS is disabled
+(`tls_enabled = false`, e.g. TLS terminated by a reverse proxy) the same port
+serves plain HTTP.
+
+Cleartext requests to a TLS-enabled listener are answered with `308 Permanent
+Redirect` to the `https://` URL on the same host, so scripts should either use
+`https://` directly or follow redirects. The two health endpoints (`/healthz`
+and `/api/v1/health`) are exempt and answer on both schemes, which keeps
+container health checks working without a certificate.
+
+## Authentication
+
+All endpoints (except `/auth/login`, `/auth/register`, `/auth/status`, the
+passkey sign-in pair `/auth/passkey/login/begin`, `/auth/passkey/login/finish`,
+`/health` and `/version`) require a Bearer token:
+
+```
+Authorization: Bearer <access_token>
+```
+
+### POST /auth/login
+
+Authenticate and receive tokens.
+
+**Request:**
+```json
+{
+  "email": "admin@wafred.local",
+  "password": "wafred123"
+}
+```
+
+**Response (200):**
+```json
+{
+  "access_token": "eyJ...",
+  "refresh_token": "eyJ...",
+  "token_type": "Bearer",
+  "expires_in": 43200,
+  "user": {
+    "id": "uuid",
+    "email": "admin@wafred.local",
+    "name": "Administrator",
+    "role": "admin",
+    "must_change_password": false,
+    "disabled": false,
+    "created_at": "2024-01-01T00:00:00Z",
+    "updated_at": "2024-01-01T00:00:00Z"
+  }
+}
+```
+
+The user object (also returned by `GET /auth/me`) carries two extra flags.
+`disabled` accounts cannot sign in at all. An account seeded with the shipped
+default password also starts with `must_change_password: true`: until the
+password is changed, every *authenticated* request — reads and writes alike —
+answers `403` with
+`{"error":{"code":"password_change_required","message":"change the default
+password first"}}`. Only the endpoints needed to finish the change stay
+reachable: `/auth/status`, `/auth/login`, `/auth/register`, `/auth/refresh`,
+`PUT /auth/password` and `/auth/me` — both methods of the profile route, since
+the console needs the read and the route cannot be split by method. A
+first-sign-in account can therefore still rename itself; changing the login
+name additionally requires `current_password`. The passkey endpoints
+(`/auth/passkeys*`) are deliberately *not* exempt, so they are refused too.
+Requests without a bearer token are unaffected by this gate and keep returning
+their usual `401` from the handlers.
+
+### POST /auth/register
+
+Create a new account (when registration is open).
+
+**Request:**
+```json
+{
+  "email": "user@example.com",
+  "password": "secure-password",
+  "name": "Optional Name"
+}
+```
+
+**Response (201):** Same as login.
+
+### POST /auth/refresh
+
+Exchange a refresh token for new tokens.
+
+**Request:**
+```json
+{
+  "refresh_token": "eyJ..."
+}
+```
+
+**Response (200):** Same as login.
+
+### GET /auth/status
+
+Check if setup is needed, and which credential types this deployment offers.
+
+**Response (200):**
+```json
+{
+  "needs_setup": false,
+  "registration_open": true,
+  "passkey_enabled": true
+}
+```
+
+### GET /auth/me
+
+Get current user profile. Same shape as the `user` object above, including the
+`must_change_password` and `disabled` flags.
+
+### PUT /auth/me
+
+Update current user profile. Optionally change the login name (the `email`)
+by supplying `email` together with `current_password` — the server answers
+`400` when the password is missing or wrong and `409` when the login name is
+already taken. A login-name change revokes every outstanding token, so the
+console must sign in again.
+
+**Request:**
+```json
+{
+  "name": "New Name",
+  "email": "new-login-name@example.com",
+  "current_password": "current-password"
+}
+```
+
+### PUT /auth/password
+
+Change password. The new password must be at least 8 characters.
+
+**Request:**
+```json
+{
+  "current_password": "old-password",
+  "new_password": "new-password"
+}
+```
+
+**Response (204):** empty.
+
+A wrong `current_password` is a `400` (not a `401`), so clients do not treat a
+typo as a dead session. Answers `204` on success. Changing the password also
+clears the account's `must_change_password` flag, which is what releases a
+first sign-in from the forced password change.
+
+Like a login-name change, a password change revokes every token issued to the
+account — including the access token the request itself was authenticated with
+and its refresh token. The response carries no replacement pair, so the client
+must sign in again with the new password.
+
+---
+
+## Users
+
+Dashboard user administration. Every route here requires the `admin` role.
+Self-lockout is prevented: an administrator can neither change their own role
+nor disable themselves, and the last enabled administrator can never be
+downgraded or disabled.
+
+Roles: `admin` (read and write everything), `auditor` (read-only across all
+resources) and `viewer` (read-only).
+
+### GET /users
+
+List users (paginated).
+
+### POST /users
+
+Create an account. `role` defaults to `viewer`; `password` must be at least 8
+characters. The new account starts with `must_change_password: false` — the
+administrator picked its password, so the console does not force a change at
+first sign-in. Only the seeded administrator and accounts created with
+`wafred user add-admin` start with the flag set.
+
+**Request:**
+```json
+{
+  "email": "auditor@example.com",
+  "password": "start-up-password",
+  "name": "Compliance",
+  "role": "auditor"
+}
+```
+
+**Response (201):** the created user object (same shape as `GET /auth/me`).
+
+### PUT /users/{user_id}
+
+Update `name`, `role`, `disabled` and/or `email` (the login name). An
+administrator cannot change their own `role`/`disabled` (`400`); downgrading
+or disabling the last enabled administrator is rejected with `400` as well.
+A login-name change revokes the account's outstanding tokens; a duplicate
+login name is rejected with `409`.
+
+---
+
+## Visitors
+
+Visitor accounts for the protected sites: the accounts a site's login page
+admits. They are separate from console `users` — a visitor never reaches the
+console, and a visitor signs in on the data plane (the credential check runs
+over gRPC), so no endpoint here ever returns a password or its hash. An
+operator who loses a visitor's password sets a new one with `PUT`; there is
+no mask to send back because the console is not the party that signs in with
+it.
+
+Every route in this chapter requires the `admin` role.
+
+### GET /visitors
+
+List every visitor account, sorted by email ascending. There is no pagination
+and no search parameter — the list is returned in full, with each visitor's
+site grants inlined so the dashboard needs no second request per row.
+
+**Response (200):**
+```json
+[
+  {
+    "id": "uuid",
+    "email": "alice@example.com",
+    "name": "Alice",
+    "remark": "",
+    "disabled": false,
+    "site_ids": ["uuid"],
+    "created_at": "2024-01-01T00:00:00Z",
+    "updated_at": "2024-01-01T00:00:00Z"
+  }
+]
+```
+
+`remark` is console-only context for collaborators and is never used for
+authentication; `site_ids` are the sites the visitor may enter.
+
+### POST /visitors
+
+Create a visitor account and (optionally) grant its sites in one call. The
+account and its grants are written in one transaction: a refused grant list
+leaves no half-created visitor behind.
+
+**Request:**
+```json
+{
+  "email": "alice@example.com",
+  "password": "start-up-password",
+  "name": "Alice",
+  "remark": "Contractor",
+  "disabled": false,
+  "site_ids": ["uuid"]
+}
+```
+
+| Field | Rules |
+|-------|-------|
+| `email` | Required. Trimmed and lower-cased (so `A@B.test` and `a@b.test` are one account), 1-255 characters, exactly one `@` with a dotted domain on the right. |
+| `password` | Required, at least 8 characters; stored as a bcrypt hash, never returned. |
+| `name` | Optional, max 128 characters, trimmed. |
+| `remark` | Optional, max 500 characters (counted in characters, not bytes). |
+| `disabled` | Optional, default `false`. |
+| `site_ids` | Optional list of site UUIDs to grant on creation. |
+
+**Errors:** `400` for any validation failure — including a duplicate email
+(`a visitor with the address '…' already exists`; there is no `409` here) and
+a `site_ids` entry naming a nonexistent site.
+
+**Response (200):** the created visitor object (same shape as the list rows).
+
+### GET /visitors/{visitor_id}
+
+One visitor account, same shape as the list rows. **404** when the id is
+unknown; **400** when the id is not a UUID.
+
+### PUT /visitors/{visitor_id}
+
+Partial update: every field is optional and omitted fields keep their value.
+
+| Field | Behaviour |
+|-------|-----------|
+| `name` | Replaces the display name (max 128 characters). |
+| `remark` | Replaces the note; an empty string clears it. |
+| `disabled` | Disabling also bumps the account's token version, ending every session it holds. |
+| `password` | Sets a new password (at least 8 characters) and ends every existing session the same way. |
+| `site_ids` | Replaces the **whole** grant list (not a merge); an unknown site id is refused with `400`. |
+
+Account fields and grants are written in one transaction; a refused grant
+list leaves the other fields untouched.
+
+**Response (200):** the refreshed visitor object.
+
+### DELETE /visitors/{visitor_id}
+
+Delete the account. Its site grants and any passkeys enrolled for it cascade
+with the row, so no usable credential survives.
+
+**Response (200):** `{"deleted": true}`. **404** when the id is unknown.
+
+---
+
+## Passkeys
+
+Passkeys (WebAuthn) are an alternative sign-in for a browser that owns a
+platform authenticator or a security key. A passkey is always bound to an
+account that is already signed in — the console mints them from Settings →
+Passkeys, and the operator then signs in with the fingerprint/face/PIN prompt
+instead of a password.
+
+Two conditions must hold for the browser prompt to even appear:
+
+* `GET /auth/status` reports `passkey_enabled: true` (the `passkey_enabled`
+  server setting, on by default). When it is `false` every endpoint below
+  answers `501`.
+* The page is a secure context: HTTPS, or `localhost`. A passkey cannot be
+  created for a bare IP address or over plain HTTP on a hostname. The control
+  plane therefore serves HTTPS by default with a self-signed certificate that
+  can be replaced under [Control-plane certificate](#control-plane-certificate);
+  a bare-IP deployment needs that IP in the certificate's SANs.
+
+### GET /auth/passkeys
+
+List the passkeys bound to the signed-in account. Neither the credential id nor
+the public key is exposed.
+
+```json
+[
+  {
+    "id": "uuid",
+    "name": "Work laptop",
+    "created_at": "2024-01-01T00:00:00Z",
+    "last_used_at": "2024-02-01T09:12:00Z"
+  }
+]
+```
+
+### PATCH /auth/passkeys/{passkey_id}
+
+Rename a passkey.
+
+**Request:**
+```json
+{ "name": "Work laptop" }
+```
+
+**Response (200):** the updated summary. Names are 1-100 characters.
+
+### DELETE /auth/passkeys/{passkey_id}
+
+Remove a passkey. Answers `204`. The credential can no longer sign in; the
+account's password still can.
+
+### POST /auth/passkey/register/begin
+
+Start binding a new passkey to the signed-in account.
+
+**Response (200):** `PublicKeyCredentialCreationOptions` in the WebAuthn JSON
+encoding (base64url strings, camelCase fields) to be handed to
+`navigator.credentials.create()`.
+
+```json
+{
+  "rp": { "id": "waf.example.com", "name": "WAFred" },
+  "user": { "id": "…", "name": "ops@example.com", "displayName": "Ops" },
+  "challenge": "…",
+  "pubKeyCredParams": [{ "type": "public-key", "alg": -7 }],
+  "timeout": 300000,
+  "excludeCredentials": [],
+  "authenticatorSelection": { "residentKey": "preferred" },
+  "attestation": "none"
+}
+```
+
+### POST /auth/passkey/register/finish
+
+Complete the ceremony with the credential returned by the browser.
+
+**Request:** the standard registration response — `id`, `rawId`, `type`,
+`response.{clientDataJSON, attestationObject, transports}` (base64url) plus an
+optional `name` label and `clientExtensionResults`.
+
+**Response (201):** the stored passkey summary, shaped like `GET /auth/passkeys`.
+
+### POST /auth/passkey/login/begin
+
+Start a password-less sign-in. Public — no bearer token.
+
+**Response (200):** `PublicKeyCredentialRequestOptions` (base64url `challenge`,
+`rpId`, `allowCredentials`) to be handed to `navigator.credentials.get()`.
+
+Because the account is not known yet, the authenticator must be able to
+discover the credential (a "discoverable"/resident key). Passkeys minted through
+`register/finish` are created as `residentKey: "preferred"`: platform
+authenticators make them discoverable by default, but a legacy security key that
+refuses to store the credential cannot be used for password-less sign-in.
+
+### POST /auth/passkey/login/finish
+
+Verify the assertion and mint a session. Public — no bearer token.
+
+**Request:** the standard assertion — `id`, `rawId`, `type`,
+`response.{clientDataJSON, authenticatorData, signature, userHandle}` (base64url)
+and `clientExtensionResults`.
+
+**Response (200):** identical to `POST /auth/login`, so the client stores the
+tokens the same way.
+
+**Errors:** every verification failure is a `400` with an `error` message — a
+`401` would make the console log the operator out mid-ceremony.
+
+Ceremony state lives in the database with a 5 minute lifetime, so several
+control plane replicas can serve one ceremony without sticky sessions.
+Unauthenticated challenges share a process-wide budget (120/minute); exceeding
+it answers `429`.
+
+**Configuration** (`ServerConfig`, environment overrides):
+
+| Env var | Default | Meaning |
+|---------|---------|---------|
+| `WAFRED_PASSKEY_ENABLED` | `true` | Offer passkeys at all |
+| `WAFRED_PASSKEY_RP_NAME` | `WAFred` | Relying party name shown by the browser |
+| `WAFRED_PASSKEY_RP_ID` | derived from `Host` | Relying party id (registrable domain) |
+| `WAFRED_PASSKEY_ORIGIN` | derived from `Host` | Exact origin the browser must report |
+| `WAFRED_PASSKEY_TRUST_FORWARDED_PROTO` | `false` | Honour `X-Forwarded-Proto` when deriving the origin |
+
+Deriving from `Host` assumes the console is reached directly. Behind a reverse
+proxy that terminates TLS, either set `WAFRED_PASSKEY_ORIGIN` explicitly or turn
+on `WAFRED_PASSKEY_TRUST_FORWARDED_PROTO` — a wrong origin is an opaque
+`SecurityError` in the browser, not a helpful message.
+
+---
+
+## Health & Version
+
+### GET /health
+
+Database connectivity check.
+
+**Response (200):**
+```json
+{"status": "ok", "database": "up"}
+```
+
+### GET /version
+
+Build metadata.
+
+**Response (200):**
+```json
+{
+  "name": "pingwaf-server",
+  "version": "0.25.0",
+  "api": "/api/v1",
+  "registration_open": true
+}
+```
+
+`/version` is unauthenticated, so it deliberately carries no deployment
+posture: the plaintext-gRPC flag moved to the admin-only
+[`GET /system/status`](#get-systemstatus).
+
+---
+
+## Sites
+
+A site is one protected domain plus its origin pools, rules and TLS posture. A
+site may serve several hostnames: `domain` is the primary one and
+`alternate_domains` lists the rest, all sharing the same routing, WAF and cache
+configuration. Wildcards are accepted in the leading label (`*.example.com`)
+and only match subdomains — the bare domain needs its own entry. A wildcard
+never matches the apex, so `example.com` plus `*.example.com` is a valid pair.
+
+Two sites may not claim overlapping hostnames: identical names, a wildcard
+covering another site's hostname, and nested wildcards are all rejected with
+`400` because pingap's host matching would make the winner depend on
+configuration order. A conflicting `domain` is additionally guarded by a
+database unique constraint: create and update requests return `400` with
+`"domain already in use by another site"`. When upgrading to the release that
+introduced this constraint (migration `000055`), startup fails and lists the
+conflicting domains if the existing data already contains duplicates — resolve
+them manually (rename or delete one of the sites) before the upgrade can
+complete. An ACME certificate for a wildcard hostname requires the
+`dns-01` challenge with a configured DNS provider — `http-01` cannot validate
+`*`, and the API refuses that combination.
+
+`status` is the site lifecycle:
+
+| Value | Edge behaviour |
+|-------|----------------|
+| `active` | Traffic is proxied normally |
+| `paused` | Every request is answered `503` with `Retry-After: 3600` before any rule runs — the certificate keeps serving and the request is still logged, so pausing is visible in the console rather than a silent outage. The site's custom `503` page is used when one is configured. |
+| `pending` | Serves normally; a bookkeeping state for sites that are not finished being set up |
+
+Only `paused` changes how traffic is handled.
+
+### GET /sites
+
+List sites (paginated).
+
+**Query Parameters:**
+| Param | Type | Description |
+|-------|------|-------------|
+| `page` | int | Page number (default: 1) |
+| `page_size` | int | Items per page (default: 50, max: 200) |
+| `search` | string | Filter by name/domain |
+| `status` | string | Filter by status: `active`, `paused`, `pending` |
+
+**Response (200):**
+```json
+{
+  "items": [
+    {
+      "id": "uuid",
+      "name": "My Site",
+      "domain": "example.com",
+      "alternate_domains": ["api.example.com", "*.static.example.com"],
+      "status": "active",
+      "plan": "free",
+      "user_id": "uuid",
+      "trust_proxy_headers": false,
+      "trusted_header": "",
+      "trust_last_hop": false,
+      "trusted_proxy_ranges": [],
+      "trusted_proxy_group_ids": [],
+      "origin_verify_cert": null,
+      "created_at": "...",
+      "updated_at": "..."
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "page_size": 50
+}
+```
+
+### POST /sites
+
+Create a new site. `upstream_address` is required: a site without an origin cannot serve traffic. The site is created with a `default` origin pool containing that origin.
+
+**Request:**
+```json
+{
+  "name": "My Site",
+  "domain": "example.com",
+  "alternate_domains": ["*.example.com"],
+  "upstream_address": "10.0.1.50:3000",
+  "upstream_name": "origin",
+  "upstream_tls": false,
+  "status": "active",
+  "plan": "free"
+}
+```
+
+**Response (201):** Site object.
+
+### GET /sites/{site_id}
+
+Get site details including upstreams and SSL config.
+
+### PUT /sites/{site_id}
+
+Update site fields, including the status that pauses and resumes a site:
+
+```json
+{ "status": "paused" }
+```
+
+Only the fields present in the body are touched. `alternate_domains` replaces
+the whole list when present; `[]` clears it. Changing `domain` or
+`alternate_domains` re-runs the cross-site hostname checks above.
+
+Reverse-proxy trust fields: set `trust_proxy_headers: true` when the site is
+behind a CDN/reverse proxy and `trusted_header` names the header the client IP
+is resolved from (`x-forwarded-for` default; `cf-connecting-ip`, `x-real-ip`,
+`true-client-ip`, `forwarded` accepted). `trust_last_hop: true` restricts the
+lookup to the right-most value. With trust enabled, IP block lists, rate
+limiting and logged client IPs derive from that header instead of the TCP
+peer.
+
+Trust is **strict**: the direct TCP peer must fall inside `trusted_proxy_ranges`
+(a list of CIDRs, e.g. `173.245.48.0/20`) for the trusted header to be
+believed; otherwise the connection's own address is used and the header is
+ignored. An empty list therefore means "trust no one" — set the ranges of
+every proxy that can reach the listener. `trusted_proxy_group_ids` references
+IP groups (see [IP Groups](#ip-groups)); the union of the group's ranges and
+the hand-entered `trusted_proxy_ranges` forms the effective trust scope. The
+console's Cloudflare subscription group covers the official CDN ranges for
+exactly this purpose.
+
+`origin_verify_cert` sets the site-level default for origin TLS certificate
+verification: omitting the key leaves the current value unchanged, `null`
+clears the site's preference, and `true`/`false` pins a site-wide default for
+every origin pool under the site. It only applies to pools whose own
+`verify_cert` is `null` — see [origin pools](#post-sitessite_idupstream-pools) for the
+full precedence order.
+
+#### Response body replacement (`response_replace`)
+
+`response_replace` (JSON object or `null`) rewrites strings in response
+bodies served by the site. Omitting the key leaves the stored policy
+unchanged; `null` clears it; a policy with `rules: []` is treated as cleared
+too. The document:
+
+```json
+{
+  "path": "^/status",
+  "status_codes": [200],
+  "rules": [
+    { "pattern": "Google", "replacement": "WAFred", "is_regex": false }
+  ]
+}
+```
+
+- `path` — regex the request path must match; empty applies to every path.
+- `status_codes` — status codes the replacement applies to; empty applies to
+  all. Each entry must be 100–599.
+- `rules` — applied in order, at most 20. `pattern` (1–512 bytes) is matched
+  literally unless `is_regex` is `true`, in which case it must compile as a
+  regex and `replacement` supports `$1` / `$name` capture references;
+  `replacement` is 1–2048 bytes. Neither side may contain a **single quote**
+  (the data plane's rule syntax delimits pattern and replacement with `'`),
+  and neither may be empty.
+
+Violations are rejected with `400` at write time — a rule the data plane
+cannot build would otherwise take down the whole agent configuration for the
+site. The policy becomes a per-site `sub_filter` plugin instance in the
+generated agent configuration.
+
+Compressed encodings: the plugin understands `gzip` / `x-gzip`, `deflate`
+(zlib wrapper, with raw deflate tried as a fallback), **`br`** (brotli) and
+**`zstd`** — the body is decompressed, rewritten and recompressed with the
+same algorithm, keeping `Content-Encoding`. The limits are the same for every
+supported encoding:
+
+- decompressed bodies are capped at **8 MiB**; anything larger is passed
+  through as the original compressed bytes;
+- decompression failure, recompression failure or **no match at all** output
+  the original compressed bytes — with no match the output is byte-identical
+  to the source, so the `ETag` and integrity digests stay valid;
+- the header changes apply whenever the plugin takes the response over (even
+  when the body falls back to the original bytes): `Content-Length` removed,
+  the response switched to chunked, a strong `ETag` weakened to `W/`,
+  `Content-MD5` and `Digest` removed, `Vary: Accept-Encoding` added;
+- multi-value encodings (e.g. `gzip, br`) are still passed through untouched,
+  no replacement.
+
+
+### DELETE /sites/{site_id}
+
+Delete a site and all associated resources.
+
+### POST /sites/{site_id}/clone
+
+Copy a site's configuration onto a new site. The caller must supply the new
+primary domain — every hostname has to stay unique, so a domain already in
+use answers `400 bad_request` (the message contains `"already in use"`).
+
+**Request:**
+```json
+{
+  "domain": "example.net",
+  "alternate_domains": ["*.example.net"],
+  "name": "My Site copy"
+}
+```
+
+`domain` is required; `alternate_domains` and `name` are optional (the name
+defaults to `"<source name> copy"`). The copy is created inside one
+transaction and the clone starts **`paused`** — a clone that started serving
+immediately would silently double the source site's traffic.
+
+**What is copied** (each row re-keyed to the new site id):
+
+- Site settings, SSL protocol switches (`https_enabled`, TLS version bounds,
+  HSTS, mTLS switches) and the ACME contact settings on `site_ssl`.
+- Upstream pools (ids remapped), nodes and routes, path exceptions.
+- WAF / challenge / geo / bot-protection / rewrite / ip-access / cache /
+  rate-limit configuration and the AI crawler policy — including the site's
+  **custom rules and their rule-group assignments**, copied rule-for-rule into
+  the clone's own groups.
+- IP-group bindings (`ip_group_sites`): without them the clone would silently
+  lose group-based access rules and proxy-trust ranges.
+- mTLS material: the site's trust CAs and its issued client certificates
+  (client certificates are remapped to the clone's own CA rows; one that
+  references a CA outside the source site is skipped with a warning).
+- Certificates: every `site_certificates` row — including its `cert_pem` /
+  `key_pem` (the private key), its ACME configuration and its status — is
+  copied with a fresh id and belongs to the clone (reusing the source rows
+  would couple the two sites: deleting one would revoke the other's TLS).
+  The clone's `site_ssl.certificate_id` is remapped to the clone's own copy,
+  and the legacy inline PEM (`cert_pem`, `key_pem`, `issuer`, `expires_at`)
+  stays cleared so the managed row remains authoritative. If the source
+  selected a certificate it only had shared access to, the clone starts with
+  no selection and logs a warning; pick or link a certificate before enabling
+  it.
+- Certificate sharing: only the source site's **own** `site_certificate_links`
+  are copied, with the certificate id remapped to the clone's copy. A link
+  some *other* site holds on a source certificate is that site's
+  authorisation and never extends to the clone; a grant on a certificate
+  shared *into* the source from elsewhere is skipped with a warning — the
+  clone can use that certificate only after its owner links it explicitly.
+- Basic-auth credentials (`site_basic_auth`; the row stores them as
+  plaintext at rest).
+- OIDC single sign-on (`site_oidc`), including `cookie_secret` /
+  `cookie_name` and the `redirect_url`. The copied row is **disabled**: the
+  redirect URL still names the source host, so update the provider
+  registration (and the URL) before enabling it on the clone.
+- Visitor authorizations (`visitor_site_grants`).
+
+**Security note — sensitive data travels with the clone.** The clone carries
+everything above verbatim: certificate private keys, Basic Auth passwords,
+the OIDC cookie secret and visitor grants all become readable on the new
+site. ACME settings (account e-mail, DNS provider credentials) are copied too,
+so a clone that renews its certificate can update the **source's** DNS zone
+when both share the same provider credentials; review or clear them before
+enabling the clone. Treat the clone API like a secret-duplication operation. The console's
+clone dialog shows a warning and requires an explicit acknowledgement
+checkbox before it will send the request; API callers should apply the same
+care (the clone is created **paused**, so nothing serves until it is enabled
+deliberately). Two things still do not survive the copy unchanged:
+
+- Forwarded-header trust (`trust_proxy_headers`, `trusted_header`,
+  `trusted_proxy_ranges`, `trusted_proxy_group_ids`, `trust_last_hop`) is
+  copied with the site. The clone is created **paused**; confirm that the
+  clone's network path really supplies the copied forwarded header before
+  enabling it, otherwise the edge will read a client IP the clone path does
+  not control.
+- The OIDC callback still names the source domain (`redirect_url`, or the
+  callback derived from the request `Host`), so the identity provider keeps
+  sending logins back to the source until the provider registration is
+  updated for the new hostname. If the two domains are sibling subdomains
+  under one wildcard `Domain`, the copied `cookie_secret` would also make
+  them share sessions — rotate the secret for the clone.
+
+**Pool references never survive as-is.** Nodes and routes point at pools by
+id, and the clone gets its own pool rows. A reference the mapping cannot
+resolve — legacy rows that predate pools, or a pool deleted from the source —
+is repointed at the clone's **default pool** (creating one if the source had
+none), never left pointing at a pool owned by the source site: that would
+render the row under a pool the clone does not own, and deleting the source
+site would cascade into the clone. The same rule applies to WAF rule groups
+(a rule referencing a group outside the source site drops the reference) and
+to client certificates (skipped rather than left on a foreign CA).
+
+**Response:** `201 Created` with the new `SiteResponse`.
+
+### GET /sites/{site_id}/failover
+
+The site's disconnected (failover) policy plus the global default it
+inherits from. `failover_policy` decides how the site behaves while the
+control plane is unreachable and the host has no synced rule bundle:
+
+| Value | Behaviour |
+|-------|-----------|
+| `inherit` | Follow `defense_settings.default_fail_open` |
+| `open` | Keep proxying through the base engine |
+| `closed` | Answer `503` |
+
+**Response (200):**
+```json
+{
+  "failover_policy": "inherit",
+  "default_fail_open": true
+}
+```
+
+`default_fail_open` comes from the global defense settings, so the console
+can render "follow global (currently: fail open)". Requires site read
+permission.
+
+### PUT /sites/{site_id}/failover
+
+Set the site's failover policy. `policy` must be exactly one of `inherit`,
+`open` or `closed` (case-insensitive; other values are rejected with `400`).
+Requires site write permission.
+
+**Request:**
+```json
+{
+  "policy": "open"
+}
+```
+
+Changing the policy emits a `site.failover_changed` event — `warning` when
+the new policy is `closed`, `info` otherwise — pushes the updated
+configuration to the site's agents, and the change lands in the notification
+history even though it is not a fault.
+
+**Response (200):** the same view as `GET`.
+
+---
+
+## Site Upstreams
+
+### GET /sites/{site_id}/upstreams
+
+List origin servers for a site.
+
+### POST /sites/{site_id}/upstreams
+
+Add an upstream (origin node). Without `pool_id` the node joins the site's default pool.
+
+**Request:**
+```json
+{
+  "name": "app-server-1",
+  "address": "10.0.1.50:3000",
+  "weight": 1,
+  "tls": false,
+  "pool_id": "uuid"
+}
+```
+
+`address` is `host[:port]`. A leading `http://` or `https://` is accepted and
+stripped (copy-pasting a URL is normal), a trailing `/` is ignored, and anything
+longer — a path, query or fragment — is rejected with `400` rather than silently
+dropped, because a dropped path also corrupts the SNI derived from the host. To
+speak TLS to the origin set `tls: true` or give the pool an `sni`.
+
+An address that already exists **in the same pool** is rejected with `400`
+(`"upstream <address> already exists in this pool"`): two identical nodes in
+one pool are never a load-balancing decision — every request would be
+balanced onto the same server twice and the duplicate only doubles the
+health-check load. The same address in *another* pool stays allowed (mirroring
+one origin into two pools is a legitimate setup). On update, the row being
+changed is excluded from the check, so re-sending an unchanged address is a
+no-op, not a self-collision.
+
+### PUT /sites/{site_id}/upstreams/{upstream_id}
+
+Update an upstream.
+
+### DELETE /sites/{site_id}/upstreams/{upstream_id}
+
+Remove an upstream.
+
+### GET /sites/{site_id}/upstream-pools
+
+List origin pools for a site, default pool first. Each pool:
+
+```json
+{
+  "id": "uuid",
+  "site_id": "uuid",
+  "name": "default",
+  "lb_algorithm": "round_robin",
+  "sni": null,
+  "verify_cert": null,
+  "address_family": "auto",
+  "is_default": true,
+  "created_at": "2024-01-01T00:00:00Z",
+  "upstreams": []
+}
+```
+
+`address_family` — which address family the agent may resolve this pool's
+origin names to:
+
+| Value | Meaning |
+|---|---|
+| `auto` (default) | Prefer IPv4, fall back to IPv6 only when the host has no A record; an IP-literal origin ignores it |
+| `ipv4` | Pin IPv4 |
+| `ipv6` | Pin IPv6 |
+
+It is the three-valued replacement for the legacy boolean `ipv4_only` in the
+generated agent configuration (where the old switch is still accepted and kept
+in sync by the builders; when both are present `address_family` wins). The pool
+API itself only accepts `address_family`. Create and update share the same
+three-value validation — an empty or unknown value is rejected with `400`
+rather than treated as "unset".
+
+`upstreams` is an inline member array: each pool's origin nodes are embedded in
+the pool object, so the console can render a pool's members without a second
+request per pool. It is also how you inspect the members you must drain before
+a delete — removing a pool is refused with `409` while origin nodes remain in it.
+
+### POST /sites/{site_id}/upstream-pools
+
+Create an origin pool.
+
+**Request:**
+```json
+{
+  "name": "primary",
+  "lb_algorithm": "hash:cookie:session",
+  "sni": "origin.example.com",
+  "verify_cert": true
+}
+```
+
+`lb_algorithm` accepts `round_robin`, `random`, `least_connections` or `hash:<type>[:<key>]` with type in `ip`, `url`, `path` (no key) or `header`, `cookie`, `query` (key required). A non-empty `sni` enables TLS to the origin.
+
+`sni` takes a concrete hostname or the marker **`$host`**, which makes the SNI follow each request: the proxy sends the client's `Host` header — port stripped, lowercased; a route's [upstream_host override](#upstream-host-override-upstream_host) override wins when set — as the TLS SNI, so one pool can front an origin that serves several virtual hosts (best when the site's domains and the `Host` headers actually agree). A `Host` that cannot be a TLS name — an IP literal, missing or malformed — resolves to **no SNI**, so origin certificate validation rejects the connection. The matched location also carries the site's host set (`site_hosts`: the site's `domain` plus its `alternate_domains`): a `Host` outside that set is still used, but the data plane logs a **warning** — advisory only, it never blocks the request; when the set is empty the membership check is skipped entirely, keeping the old no-warning behaviour. `sni: ""` stays a plaintext pool with no SNI semantics at all. **Behaviour change for transparent upstreams:** a transparent pool (`discovery = "transparent"` — no static nodes, it peers at the request's own target) now resolves its SNI through the same code path as static pools, whereas it previously forwarded the raw `Host` as SNI, IP literal included and case preserved. With this change an IP-literal `Host` resolves to **no SNI** and a hostname is lowercased before being sent, so a client that reaches an origin **by IP** through a TLS transparent pool whose origin selects its certificate by SNI (no default certificate) used to complete the handshake and now fails it — reach such origins by hostname.
+
+`$host` requires origin certificate verification to be enabled. Because the client thereby chooses the name the origin certificate must cover, that validation is the only backstop against an intercepted origin: a pool that pins `verify_cert: false` together with `sni: "$host"` is refused with `400 "$host requires origin certificate verification"` (leaving `verify_cert` unset is accepted and follows the cascade below, so switching verification off at site or global level removes the same guarantee — keep it on where `$host` pools run).
+
+`verify_cert` is tri-state: `true` requires the origin's certificate to validate against the system trust store or the pool's own CA, `false` accepts any certificate (not recommended), and `null` — the default — defers first to the site-level `origin_verify_cert` default and, when that is also unset, to [the global `/settings/origin` value](#get-settingsorigin). Only meaningful when `sni` is set.
+
+### PUT /sites/{site_id}/upstream-pools/{pool_id}
+
+Update an origin pool (`sni: ""` disables origin TLS).
+
+### DELETE /sites/{site_id}/upstream-pools/{pool_id}
+
+Remove an origin pool. Refused with `400` for the default pool and `409` while routes still reference it or origin nodes remain in it.
+
+### GET /sites/{site_id}/routes
+
+List path-based routes for a site, highest priority first. Each route:
+
+```json
+{
+  "id": "uuid",
+  "site_id": "uuid",
+  "name": "api-to-dedicated-pool",
+  "match_type": "prefix",
+  "path": "/api",
+  "priority": 512,
+  "enabled": true,
+  "pool_id": "uuid",
+  "ip_group_id": null,
+  "ip_group_name": null,
+  "strip_prefix": false,
+  "rewrite_path": null,
+  "upstream_host": null,
+  "created_at": "2024-01-01T00:00:00Z"
+}
+```
+
+### POST /sites/{site_id}/routes
+
+Create a route.
+
+**Request:**
+```json
+{
+  "name": "api-to-dedicated-pool",
+  "match_type": "prefix",
+  "path": "/api",
+  "priority": 512,
+  "enabled": true,
+  "pool_id": "uuid",
+  "ip_group_id": "uuid",
+  "strip_prefix": false,
+  "rewrite_path": null,
+  "upstream_host": null
+}
+```
+
+`match_type` is `prefix`, `exact` or `regex`; `priority` (1-60000) is optional and defaults to the auto weight. `ip_group_id` is optional and must name an existing, enabled IP group visible to the caller whose membership is not empty; `ip_group_name` is filled in on responses.
+
+#### Path rewriting (`strip_prefix` / `rewrite_path`)
+
+Two optional fields control what path the origin receives; both default to
+off, so existing routes keep forwarding the request path unchanged.
+
+- `strip_prefix` (boolean, default `false`) — remove the matched `path`
+  prefix from the forwarded path. With a rule on `/api`, `/api/users` is
+  forwarded as `/users` and `/api` itself as `/`; the query string is kept.
+- `rewrite_path` (string or `null`) — replace the **whole** forwarded path
+  with this fixed value; the query string is kept. It wins over
+  `strip_prefix` when both are set.
+
+`strip_prefix` takes effect only for `match_type: "prefix"` routes — on an
+`exact` or `regex` route there is no prefix to strip, so the combination is
+rejected with `400`. `rewrite_path` works with any match type: it replaces
+the whole path of every request the route matched. Validation for
+`rewrite_path`: must start with `/`, at most 2048 bytes (multi-byte
+characters count as UTF-8 bytes), and must not
+contain `?`, `#`, whitespace or control characters (the client's query
+string is appended verbatim, so those would be ambiguous). Saving fails
+with `400` on violation.
+
+On `PUT`, `strip_prefix` is tri-state (`true`/`false` set it, absent leaves
+it); `rewrite_path` follows the same pattern — absent leaves the stored
+value, `null` or a blank string clears it, a value sets it.
+
+Example: to point a site's `/api` traffic at a pool that serves `/users`
+without the prefix, create a `prefix` route on `/api` with
+`strip_prefix: true` — `/api/users` reaches the origin as `/users`. To send
+everything under `/legacy` to a fixed upstream path instead, set
+`rewrite_path: "/v2"`.
+
+#### Upstream Host override (`upstream_host`)
+
+`upstream_host` (string or `null`) overrides the `Host` header the origin
+sees for requests the route matched. Unset (the default) forwards the
+client's `Host` unchanged — the behaviour every existing route relies on. It
+is required when the pool's origins are virtual hosts that route by
+`Host` (e.g. a mirror route to `google.com`): without it the origin sees
+your site's domain and answers 404.
+
+Validation — saving fails with `400` unless the value is a bare host name:
+
+- at most 253 bytes;
+- no scheme (`://`), no path (`/`), no whitespace, no control characters.
+  A port is accepted (`internal.example.com:8080`).
+
+On `PUT`, `upstream_host` follows the same tri-state pattern as
+`rewrite_path` — absent leaves the stored value, `null` or a blank string
+clears it, a value replaces it. The override applies only to the traffic the
+route matched; every other request keeps forwarding the client's `Host`.
+
+A route with an IP group only matches clients whose address is inside one of the
+group's CIDR ranges. Both conditions are ANDed, so the route above sends
+`203.0.113.7` to the dedicated pool for `/api` but leaves every other client on
+the default pool. This is how an internal-only or partner-only path is split off
+without touching address-based access rules. The IP ranges are resolved when the
+configuration is generated, so changing group membership takes effect after the
+next configuration push — the agent does not need to be pointed at the group.
+Routes without an IP group match any client.
+
+### PUT /sites/{site_id}/routes/{route_id}
+
+Update a route (`priority: 0` resets it to the auto weight; `ip_group_id: null`
+clears the group).
+
+### DELETE /sites/{site_id}/routes/{route_id}
+
+Remove a route; matching traffic falls back to the default pool.
+
+---
+
+## Site SSL
+
+### GET /sites/{site_id}/ssl
+
+Get SSL configuration for a site. The response carries the same
+`http1_enabled` / `http2_enabled` protocol switches as
+[`ssl-settings`](#get-sitessite_idssl-settings), so a switch sent via
+`PUT /ssl` reads back from the same resource.
+
+### PUT /sites/{site_id}/ssl
+
+Create or update SSL settings. `domain` is required; TLS switches (https, HSTS, mTLS, TLS versions, `http1_enabled` / `http2_enabled`) are shared with the ssl-settings endpoint.
+
+**Request:**
+```json
+{
+  "domain": "example.com",
+  "https_enabled": true,
+  "min_tls_version": "1.2",
+  "hsts_enabled": true,
+  "hsts_max_age": 31536000
+}
+```
+
+### DELETE /sites/{site_id}/ssl
+
+Remove SSL settings.
+
+### GET /sites/{site_id}/ssl-settings
+
+The effective TLS posture of the site.
+
+**Response (200):**
+```json
+{
+  "https_enabled": true,
+  "min_tls_version": "1.2",
+  "max_tls_version": null,
+  "self_signed": false,
+  "certificate_id": "uuid",
+  "mtls_enabled": false,
+  "has_mtls_client_ca": false,
+  "mtls_organization": null,
+  "mtls_require_client_cert": false,
+  "hsts_enabled": true,
+  "hsts_max_age": 15552000,
+  "always_use_https": true,
+  "http1_enabled": true,
+  "http2_enabled": false
+}
+```
+
+### PUT /sites/{site_id}/ssl-settings
+
+Update one or more fields; omitted fields keep their value. Requires the `write`
+role.
+
+**Request:**
+```json
+{
+  "certificate_id": "uuid",
+  "hsts_enabled": true,
+  "hsts_max_age": 15552000,
+  "always_use_https": true,
+  "mtls_enabled": true,
+  "mtls_require_client_cert": true,
+  "mtls_organization": "Acme Devices",
+  "http2_enabled": true
+}
+```
+
+| Field | Behaviour at the edge |
+|-------|-----------------------|
+| `certificate_id` | Selects the certificate the site serves. The site may select a certificate it **owns or one shared with it** through a certificate link (see [Certificate sharing](#certificate-sharing)); anything else is a `400` with `certificate {id} does not belong to this site and is not linked to it`. |
+| `clear_certificate` | `true` detaches the current certificate (`certificate_id` returns to `null`). Mutually exclusive with `certificate_id`: sending both is a `400` (`certificate_id and clear_certificate are mutually exclusive`). |
+| `hsts_enabled` / `hsts_max_age` | Adds `Strict-Transport-Security: max-age=<n>` to HTTPS responses. `max-age` is 0-63072000 seconds (two years); `hsts_max_age: 0` is what browsers read as "stop pinning", so the console defaults to `15552000` (180 days) when HSTS is switched on. |
+| `always_use_https` | Plain HTTP requests are answered `301` with the `https://` equivalent before any rule runs. The two listeners share one location, so this is safe to enable with traffic on both ports. **Browsers cache HSTS**: when testing, keep `hsts_max_age` low or use a throwaway domain, or a redirect will haunt the browser for months. |
+| `mtls_enabled` / `mtls_require_client_cert` / `mtls_organization` | Requires a client certificate; see [mTLS](#mtls). |
+| `min_tls_version` / `max_tls_version` | Accepted as `1.0`, `1.1`, `1.2` (default) or `1.3`. |
+| `http1_enabled` / `http2_enabled` | The site's downstream protocol switches. Setting both to `false` is rejected with a `400` — a site that speaks neither protocol is unreachable. **Listener-level aggregation**: the `:443` listener is shared by every HTTPS site and ALPN is negotiated once per connection, so the effective protocol set is the union of the enabled sites' switches — if *any* enabled HTTPS site has `http2_enabled: true`, the listener negotiates HTTP/2. Sites created after this field existed default to both on; existing sites were migrated with `http1_enabled: true` / `http2_enabled: false` to keep serving HTTP/1.1 exactly as before. |
+
+---
+
+## Certificates
+
+### GET /sites/{site_id}/certificates
+
+List certificates for a site. Returns the certificates the site **owns plus the
+ones shared with it** through a certificate link, newest first (paginated) — a
+site can only select what is visible here, so the link table is part of the
+listing.
+
+### Certificate `relation`
+
+Every certificate response carries a `relation` field telling the caller where
+the row came from:
+
+| Value | Meaning |
+|-------|---------|
+| `owner` | The site owns the certificate row (`site_certificates.site_id` is this site). |
+| `linked` | The certificate is owned by another site and shared with this one via a link row. |
+| `available` | Returned only by [GET /sites/{site_id}/certificates/available](#get-sitessite_idcertificatesavailable): the certificate is owned by a site the caller can read and may still be linked. |
+
+`site_certificates.site_id` remains the **owner** — it drives config-version
+scoping, backup/restore layering and ACME bookkeeping; a link is only the
+authorisation to serve the certificate on another site.
+
+### Certificate sharing
+
+A certificate row can serve more than one site: one wildcard or multi-SAN
+certificate, several edges. The owner stays in `site_certificates.site_id` and
+may be **null** — a certificate uploaded without a site is
+[unbound](#unbound-certificates) until it is attached; the
+`site_certificate_links` table records which sites may serve it. The
+endpoints below manage those links.
+
+### GET /sites/{site_id}/certificate-links
+
+The certificates linked **to** this site (i.e. shared with it). Same page and
+shape as the certificate list above — a link is not a separate resource, it
+only changes where a row came from — so every item carries
+[`relation: linked`](#certificate-relation) plus `warnings`.
+
+### POST /sites/{site_id}/certificate-links
+
+Share another site's certificate with this site. Requires write access to this
+site **and read access to the owning site** (linking grants the right to serve
+someone else's certificate).
+
+**Request:**
+```json
+{ "certificate_id": "uuid" }
+```
+
+**Response (201):** the certificate with `relation: "linked"`, fully decorated
+(`bound_sites` / `bound_count` / `warnings`, semantics under
+[Unbound certificates](#unbound-certificates)) — the same shape every other
+certificate response uses — and the site's agent configuration is **pushed
+immediately**: the shared PEM has to reach that site's data plane.
+
+**Idempotent:** calling again when the certificate is already linked to this
+site does not conflict — it returns the same **200** as
+[`POST /certificates/{id}/bindings`](#post-certificatescert_idbindings), with
+the same decorated certificate body. The target state is already reached, so a
+retry is a success, not an error.
+
+**Errors:**
+
+| Status | When |
+|--------|------|
+| `404` | The certificate does not exist (`certificate {id} not found`), or the caller cannot read the owning site. |
+| `409` | The certificate is already owned by this site (`certificate already belongs to this site`) — ownership is a real conflict: the site does not need, and cannot be granted, an authorisation to serve its own certificate. |
+
+### DELETE /sites/{site_id}/certificate-links/{cert_id}
+
+Remove a certificate link. Requires write access to the site.
+
+**Response:** `204`.
+
+**Errors:**
+
+| Status | When |
+|--------|------|
+| `409` | The certificate is the site's current TLS certificate (`certificate is the site's current TLS certificate; clear or replace it first`) — unlinking it would silently drop TLS, so clear or replace the selection first (`clear_certificate: true` on [PUT /sites/{site_id}/ssl-settings](#put-sitessite_idssl-settings)). |
+| `404` | No such link for this site (`certificate link {cert_id} not found`). |
+
+### GET /sites/{site_id}/certificates/available
+
+The certificates this site may still link: owned by a site the caller can read,
+not owned by this site and not linked yet (paginated). Each item carries
+`relation: "available"` plus `warnings`.
+
+### Certificate `warnings`
+
+Every response that returns a certificate — the create and update responses,
+and the list/show reads below — may carry a `warnings` array:
+
+```json
+"warnings": ["certificate domain api.other.com is not served by this site"]
+```
+
+The entries name certificate hostnames (from `domain`, a comma-separated list)
+that the certificate's **own** site does not serve, i.e. that match neither the
+site's `domain` nor its `alternate_domains` (wildcards cover exactly one label,
+in both directions, case-insensitively).
+
+**Advisory only — it never blocks anything.** A certificate naming a hostname
+the site does not serve is still saved, and `200`/`201` is still returned:
+uploading a certificate before adding its hostname, or for a site that serves
+it through another edge, are legitimate workflows, and refusing the save would
+take HTTPS down over a warning. An empty array means "checked, nothing wrong".
+
+### POST /sites/{site_id}/certificates
+
+Add a certificate (manual upload or ACME request).
+
+**Request (manual):**
+```json
+{
+  "domain": "example.com",
+  "cert_pem": "-----BEGIN CERTIFICATE-----\n...",
+  "key_pem": "-----BEGIN PRIVATE KEY-----\n...",
+  "issuer": "Let's Encrypt",
+  "expires_at": "2025-12-31T23:59:59Z",
+  "auto_renew": false
+}
+```
+
+**Request (ACME):**
+```json
+{
+  "domain": "example.com",
+  "acme_email": "ops@example.com",
+  "acme_challenge_type": "dns-01",
+  "acme_dns_provider": "cloudflare",
+  "acme_dns_config": {"api_token": "..."},
+  "auto_renew": true
+}
+```
+
+`acme_challenge_type` is `http-01` or `dns-01`; `acme_dns_provider` is one of `cloudflare`, `route53`, `digitalocean`, `aliyun`, `dnspod`, `cloudxns`, `manual`.
+
+The response is the saved certificate, `warnings` included (see
+[Certificate `warnings`](#certificate-warnings)).
+
+### GET /sites/{site_id}/certificates/{cert_id}
+
+Get certificate details, `warnings` included.
+
+### PUT /sites/{site_id}/certificates/{cert_id}
+
+Update certificate. The response carries `warnings` recomputed against the
+post-update hostnames.
+
+### DELETE /sites/{site_id}/certificates/{cert_id}
+
+Remove certificate. **409 `certificate is selected by site(s) …; clear or
+replace it there first`** while any site still has it selected: deleting it
+would leave `site_ssl.certificate_id` dangling and the site would silently stop
+serving a certificate. Clear the selection (`clear_certificate`) or pick another
+certificate first.
+
+A certificate with `site_certificate_links` rows (bindings) is refused with
+`409 certificate is bound to site(s) …; unbind it there first` — other sites
+still serve this PEM, so the grants must be removed explicitly
+([DELETE /certificates/{cert_id}/bindings/{site_id}](#delete-certificatescert_idbindingssite_id))
+before the delete can go through.
+
+### Unbound certificates
+
+Every certificate response carries `site_id` (now nullable), `bound_sites` and
+`bound_count`:
+
+```json
+{
+  "id": "uuid",
+  "site_id": null,
+  "bound_sites": [{"id": "uuid", "domain": "a.example.com"}],
+  "bound_count": 1,
+  "domain": "example.com"
+}
+```
+
+`bound_sites` lists every site that may serve the certificate through a
+**shared binding** (id + domain, so the console renders the list without a
+second request per row); `bound_count` is its length. Both are derived from
+the `site_certificate_links` rows only — the **owner site is not counted**;
+it is expressed separately by `site_id`. A certificate owned by site A and
+shared with B and C therefore reports `site_id: A`, `bound_sites: [B, C]`
+and `bound_count: 2`. A certificate uploaded without a site is **unbound**:
+`site_id` is `null`, `bound_sites` is empty and `bound_count` is `0` — the
+fields are always present, so "checked, nothing bound" is distinguishable from
+a missing field — and its `status` follows its own validity dates, because no
+edge serves it and therefore no edge report corrects the status.
+
+Restrictions on an unbound row:
+
+- **No ACME.** Issuance and renewal run on the edge, driven by the
+  configuration of the site that carries the certificate. `POST /certificates`
+  without a site answers `400` to an ACME request (`an ACME certificate needs
+  a site_id: issuance runs on the edge for the site that carries it — upload
+  the PEM instead, or name the site`), and
+  `POST /certificates/{cert_id}/renew` answers `400` until the row is bound
+  (`certificate is not bound to any site; bind it before triggering an ACME
+  renewal`).
+- **No `activate: true`.** Turning HTTPS on is a per-site setting, so the
+  create call answers `400` (`activate requires site_id: turning HTTPS on is
+  a per-site setting`). Upload, bind, then activate per site.
+- **Deleting is a plain `204`** — nothing serves it, so nothing can break;
+  see [DELETE /certificates/{cert_id}](#delete-certificatescert_id).
+
+### POST /certificates
+
+Upload a certificate **without** naming a site (administrators). The body is
+the manual-upload shape — `domain` and the PEM pair are mandatory; `site_id`
+is simply omitted:
+
+```json
+{
+  "domain": "example.com",
+  "cert_pem": "-----BEGIN CERTIFICATE-----\n...",
+  "key_pem": "-----BEGIN PRIVATE KEY-----\n..."
+}
+```
+
+**Response (201):** the saved unbound certificate — `site_id: null` and an
+empty `warnings` array (coverage is measured against a site's hostnames, and
+nothing is bound yet). Attach sites with
+[POST /certificates/{cert_id}/bindings](#post-certificatescert_idbindings).
+Updates work on an unbound row too (a wrong domain or a rotated PEM can be
+fixed before anything serves it); only the ACME wildcard guard is skipped,
+since there is no site hostname set to compare against.
+
+### POST /certificates/{cert_id}/bindings
+
+Grant a site the right to serve the certificate
+(`{"site_id": "uuid"}`) — which is what puts the PEM into that site's
+data-plane configuration. The grant is the same `site_certificate_links` row
+the site-scoped [certificate link](#post-sitessite_idcertificate-links)
+creates; the certificate-first form exists so an uploaded-without-site
+certificate can be attached afterwards, and because a multi-SAN certificate
+is bound to several sites from one place.
+
+**Response (200):** the certificate with its bindings recomputed. Idempotent:
+binding the same site twice returns the same `200` instead of a conflict.
+
+**Errors:**
+
+| Status | When |
+|--------|------|
+| `400` | The certificate does not cover the site's hostnames: `certificate {id} (issued for {domain}) does not cover site hostname(s) …` lists the **site** hostnames the certificate cannot validate — binding one that cannot validate them would leave the site serving a TLS error it has no way to notice. Hostnames the certificate names beyond the site's are *not* an error (the same advisory warning the upload path reports), so a multi-SAN certificate binds to each site it covers. |
+| `404` | The certificate or the site does not exist, the caller cannot write the site, or — for a certificate another site owns — cannot read the owning site. |
+| `409` | The site already owns the certificate (`certificate already belongs to this site`). |
+
+### DELETE /certificates/{cert_id}/bindings/{site_id}
+
+Remove one site's grant; the certificate itself stays. The site falls back to
+whatever its own SSL settings provide — nothing, when it was relying on the
+link — so the change is pushed to its agents straight away.
+
+**Response:** `204`.
+
+**Errors:**
+
+| Status | When |
+|--------|------|
+| `409` | The certificate is the site's current TLS selection (`certificate is the site's current TLS certificate; clear or replace it first`) — removing the grant underneath would drop the PEM out of the configuration silently. Clear or replace the selection first. |
+| `404` | The site has no binding for this certificate (`certificate {id} is not bound to site {site_id}`). |
+
+### DELETE /certificates/{cert_id}
+
+Delete a certificate across sites. Two blockers, in this order — both `409`:
+
+1. a site still **selects** it in its SSL settings
+   (`certificate is selected by site(s) …; clear or replace it there first`);
+2. a **binding** still grants it to a site
+   (`certificate is bound to site(s) …; unbind it there first`) — that site's
+   data-plane configuration carries the PEM, so deleting would take its TLS
+   down.
+
+An unbound certificate (no owner, no bindings) deletes with `204` straight
+away.
+
+### GET /certificates
+
+Certificate applications across every site the caller may see, newest first
+(paginated, optionally scoped with `site_id` and filtered with `status`). Each
+item is the certificate flattened together with its `site_id`/`site_domain`/
+`site_name` — empty for an
+[unbound](#unbound-certificates) certificate, which is what the console
+renders as "not bound yet" — plus
+[`bound_sites`/`bound_count`](#unbound-certificates), and — like the per-site
+list — carries [`warnings`](#certificate-warnings) computed against the
+certificate's own site. Hostnames for the whole page are fetched in one
+query, so paging does not cost a lookup per row.
+
+### GET /certificates/{cert_id}
+
+Get certificate details across sites, `warnings` included.
+
+### PUT /certificates/{cert_id}
+
+Update a certificate by id (the global alias of
+[PUT /sites/{site_id}/certificates/{cert_id}](#put-sitessite_idcertificatescert_id)).
+Every field is optional and omitted fields keep their value.
+
+| Field | Rules |
+|-------|-------|
+| `domain` | Comma-separated hostname list, validated like on the create path. |
+| `cert_pem` / `key_pem` | Replacing either half re-validates the pair **as it will be after this request** (a replacement certificate is checked against the stored key and vice versa, so a mismatched pair cannot be assembled one request at a time). Sending `key_pem` without a certificate (new or stored) is refused with `400`. |
+| `issuer`, `not_before`, `expires_at`, `auto_renew` | Metadata updates. |
+| `acme_email`, `acme_challenge_type`, `acme_dns_provider`, `acme_dns_config` | ACME settings; `acme_challenge_type` must be `http-01` or `dns-01` (`400` otherwise). An ACME order without a stored PEM for a wildcard hostname requires `dns-01` (`400` otherwise). |
+| `status` | Must be a valid certificate status (`400` otherwise); setting it back to `pending` also clears a stored `failure_reason`. |
+
+**Permissions:** the update is authorised through the certificate's owning
+site (site write permission); a certificate bound to no site requires the
+`admin` role. An unknown id answers `404`; validation failures `400`.
+
+**Response (200):** the updated certificate, with `warnings` recomputed
+against the post-update hostnames. The new material is pushed to every site
+that uses the certificate (the owner and every linked site).
+
+### GET /certificates/{cert_id}/usage
+
+Who owns, shares and serves a certificate — the answer the console's bind,
+unbind and delete dialogs fetch before presenting any action, so a `409` can
+be explained (or prevented) instead of surfacing as a surprise. Administrators
+only.
+
+**Response (200):**
+```json
+{
+  "owner": { "id": "uuid", "domain": "a.example.com" },
+  "linked_sites": [
+    { "id": "uuid", "domain": "b.example.com", "selected": true }
+  ],
+  "serving_sites": [ { "id": "uuid", "domain": "b.example.com" } ]
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `owner` | The site that owns the certificate row (`site_certificates.site_id`), or `null` when the certificate is [unbound](#unbound-certificates). Binding the certificate to this site answers `409 certificate already belongs to this site`. |
+| `linked_sites` | Every site the certificate is **shared** with — the `site_certificate_links` grant rows that [DELETE /certificates/{cert_id}/bindings/{site_id}](#delete-certificatescert_idbindingssite_id) removes. `selected` is `true` when the site's current TLS choice (`site_ssl.certificate_id`) is this certificate — exactly the condition that makes unbinding that site a `409`. |
+| `serving_sites` | Sites whose SSL settings currently select this certificate (`site_ssl.certificate_id`) — the first [delete](#delete-certificatescert_id) blocker. Derived from `site_ssl`, **not** from the link table: a site can select its own certificate without any grant row, so a site may appear here while missing from `linked_sites`. |
+
+Both site lists are sorted by domain (id as the tiebreaker), so two identical
+requests produce identical output. The answer is assembled with a fixed four
+queries regardless of how many sites are involved — the certificate row, the
+link rows, the `site_ssl` rows and the site rows (which double as the
+visibility oracle for the owner). An unknown certificate id answers `404`.
+
+**Recommended sequence** when a certificate has to be removed and the console
+cannot do it in one step: clear or replace the selection on every serving
+site's SSL page ([PUT /sites/{site_id}/ssl-settings](#put-sitessite_idssl-settings)
+with `clear_certificate: true` or another `certificate_id`), unbind the
+remaining grants, then delete the certificate — switching/clearing first,
+then unbinding, then deleting. [GET /certificates/{cert_id}/usage](#get-certificatescert_idusage)
+tells you exactly which sites sit in each bucket before you start.
+
+### POST /sites/{site_id}/certificates/{cert_id}/renew
+
+Trigger manual certificate renewal (ACME-managed certificates only).
+
+### POST /certificates/{cert_id}/renew
+
+The global alias of the site-scoped renew above: renew by certificate id.
+The certificate must be bound to a site (`400 certificate is not bound to any
+site; bind it before triggering an ACME renewal` otherwise — ACME issuance
+runs on the edge, driven by a site's configuration) and must be ACME-managed
+(`acme_email` present; `400 certificate is not ACME-managed; cannot
+auto-renew` otherwise). Requires site write permission on the owning site.
+
+The call is asynchronous: it marks the certificate `pending` (superseding any
+previous failure by clearing `failure_reason`), writes a
+`renewal_requested` event and pushes the site configuration so the edge picks
+up the renewal order.
+
+**Response (200):**
+```json
+{
+  "message": "renewal initiated",
+  "certificate_id": "uuid",
+  "status": "pending"
+}
+```
+
+### GET /certificates/summary
+
+Certificate counts across every site the caller may see (administrators: all
+sites; other accounts: their own). Handy for a dashboard badge — one call
+instead of paging through every site.
+
+**Response (200):**
+```json
+{
+  "total": 12,
+  "active": 10,
+  "pending": 1,
+  "failed": 0,
+  "expired": 0,
+  "expiring_soon": 1
+}
+```
+
+`expiring_soon` counts certificates that lapse within the next 30 days,
+already-lapsed ones included.
+
+### GET /certificates/{cert_id}/events
+
+Event log for one certificate, newest first (paginated).
+
+**Query Parameters:**
+| Param | Type | Description |
+|-------|------|-------------|
+| `event_type` | string | Filter by event type (e.g., `created`, `renewal_requested`, `renewed`, `failed`, `deleted`, `acme_raw`) |
+| `page` | int | Page number |
+| `page_size` | int | Items per page |
+
+**Response (200):**
+```json
+{
+  "items": [
+    {
+      "id": "uuid",
+      "certificate_id": "uuid",
+      "site_id": "uuid",
+      "event_type": "renewal_requested",
+      "message": "Manual renewal requested for example.com",
+      "details": null,
+      "created_at": "2024-01-01T00:00:00Z",
+      "domain": "example.com",
+      "site_domain": null
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "page_size": 50
+}
+```
+
+### GET /ssl-events
+
+Cross-certificate event log for every site the caller may see (paginated). Supports the same `certificate_id` and `event_type` filters; each event additionally carries the resolved `domain` and `site_domain`.
+
+---
+
+## mTLS
+
+Mutual TLS for one site: the edge asks the client for a certificate, and a
+request only reaches the origin when that certificate was issued by a CA the
+site trusts, has not been revoked, and was issued for this site.
+
+Two halves work together:
+
+* **Trust and revocation** live here — a CA (generated by the control plane or
+  imported) plus the client certificates issued from it.
+* **Enforcement** is the site's TLS posture: set `mtls_enabled: true` via
+  `PUT /sites/{site_id}/ssl-settings`, and `mtls_require_client_cert: true` to
+  refuse requests that present no certificate at all. Setting `mtls_organization`
+  pins the organization a client certificate must carry, which is what keeps a
+  certificate issued for one site from being replayed against another.
+
+Adding or removing a CA rewrites the site's trust anchor and pushes the
+configuration; a site that loses its last CA is left with `mtls_enabled: false`
+rather than enabled-but-unverifiable.
+
+Only certificates generated here come with a private key, and the key is
+returned **exactly once** — when the CA or the certificate is created. Imported
+CAs act as trust anchors only.
+
+> Certificates generated by the control plane are stored unencrypted in the
+> database. Treat a database dump as key material.
+
+### GET /sites/{site_id}/mtls/cas
+
+List the site's CAs. Private keys are never included; `has_private_key` and the
+SHA-256 fingerprint are.
+
+```json
+[
+  {
+    "id": "uuid",
+    "site_id": "uuid",
+    "name": "Acme device CA",
+    "source": "generated",
+    "cert_pem": "-----BEGIN CERTIFICATE-----\n…",
+    "has_private_key": true,
+    "subject_dn": "CN=Acme device CA",
+    "serial": "0a1b…",
+    "fingerprint_sha256": "9f2c…",
+    "expected_organization": "Acme Devices",
+    "not_before": "2024-01-01T00:00:00Z",
+    "not_after": "2025-01-01T00:00:00Z",
+    "is_active": true,
+    "created_at": "2024-01-01T00:00:00Z",
+    "certificate_count": 3
+  }
+]
+```
+
+### POST /sites/{site_id}/mtls/cas
+
+Create a CA. Requires the `write` role.
+
+**Request (generate):**
+```json
+{
+  "name": "Acme device CA",
+  "organization": "Acme Devices",
+  "validity_days": 3650
+}
+```
+
+**Request (import):**
+```json
+{
+  "name": "Corporate PKI",
+  "cert_pem": "-----BEGIN CERTIFICATE-----\n…",
+  "organization": "Acme Devices"
+}
+```
+
+`cert_pem` switches to import mode: the certificate becomes a trust anchor and
+no private key is involved. `validity_days` is capped at 3650 for a CA.
+
+**Response (201):** the CA plus `key_pem`, present only for a generated CA and
+only on this response.
+
+### DELETE /sites/{site_id}/mtls/cas/{ca_id}
+
+Delete a CA. Refused with `400` while any client certificate issued from it still
+exists — revoked ones included, since they are what keeps the revocation list
+intact.
+
+### GET /sites/{site_id}/mtls/certificates
+
+List client certificates, revoked ones included (`status` is `active` or
+`revoked`). `ca_name` is filled in for convenience.
+
+```json
+[
+  {
+    "id": "uuid",
+    "site_id": "uuid",
+    "ca_id": "uuid",
+    "ca_name": "Acme device CA",
+    "name": "laptop-1",
+    "common_name": "laptop-1",
+    "organization": "Acme Devices",
+    "serial": "1f0c…",
+    "fingerprint_sha256": "c4d1…",
+    "cert_pem": "-----BEGIN CERTIFICATE-----\n…",
+    "has_private_key": true,
+    "not_before": "2024-01-01T00:00:00Z",
+    "not_after": "2025-01-01T00:00:00Z",
+    "status": "active",
+    "revoked_at": null,
+    "revocation_reason": null,
+    "created_at": "2024-01-01T00:00:00Z"
+  }
+]
+```
+
+### POST /sites/{site_id}/mtls/certificates
+
+Issue a client certificate from one of the site's CAs.
+
+**Request:**
+```json
+{
+  "ca_id": "uuid",
+  "name": "laptop-1",
+  "common_name": "laptop-1",
+  "organization": "Acme Devices",
+  "validity_days": 365
+}
+```
+
+`name`, `common_name` and `organization` default to the CA's values; the
+validity is capped at the CA's own `not_after`, because a certificate outliving
+its CA verifies against nothing.
+
+**Response (201):** the certificate plus `key_pem`, returned exactly once.
+
+### POST /sites/{site_id}/mtls/certificates/{cert_id}/revoke
+
+Revoke a certificate. The fingerprint joins the site's revocation list and the
+configuration is pushed, so the very next request with that certificate is
+refused with `403` — no waiting for a CRL or an OCSP check.
+
+**Request:**
+```json
+{ "reason": "laptop lost" }
+```
+
+**Response (200):** the updated certificate.
+
+### DELETE /sites/{site_id}/mtls/certificates/{cert_id}
+
+Delete a certificate row. An `active` certificate must be revoked first (`400`
+otherwise) so that removing a record cannot quietly re-admit a client that is
+still holding the key. Revoking also removes its fingerprint from the deny list;
+the request-detail history keeps naming it.
+
+### GET /sites/{site_id}/mtls/certificates/{cert_id}/download
+
+Download the certificate, and its private key when it has one, as a single PEM
+bundle (`application/x-pem-file`) suitable for `curl --cert`.
+
+### How a client presents it
+
+```bash
+curl --cert laptop-1.pem --key laptop-1.pem https://example.com/
+```
+
+Requests that reach the site from a client without a usable certificate are
+answered `403` and recorded as access-log rows only — they are not WAF verdicts
+and do not show up as security events.
+
+---
+
+## API Keys
+
+Keys authenticate an agent (or any script) without a user password. The
+plaintext is shown once, at creation; the row keeps a bcrypt hash and the first
+8 characters for display. Agents send the key as `Authorization: Bearer pwk_…`.
+
+### GET /keys
+
+List API keys (paginated). Administrators see every key, other callers see their
+own. The plaintext is never returned here.
+
+### POST /keys
+
+Create a new API key. Every authenticated account may create keys for itself;
+a key can never exceed its owner's role, so a non-administrator's requested
+permissions are silently narrowed to `["read"]` (the `agent` permission, which
+is what a WAF agent needs, is administrator-only).
+
+**Request:**
+```json
+{
+  "name": "Agent Key",
+  "permissions": ["agent", "read"],
+  "expires_at": "2025-01-01T00:00:00Z"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Label, 1-100 characters (required) |
+| `permissions` | string[] | Any of `agent`, `read`, `write`; defaults to `["agent", "read"]` |
+| `expires_at` | string | RFC 3339 instant in the future; omitted = never expires |
+
+**Response (201):**
+```json
+{
+  "id": "uuid",
+  "user_id": "uuid",
+  "name": "Agent Key",
+  "key_prefix": "pwk_9f2c",
+  "key": "pwk_9f2c8d1e…",
+  "permissions": ["agent", "read"],
+  "expires_at": "2025-01-01T00:00:00Z",
+  "last_used_at": null,
+  "created_at": "2024-01-01T00:00:00Z"
+}
+```
+
+> The full key is returned **only** by this call. `last_used_at` is filled in as
+> agents authenticate.
+
+### DELETE /keys/{key_id}
+
+Revoke an API key. Answers `204`; the key stops authenticating immediately.
+Administrators may revoke any key, other callers only their own.
+
+---
+
+## Agents
+
+> **Note on `agent_metrics`:** the underlying edge-metric data is still
+> collected from agents over gRPC (`ShipMetrics`), stored in the database and
+> pruned by the retention policy — only the REST query endpoints were removed
+> (October 2026 change). There is no built-in consumer UI for it today.
+
+### GET /agents
+
+List registered agents.
+
+**Query Parameters:**
+| Param | Type | Description |
+|-------|------|-------------|
+| `page` | int | Page number |
+| `page_size` | int | Items per page |
+| `site_id` | string | Filter by site |
+| `status` | string | Filter: `online`, `offline`, `degraded` |
+| `search` | string | Case-insensitive substring match against `display_name`, `hostname` and `ip_address` |
+
+**Response (200):**
+```json
+{
+  "items": [
+    {
+      "id": "uuid",
+      "site_id": "uuid",
+      "site_domain": "example.com",
+      "hostname": "edge-01",
+      "display_name": "edge-01 (backup)",
+      "name": "edge-01",
+      "ip_address": "10.0.1.5",
+      "version": "0.25.0",
+      "os_info": "Linux 6.1.0",
+      "cpu_cores": 4,
+      "memory_bytes": 8589934592,
+      "status": "online",
+      "last_heartbeat": "2024-01-01T12:00:00Z",
+      "last_seen": "2024-01-01T12:00:00Z",
+      "registered_at": "2024-01-01T00:00:00Z",
+      "last_config_sync_at": "2024-01-01T11:58:00Z",
+      "last_policy_sync_at": "2024-01-01T11:58:00Z",
+      "connected": true,
+      "pending_commands": 0
+    }
+  ],
+  "total": 1
+}
+```
+
+`name` is the operator-facing label: it is `display_name` when one is set,
+otherwise it falls back to `hostname`. `hostname` is the identity the agent
+reports itself — registration matches on `hostname` + API key, so renaming a
+node does not create a duplicate. The inventory stores one identity per
+node, and the node view (`GET /system/nodes`) names it `name`; carrying both
+keeps one shape for the console without breaking callers that read
+`hostname`. `last_seen` is likewise an alias of `last_heartbeat`
+(`null` = the agent has never heartbeated).
+
+### POST /agents/enroll
+
+Mint an agent API key and get back the command line that brings a node
+online. Any account with write access (non-viewer). The agent registers
+itself over gRPC on first connect, so running the returned command is all
+that is needed for the node to appear in `GET /agents`.
+
+**Request:**
+```json
+{
+  "name": "edge-01"
+}
+```
+
+`name` is optional — it labels the minted key in `GET /keys` and defaults to
+`agent-enrollment-<timestamp>`. Max `100` characters.
+
+**Response (201):**
+```json
+{
+  "key_id": "uuid",
+  "token": "pwk_…",
+  "server_url": "https://waf.example.com:9090",
+  "install_command": "curl -fsSL …/install.sh | sudo bash -s -- --mode agent --server-url https://waf.example.com:9090 --api-key pwk_…"
+}
+```
+
+`token` is returned exactly once — only its hash is stored. It is already part
+of `install_command`; API callers may build their own command from it.
+`server_url` is the caller's host plus the configured gRPC port (the bind
+address is not routable from another server). The scheme follows the request:
+`X-Forwarded-Proto` (first value) when the deployment trusts forwarded headers
+(`WAFRED_PASSKEY_TRUST_FORWARDED_PROTO`), else the `Referer` scheme, else
+whether the console listener itself serves TLS — the gRPC listener serves TLS by
+default, so the value is usually `https://`. Behind a TLS-terminating reverse
+proxy that terminates TLS, turn on the trust flag or make sure the browser sends
+a `Referer`. The key
+carries the `agent` and `read` permissions. Running `install_command` on a
+fresh host installs the binary, writes the node configuration and starts the
+service, so the node registers itself without further steps.
+
+### GET /agents/{agent_id}
+
+Get agent details. The response carries the same `display_name` /
+`name` fields as the list: `display_name` is the set label or `null`,
+`name` is `display_name` falling back to `hostname`.
+
+### PATCH /agents/{agent_id}
+
+Set or clear the operator-facing display name. Requires write access
+(non-viewer).
+
+**Request:**
+```json
+{
+  "display_name": "edge-01 (backup)"
+}
+```
+
+**Response (200):** the updated agent object (same shape as the list
+items), with `display_name` reflecting the new value.
+
+Rules:
+
+- The value is trimmed; `null`, an omitted field, or a string that is empty
+  after trimming clears the name — the node displays its hostname again. The
+  endpoint is single-field, so omission has no other meaning to preserve.
+- At most `100` characters; control characters are rejected (`display_name
+  must be at most 100 characters` / `display_name must not contain control
+  characters`).
+- `display_name` is purely a label: `hostname` stays the reported identity,
+  registration still matches on `hostname` + API key, and renaming never
+  produces a duplicate node.
+- `404` when the agent does not exist.
+
+### GET /agents/{agent_id}/samples
+
+Host probe history (CPU, memory, network, disk), newest first. Cumulative counters (network and disk totals) are returned raw; difference consecutive rows to obtain rates.
+
+**Query params:** `from`, `to` (RFC 3339), `page`, `page_size`.
+
+### DELETE /agents/{agent_id}
+
+Deregister an agent.
+
+### POST /agents/{agent_id}/commands
+
+Send a command to an agent.
+
+**Request:**
+```json
+{
+  "command": "block_ip",
+  "payload": {
+    "ip": "1.2.3.4",
+    "duration_secs": 3600
+  }
+}
+```
+
+**Available commands:**
+| Command | Payload |
+|---------|---------|
+| `rule_update` | `{}` |
+| `config_reload` | `{}` |
+| `block_ip` | `{"ip": "single address or CIDR", "duration_secs": 3600}` |
+| `unblock_ip` | `{"ip": "single address or CIDR"}` |
+| `purge_cache` | `{"pattern": "..."}` |
+| `update_site` | `{"site_id": "..."}` |
+| `restart_agent` | `{}` |
+| `flush_logs` | `{}` — per-agent form of the broadcast below |
+
+### POST /agents/flush-logs
+
+Ask every connected agent to flush its in-memory log buffer to the control
+plane immediately, instead of waiting out the batch interval. Requires an
+administrator account (viewers and auditors get `403`).
+
+**Request:** empty body.
+
+**Response (200):**
+```json
+{ "delivered": 2, "offline": 1 }
+```
+
+Semantics worth knowing before you reach for it:
+
+- Only **connected** agents receive the command — it is never queued for
+  offline ones (replaying "flush" after a reconnect has no value and would
+  only occupy a pending-command slot). `offline` counts registered agents
+  that were not connected.
+- `delivered` means the command was handed to the agent, **not** that the
+  logs are stored yet: the agent flushes its current batch (and up to one
+  more batch drained while the RPC was in flight) asynchronously.
+- The agent's in-memory log channel holds at most 2048 entries; anything
+  dropped while the control plane was unreachable is gone for good.
+- A batch whose transport failed is kept by the agent and retried, capped at
+  one `log_batch_size` batch — the flush never turns into an unbounded send
+  loop.
+
+---
+
+## WAF Settings
+
+Per-site switches for the WAF engine and its judgement layers.
+
+### GET /sites/{site_id}/waf/settings
+
+Reads the site's WAF settings, creating the default row on first access.
+
+### PUT /sites/{site_id}/waf/settings
+
+Patch semantics: omitted fields keep their current value.
+
+**Request:**
+```json
+{
+  "waf_enabled": true,
+  "advanced_mode": false,
+  "monitor_categories": ["sqli"],
+  "monitor_stacks": ["java"],
+  "monitor_managed_rules": ["930120"],
+  "body_stage_timeout_secs": 10
+}
+```
+
+`waf_enabled` is the explicit engine switch (`true` default). With it off the
+data plane skips WAF evaluation for the site entirely — custom rules, managed
+rules, CC and bot checks included. `advanced_mode` raises the managed ruleset
+to the Strict level with body deep inspection. The three `monitor_*` lists
+downgrade matching managed rules to observe-only, described in
+[Monitoring downgrades](#waf-rules).
+
+`mode` is the site-level enforcement mode. It accepts exactly three values —
+the same enum every rule carries (see [Rule modes](#rule-modes)):
+
+| `mode` | Behaviour at the edge |
+|--------|-----------------------|
+| `off` | The engine returns immediately: nothing is detected, no events are written.; site-level signature detectors still score |
+| `monitor` | Everything is detected and recorded, nothing is blocked. A rule that asks to block is downgraded and the event says so (`downgraded=true`). |
+| `block` | Rules enforce their configured action. |
+
+The value that enforces is `block`; `enforce` and `prevention` are **not**
+accepted, and a request that sends one is rejected with
+`400 unknown mode value 'enforce'; allowed: off|monitor|block` (plus a hint
+that `block` is the enforcing value). A site without a settings row falls back
+to the aggregate mode of its enabled rules and, when it has none, to `monitor`
+— never to `off`, which is only ever an explicit choice.
+
+#### `body_stage_timeout_secs`
+
+Upper bound, in seconds, on how long the data plane may **withhold** a request
+body while body inspection runs. With `advanced_mode` on, the edge buffers the
+body before handing it to the WAF; this is the wall-clock budget for that wait
+— a slow client trickling bytes, or a large upload completing.
+
+| Value | Behaviour |
+|-------|-----------|
+| `1`–`30` | The window, in seconds. `30` is the default. |
+| `0` | **Reset to the default (30).** Accepted on write; the response reports `30`, and `30` is what is stored. |
+
+Anything outside `0..=30` is a `400 body_stage_timeout_secs must be between 0
+and 30 (0 resets to the default)` — out-of-range values are rejected rather
+than silently clamped, so a caller that sent `50` finds out instead of quietly
+running with 30.
+
+`0` meaning "unset / default" is the same rule the data plane applies: a row
+that has never been written reads as 30. There is no way to store a *different*
+default per site; set `1`–`29` for a shorter window.
+
+The window is a **fail-open** bound, not a block. Expiring it does not reject
+the request: the body is released to the upstream with whatever inspection
+completed, and the truncated inspection is the price of not letting a trickling
+client hold a connection. Keeping it small is therefore the security-relevant
+direction — 30s is the ceiling because holding a body longer than that turns
+every slowloris-style client into a connection-exhaustion vector.
+
+**Response (200)** — the same fields on `GET` and `PUT`:
+
+```json
+{
+  "waf_enabled": true,
+  "mode": "monitor",
+  "paranoia_level": 2,
+  "advanced_mode": false,
+  "monitor_categories": ["sqli"],
+  "monitor_stacks": ["java"],
+  "monitor_managed_rules": ["930120"],
+  "body_stage_timeout_secs": 30,
+  "created_at": "2025-01-01T00:00:00Z",
+  "updated_at": "2025-01-01T00:00:00Z"
+}
+```
+
+`body_stage_timeout_secs` in a response is always inside `1..=30`: a row
+edited behind the API's back (`0`, `-5`, `31`, ...) is reported as the default
+30 rather than as a value the data plane would never run with.
+
+### GET /sites/{site_id}/waf/posture
+
+The site's effective WAF posture — what the data plane enforces right now,
+aggregated from the engine switch, rules, rate limits, bot protection and the
+global observation mode. The dashboard renders this on the protection page;
+automation can poll it to detect configuration drift.
+
+**Response (200):**
+```json
+{
+  "engine": "on",
+  "detection": {
+    "managed": true,
+    "custom": true,
+    "deep_inspection": false,
+    "under_attack": false
+  },
+  "enforcement": {
+    "managed": { "sqli": "monitor", "xss": "block" },
+    "custom_rules": "block",
+    "cc": "block",
+    "bot": "challenge",
+    "observation_mode": false
+  }
+}
+```
+
+`engine` mirrors `waf_enabled`; when off, the rest still reports what *would*
+apply. `detection.managed` is always true (the managed ruleset ships with the
+binary); `custom` reflects enabled custom rules; `deep_inspection` mirrors
+`advanced_mode`; `under_attack` mirrors the challenge settings. In
+`enforcement`, `managed` maps each attack category to `block` or `monitor`,
+`custom_rules` aggregates custom-rule modes (block > monitor > off), `cc` is
+the strongest action among enabled rate-limit rules, and `bot` the bot
+protection action — both `"off"` when none apply. `observation_mode: true`
+means the global switch turns every protective action into logging.
+
+### GET /managed-rules
+
+Catalogue of the built-in managed rules. Requires an authenticated user (any
+role); like every other `/api/v1` endpoint it is not public. The list is taken
+at the Strict level, so strict-only rules appear too; a site running the Normal
+level simply never matches them, which the `strict_only` flag tells the
+dashboard.
+
+**Response (200):**
+```json
+[
+  {
+    "id": "WAFRED-1002",
+    "name": "Block known SQL injection anomaly scores",
+    "action": "block",
+    "severity": 5,
+    "tags": ["sqli", "anomaly"],
+    "stacks": ["generic"],
+    "category": "sqli",
+    "strict_only": false
+  }
+]
+```
+
+| Field | Meaning |
+|-------|---------|
+| `stacks` | Backend stacks the rule targets (`generic`, `java`, `php`, `python`, `node`). |
+| `category` | Attack family (`sqli`/`xss`/`rce`) whose per-category downgrade also affects this rule; `null` for policy/recon rules. |
+| `strict_only` | `true` when the rule only exists at the Strict level (advanced mode). |
+
+## WAF Rules
+
+### Security event detail suffixes
+
+`waf_details` may end with optional, machine-readable suffixes (added 2026-10-19):
+
+- `; surface=<query|header|body|path>` — the first surface that matched;
+- `; surfaces=<a,b>` — every surface that matched in this pass;
+- `; downgraded=true would_enforce=<block|challenge> cause=site-mode-monitor` —
+  a would-be enforcement suppressed by the site-wide monitor mode.
+
+They never contain rule ids, rule names or request content.
+
+### Rule modes
+
+Every rule — custom or built-in — carries a `mode` field with the same three
+values as the site mode:
+
+| `mode` | Behaviour |
+|--------|-----------|
+| `off` | Fully disabled: the rule is **not compiled, not evaluated, and produces no security event or log entry**. `enabled: false` is equivalent — the rule is skipped when the compiled rule set is built. To observe a rule without enforcing it, use `monitor` instead. |
+| `monitor` | The rule still evaluates and its match is recorded, but it never blocks or challenges. |
+| `block` | The rule enforces the action in its `action` field. |
+
+The API field name is `block`, **not** `enforce`: `"mode": "enforce"` is
+rejected with a `400` that lists `off|monitor|block`. UI copy may call the
+blocking mode "Prevention"/"Enforce"; the wire value is always `block`.
+
+The site mode is a ceiling on top of the rule mode. With the site in `monitor`,
+a rule whose action is `block` is downgraded rather than dropped: the request
+goes through, and the security event records the suppression. `waf_details`
+ends with `downgraded=true would_enforce=block cause=site-mode-monitor`, while
+each matched rule keeps its configured `rule_action=block`. `action: "monitor"`
+plus that marker is the "observed, not enforced" signal; a plain `monitor` with
+no marker means the rule itself was configured to observe.
+
+A **new site** is seeded with the built-in rule set in `mode: "block"`, so
+"WAF enabled" means the shipped SQLi/XSS/reconnaissance rules actually enforce;
+before this change they were seeded as `monitor` and a fresh site answered 200
+to SQLi/XSS payloads while only logging them. The restore endpoint
+(`POST /sites/{site_id}/waf/defaults`) is the deliberate exception: rules it
+re-adds come back in `monitor`, so repairing an existing site never starts
+blocking traffic that site was serving unfiltered. Seeding is matched on the
+rule name and never edits an existing row.
+
+### Action / mode combination check
+
+An `action: "allow"` rule always passes the request, so pairing it with
+`mode: "block"` promises enforcement that can never happen. The combination is
+rejected on create **and** on update — including an update that changes only
+one side, where the stored value of the other completes the pair — with:
+
+```
+400 action 'allow' cannot use mode 'block': an allow rule always passes the
+request, so the block mode would never apply; use 'monitor' or 'off'
+```
+
+`allow` is accepted with `mode: "monitor"` or `mode: "off"` only.
+
+### POST /sites/{site_id}/waf/defaults
+
+Re-adds any built-in rule that is missing from the site. Rules the operator
+edited or deleted are left as they are — only absent ones come back (matched
+by rule name, existing rows are never edited). Requires site write
+permission.
+
+As noted under [Rule modes](#rule-modes), rules this endpoint re-adds come
+back in `monitor`, so repairing an existing site never starts blocking
+traffic that site was serving unfiltered.
+
+**Response (200):**
+```json
+{
+  "inserted": 2,
+  "total": 11
+}
+```
+
+`total` is the number of built-in WAF rules; `inserted` how many were
+missing. The site's configuration is pushed to its agents when anything was
+inserted.
+
+### GET /sites/{site_id}/rule-groups
+
+List rule groups.
+
+### POST /sites/{site_id}/rule-groups
+
+Create a rule group.
+
+**Request:**
+```json
+{
+  "name": "Custom Rules",
+  "phase": "request",
+  "priority": 100,
+  "enabled": true
+}
+```
+
+### PUT /sites/{site_id}/rule-groups/{group_id}
+
+Update a rule group.
+
+### DELETE /sites/{site_id}/rule-groups/{group_id}
+
+Delete a rule group and its rules.
+
+### GET /sites/{site_id}/rules
+
+List rules.
+
+**Query Parameters:**
+| Param | Type | Description |
+|-------|------|-------------|
+| `page` | int | Page number |
+| `page_size` | int | Items per page |
+| `group_id` | string | Filter by group |
+| `enabled` | bool | Filter enabled/disabled |
+| `search` | string | Search by name/description |
+
+### POST /sites/{site_id}/rules
+
+Create a rule.
+
+**Request:**
+```json
+{
+  "group_id": "uuid",
+  "name": "Block SQL Injection",
+  "description": "Detects common SQLi patterns",
+  "enabled": true,
+  "priority": 10,
+  "mode": "block",
+  "conditions": [
+    {
+      "field": "uri",
+      "operator": "regex",
+      "value": "(?i)(union\\s+select|drop\\s+table)"
+    }
+  ],
+  "action": "block",
+  "tags": ["sqli", "owasp-a03"]
+}
+```
+
+### GET /sites/{site_id}/rules/{rule_id}
+
+Get rule details.
+
+### PUT /sites/{site_id}/rules/{rule_id}
+
+Update a rule.
+
+### DELETE /sites/{site_id}/rules/{rule_id}
+
+Delete a rule.
+
+---
+
+## Path Exceptions
+
+Per-site request paths that skip selected protection layers (WAF, bot
+protection, access rules, …), like Cloudflare's path bypass. Exceptions are
+available in **every** WAF mode — monitor and block alike. A matching request
+is still access-logged, while the named layers are skipped.
+
+What an exception can **never** bypass, because those checks run before the
+exception is consulted: a paused site (maintenance page), a fail-closed edge
+(`fail_open = false` with no synced rules) and an active dynamic IP ban.
+
+### GET /sites/{site_id}/path-exceptions
+
+List the site's path exceptions, ordered by `path`.
+
+**Response (200):**
+```json
+[
+  {
+    "id": "uuid",
+    "site_id": "uuid",
+    "path": "/api/health",
+    "match_type": "prefix",
+    "skip_layers": ["waf", "bot"],
+    "note": "health probes",
+    "log_hits": true,
+    "enabled": true,
+    "created_at": "2024-01-01T00:00:00Z",
+    "updated_at": "2024-01-01T00:00:00Z"
+  }
+]
+```
+
+### POST /sites/{site_id}/path-exceptions
+
+Create an exception. Requires write access; no observation-mode gate.
+
+**Request:**
+```json
+{
+  "path": "/api/health",
+  "match_type": "prefix",
+  "skip_layers": ["waf", "bot"],
+  "note": "health probes",
+  "log_hits": true,
+  "enabled": true
+}
+```
+
+All fields except `path` are optional. `match_type` defaults to `prefix`,
+`skip_layers` defaults to `["*"]`, `log_hits` to `false`, `enabled` to `true`.
+
+| Field | Validation (violations are `400` unless stated) |
+|-------|--------------------------------------------------|
+| `path` | Required on create. 1–512 characters, must start with `/`, no whitespace or control characters. `*` is only allowed with `match_type: "wildcard"`, and there only as a single trailing `*` (`/api/*`); a bare `*` is rejected (`use path '/' with match_type prefix instead of '*'`). With `match_type: "regex"` the value is a regular expression instead — the leading-`/` and wildcard rules do not apply there, only the shared length/whitespace limits plus a compile check (see below). |
+| `match_type` | `prefix` (default) / `exact` / `wildcard` / `regex`; anything else → `unknown match_type '<x>'; expected one of prefix, exact, wildcard, regex`. |
+| `skip_layers` | Array of tokens: `*`, `waf`, `bot`, `access`, `basic_auth`, `mtls`, `ai_bot`, `rate_limit`, `challenge`. Empty array → `skip_layers must not be empty; use ["*"] to skip every layer`; unknown token → named in the error; `*` collapses the list to every layer. |
+| `note` | At most 200 characters. |
+| `log_hits` | Default `false`. When `true`, every hit is recorded (see [Hit behaviour](#path-exception-hit-behaviour)). |
+| `enabled` | Default `true`; disabled exceptions are neither compiled nor matched. |
+
+Limits: a site accepts at most **64** exceptions
+(`a site accepts at most 64 path exceptions`); `(site_id, path)` is unique — a
+duplicate is a `409` (`a path exception for '<path>' already exists on this site`).
+
+**`match_type: "regex"`** — the `path` value is a regular expression evaluated
+with the Rust `regex` crate: unanchored `is_match` (write `^…$` yourself when
+the whole path must match), case-sensitive by default (`(?i)` opts out). The
+pattern must compile server-side; compilation uses 4 MiB `size_limit` /
+`dfa_size_limit` limits, the same budget as the WAF expression engine. An
+invalid pattern is a `400` carrying the compiler's reason
+(`invalid regex '<pattern>': <reason>`). Compatibility: agents that have not
+been upgraded receive the unknown `PATH_MATCH_REGEX = 3` and degrade to
+`prefix` semantics (fail-safe — the exception simply stops applying), so a
+regex exception does **not** take effect there; upgrade agents before relying
+on this type.
+
+**Response (200):** the created exception (same shape as the list items).
+
+### GET /sites/{site_id}/path-exceptions/{id}
+
+Get one exception. `404` (`path exception {id} not found`) when it does not
+belong to this site.
+
+### PUT /sites/{site_id}/path-exceptions/{id}
+
+Partial update: omitted fields keep their value. The observation-mode gate and
+the same validation apply. Switching `match_type` re-validates the stored
+`path` against the new type (e.g. changing to `wildcard` without a trailing
+`*` on the path is rejected). Changing `path` to a value another exception
+already uses is a `409`.
+
+### DELETE /sites/{site_id}/path-exceptions/{id}
+
+Delete an exception. `204` on success; `404` when the id does not belong to
+this site.
+
+### Path exception hit behaviour
+
+Matching runs on the request path only (query strings ignored), `exact` before
+`prefix` before `wildcard` before `regex` — the first hit wins. `prefix` matches by **path segment**: `/api`
+matches `/api` and `/api/x`, never `/apix`; `wildcard` covers anything below
+the pattern with the `*` removed (`/api/*` matches `/api/x`, not `/api`).
+
+A hit skips exactly the layers the exception names for that one request. When
+the list includes `challenge` (directly or via `*`), **every** challenge source
+is waived for the request and it continues to the origin: WAF rule / scoring
+judgements of `Challenge`, the `challenge` action of CC and rate-limit rules,
+bot-protection challenges, IP / geo rule challenges and the standalone
+challenge plugin. `block` is unaffected — blocks still enforce, and the
+hard gates (paused site, fail-closed edge, dynamic IP bans) still run before
+the exception. Security events and access logging continue as usual. When
+`log_hits` is `true`, the hit is written to `security_events` so the bypass is
+visible in the dashboard:
+
+| Field | Value |
+|-------|-------|
+| `event_type` | `path_bypass` |
+| `action` | `log` (kept out of block/challenge accounting) |
+| `rule_id` | The exception's id |
+| `rule_name` | The exception's `note`, or its `path` when the note is empty |
+| `waf_details` | `bypassed: <layers>` — the token list, or `bypassed: *` |
+
+---
+
+## Path Restrictions
+
+Per-site rules run before path exceptions. They match the request path and an
+optional WAF expression, then block the request or require an existing Basic
+Auth or OIDC configuration. Read operations require site read access; writes
+require site write access. Up to 64 rules are allowed per site. Lower `priority`
+values run first; ties are ordered by rule ID.
+
+### GET /sites/{site_id}/path-restrictions
+
+List the site's rules in priority order. The response is an array of rule
+objects with the fields shown in the create response, including `id`,
+`site_id`, `created_at` and `updated_at`.
+
+### POST /sites/{site_id}/path-restrictions
+
+Create a rule. Only `path` is required; when `name` is omitted it defaults to
+the path. For an authentication action, first enable the matching site Basic
+Auth settings or enable OIDC with `auth_mode: "oidc"` and
+`auth_scope: "path"`.
+
+**Request:**
+```json
+{
+  "name": "Protect admin area",
+  "path": "/admin/*",
+  "match_type": "wildcard",
+  "expression": "",
+  "action": "block",
+  "threshold": 10,
+  "period_seconds": 60,
+  "block_duration_seconds": 300,
+  "schedule_enabled": true,
+  "schedule_timezone": "Asia/Shanghai",
+  "schedule_days": [1, 2, 3, 4, 5],
+  "schedule_start": "09:00",
+  "schedule_end": "18:00",
+  "enabled": true,
+  "priority": 100
+}
+```
+
+**Response (200):** The saved rule with generated `id`, `site_id`,
+`created_at` and `updated_at` in addition to the request fields.
+
+`match_type` accepts `prefix` (default), `exact`, `wildcard` (one trailing
+`*`) or `regex` (Rust regex). `action` accepts `block` (default), `basic_auth`
+or `oidc`. A `threshold` of `0` blocks immediately; positive values allow that
+many requests per client IP in `period_seconds` before blocking for
+`block_duration_seconds` (zero means until the current window ends). This
+counter is local to each agent and does not add the IP to the blacklist.
+Thresholds apply only to `block` rules. The period must be 1–86400 seconds and
+block duration at most 604800 seconds. `schedule_days` uses ISO weekdays
+1–7; the time zone must be a valid IANA name, and times use 24-hour `HH:MM`.
+When scheduling is disabled, the rule applies at all times.
+
+### GET /sites/{site_id}/path-restrictions/{id}
+
+Return one rule; `404` if it does not belong to this site.
+
+### PUT /sites/{site_id}/path-restrictions/{id}
+
+Partially update a rule. Omitted fields keep their current values; the same
+validation and authentication prerequisites apply. Returns the updated rule.
+
+### DELETE /sites/{site_id}/path-restrictions/{id}
+
+Delete a rule. Returns `204`, or `404` if the ID does not belong to this site.
+
+---
+
+## Rate Limiting
+
+### GET /sites/{site_id}/rate-limit-rules
+
+List rate limit rules.
+
+### POST /sites/{site_id}/rate-limit-rules
+
+Create a rate limit rule.
+
+**Request:**
+```json
+{
+  "name": "API Rate Limit",
+  "expression": "",
+  "exception_expression": "",
+  "enabled": true,
+  "threshold": 100,
+  "period_seconds": 60,
+  "action": "block",
+  "mitigation_timeout_seconds": 60,
+  "characteristics": ["ip"],
+  "priority": 100
+}
+```
+
+`characteristics` accepts `ip`, `ip_nat`, `host`, `path`, `asn`, `country`, and the parameterized forms `header:<name>`, `cookie:<name>`, `query:<name>` (requests missing the value bucket together). Header names match case-insensitively; cookie and query names are case-sensitive. `ja3` is reserved for future use. `expression` is an optional **inclusion** filter — empty means all requests. `exception_expression` is an optional **exclusion** filter: a matching request is not counted, mitigated or challenged by this rule. `action: "allow"` is also an explicit exception and stops evaluation of lower-priority rate-limit rules. The console now presents one `challenge` action; `js_challenge` remains accepted as a compatibility alias and is stored/displayed as `challenge`.
+
+### PUT /sites/{site_id}/rate-limit-rules/{rule_id}
+
+Update a rate limit rule.
+
+### DELETE /sites/{site_id}/rate-limit-rules/{rule_id}
+
+Delete a rate limit rule.
+
+---
+
+## Cache
+
+Caching for a site is expressed two ways, and the REST API keeps them
+separate (the console merges them into one list — that is presentation only,
+the endpoints below are unchanged):
+
+- **Explicit cache rules** — `GET|POST /sites/{site_id}/cache-rules` and the
+  `PUT|DELETE /sites/{site_id}/cache-rules/{rule_id}` variants, matched by
+  `match_expression`. Explicit rules are evaluated **before** the category
+  presets below; first match wins.
+- **Category presets** — the extension-based policy on
+  `GET|PUT /sites/{site_id}/cache-settings` (`cache_type_policy`: five fixed
+  families `web_assets`, `image`, `media`, `other`, `html`, each with
+  `enabled`, TTLs and an `extensions` list). Presets compile into rules
+  behind the site's explicit rules on the data plane and match **only by
+  extension** — API endpoints and extension-less paths need an explicit rule.
+
+A site with only presets (no enabled explicit rule) still caches: the cache
+plugin is generated when an explicit rule is enabled *or* a preset family is
+enabled with a non-empty extension list. A "convert preset to rule" action in
+the console turns a preset into an explicit rule with the same extensions and
+TTLs — the generated expression looks like
+`http.request.uri.path matches "(?i)\.(?:png|jpg)$"` — and disables the
+preset so the same requests are not matched twice.
+
+### GET /sites/{site_id}/cache-rules
+
+List cache rules for a site.
+
+### POST /sites/{site_id}/cache-rules
+
+Create a cache rule.
+
+**Request:**
+```json
+{
+  "name": "Static Assets",
+  "path_pattern": "/static/*",
+  "edge_ttl": 86400,
+  "browser_ttl": 3600,
+  "status": "enabled"
+}
+```
+
+### PUT /sites/{site_id}/cache-rules/{rule_id}
+
+Update a cache rule.
+
+### DELETE /sites/{site_id}/cache-rules/{rule_id}
+
+Delete a cache rule.
+
+### GET /sites/{site_id}/cache-settings
+
+The site's cache settings: its disk budget and single-file caps, plus the
+extension-based category presets. The disk budget belongs to the site, not to
+an individual rule — the agent enforces one ceiling per hostname, and every
+hostname of a site shares the same budget. Reads require site read
+permission.
+
+**Response (200):**
+```json
+{
+  "site_id": "uuid",
+  "quota_mb": 2048,
+  "max_file_size_mb": 16,
+  "type_limits": {"html": 8, "image": 16},
+  "cache_type_policy": null,
+  "global_max_file_size_mb": 16,
+  "effective_max_file_size_mb": 16,
+  "cache_enabled": true,
+  "rule_count": 3,
+  "enabled_rule_count": 2
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `quota_mb` | Disk budget, in MiB, the agents may use for this site's cache. |
+| `max_file_size_mb` | Site-level single-file cap in MiB; `null` follows the global ceiling. |
+| `type_limits` | Per-content-type single-file caps in MiB, keyed by `html/css/js/image/font/media/other`; a missing key follows `max_file_size_mb`. |
+| `cache_type_policy` | The extension-based category presets (see the chapter intro); `null` when unconfigured — the site then relies solely on its cache rules. |
+| `global_max_file_size_mb` | The global single-file ceiling every site-level value is clamped against. |
+| `effective_max_file_size_mb` | The resolved cap this site actually enforces: `min(global, max_file_size_mb?)`. |
+| `cache_enabled` / `rule_count` / `enabled_rule_count` | Whether any cache rule of the site is enabled, and how many rules exist / are enabled. |
+
+### PUT /sites/{site_id}/cache-settings
+
+Update the site's cache settings. Requires site write permission. Every field
+is optional: absent = unchanged; explicit `null` resets
+`max_file_size_mb` / `cache_type_policy` to follow the global ceiling (and
+removes the policy, respectively); an empty `type_limits` map clears every
+override.
+
+| Field | Rules |
+|-------|-------|
+| `quota_mb` | 0-1048576 MiB. |
+| `max_file_size_mb` | 1 MiB up to `global_max_file_size_mb`. |
+| `type_limits` | Every key must be one of `html`, `css`, `js`, `image`, `font`, `media`, `other`; every value between 1 MiB and the site cap (the new value when both change in one request). |
+| `cache_type_policy` | The five fixed families `web_assets`, `image`, `media`, `other`, `html`. |
+
+Validation failures return `400`: a TTL above 2592000 seconds, an enabled
+family with a zero edge TTL, an extension outside 1-16 lowercase
+alphanumeric characters, or the same extension appearing in two families.
+
+**Response (200):** the same view as `GET`, recomputed.
+
+### POST /sites/{site_id}/cache/defaults
+
+Re-add the built-in cache rules that are missing, **disabled**, so caching can
+be turned on with a single switch instead of writing rules from scratch. Rules
+that already exist (matched by name) are left untouched, and the site's
+configuration is pushed to its agents when anything was inserted.
+
+**Response (200):**
+```json
+{
+  "inserted": 2,
+  "total": 5
+}
+```
+
+`total` is the number of built-in rules; `inserted` how many were missing.
+
+### GET /cache/status
+
+Get cache usage across all sites.
+
+### GET /cache/status/{site_id}
+
+Get cache usage for a specific site.
+
+### POST /cache/purge
+
+Purge cached content.
+
+**Request:**
+```json
+{
+  "site_id": "uuid",
+  "pattern": "/images/*"
+}
+```
+
+**Delivery scope (D09).** `site_id` is required. The command reaches the
+agents **bound to that site plus the global (unbound) agents** (the latter
+serve the site through their key's owner). An agent bound to *another* site
+is never included, so one tenant's purge cannot spill onto another tenant's
+edges.
+
+There is no request form that purges "everything on every edge": the
+`purge_target_agents(None)` branch inside the control plane is reserved for a
+future global endpoint and has no HTTP caller today.
+
+### GET /cache/rules
+
+List all cache rules (cross-site, query by `site_id`).
+
+### POST /cache/rules
+
+Create cache rule with `site_id` in body.
+
+### PUT /cache/rules/{rule_id}
+
+Update by rule ID.
+
+### DELETE /cache/rules/{rule_id}
+
+Delete by rule ID.
+
+---
+
+## Logs
+
+Every proxied request writes one `access_logs` row; a request the WAF acted on
+also writes a `security_events` row that shares its `request_id` with the access
+row, so a security event can be joined back to the full request and response.
+
+The control plane keeps a third, separate log about *itself*:
+`control_plane_access_logs` records the requests served by the dashboard and
+REST API on port 9080. It is never mixed into the site logs, carries no site
+id, and is readable by administrators only — see
+[GET /logs/control-plane](#get-logscontrol-plane).
+
+> **Headers and bodies are stored verbatim.** `Cookie`, `Authorization` and
+> `Set-Cookie` values are deliberately *not* redacted — the console is meant to
+> reproduce what a client actually sent — so `access_logs` is sensitive data.
+> Keep the retention window short (`DELETE /logs/purge`) and restrict access.
+> One exception on the response side: `content-security-policy-report-only`
+> is dropped from the stored `response_headers` (Postgres and Elasticsearch
+> alike) — it is noise from report-only CSP deployments, while `cookie` and
+> `set-cookie` are kept for site-origin forensics.
+
+Request and response bodies are prefixes: the agent stores at most
+`max_body_log_size` bytes per direction (8 KiB by default, 64 KiB ceiling,
+`capture_response_body` can switch response capture off). Both directions report
+the real size and a `*_truncated` flag, so a short body is never mistaken for a
+complete one.
+
+Repeated header names are folded into the single value the stored map accepts:
+most headers join with `, ` (the way HTTP prescribes), while `Set-Cookie`
+values join with a newline (`\n`) — cookie values routinely carry commas of
+their own inside `Expires` attributes, so a comma join would make the pairs
+indistinguishable.
+
+**Console search syntax.** The log pages accept one Kibana-style query string and
+translate it into the parameters below, so the same filters are reachable from
+the API:
+
+```
+client_ip:203.0.113.44      exact;  client_ip:203.0.113.*   prefix
+client_ip:10.0.0.1,10.0.0.8 any of several values
+path:/api/v1/users          substring;  status:404  status:4xx
+method:POST,PUT   action:block   rule:xss-001
+country:CN   cache_status:hit   latency:>500   site:<uuid>
+from:2026-09-01  to:2026-09-02
+api/v1/users                free text: matches path or host
+```
+
+Values containing spaces go in double quotes (`path:"/my files"`), `ip:` and
+`rule:` alias `client_ip:` and `rule_id:`, and `method`, `action`, `rule` and
+`cache_status` are only understood on the tab they belong to. A term the grammar
+cannot place is reported to the operator rather than ignored.
+
+### GET /logs/security
+
+List security events, newest first.
+
+**Query Parameters:**
+| Param | Type | Description |
+|-------|------|-------------|
+| `page` | int | Page number (default: 1) |
+| `page_size` | int | Items per page (default: 50, max: 200) |
+| `site_id` | string | Filter by site; omitted = every site the caller may see |
+| `from` | string | RFC 3339 start (default: 24 hours ago) |
+| `to` | string | RFC 3339 end (default: now) |
+| `client_ip` | string | Exact IP; `a,b` for a list; `10.0.0.*` for a prefix |
+| `action` | string | `block`, `challenge`, `log`, `allow` (`a,b` for a list) |
+| `rule_id` | string | Rule id (`a,b` for a list) |
+| `host` | string | Request host (`*` wildcards allowed) |
+| `path` | string | Substring match on the request path |
+| `country_code` | string | ISO country code, upper-cased server side |
+| `user_identity` | string | The authenticated caller's OIDC `sub` (exact match) |
+| `request_id` | string | Exact request id, e.g. from an `X-Request-ID` header |
+| `q` | string | Free text; matches the path or the host |
+
+`from` must be earlier than `to` and the window may not exceed 90 days.
+
+`action` is the verdict that was actually taken: `monitor` covers both "the rule
+was configured to observe" and "a block was suppressed by the site mode". Those
+two are told apart by `waf_details`: a downgraded block ends with
+`downgraded=true would_enforce=block cause=site-mode-monitor` and keeps the
+rule's own `rule_action=block`, so a monitor-mode site never looks like a site
+whose block rules silently stopped working.
+
+**`rule_id` is the rule that enforced the verdict.** When the rule that
+executed the block/challenge differs from the detection signature (for
+example, a log-only signature firing alongside a blocking rule), the
+enforcer is stored in `rule_id`; the detection signature is preserved on
+the agent→control-plane wire as `waf_rule_id`, with the enforcer in the
+additional `waf_enforced_rule_id` field (protobuf `LogEntry` field 57).
+Events with no single enforcing rule (anomaly-score gate, stage-1 critical
+fast path) keep the detection signature. Statistics and `rule_id` filters
+therefore match the rule that actually blocked — a log-only rule no longer
+appears as the blocker.
+
+**Rejects during an IP ban are events too.** A request refused because its
+client IP is currently banned writes a `security_events` row with
+`event_type = "defense"`, `rule_id = "ip_ban"`, `action = "block"` and a
+`waf_details` payload carrying the ban reason and the unblock time (or
+`never` for a permanent ban) — so probing that continues after a ban is
+visible in the event counts and analytics, not only in `access_logs`.
+
+**Response (200):** paginated `security_events` rows.
+
+```json
+{
+  "items": [
+    {
+      "id": 1,
+      "site_id": "uuid",
+      "agent_id": "uuid",
+      "request_id": "6f1c…",
+      "timestamp": "2024-01-01T00:00:00Z",
+      "client_ip": "203.0.113.7",
+      "method": "GET",
+      "host": "example.com",
+      "path": "/search",
+      "rule_id": "942100",
+      "rule_name": "SQL Injection Attack Detected",
+      "action": "block",
+      "score": 5,
+      "waf_details": "{\"matched\":\"1' or '1'='1\"}",
+      "country_code": "US",
+      "user_agent": "curl/8.4.0",
+      "created_at": "2024-01-01T00:00:01Z"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "page_size": 50
+}
+```
+
+### GET /logs/access
+
+List access logs, newest first.
+
+**Query Parameters:**
+| Param | Type | Description |
+|-------|------|-------------|
+| `page` | int | Page number (default: 1) |
+| `page_size` | int | Items per page (default: 50, max: 200) |
+| `site_id` | string | Filter by site; omitted = every site the caller may see |
+| `from` | string | RFC 3339 start (default: 24 hours ago) |
+| `to` | string | RFC 3339 end (default: now) |
+| `client_ip` | string | Exact IP; `a,b` for a list; `10.0.0.*` for a prefix |
+| `method` | string | HTTP method, upper-cased server side (`a,b` for a list) |
+| `status_code` | int | Exact status, 100-599 |
+| `status_class` | int | Status class: `1`, `2`, `3`, `4` or `5` |
+| `host` | string | Request host (`*` wildcards allowed) |
+| `path` | string | Substring match on the request path |
+| `cache_status` | string | `hit`, `miss`, … (lower-cased, `a,b` for a list) |
+| `country_code` | string | ISO country code, upper-cased server side |
+| `user_identity` | string | The authenticated caller's OIDC `sub` (exact match) |
+| `min_latency_ms` | int | Only rows at or above this total latency |
+| `request_id` | string | Exact request id |
+| `q` | string | Free text; matches the path or the host |
+
+**Response (200):** paginated `access_logs` rows.
+
+```json
+{
+  "items": [
+    {
+      "id": 1,
+      "site_id": "uuid",
+      "agent_id": "uuid",
+      "request_id": "6f1c…",
+      "timestamp": "2024-01-01T00:00:00Z",
+      "client_ip": "203.0.113.7",
+      "method": "GET",
+      "host": "example.com",
+      "path": "/search",
+      "query_string": "q=hello",
+      "status_code": 200,
+      "response_size": 5120,
+      "upstream_addr": "10.0.1.50:3000",
+      "upstream_latency_ms": 12,
+      "total_latency_ms": 15,
+      "cache_status": null,
+      "user_agent": "curl/8.4.0",
+      "referer": null,
+      "country_code": "US",
+      "tls_version": "TLSv1.3",
+      "scheme": "https",
+      "protocol": "HTTP/1.1",
+      "request_headers": {"accept": "*/*", "cookie": "session=…"},
+      "request_body": "q=hello",
+      "request_body_size": 7,
+      "request_body_truncated": false,
+      "response_headers": {"content-type": "text/html", "set-cookie": "a=1; Path=/\nb=2; Expires=Wed, 21 Oct 2026 07:28:00 GMT"},
+      "response_body": "<!doctype html>…",
+      "response_body_size": 5120,
+      "response_body_truncated": true
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "page_size": 50
+}
+```
+
+Rows are only as complete as the agent that produced them: `scheme`, `protocol`
+and the response fields come from agents on 0.15.0 or newer. Against an older
+agent those columns stay `null` and the console shows the request side only.
+
+### GET /logs/access/{id}
+
+One access-log row by id, same shape as the list items above (the full
+`access_logs` row, no pagination). Visibility matches the list endpoint:
+administrators see every row; every other account only rows belonging to
+sites it owns — another tenant's row, an unassigned row (`site_id: null`) and
+an unknown id all answer **404 `access log not found`** (a non-existent and
+an unreadable row are indistinguishable by design).
+
+### GET /logs/control-plane
+
+List the control plane's own access log (port 9080), newest first.
+Administrators only: the table is cross-tenant and has no site column.
+Recording is controlled by the `access_log_enabled` switch and
+`access_log_retention_days` of
+[PUT /settings/api-protection](#put-settingsapi-protection). Health probes
+(`/healthz`, `/api/v1/health`) are exempt and write no rows.
+
+**Query Parameters:**
+| Param | Type | Description |
+|-------|------|-------------|
+| `page` | int | Page number (default: 1) |
+| `page_size` | int | Items per page (default: 50, max: 200) |
+| `from` | string | RFC 3339 start (default: 24 hours ago) |
+| `to` | string | RFC 3339 end (default: now) |
+| `client_ip` | string | Exact IP; `a,b` for a list; `10.0.0.*` for a prefix |
+| `method` | string | HTTP method, upper-cased server side (`a,b` for a list) |
+| `action` | string | `allowed`, `blocked_allowlist`, `blocked_waf`, `observed_waf` (`a,b` for a list) |
+| `status_code` | int | Exact status, 100-599 |
+| `path` | string | Substring match on the request path |
+| `host` | string | Request host (`*` wildcards allowed) |
+| `request_id` | string | Exact request id |
+| `q` | string | Free text; matches the path or the host |
+
+`from` must be earlier than `to` and the window may not exceed 90 days.
+
+**Response (200):** paginated `control_plane_access_logs` rows.
+
+```json
+{
+  "items": [
+    {
+      "id": 1,
+      "request_id": "6f1c…",
+      "timestamp": "2024-01-01T00:00:00Z",
+      "client_ip": "203.0.113.7",
+      "method": "GET",
+      "host": "waf.example.com:9080",
+      "path": "/api/v1/sites",
+      "query_string": "page=1",
+      "scheme": "https",
+      "protocol": "HTTP/1.1",
+      "status_code": 200,
+      "latency_ms": 12,
+      "user_agent": "curl/8.4.0",
+      "referer": null,
+      "user_id": "uuid",
+      "user_email": "admin@wafred.local",
+      "action": "allowed",
+      "reason": null
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "page_size": 50
+}
+```
+
+`action` records what the listener's self-protection did with the request:
+
+| Value | Meaning |
+|-------|---------|
+| `allowed` | The request passed every check (the default). |
+| `blocked_allowlist` | Refused with `403 ip_not_allowed` by the IP allowlist. |
+| `blocked_waf` | Refused with `403 blocked_by_waf`, or `413 request_body_too_large` when the body exceeded the inspection limit. |
+| `observed_waf` | A WAF match that was recorded but not enforced, either because `waf_mode` is `monitor` or because the engine itself rated the verdict monitor-only. |
+
+`reason` carries the detail behind a non-`allowed` action and is `null`
+otherwise. `user_id` and `user_email` are decoded from a Bearer token that
+happens to be on the request, purely for the log — the handler still
+authenticates for real, so an invalid token logs `null` for both. `client_ip`
+is always the TCP peer, never a forwarding header: behind a reverse proxy the
+proxy's address is what is logged (and must be allowlisted).
+
+Rows are written asynchronously and in batches, so the newest seconds of
+traffic may not be visible yet; a queue overflow drops records with a server
+warning rather than stalling requests.
+
+### DELETE /logs/purge
+
+Delete log rows older than a cutoff. Administrators only.
+
+**Query Parameters:**
+| Param | Type | Description |
+|-------|------|-------------|
+| `older_than_days` | int | Retention window in days, 1-3650 (default: 30) |
+| `site_id` | string | Limit the purge to one site; omitted = every site |
+
+```
+DELETE /api/v1/logs/purge?older_than_days=30
+```
+
+**Response (200):**
+```json
+{
+  "deleted_security_events": 120,
+  "deleted_access_logs": 8421,
+  "deleted_control_plane_logs": 42,
+  "cutoff": "2024-01-01T00:00:00Z"
+}
+```
+
+`deleted_control_plane_logs` counts rows removed from
+`control_plane_access_logs`; it is always `0` when `site_id` is given, since
+control plane rows carry no site. The scheduled sweep keeps that table to its
+own window (`access_log_retention_days` of the API protection settings).
+
+---
+
+## Analytics
+
+### GET /analytics/summary
+
+Aggregate statistics for a time range.
+
+**Query Parameters:** `site_id`, `from`, `to` (ISO 8601; default window is the last 24 hours, capped at 31 days)
+
+**Response (200):**
+```json
+{
+  "from": "2024-01-01T00:00:00Z",
+  "to": "2024-01-02T00:00:00Z",
+  "site_id": null,
+  "requests": 125000,
+  "unique_ips": 8900,
+  "cache_hits": 98000,
+  "cache_hit_rate": 0.784,
+  "avg_latency_ms": 42,
+  "max_latency_ms": 5120,
+  "client_errors": 2100,
+  "server_errors": 130,
+  "security_events": 3650,
+  "blocked_requests": 3200,
+  "distinct_attackers": 412,
+  "rules_triggered": 1880
+}
+```
+
+### GET /analytics/requests-over-time
+
+Time-series request data.
+
+**Query Parameters:** `site_id`, `from`, `to`, `interval` (`minute`, `hour` (default), `day` or `week`), `limit`
+
+### GET /analytics/traffic
+
+Egress bandwidth per fixed-width bucket — response bytes streamed to clients only; origin-pull traffic is never counted. Without `site_id` the call covers every site the caller may see.
+
+**Query Parameters:** `site_id`, `from`, `to`, `step` (bucket width in seconds; one of `5`, `10`, `30`, `60`, `300`, `900`, `3600`, `86400` — default `5`)
+
+**Response (200):**
+```json
+{
+  "from": "2024-01-01T00:00:00Z",
+  "to": "2024-01-01T00:10:00Z",
+  "site_id": null,
+  "step_seconds": 5,
+  "total_bytes": 536870912,
+  "buckets": [
+    {
+      "bucket": "2024-01-01T00:00:00Z",
+      "bytes": 1048576
+    }
+  ]
+}
+```
+
+### GET /analytics/sites-over-time
+
+Request volume over time for the busiest sites — one series per site, for the dashboard's multi-line chart. Without `site_id` the top 8 sites by in-window traffic are returned; non-administrators are scoped to their own sites.
+
+**Query Parameters:** `site_id`, `from`, `to`, `interval` (`minute`, `hour` (default), `day` or `week`)
+
+**Response (200):**
+```json
+[
+  {
+    "bucket": "2024-01-01T12:00:00Z",
+    "site_id": "uuid",
+    "site_domain": "example.com",
+    "site_name": "My Site",
+    "requests": 1520
+  }
+]
+```
+
+### GET /analytics/top-rules
+
+Most triggered rules.
+
+### GET /analytics/top-ips
+
+Top client IPs by request count.
+
+**Query Parameters:** `site_id`, `from`, `to`, `interval`, `limit`, and:
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `blocked_only` | boolean | `false` | `true` restricts the ranking to IPs with at least one blocked request (HTTP 403 or 429) and orders by `blocked DESC, requests DESC, client_ip ASC`. Absent or `false` keeps the historical "top client IPs" behavior: no filter, ordered by request count only. |
+
+Accepted values for `blocked_only`: `true`, `false`, `1`, `0`, `yes`, `no`
+(any casing). Anything else is rejected with **400 `invalid_blocked_only`**
+rather than silently falling back to `false`, so a typo cannot quietly change
+the ranking. A present-but-empty value (`?blocked_only=`) is rejected too; omit
+the parameter for the default. `blocked_only=false` is byte-for-byte the statement the endpoint
+served before the parameter existed.
+
+### GET /analytics/top-paths
+
+Most requested paths.
+
+### GET /analytics/status-codes
+
+Distribution of HTTP response codes. This includes responses WAFred itself
+produced: the `503` answers of a CC challenge are written to `access_logs`
+(with a mitigated marker), so a challenge storm shows up in the panel with
+the same counts the clients observed.
+
+### GET /analytics/sites
+
+Overview of all sites with request counts.
+
+### GET /analytics/ai-crawlers
+
+Aggregated AI crawler traffic: one row per crawler family that had matching
+traffic inside the window — rows are produced from `access_logs` by
+matching the recorded raw user agent against the catalogue, so a family
+with no requests in the window is absent rather than reported as zero.
+
+**Query Parameters:** `site_id`, `from`, `to` (ISO 8601), or the shorthand
+`range` with one of `24h` (default), `7d`, `30d` — `range` is converted to
+a `from`/`to` window identical to the explicit pair, and an explicit
+`from`/`to` takes precedence when both are given. An unknown `range` value
+answers `400 invalid_range` (it is never silently treated as 24 hours).
+
+### GET /analytics/active-visitors
+
+Unique client IPs seen in the last few minutes — the "live visitors" figure.
+The window is fixed at five minutes on the dashboard; `minutes` is accepted
+(1–60, default 5) for callers that need a different span. Always scoped to
+`access_logs`, so a request that never reached an agent is not counted.
+
+```json
+{ "active_visitors": 12, "window_minutes": 5, "as_of": "2026-10-21T11:02:03Z" }
+```
+
+### GET /analytics/client-types
+
+Share of desktop vs. mobile vs. AI bots vs. other clients over a window.
+Classification is a constant predicate over the recorded user agent, applied
+in a fixed order so later branches cannot shadow earlier ones: `mobile`
+matches Mobile/Android/iPhone/iPad/iPod, then `ai_bots` matches the
+distinctive AI-crawler markers (`gpt`, `claude`, `-ai`, `extended`,
+`perplexity`), then `other` matches an empty agent plus
+bot/spider/crawler/curl/wget/python/go-http-client/headless, and everything
+else counts as `desktop`. AI crawlers whose only marker is the generic `bot`
+suffix (ccbot, bytespider, amazonbot, …) still land in `other`; because the AI
+families moved out of it, the `other` count is expected to drop compared with
+the previous three-way classification. Shares are computed server-side
+(`count / total`, `0.0` when the window is empty) so a client never divides by
+zero.
+
+**Query Parameters:** `site_id`, `from`, `to`, or `range` (same semantics as
+`/analytics/ai-crawlers`).
+
+```json
+{ "desktop": 100, "mobile": 40, "ai_bots": 3, "other": 2, "total": 145,
+  "desktop_share": 0.6897, "mobile_share": 0.2759, "ai_bots_share": 0.0207,
+  "other_share": 0.0138 }
+```
+
+---
+
+## Notifications
+
+Alert channels, thresholds, and the alert history the control plane records.
+Settings and channels are administrators only. The alert history is readable
+by administrators; purging it requires the `write` role. Every mutation asks
+the notification manager to reload, so changes take effect immediately.
+
+### GET /notifications/settings
+
+The alert thresholds and per-event-type delivery switches, stored as one row
+and created with the defaults below on first read.
+
+**Response (200):**
+```json
+{
+  "enabled": true,
+  "cpu_percent": 90,
+  "memory_percent": 90,
+  "disk_percent": 90,
+  "dedup_window_secs": 600,
+  "notify_agent_offline": true,
+  "notify_agent_online": true,
+  "notify_agent_resource": true,
+  "notify_control_plane_resource": true,
+  "notify_cert_expiry": true,
+  "notify_cert_renewal_failed": true,
+  "notify_config_sync_failed": true,
+  "notify_site_failover_changed": true,
+  "notify_site_upstream": true,
+  "notify_auth_login_anomaly": true,
+  "notify_site_oidc_auth": true,
+  "cert_expiry_warn_days": 30
+}
+```
+
+`enabled` is the noise master switch: `false` stops channel delivery for
+every event while the history table keeps recording. `notify_cert_expiry`
+gates `cert.expiring` **and** `cert.expired` together, `notify_site_upstream`
+gates `site.upstream_offline` **and** `site.upstream_abnormal`,
+`notify_site_oidc_auth` gates `site.oidc_login_failed` **and**
+`site.oidc_idp_unavailable`. `dedup_window_secs` is the minimum spacing
+between two identical alerts on one channel; `cert_expiry_warn_days` drives
+the `cert.expiring` window.
+
+### PUT /notifications/settings
+
+Update any subset of the fields above; omitted fields keep their value.
+Thresholds are clamped into `5`–`100` (not rejected), `dedup_window_secs` is
+capped at `86400` and `cert_expiry_warn_days` at `1`–`365`. The response is
+the full updated view, as from `GET`.
+
+### GET /notifications/channels
+
+List delivery channels, ordered by name. Secrets inside `config` are
+replaced by the `__REDACTED__` placeholder; the stored values are sealed at
+rest when `WAFRED_SECRET_KEY` is set.
+
+**Response (200):**
+```json
+[ { "id": "uuid", "name": "ops email", "kind": "email",
+    "config": { "smtp_host": "smtp.example.com", "smtp_port": 465,
+                "smtp_user": "alerts@example.com", "smtp_pass": "__REDACTED__",
+                "tls": "ssl", "from": "alerts@example.com",
+                "to": ["ops@example.com"] },
+    "events": ["agent.offline"], "enabled": true,
+    "created_at": "2026-10-01T00:00:00Z",
+    "updated_at": "2026-10-01T00:00:00Z" } ]
+```
+
+`kind` is one of `email`, `wecom`, `dingtalk`, `webhook` (the generic one
+POSTs the full event payload as JSON). `events` lists the subscribed event
+types — an empty list subscribes to all of
+`agent.offline`, `agent.online`, `agent.resource`,
+`control_plane.resource`, `cert.renewal_failed`, `cert.expiring`,
+`cert.expired`, `config.sync_failed`, `site.failover_changed`,
+`site.upstream_offline`, `site.upstream_abnormal`, `auth.login_anomaly`,
+`site.oidc_login_failed`, `site.oidc_idp_unavailable`.
+
+### POST /notifications/channels
+
+Create a channel. `name` is trimmed 1–100 characters; `config` and `events`
+default to empty, `enabled` to `true`. The config is validated per kind at
+save time — a broken channel is refused with `400` instead of failing at the
+first alert: `email` requires `smtp_host`, `from` and a non-empty `to` list
+(optional `smtp_port` default 465, `smtp_user`, `smtp_pass`, `tls`: `ssl`
+default / `starttls` / `none`); `wecom`, `dingtalk` and `webhook` require a
+non-empty `config.url`. An unknown `kind` or an unknown event type answers
+`400 bad_request` naming the accepted values.
+
+Secret keys (`smtp_pass`, `secret`, `secret_token`) never come back in plain
+text: responses carry `__REDACTED__` in their place.
+
+### GET /notifications/channels/{channel_id}
+
+One channel, in the same (secret-masked) shape as the list. Unknown ids
+answer `404 not_found`.
+
+### PUT /notifications/channels/{channel_id}
+
+Replace a channel: `name` and `kind` are required, `config`, `events` and
+`enabled` follow the same defaults and validation as create. Echoing
+`__REDACTED__` for a secret key keeps the stored value — a client cannot echo
+a secret it never received — so the dashboard can round-trip a channel
+without re-entering credentials. Unknown ids answer `404`.
+
+### DELETE /notifications/channels/{channel_id}
+
+Delete a channel. Unknown ids answer `404`; success returns
+`{ "deleted": true }`.
+
+### POST /notifications/channels/{channel_id}/test
+
+Send a test alert through the channel. Always `200`: `{"ok": true}` on
+delivery, `{"ok": false, "error": "…"}` with the delivery error otherwise, so
+a broken SMTP password surfaces before an incident. `500 internal_error` only
+when the notification manager is not running.
+
+### GET /notifications/events
+
+Paginated alert history, newest first (`created_at DESC, id DESC`, so pages
+stay stable while new events arrive).
+
+**Query Parameters:** `page` (default 1), `page_size` (default 50, 1–200 —
+the console explicitly requests 20), `event_type` (optional filter, e.g.
+`attack_spike`).
+
+```json
+{ "items": [ { "id": "…", "event_type": "…", "severity": "…",
+               "title": "…", "message": "…", "details": null,
+               "created_at": "2026-10-21T10:00:00Z" } ],
+  "total": 123, "total_truncated": false, "page": 1, "page_size": 20 }
+```
+
+### DELETE /notifications/events
+
+Deletes alert history. Exactly one of the two selectors is required — sending
+both (or neither) answers `400 invalid_query`, and `all=false` is rejected
+rather than silently interpreted as "delete nothing".
+
+| Selector | Effect |
+|---|---|
+| `?all=true` | Deletes every alert event |
+| `?before_days=N` | Deletes events older than `N` days (`1`–`365`; out of range is `400`, not clamped) |
+
+Rows are removed in bounded batches (2 000 per statement) so a large purge
+does not hold locks for one long scan while alerts keep being written. The
+`deleted` count is the total across batches.
+
+```json
+{ "deleted": 42 }
+```
+
+---
+
+## AI Crawl Control
+
+Per-site AI crawler policy: which families are recognised, what happens to
+each, and the generated `robots.txt` / `llms.txt` the edge serves. Full
+semantics (generated-file rendering, Content Signals, security boundaries)
+are documented in [ai-crawl.md](./ai-crawl.md).
+
+### GET /sites/{site_id}/ai-crawl
+
+The site's AI crawl settings plus the per-family override list. See
+[ai-crawl.md](./ai-crawl.md#get-apisv1sitessite_idai-crawl) for the
+response shape and the defaults a site without a settings row reports.
+
+### PUT /sites/{site_id}/ai-crawl
+
+Update settings and/or replace the override set (`policies`, when present,
+replaces the whole set). Bodies are capped at 64 KiB and CR characters are
+stripped on save; setting both file modes and the action set is validated
+against the catalogue. Requires the `write` role.
+
+### GET /sites/{site_id}/ai-crawl/preview?file=robots|llms
+
+Render the generated file without saving. Returns `{ "mode",
+"content_type": "text/plain; charset=utf-8", "body" }`; `file` selects
+`robots` (default) or `llms`. Any other value — a typo such as
+`?file=bogus` — is rejected with `400 unknown_file` instead of silently
+falling back to `robots`.
+
+### GET /ai-crawl/catalog
+
+The 19 AI crawler families WAFred recognises, each with `id`, `operator`,
+`name`, `category` (`training` / `search` / `agent` / `other`) and
+`ua_substrings`. The 19th entry, added after the initial 18, is
+`facebookexternalhit` (Meta, category `other`) — the link-preview fetcher
+is its own family so it can be observed or allowed independently of the
+Meta-ExternalAgent training crawler.
+
+---
+
+## IP Access Rules
+
+### GET /sites/{site_id}/ip-rules
+
+List IP access rules.
+
+### POST /sites/{site_id}/ip-rules
+
+Create an IP rule. Set either `ip_ranges` (manual mode) or `group_id` (reference a global/per-site IP group) — not both.
+
+**Request:**
+```json
+{
+  "name": "Known bad actor",
+  "ip_ranges": ["192.168.1.0/24"],
+  "action": "block",
+  "note": "Blocked subnet",
+  "enabled": true,
+  "priority": 100
+}
+```
+
+`action` is `block`, `allow`, `challenge`, `js_challenge` or `basic_auth`. Sending `group_id` instead of `ip_ranges` makes the rule track the group's latest ranges. A `basic_auth` rule challenges the matched clients and continues to the remaining checks once they authenticate; configure the credentials under [Basic Auth](#basic-auth) first.
+
+### PUT /sites/{site_id}/ip-rules/{rule_id}
+
+Update an IP rule (sending `ip_ranges` or `group_id` switches between manual and group mode).
+
+### DELETE /sites/{site_id}/ip-rules/{rule_id}
+
+Remove an IP rule.
+
+### POST /sites/{site_id}/ip-rules/bulk
+
+Bulk import IP rules (one IP or CIDR per entry).
+
+**Request:**
+```json
+{
+  "ip_ranges": ["1.2.3.4", "5.6.7.0/24"],
+  "action": "block",
+  "note": "Imported blocklist",
+  "enabled": true
+}
+```
+
+### GET /sites/{site_id}/blocked-ips
+
+Dynamic blocks the edge currently enforces for the site — WAF/rate-limit auto-blocks, server-issued block commands and manual CIDR blocks. Every agent reports the blocks it enforces on each heartbeat; rows are folded per IP (or CIDR), with the attack history folded in from the security-event log.
+
+**Response (200):**
+```json
+[
+  {
+    "ip": "203.0.113.7",
+    "kind": "single",
+    "reason": "waf: SQL injection in query string",
+    "blocked_at": "2024-01-01T12:00:00Z",
+    "expires_at": "2024-01-01T12:10:00Z",
+    "agent_count": 2,
+    "attack_count": 1842,
+    "last_attack_at": "2024-01-01T11:59:58Z"
+  },
+  {
+    "ip": "198.51.100.0/24",
+    "kind": "cidr",
+    "reason": "manual block from dashboard",
+    "blocked_at": "2024-01-01T12:05:00Z",
+    "expires_at": null,
+    "agent_count": 2,
+    "attack_count": 0,
+    "last_attack_at": null
+  }
+]
+```
+
+`expires_at` is `null` for permanent blocks; `reason` may be `null` for blocks reported by older agents. `kind` is `"single"` for one address and `"cidr"` for a range; the same field appears on every row of the global list (`GET /blocked-ips`).
+
+### GET /blocked-ips
+
+The same dynamic blocks across every site, folded per (site, IP) and joined
+with each site's display name — the global blacklist page. Administrators see
+all sites; every other account only the sites it owns. Only blocks still in
+force are listed (`expires_at` `null` or in the future — a just-expired row
+may linger until the next agent heartbeat reconciles the mirror).
+
+**Query Parameters:**
+| Param | Type | Description |
+|-------|------|-------------|
+| `site_id` | string | Restrict to one site (a malformed UUID answers `400`; a site the caller may not see answers `404`) |
+| `ip` | string | Substring match on the stored address/CIDR |
+
+**Response (200):**
+```json
+[
+  {
+    "ip": "203.0.113.7",
+    "kind": "single",
+    "site_id": "uuid",
+    "site_name": "Example",
+    "reason": "waf: SQL injection in query string",
+    "blocked_at": "2024-01-01T12:00:00Z",
+    "expires_at": "2024-01-01T12:10:00Z",
+    "agent_count": 2,
+    "attack_count": 1842,
+    "last_attack_at": "2024-01-01T11:59:58Z"
+  }
+]
+```
+
+`kind` is `"single"` for one address and `"cidr"` for a range; `expires_at`
+`null` marks a permanent block (no automatic expiry). Sorted by `blocked_at`,
+newest first.
+
+### POST /blocked-ips/block
+
+Issue a manual dynamic block for a site: a `BlockIp` command goes to every registered agent (queued for offline ones) and mirror rows are written so the dashboard reflects the block immediately; the next heartbeat reconciles any drift. `duration_seconds` of `0` (or omitted) blocks permanently until unblocked. Requires write permission on the site.
+
+The `ip` field accepts a single address **or a CIDR range** (e.g. `198.51.100.0/24`, `2001:db8:abcd::/48`). CIDRs are normalised — host bits are truncated (`203.0.113.99/24` is stored as `203.0.113.0/24`) — and re-blocking the same target is idempotent. To keep a fat-fingered network-wide ban from taking the edge down, the mask is capped: **at most /16 for IPv4 and /32 for IPv6**; broader prefixes are rejected with `400` and a message containing `CIDR prefix too broad`.
+
+**Request:**
+```json
+{
+  "site_id": "…",
+  "ip": "198.51.100.0/24",
+  "duration_seconds": 3600,
+  "reason": "manual block from dashboard"
+}
+```
+
+**Response (202):**
+```json
+{
+  "ip": "198.51.100.0/24",
+  "kind": "cidr",
+  "site_id": "…",
+  "duration_seconds": 3600,
+  "agents": 2,
+  "delivered": 2
+}
+```
+
+### POST /sites/{site_id}/blocked-ips/unblock
+
+Lift a dynamic block: an `UnblockIp` command goes to every agent still enforcing it (queued when disconnected) and the mirrored rows are removed. Requires write permission.
+
+`ip` accepts a single address or a CIDR, matching the block input. Unblocking a CIDR only removes the **exactly identical** CIDR entry — it does not lift blocks for individual addresses that happen to fall inside the range (and vice versa).
+
+**Request:**
+```json
+{
+  "ip": "198.51.100.0/24"
+}
+```
+
+**Response (202):**
+```json
+{
+  "ip": "203.0.113.7",
+  "agents": 2,
+  "delivered": 2
+}
+```
+
+---
+
+## IP Groups
+
+Named collections of IP ranges, global (`is_global`, applied to all sites) or per-site. Each group carries an `action` of `block` or `allow`, and can subscribe to an external list via `source_url` with a `sync_interval_minutes` refresh interval (`null` = manual sync only).
+
+Groups can also be **subscription-backed** (`subscription_kind`): `builtin`
+groups ship with the control plane — Google, Yandex, DuckDuckGo and Cloudflare
+verifier/CDN ranges as static snapshots, seeded on first start — and `url`
+groups pull a plain-text or CIDR list over HTTP. Both are refreshed
+automatically by a daily background job (`subscription_enabled: false` opts
+out); `last_synced_at` and `last_sync_error` report the last run. Range
+changes propagate: sites that use the group for access rules, route gating,
+bot verification or proxy trust get their configuration re-pushed
+immediately.
+
+Subscription fetches refuse to contact non-public networks. Three layers apply
+(`pingwaf-server/src/subscription.rs`):
+
+* **No redirects.** The fetch client sets `redirect::Policy::none()`, so a
+  public source cannot answer with a `302 -> http://169.254.169.254/` and slip
+  past the IP checks.
+* **Full IP blacklist on the initial host.** The `source_url` host — an IP
+  literal directly, otherwise resolved via DNS with *every* returned address
+  checked — is validated against a blacklist: loopback, RFC 1918 private,
+  link-local (including the cloud metadata service `169.254.169.254`),
+  fe80::/10, fc00::/7 unique-local, 0.0.0.0/8, multicast, 240.0.0.0/4, CGNAT
+  100.64.0.0/10, IETF protocol assignments 192.0.0.0/24, benchmarking
+  198.18.0.0/15, the NAT64 prefix 64:ff9b::/96, and IPv4-mapped IPv6 (judged
+  by the IPv4 blacklist). A rejected URL fails with an error mentioning
+  `private, loopback or otherwise non-public network` — at validation time and
+  again before each sync sends a byte.
+* **Known residual risk.** DNS resolution and the actual connection are
+  performed independently by reqwest, so a DNS rebinding TOCTOU window
+  theoretically remains. The precondition is an already-authenticated admin
+  configuring the subscription source; the risk is accepted at the level of
+  this documentation note rather than mitigated in code.
+
+**Permissions:** reads are available to every role; the mutating endpoints
+(`POST/PUT/DELETE /ip-groups`, `PUT /ip-groups/{group_id}/sites` and
+`POST /ip-groups/{group_id}/sync`) require write access (`admin`) — viewer and
+auditor accounts receive `403`.
+
+### GET /ip-groups
+
+List IP groups (paginated), each with a `site_count`.
+
+**Query Parameters:**
+| Param | Type | Description |
+|-------|------|-------------|
+| `page` | int | Page number |
+| `page_size` | int | Items per page |
+| `action` | string | Filter: `block` or `allow` |
+| `is_global` | bool | Filter global/per-site groups |
+| `enabled` | bool | Filter enabled/disabled |
+
+**Response (200):**
+```json
+{
+  "items": [
+    {
+      "id": "uuid",
+      "name": "Cloudflare",
+      "description": "Official Cloudflare IP ranges, refreshed daily from api.cloudflare.com.",
+      "ip_ranges": ["173.245.48.0/20"],
+      "action": "block",
+      "is_global": true,
+      "source_url": "https://api.cloudflare.com/client/v4/ips",
+      "sync_interval_minutes": 1440,
+      "last_synced_at": "2024-01-01T12:00:00Z",
+      "last_sync_error": null,
+      "subscription_kind": "builtin",
+      "subscription_enabled": true,
+      "enabled": false,
+      "created_at": "2024-01-01T00:00:00Z",
+      "updated_at": "2024-01-01T00:00:00Z",
+      "site_count": 0
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "page_size": 50
+}
+```
+
+### POST /ip-groups
+
+Create an IP group (up to 10000 ranges). Requires write access (`admin`).
+
+**Request:**
+```json
+{
+  "name": "Office allowlist",
+  "description": "Corporate egress IPs",
+  "ip_ranges": ["203.0.113.7", "198.51.100.0/24"],
+  "action": "allow",
+  "is_global": false,
+  "source_url": "https://example.com/ip-list.txt",
+  "sync_interval_minutes": 1440,
+  "enabled": true
+}
+```
+
+### GET /ip-groups/{group_id}
+
+Get an IP group with its `site_count`.
+
+### PUT /ip-groups/{group_id}
+
+Update an IP group (all fields optional). Requires write access (`admin`).
+
+### DELETE /ip-groups/{group_id}
+
+Delete an IP group. Requires write access (`admin`).
+
+### GET /ip-groups/{group_id}/sites
+
+List the sites associated with a per-site group.
+
+### PUT /ip-groups/{group_id}/sites
+
+Replace the site associations of a per-site group. Refused with `400` for global groups. Requires write access (`admin`).
+
+**Request:**
+```json
+{
+  "site_ids": ["uuid"]
+}
+```
+
+### POST /ip-groups/{group_id}/sync
+
+Trigger an immediate subscription sync from `source_url`. Requires write access (`admin`). On success the fetched ranges replace the stored ones; on failure the previous ranges are kept, the error is recorded in `last_sync_error`, and the API returns `502`.
+
+**Response (200):**
+```json
+{
+  "id": "uuid",
+  "synced_at": "2024-01-01T12:00:00Z",
+  "ip_count": 15
+}
+```
+
+---
+
+## Geo Restrictions
+
+### GET /sites/{site_id}/geo
+
+Get geo restriction settings.
+
+### PUT /sites/{site_id}/geo
+
+Update geo restrictions.
+
+**Request:**
+```json
+{
+  "enabled": true,
+  "mode": "block_list",
+  "countries": ["CN", "RU", "IR"],
+  "blocked_asns": ["AS13335"],
+  "block_unknown": false,
+  "action": "block"
+}
+```
+
+`mode` is `block_list` or `allow_list`; `blocked_asns` entries are ASN numbers, optionally prefixed with `AS`. `action` is `block`, `challenge`, `js_challenge` or `basic_auth`.
+
+### GET /sites/{site_id}/geo/stats
+
+Requests per country over the last 24 hours (up to 20 countries), for the bar chart next to the policy editor. Traffic whose country could not be resolved is skipped.
+
+**Response (200):**
+```json
+[
+  {"country_code": "CN", "requests": 5210},
+  {"country_code": "US", "requests": 1240}
+]
+```
+
+### GET /geo/global-stats
+
+Requests per country aggregated across every site the caller may see
+(administrators: all sites; other accounts: the sites they own) — drives the
+world map on the global traffic page. Traffic whose country could not be
+resolved is skipped.
+
+**Query Parameters:**
+| Param | Type | Description |
+|-------|------|-------------|
+| `hours` | int | Look-back window (default: 24, clamped to 1-744) |
+| `limit` | int | Maximum countries returned (default: 100, clamped to 1-250) |
+
+**Response (200):** the same shape as the per-site stats, sorted by requests
+descending:
+```json
+[
+  {"country_code": "CN", "requests": 5210},
+  {"country_code": "US", "requests": 1240}
+]
+```
+
+---
+
+## Basic Auth
+
+HTTP basic authentication for one site. The check runs inside the WAF plugin,
+ahead of the cache, so a stored response can never answer an unauthenticated
+request. It applies site-wide when `enabled` is true, and to the clients an IP
+or geo rule with the `basic_auth` action matches — an explicit `allow` rule
+exempts a client from the site-wide gate.
+
+Passwords are masked with `***` in responses; sending the mask back keeps the
+stored password instead of overwriting it. Site write permission is required.
+
+### GET /sites/{site_id}/basic-auth
+
+Get the site's basic auth configuration, creating a disabled default when the
+site never saved one.
+
+**Response (200):**
+```json
+{
+  "id": "0d1b0f2e-…",
+  "site_id": "6f1c…",
+  "enabled": false,
+  "realm": "Restricted",
+  "credentials": [{"username": "alice", "password": "***"}],
+  "delay_seconds": 1,
+  "hide_credentials": false,
+  "created_at": "2026-09-30T09:00:00Z",
+  "updated_at": "2026-09-30T09:00:00Z"
+}
+```
+
+### PUT /sites/{site_id}/basic-auth
+
+Update basic auth. `credentials` replaces the whole list when present; `realm`
+must be 1–200 characters, `delay_seconds` between 0 and 10, and usernames must
+be non-empty and unique. Enabling the gate with no credential is rejected.
+
+**Request:**
+```json
+{
+  "enabled": true,
+  "realm": "Staging",
+  "credentials": [
+    {"username": "alice", "password": "hunter2"},
+    {"username": "bob", "password": "***"}
+  ],
+  "delay_seconds": 1,
+  "hide_credentials": true
+}
+```
+
+---
+
+## OIDC Authentication
+
+OpenID Connect login (authorization code flow with PKCE) for a whole site or
+only paths selected by path restriction rules. The stored configuration is
+shipped to the agents, whose `oidc` data
+plane plugin sends unauthenticated browsers to the identity provider, verifies
+the ID token that comes back and issues an encrypted session cookie — flow
+details and the security properties are in
+[oidc.md](../pingap-plugin/docs/oidc.md). Failed logins and an unreachable
+provider surface as the `site.oidc_login_failed` (warning) and
+`site.oidc_idp_unavailable` (critical) alert events; delivery is gated by the
+`notify_site_oidc_auth` notification switch (on by default, covering both).
+Normal unauthenticated redirects are not alerted.
+
+Reads require site read permission, writes site write permission.
+
+### GET /sites/{site_id}/oidc
+
+Get the site's OIDC configuration, creating a disabled default when the site
+never saved one.
+
+**Response (200):**
+```json
+{
+  "id": "0d1b0f2e-…",
+  "site_id": "6f1c…",
+  "enabled": false,
+  "auth_mode": "oidc",
+  "auth_scope": "site",
+  "issuer": "",
+  "client_id": "",
+  "client_secret": "",
+  "cookie_secret": "",
+  "redirect_path": "/oauth2/callback",
+  "logout_path": "",
+  "redirect_url": "",
+  "scopes": ["openid"],
+  "cookie_name": "pingap_oidc",
+  "session_ttl_seconds": 43200,
+  "claims_to_headers": [],
+  "created_at": "2026-09-30T09:00:00Z",
+  "updated_at": "2026-09-30T09:00:00Z"
+}
+```
+
+`session_ttl_seconds` is the plugin's `session_ttl` in seconds (60–31536000;
+the default 43200 is 12 hours), and `claims_to_headers` entries are
+`{"claim": "email", "header": "X-Auth-Email"}` objects.
+
+**Masking differs from basic auth:** `client_secret` and `cookie_secret` are
+returned as `***` only when a value is stored — an unset secret comes back as
+`""`. Public OIDC clients and no-logout setups legitimately have an empty
+`client_secret`, so a blanket mask would leave the dashboard unable to tell
+"unset" from "set".
+
+### PUT /sites/{site_id}/oidc
+
+Update the configuration. Every field is optional; an omitted field keeps its
+value. `claims_to_headers` replaces the whole list when present. Secrets
+follow the mask rules above: sending `***` keeps the stored secret (rejected
+with `400` when nothing is stored — there is no old value to keep), and `""`
+clears it.
+
+**Request:**
+```json
+{
+  "enabled": true,
+  "auth_mode": "oidc",
+  "auth_scope": "path",
+  "issuer": "https://keycloak.example.com/realms/main",
+  "client_id": "pingap",
+  "client_secret": "***",
+  "cookie_secret": "0123456789abcdef0123456789abcdef",
+  "redirect_path": "/oauth2/callback",
+  "logout_path": "/oauth2/logout",
+  "redirect_url": "https://app.example.com/oauth2/callback",
+  "scopes": ["openid", "profile", "email"],
+  "cookie_name": "pingap_oidc",
+  "session_ttl_seconds": 43200,
+  "claims_to_headers": [{"claim": "email", "header": "X-Auth-Email"}]
+}
+```
+
+Validation failures are `400` with `code: "bad_request"` and a stable
+message prefix per rule — e.g. `issuer must be an absolute http(s) URL`,
+`client_id must be 1-255 characters`, `cookie_secret must be at least 16
+characters`, `redirect_path must be an absolute path without a query or
+fragment`, `logout_path must differ from redirect_path`,
+`redirect_url path must equal redirect_path`, `cookie_name must not start
+with '__Host-'`, `session_ttl_seconds must be between 60 and 31536000`, and
+`header '{header}' must not be set from a claim` (the header names a request
+header the plugin must own: `Content-Length`, `Transfer-Encoding`, `Host`,
+`Connection`). Duplicate claims or headers, duplicate scopes and over-long
+values are rejected the same way; `openid` is always kept as the first scope.
+
+Enabling the gate is refused — never silently downgraded to disabled — when a
+required value is missing, checked in this order: `issuer is required while
+oidc is enabled`, `client_id is required while oidc is enabled`,
+`cookie_secret is required while oidc is enabled`, `cookie_secret must be at
+least 16 characters`. `client_secret` is deliberately *not* required: a public
+client authenticates with PKCE alone, and the plugin sends the `client_id` on
+its own for it.
+
+`auth_scope` is `site` (default) or `path`. Path scope requires
+`auth_mode: "oidc"`; the `local` and combined sign-in modes cannot use it.
+With path scope, only matching path restriction rules trigger OIDC, while the
+OIDC callback and provider entry paths remain reachable.
+
+Global OIDC providers — the registry sites reference by id — live in the same
+section. They belong to the deployment, not to a site: one Keycloak realm can
+front several sites, and rotating its client secret is one edit rather than
+one per site. All five endpoints are administrators only.
+
+### GET /oidc/providers
+
+List providers, ordered by name, each with a `site_count` so the dashboard
+can show what a delete or a disable would affect before it is attempted.
+
+**Response (200):**
+```json
+[ { "id": "uuid", "name": "keycloak", "enabled": true,
+    "issuer": "https://idp.example.com/realms/main",
+    "client_id": "pingap", "client_secret": "***",
+    "scopes": ["openid", "email", "profile"],
+    "site_count": 2,
+    "created_at": "2026-10-01T00:00:00Z",
+    "updated_at": "2026-10-01T00:00:00Z" } ]
+```
+
+`client_secret` is masked on every read path — `"***"` when a secret is
+stored, `""` when it is not (a public client has a legitimate empty secret),
+and the stored value is never echoed.
+
+### POST /oidc/providers
+
+Create a provider. Validation failures are `400 bad_request` with a stable
+message: `name` is trimmed 1–128 characters and must be unique (`a provider
+named '…' already exists`); `issuer` is an absolute http(s) URL of at most
+512 characters whose trailing `/` is stripped rather than rejected (the
+discovery URL is built by appending `/.well-known/openid-configuration`);
+`client_id` is 1–255 characters; `client_secret` is optional, at most 1024
+characters; `scopes` (optional) are deduplicated with `openid` forced first,
+at most 32 entries of at most 128 characters without whitespace. `enabled`
+defaults to `true`.
+
+**Request:**
+```json
+{
+  "name": "keycloak",
+  "enabled": true,
+  "issuer": "https://idp.example.com/realms/main/",
+  "client_id": "pingap",
+  "client_secret": "s3cret",
+  "scopes": ["email", "profile"]
+}
+```
+
+**Response (200):** the same shape as `GET /oidc/providers/{provider_id}`.
+
+### GET /oidc/providers/{provider_id}
+
+One provider in the list shape. Unknown ids answer `404 not_found`; a
+non-UUID id answers `400 bad_request`.
+
+### PUT /oidc/providers/{provider_id}
+
+Update a provider; every field is optional and an omitted field keeps its
+value. `client_secret` follows the mask round-trip: omitted or `null` keeps
+the stored secret, sending the `***` mask keeps it too (rejected with `400`
+when nothing is stored — there is no old value to keep), any other value
+replaces it and `""` clears it. `scopes`, when present, replaces the whole
+list (same normalisation as create).
+
+Sites that reference the provider are re-pushed their configuration
+immediately, so the data plane enforces the new settings without waiting for
+an unrelated change.
+
+### DELETE /oidc/providers/{provider_id}
+
+Delete a provider. A provider still referenced by sites is refused with
+`409 conflict` — `N site(s) still use this provider; point them elsewhere
+first` — because the site foreign key is `ON DELETE SET NULL` and the delete
+would otherwise silently leave those sites unconfigured. Success returns
+`{ "deleted": true }`.
+
+---
+
+## Bot Protection
+
+### GET /sites/{site_id}/bot-protection
+
+Get bot protection settings.
+
+### PUT /sites/{site_id}/bot-protection
+
+Update bot protection.
+
+**Request:**
+```json
+{
+  "enabled": true,
+  "ua_analysis": true,
+  "action": "challenge",
+  "known_bots_whitelist": ["Googlebot", "bingbot"],
+  "ip_verification_enabled": true,
+  "dns_verification_enabled": true,
+  "verified_ip_group_id": "uuid"
+}
+```
+
+`action` is `block`, `challenge`, `js_challenge`, `log` or `allow` and is applied to traffic classified as a bot (non-browser user agents). `known_bots_whitelist` is a JSON array of case-insensitive User-Agent substrings that always pass.
+
+Beyond the user agent — trivially spoofed — two stronger signals exist.
+`ip_verification_enabled` plus `verified_ip_group_id` treats client IPs inside
+the referenced group's ranges as verified bots (pick the built-in Google or
+Cloudflare subscription group). `dns_verification_enabled` adds reverse DNS:
+for a suspicious user agent the client's PTR record is resolved and forward-
+confirmed against the vendor's domain (`*.googlebot.com`, `yandex.com`,
+`duckduckgo.com`, …). Verification runs only when the UA already looks like a
+bot, results are cached, and a failed lookup falls back to the UA verdict
+rather than blocking the request. Signals compose in the order: IP match >
+confirmed DNS > UA whitelist > browser fingerprint heuristic > the configured
+action.
+
+---
+
+## Challenge Settings
+
+### GET /sites/{site_id}/challenge
+
+Get challenge configuration, creating a disabled default when the site never
+saved one.
+
+**Response (200):**
+```json
+{
+  "id": "0d1b0f2e-…",
+  "site_id": "6f1c…",
+  "enabled": false,
+  "under_attack_mode": false,
+  "default_level": "non_interactive",
+  "clearance_duration_secs": 1800,
+  "rate_threshold": 100,
+  "exempt_paths": [],
+  "browser_integrity_check": true,
+  "tls_fingerprint_check": false,
+  "updated_at": "2026-09-30T09:00:00Z"
+}
+```
+
+### PUT /sites/{site_id}/challenge
+
+Update challenge settings. All fields are optional; omitted fields keep their
+value. Site write permission is required. Unknown fields are rejected with
+`422 Unprocessable Entity` (`deny_unknown_fields`) — note that axum 0.8 maps
+serde deserialization rejections to 422, and the response body is plain text,
+not the unified JSON error envelope.
+
+**Request:**
+```json
+{
+  "enabled": true,
+  "under_attack_mode": true,
+  "default_level": "managed",
+  "clearance_duration_secs": 1800,
+  "rate_threshold": 100,
+  "exempt_paths": ["/health", "/static/"],
+  "browser_integrity_check": true,
+  "tls_fingerprint_check": false
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `enabled` | Master switch for the challenge gate |
+| `under_attack_mode` | Show the under-attack banner; setting it to `true` also forces `enabled` to `true` |
+| `default_level` | `none`, `non_interactive`, `managed` or `interactive`; other values are rejected with `400` |
+| `clearance_duration_secs` | Clearance cookie lifetime, 60–86400 seconds |
+| `rate_threshold` | Requests per window before a challenge is issued, 1–10000000 |
+| `exempt_paths` | Bypass list; see validation rules below |
+| `browser_integrity_check` | Browser fingerprint heuristic |
+| `tls_fingerprint_check` | TLS fingerprint check |
+
+`exempt_paths` is an optional bypass list of path prefixes served without a
+challenge. Each entry must start with `/`, contain no whitespace or control
+characters, be at most 512 characters, and the list accepts at most 100
+entries — anything else is rejected with `400`. Entries are trimmed and blank
+entries are dropped. The challenge cookie signing secret is internal to the
+server and is not part of this API (the former `cookie_secret` field was
+removed; the database column is dropped by migration `000054`).
+
+---
+
+## Rewrite Rules
+
+### GET /sites/{site_id}/rewrite-rules
+
+List rewrite rules (paginated), ordered by `priority` then `name`.
+
+### POST /sites/{site_id}/rewrite-rules
+
+Create a rewrite rule.
+
+**Request:**
+```json
+{
+  "name": "Strip API prefix",
+  "direction": "request",
+  "condition_expr": "http.request.uri.path starts_with \"/api/\"",
+  "operations": [
+    { "type": "regex_replace_path", "name": "^/api/(.*)", "value": "/$1" }
+  ],
+  "priority": 10,
+  "enabled": true
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `name` | 1–200 characters |
+| `direction` | `request` (default) or `response` |
+| `condition_expr` | Optional Cloudflare-style condition expression (see the plugin doc `pingap-plugin/docs/rewrite.md`); omitted = always matches |
+| `operations` | Ordered JSON array of operations; every entry must carry a whitelisted `type` |
+| `priority` | Lower runs first |
+| `enabled` | Defaults to `true` |
+
+Operation types:
+
+| `type` | Fields | Direction | Effect |
+|---|---|---|---|
+| `set_header` / `add_header` | `name`, `value` | both | Set (replacing) or append a header |
+| `remove_header` | `name` | both | Remove a header |
+| `set_path` | `value` | request | Replace the whole forwarded path |
+| `regex_replace_path` | `name` = pattern, `value` = replacement | request | Rewrite the path via a regex (`$1` / `${name}` capture groups); **every match** is replaced |
+| `set_query_param` / `remove_query_param` | `name` (and `value` for set) | request | Set or remove a query-string parameter |
+| `replace_body` | `name` = search, `value` = replacement, plus `is_regex` / `greedy` below | response | Replace text inside the response body (requires buffering it) |
+
+`replace_body` extras (both optional): `is_regex` treats `name` as a regular
+expression — it must compile, or the API answers `400` — and `value` may
+reference `$1` / `${name}` capture groups; `greedy` (default `true`) replaces
+every match, `false` only the first occurrence. Save-time validation: pattern
+1–512 bytes, replacement at most 2048 bytes, and only the eight `type` values
+above are accepted — the protocol also carries `set_body` / `set_status_code`,
+but those are unpublished and refused with `400`. A `replace_body` operation on
+a **request** rule is also refused with `400` (body replacement only applies to
+the response), including when a PUT switches a rule's direction without
+replacing its operations.
+
+### PUT /sites/{site_id}/rewrite-rules/{rule_id}
+
+Update a rewrite rule; omitted fields keep their value. Validation is the same
+as on create.
+
+### DELETE /sites/{site_id}/rewrite-rules/{rule_id}
+
+Delete a rewrite rule.
+
+---
+
+## Error Pages
+
+A custom error page replaces the body of any response with a matching status
+code — including responses the edge itself produces (a WAF block, a rate limit,
+a paused site), not only ones that came from the origin. At most one page per
+`(scope, status_code)` combination, and the pages are global: every site is
+served the same templates. Administrators only, and edited from Settings in
+the dashboard.
+
+A write pushes the new templates to every registered agent's next configuration
+update, so no per-site publish is involved.
+
+### Scopes
+
+Every error page carries a `scope`:
+
+| Scope | Serves | Status codes |
+|-------|--------|--------------|
+| `site` (default) | Error responses of **matched** sites — WAF blocks, rate limits, paused sites, origin errors | 400–599 |
+| `unmatched_host` | Requests whose `Host` header matches **no** configured site, e.g. someone reaching the gateway by bare IP + port, or an unknown/expired hostname | 404, 421, 503 only (the dashboard defaults to 404) |
+
+The two scopes serve disjoint request paths, so a `site` 404 page and an
+`unmatched_host` 404 page can coexist; creating a second page with the same
+`(scope, status_code)` answers `409 conflict`.
+
+`site` pages render with `request_id`, `error_code`, `error_message`,
+`site_name`, `client_ip`, `timestamp`, `method`, `path` (aliased as
+`request_path`), `host` (aliased as `request_host`) and `user_agent`.
+`unmatched_host` pages render with only `{{ host }}` (HTML-escaped before it
+enters the template, so it is always safe to interpolate) and
+`{{ request_id }}` — no request header is ever reflected into the template.
+A template that fails to render (or renders past 256 KiB) falls back to a
+plain-text body, so a typo cannot turn an error page into a `500`. Fallback
+responses carry `Cache-Control: no-store`.
+
+The `unmatched_host` fallback is generated on the edge only when at least one
+**enabled** page of that scope exists: it is a host-less, `weight: 0`
+catch-all location appended after every site location, so a host that does
+match a site still resolves to that site's location and is never affected.
+With no `unmatched_host` page configured the edge keeps its plain default 404.
+
+### GET /error-pages
+
+List custom error pages (paginated), ordered by scope, then status code.
+Optional `?scope=site|unmatched_host` filters by scope.
+
+### POST /error-pages
+
+Create a custom error page.
+
+**Request:**
+```json
+{
+  "status_code": 403,
+  "scope": "site",
+  "name": "Access denied",
+  "content_type": "text/html",
+  "body_template": "<html><body><h1>Access Denied</h1><p>{{ request_id }}</p></body></html>",
+  "enabled": true
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `status_code` | 400-599; for `unmatched_host` only 404, 421, 503 (otherwise `400 bad_request`) |
+| `scope` | `site` (default) or `unmatched_host`; anything else answers `400` |
+| `name` | 1-200 characters |
+| `content_type` | Defaults to `text/html` |
+| `body_template` | Tera template, must not be empty |
+| `enabled` | Defaults to `true`; a disabled page is skipped |
+
+Duplicate `(scope, status_code)` answers `409 conflict` (message:
+`an error page for scope '<scope>' and status <code> already exists`).
+
+### PUT /error-pages/{page_id}
+
+Update an error page; omitted fields keep their value. If `scope` or
+`status_code` changes, the new combination is validated as on create (an
+`unmatched_host` page keeps the 404/421/503 restriction), and a duplicate
+combination answers `409`.
+
+### DELETE /error-pages/{page_id}
+
+Delete an error page.
+
+---
+
+## Settings
+
+> **Control-plane-local settings.** The endpoints below take effect only in
+> the control-plane process itself; they are **not** pushed to agents and do
+> not appear in the rule bundle: `PUT /settings/elasticsearch` (a saved change
+> needs a control-plane restart to apply — the response's `requires_restart`
+> flag reports this), `GET/PUT /settings/api-protection` (the 9080
+> self-protection policy is rebuilt in-process), `GET/PUT /settings/ai`,
+> `GET/PUT /login-security` and the `/notifications/*` endpoints. In a
+> multi-instance deployment each instance must be configured separately.
+
+### GET /settings/elasticsearch
+
+Get Elasticsearch configuration.
+
+### PUT /settings/elasticsearch
+
+Update Elasticsearch settings.
+
+**Request:**
+```json
+{
+  "enabled": true,
+  "urls": ["http://elasticsearch:9200"],
+  "index_prefix": "wafred",
+  "username": "elastic",
+  "password": "secret",
+  "max_body_size": 8192
+}
+```
+
+### POST /settings/elasticsearch/test
+
+Test Elasticsearch connectivity.
+
+**Response (200):**
+```json
+{
+  "success": true,
+  "message": "Connected to Elasticsearch 8.12.0"
+}
+```
+
+### GET /settings/log-retention
+
+How long the PostgreSQL log tables are kept, in days, plus the deployment-wide
+static-asset access-log filter. Administrators only. The row is created with
+the default `180` days on first read.
+
+**Response (200):**
+```json
+{
+  "id": 1,
+  "access_log_retention_days": 180,
+  "security_event_retention_days": 180,
+  "skip_static_access_logs": true,
+  "static_suffixes": ["css", "js", "mjs", "map", "png", "jpg", "jpeg",
+                      "gif", "webp", "avif", "svg", "ico", "bmp", "woff",
+                      "woff2", "ttf", "otf", "eot"],
+  "updated_at": "2026-10-31T00:00:00Z"
+}
+```
+
+The filter fields: `skip_static_access_logs` (default `true`) drops access-log
+rows for requests whose path ends in one of `static_suffixes` **and** that
+triggered no security rule. Requests that did trigger a rule are always logged,
+and `security_events` is never filtered. Matching is by path suffix only, and
+the setting is global (not per site). The filter is fail-open: an agent that
+has not received `log_settings` in its rule bundle — an agent older than the
+field, or a control-plane read failure — never skips logging.
+
+### PUT /settings/log-retention
+
+Update the retention windows and/or the static-asset filter. Administrators
+only. At least one field is required; a body with none is rejected with `400`.
+Each `*_retention_days` value must be between `1` and `3650` days.
+
+**Request:**
+```json
+{
+  "access_log_retention_days": 90,
+  "security_event_retention_days": 365,
+  "skip_static_access_logs": true,
+  "static_suffixes": ["png", "jpg", "css", "js"]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `access_log_retention_days` / `security_event_retention_days` | Omitted = keep current value |
+| `skip_static_access_logs` | Omitted = keep current value |
+| `static_suffixes` | Omitted = keep the current list; a present array **replaces** it (an empty array clears it — with the switch on, nothing is then skipped) |
+
+Suffix entries are validated server-side before the row is touched: each is
+trimmed, one leading `.` is stripped, lowercased and deduplicated (order
+preserved); every entry must end up as 1–10 lowercase letters or digits, and
+the list accepts at most 64 entries — anything else is a `400` naming the
+first offending entry.
+
+A saved change is pushed to every registered agent's next configuration
+update immediately (each site's bundle carries the filter), so no restart and
+no manual sync is involved. A background sweep runs shortly after startup and
+then every six hours, so retention changes take effect without a restart. The
+optional `site_id` on `DELETE /logs/purge` still narrows a manual purge; these
+settings configure the automatic sweeps only. Elasticsearch archives are
+governed separately: the ILM policy deletes indices after a fixed 360 days.
+
+### GET /settings/defense
+
+Global defense switches, stored as a single row. Administrators only.
+Today that is observation mode: with it **on**, the data plane keeps every
+detection running (WAF, IP and geo rules, bot protection, rate limiting) but
+only records what it would have blocked — nothing is blocked, challenged or
+rate-limited. Access control is never downgraded: mTLS, basic auth and a
+paused site still take effect.
+
+**Response (200):**
+```json
+{
+  "id": 1,
+  "observation_mode": false,
+  "updated_at": "2026-10-03T00:00:00Z"
+}
+```
+
+The row is created with `observation_mode: false` on first read.
+
+### PUT /settings/defense
+
+Set observation mode. Administrators only. The flag rides inside every rule
+bundle, so a change marks all site configurations as changed and pushes fresh
+bundles to the agents right away — no restart, no manual sync.
+
+**Request:**
+```json
+{
+  "observation_mode": true
+}
+```
+
+`observation_mode` is required; a body without it is rejected with `400`.
+A change made directly in the database — e.g. by the
+`wafred mode observe` CLI on the server — is picked up and pushed by a
+background watcher within about 15 seconds.
+
+**Response (200):** the updated row, same shape as `GET`.
+
+### GET /settings/origin
+
+The deployment-wide default for validating an HTTPS origin's certificate,
+stored as a single row. Administrators only. It applies to every origin pool
+that does not state a `verify_cert` of its own, so one self-signed origin can
+opt out without weakening the rest of the deployment.
+
+With `verify_cert` **off** (the value the console writes by default) the data
+plane accepts any origin certificate — including one it cannot chain to a
+trust store. That is what self-signed and internal-PKI origins need, and it
+keeps an existing deployment serving across an upgrade; it is not recommended
+for origins that present a publicly trusted certificate. Set it to `true` to
+require a chain that validates against the system trust store or the pool's
+own `ca`.
+
+**Response (200):**
+```json
+{
+  "id": 1,
+  "verify_cert": false,
+  "updated_at": "2026-10-13T00:00:00Z"
+}
+```
+
+The row is created with `verify_cert: false` on first read. A failed read
+degrades to that same lenient value rather than failing, because the check is
+a per-request data-plane decision and failing it closed would turn a
+transient database problem into a `502` for every HTTPS origin.
+
+### PUT /settings/origin
+
+Set the global origin certificate check. Administrators only. The value rides
+inside every rule bundle, so a change marks all site configurations as changed
+and pushes fresh bundles to the agents right away — no restart, no per-pool
+edit.
+
+**Request:**
+```json
+{
+  "verify_cert": true
+}
+```
+
+`verify_cert` is required; a body without it is rejected with `400`.
+
+**Response (200):** the updated row, same shape as `GET`.
+
+### GET /settings/api-protection
+
+The 9080 listener's self-protection: its own access log, IP allowlist and
+WAF. Administrators only. The row is created on first read with the defaults
+shown below.
+
+**Response (200):**
+```json
+{
+  "id": 1,
+  "access_log_enabled": true,
+  "access_log_retention_days": 30,
+  "ip_allowlist_enabled": false,
+  "ip_allowlist_ranges": [],
+  "ip_allowlist_group_id": null,
+  "waf_enabled": false,
+  "waf_mode": "block",
+  "trust_proxy_headers": false,
+  "trusted_header": "x-forwarded-for",
+  "trust_last_hop": true,
+  "trusted_proxy_ranges": [],
+  "updated_at": "2026-10-03T00:00:00Z",
+  "effective_allowlist_entries": 0
+}
+```
+
+`effective_allowlist_entries` is what the allowlist resolves to right now:
+the inline ranges plus the ranges of the referenced group (a disabled group
+contributes nothing); `0` while the allowlist is switched off.
+
+While a guard is on, a request it refuses never reaches the API: the
+allowlist answers `403` with error code `ip_not_allowed`, the WAF answers
+`403 blocked_by_waf` (or `413 request_body_too_large` for a body above the
+inspection limit), and either refusal is recorded in
+`GET /logs/control-plane`.
+
+### PUT /settings/api-protection
+
+Update any subset of the settings. Administrators only. Every field is
+optional — omitted fields keep their current value, so a JSON body may hold
+just the one switch being changed. A successful write rebuilds the
+in-process policy before responding, so the change applies to the next 9080
+request.
+
+**Request:**
+```json
+{
+  "access_log_enabled": true,
+  "access_log_retention_days": 30,
+  "ip_allowlist_enabled": true,
+  "ip_allowlist_ranges": ["203.0.113.4", "10.0.0.0/8"],
+  "ip_allowlist_group_id": "uuid",
+  "waf_enabled": true,
+  "waf_mode": "monitor",
+  "trust_proxy_headers": true,
+  "trusted_header": "x-forwarded-for",
+  "trust_last_hop": true,
+  "trusted_proxy_ranges": ["10.0.0.0/8"],
+  "force": false
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `access_log_enabled` | bool | Record one row per 9080 request (see `GET /logs/control-plane`). |
+| `access_log_retention_days` | int | Retention window for that log, 1-3650 days. |
+| `ip_allowlist_enabled` | bool | Restrict the API to the allowlist below. |
+| `ip_allowlist_ranges` | string[] | Addresses and CIDRs; blanks are dropped, each entry must parse. |
+| `ip_allowlist_group_id` | string | Reference an `ip_groups` row; `""` clears the reference; omit or `null` to keep it. |
+| `waf_enabled` | bool | Inspect API requests with the embedded WAF engine. |
+| `waf_mode` | string | `block` or `monitor`; monitor only records matches (they show up as `observed_waf`). |
+| `trust_proxy_headers` | bool | Use `trusted_header` for the access-log/WAF client IP when the TCP peer is in `trusted_proxy_ranges`. |
+| `trusted_header` | string | Lower-case forwarded header name, max 64 ASCII characters. Default `x-forwarded-for`. |
+| `trust_last_hop` | bool | Read the last header value (nearest proxy) instead of the first. |
+| `trusted_proxy_ranges` | string[] | Addresses/CIDRs allowed to supply the forwarded header; empty trusts no peer. |
+| `force` | bool | Apply a change the lockout guard below would refuse. |
+
+Validation failures return `400`: an unparsable allowlist entry, a retention
+outside 1-3650 days, an unknown `ip_groups` reference, or a `waf_mode` other
+than `block` / `monitor`.
+
+**Lockout guard.** A write that leaves the allowlist enabled without covering
+the connection sending it is refused with `422`, because it would lock the
+operator out of the console they are using:
+
+```json
+{
+  "error": {
+    "code": "unprocessable_entity",
+    "message": "the new allowlist does not include your address (203.0.113.7); add it first, or send force=true to apply anyway"
+  }
+}
+```
+
+Add the address (or retry with `force: true`) to apply it anyway. The
+`wafred security allowlist off` CLI on the server is the escape hatch when
+HTTP access is already gone.
+
+**Response (200):** the same view as `GET`.
+
+### GET /settings/cache
+
+Deployment-wide cache ceiling: the largest single cacheable object, the total
+disk budget every site's quota is clamped against, the cache master switch and
+the fallback edge TTL for rules without an explicit TTL. Administrators only.
+Unlike the other settings in this chapter these values **are** pushed to the
+agents — they ride inside every site's rule bundle.
+
+**Response (200):**
+```json
+{
+  "id": 1,
+  "max_file_size_mb": 16,
+  "max_space_mb": 10240,
+  "master_enabled": true,
+  "default_edge_ttl_seconds": 0,
+  "updated_at": "2024-01-01T00:00:00Z"
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `max_file_size_mb` | Largest single cacheable object, in MiB; site-level single-file caps are clamped against it. |
+| `max_space_mb` | Total disk budget, in MiB; `0` = unlimited. |
+| `master_enabled` | Cache master switch. |
+| `default_edge_ttl_seconds` | Fallback edge TTL in seconds for rules without an explicit TTL; `0` = no fallback. |
+
+### PUT /settings/cache
+
+Partial update: every field is optional, but at least one must be present —
+an empty body is rejected with `400`.
+
+| Field | Range |
+|-------|-------|
+| `max_file_size_mb` | 1-1024 MiB |
+| `max_space_mb` | 0-1048576 MiB (`0` = unlimited) |
+| `master_enabled` | bool |
+| `default_edge_ttl_seconds` | 0-2592000 seconds (30 days; `0` = no fallback) |
+
+Lowering `max_file_size_mb` below a value some site has pinned explicitly is
+refused with `400` — raise those site limits first
+([PUT /sites/{site_id}/cache-settings](#put-sitessite_idcache-settings)). A
+successful write pushes the new configuration to every agent immediately
+(each site's rule-bundle fingerprint changes).
+
+**Response (200):** the updated row (same shape as `GET`).
+
+### GET /settings/passkeys
+
+The effective passkey master switch. Administrators only.
+
+**Response (200):**
+```json
+{
+  "enabled": true
+}
+```
+
+`enabled` is the stored runtime switch when one exists, otherwise the
+`passkey_enabled` boot configuration.
+
+### PUT /settings/passkeys
+
+Persist the runtime master switch. Takes effect immediately: the next passkey
+ceremony entry point re-reads the switch, so disabling locks out new
+registrations and passkey logins without a restart (already-bound credentials
+are kept for re-enabling).
+
+**Request:**
+```json
+{
+  "enabled": false
+}
+```
+
+**Response (200):** the same `{"enabled": …}` view as `GET`.
+
+---
+
+## Login Security
+
+Anomalous-login detection for console accounts, the GeoIP database it
+geolocates with, and the login audit trail. Every successful login is recorded
+in `login_history` with the resolved client IP and — best effort — its
+geolocation; password logins are compared against the countries of the
+account's most recent resolved logins, and a country outside that baseline
+raises an `auth.login_anomaly` alert (passkey logins are recorded but never
+judged). All four endpoints require the `admin` role. The settings are
+control-plane-local (see the note at the top of [Settings](#settings)).
+
+### GET /login-security
+
+**Response (200):**
+```json
+{
+  "anomaly_enabled": false,
+  "baseline_count": 3,
+  "trusted_header": null,
+  "trust_last_hop": false,
+  "online_geo_url": "http://ip-api.com/json/{ip}?fields=status,country,countryCode,regionName,city",
+  "geoip_local_enabled": false
+}
+```
+
+`trusted_header` is the forwarding header trusted for the client IP
+(`null` keeps the TCP peer address, which a proxy would mask);
+`trust_last_hop` reads the last header value (the one the closest proxy
+appended) instead of the first; `online_geo_url` is a geo API template in
+which `{ip}` is replaced with the looked-up address (`countryCode` in the
+response is required, region/city optional); `geoip_local_enabled` prefers
+the uploaded mmdb (see below) over the online API.
+
+### PUT /login-security
+
+Partial update: omitted fields keep their value.
+
+| Field | Behaviour |
+|-------|-----------|
+| `anomaly_enabled` | Run the country-baseline check on password logins; history is recorded regardless. |
+| `baseline_count` | How many recent resolved logins form the baseline (default 3). |
+| `trusted_header` | Header name, trimmed and lower-cased; an empty string clears it. |
+| `trust_last_hop` | See above. |
+| `online_geo_url` | Trimmed. Hosts that resolve to loopback, unspecified, private, link-local (including the cloud metadata endpoint `169.254.169.254`), CGNAT or broadcast addresses — or internal names like `localhost` — are refused with `400` before anything is stored, so an SSRF attempt never reaches a persisted row. |
+| `geoip_local_enabled` | See above. |
+
+**Errors:** `400` for a rejected geo URL or a failing settings validation.
+
+### POST /login-security/geoip
+
+Upload a MaxMind-format mmdb database for local geolocation. The body is
+`multipart/form-data` with one field named `file`; this route raises the
+request-body limit to 128 MiB (the global 10 MiB API cap does not apply
+here).
+
+The upload is validated by opening it **before** it replaces the previous
+database, so a corrupt upload keeps the old file; the stored file gets `0600`
+permissions.
+
+**Response (200):**
+```json
+{
+  "uploaded": true,
+  "bytes": 65242112
+}
+```
+
+**Errors:** `400` when the `file` field is missing, the upload is empty, or
+the payload is not a valid mmdb.
+
+### GET /login-history
+
+The login audit trail, newest first. Administrators only.
+
+**Query Parameters:**
+| Param | Type | Description |
+|-------|------|-------------|
+| `limit` | int | Page size (default: 100, clamped to 1-500) |
+| `offset` | int | Rows to skip (default: 0; values above 100000 are clamped — page deeper by narrowing the filter instead) |
+| `email` | string | Exact-match filter on the account email |
+
+**Response (200):** an array of history rows:
+```json
+[
+  {
+    "id": "uuid",
+    "user_id": "uuid",
+    "email": "ops@example.com",
+    "ip": "203.0.113.7",
+    "user_agent": "Mozilla/5.0 …",
+    "country_code": "US",
+    "region": "California",
+    "city": "Mountain View",
+    "geo_source": "local",
+    "created_at": "2024-01-01T00:00:00Z"
+  }
+]
+```
+
+`geo_source` is `local` (the uploaded mmdb), `online` (the geo API),
+`private` (a non-routable address) or `unknown`.
+
+---
+
+## Configuration versions
+
+Every configuration push records a version of the rows it changed — per site,
+or deployment-wide for the global settings. The console's **Config versions**
+page is built on the three endpoints below; all of them are administrators
+only.
+
+### GET /config-versions
+
+List versions, newest first, without their snapshot payloads.
+
+| Query | Meaning |
+| --- | --- |
+| `site_id` | A site UUID, `global` for the shared settings, or `deployment` for the full restorable deployment. Omit for all scopes. Anything else is a `400`. |
+| `limit` | Rows to return, default `50`, clamped to `1..=200`. |
+| `offset` | Rows to skip, default `0`. |
+
+**Response (200):**
+```json
+[
+  {
+    "id": 412,
+    "site_id": "3f5c…",
+    "site_domain": "example.com",
+    "config_hash": "…",
+    "source": "api",
+    "actor": "admin@example.com",
+    "summary": { "sites": 1, "site_rules": 12 },
+    "created_at": "2026-10-13T09:31:02Z"
+  }
+]
+```
+
+`site_id` is `null` for a global version, and `site_domain` is resolved for
+display. `summary` holds the per-table row counts captured with the version,
+which is what the console diffs against the previous version.
+
+### GET /config-versions/{version_id}
+
+The full snapshot, including the row payloads. Returns `404` when the version
+does not exist.
+
+### POST /config-versions/{version_id}/rollback
+
+Restore a snapshot. The rows are rewritten inside a transaction, then the
+restored configuration is pushed to the agents like any other change — a site
+version through its own bundle, a global version through all of them. The
+rollback is itself recorded as a new version attributed to the operator, so
+rolling back a rollback works and the history stays linear.
+
+**Response (200):**
+```json
+{
+  "restored_version": 412,
+  "new_version": 418,
+  "scope": "3f5c…"
+}
+```
+
+`scope` is `"global"` for shared settings, `"deployment"` for a full-deployment rollback, otherwise the site UUID. The live state is archived before a rollback is applied. Secret fields in the detail response are sanitized, including snapshots recorded before that rule existed.
+
+The same history is reachable from a shell — `wafred config history|show|rollback` — but that path writes straight to PostgreSQL and does not notify a running control plane; see [deployment.md → Maintenance CLI](./deployment.md#maintenance-cli-break-glass).
+
+### POST /config-versions/prune
+
+Immediately applies retention to every scope: versions older than 30 days are deleted and only the newest 50 rows are kept per `(scope, site_id)` partition. The same policy also runs at startup and once per day, including scopes that have not changed recently.
+
+**Response (200):** `{ "deleted": 12, "cutoff": "2026-09-25T00:00:00Z" }`.
+
+---
+
+## Configuration backups
+
+Administrators only. A backup is a self-contained JSON envelope whose manifest and payload contain a complete deployment, global or site snapshot. Secrets are protected by an operator-supplied password (minimum 12 characters) using Argon2id and AES-256-GCM, compressed with zstd and verified with SHA-256 checksums. Remote targets receive only this encrypted envelope; passwords are never stored or logged.
+
+The restorable catalogue covers 38 tables: site policy, shared resources, OIDC providers and visitors, visitor grants and passkeys, notifications, AI, cache, certificates and approved instance settings. Console users, console API keys and passkeys, agent state, logs, temporary authentication state, environment variables and local GeoIP files are excluded. `instance_settings.jwt_secret` is always excluded. Instance-sealed AI and notification credentials are opened before encryption and re-sealed with the current instance key on restore.
+
+### GET /config-backup-targets
+
+List targets, ordered by name. Credentials never leave the server:
+`access_key_id`, `secret_access_key` and `token` are stripped from `config`
+and replaced by a single `has_credentials` boolean.
+
+**Response (200):**
+```json
+[ { "id": "uuid", "kind": "s3", "name": "offsite-s3",
+    "config": { "endpoint": "http://127.0.0.1:9000", "bucket": "backups",
+                "prefix": "prod", "path_style": true,
+                "has_credentials": true },
+    "enabled": true, "created_at": "2026-10-01T00:00:00Z",
+    "updated_at": "2026-10-01T00:00:00Z" } ]
+```
+
+### POST /config-backup-targets
+
+Create an `s3` or `github` target (anything else is `400 bad_request`).
+`s3` accepts a custom `endpoint` (absolute http(s), no query string),
+`region`, `bucket`, `prefix` and `path_style` (default `true`); `github`
+accepts `repository`, `branch` (default `main`), `prefix` (default
+`config-backups`), API URL and `token`. `name` is trimmed 1–128 characters
+and `enabled` defaults to `true`; both validated with `400`.
+
+Credential fields (`secret_access_key`, `token`) require `WAFRED_SECRET_KEY`
+and are sealed before storage; without the key the request is refused with
+`400` rather than stored in clear text.
+
+**Request:**
+```json
+{
+  "kind": "s3",
+  "name": "offsite-s3",
+  "config": {
+    "endpoint": "http://127.0.0.1:9000",
+    "bucket": "backups",
+    "prefix": "prod",
+    "path_style": true,
+    "access_key_id": "key-id",
+    "secret_access_key": "secret"
+  },
+  "enabled": true
+}
+```
+
+**Response (200):** the masked view shown under `GET`.
+
+### PUT /config-backup-targets/{target_id}
+
+Rename, update config or enable/disable; omitted fields keep their value.
+`config`, when present, is merged shallowly into the stored one: absent
+secret fields keep their stored values, explicit empty strings clear them
+(and target validation may then reject the result). The response is the same
+masked view as `GET`.
+
+### DELETE /config-backup-targets/{target_id}
+
+Delete a target without deleting backup history. Returns
+`{ "deleted": true }` — a nonexistent id is not an error here.
+
+### POST /config-backup-targets/{target_id}/test
+
+Test the bucket or repository connection with the stored credentials.
+`{"ok": true}` on success; a failure — unknown target, unreachable bucket,
+rejected credentials — is `400 bad_request` carrying the error (e.g.
+`… failed with HTTP 403`).
+
+### GET /config-backups
+
+List the newest 100 backup records, newest first, metadata only: `size_bytes`
+is `octet_length(payload)`, the ciphertext is never returned.
+
+**Response (200):**
+```json
+[ { "id": "uuid", "scope": "deployment", "site_id": null,
+    "target_id": null, "status": "completed",
+    "file_name": "config-backup-….json", "manifest": { "…": "…" },
+    "checksum": "3b1a…", "error": "", "actor": "admin@example.com",
+    "size_bytes": 48213, "created_at": "2026-10-13T09:31:02Z",
+    "completed_at": "2026-10-13T09:31:10Z" } ]
+```
+
+`status` is `created`, `uploading`, `completed` or `failed`; `error` carries
+an upload failure message; `site_id`, `target_id` and `completed_at` are
+`null` where not applicable.
+
+### POST /config-backups
+
+Create an encrypted backup. Body:
+`{ "scope": "deployment", "password": "…", "target_id": "optional-uuid" }`.
+`scope` (default `deployment`) may also be `global`, or `site` with the
+required `site_id`; anything else answers `400`. `password` must be at least
+12 characters (`400` otherwise). With `target_id` the target must exist and
+be enabled — the record starts as `created` and the upload is enqueued —
+otherwise the backup is `completed` immediately.
+
+**Response (200):** the record shape shown under
+`GET /config-backups/{backup_id}`.
+
+### GET /config-backups/{backup_id}
+
+Backup metadata, including the full manifest. Note that the whole backup
+path answers operational failures — a nonexistent target or backup id, a bad
+password, a checksum mismatch, a disabled target — with `400 bad_request`,
+not `404`.
+
+### GET /config-backups/{backup_id}/download
+
+The original encrypted envelope, suitable for a later upload: served as
+`application/json` with `Content-Disposition: attachment` (the stored file
+name) and `nosniff`.
+
+### POST /config-backups/upload
+
+Multipart upload (`file`, `password`, `scope`, optional `site_id`; the body
+is capped at 32 MiB) of an envelope produced here or elsewhere. The envelope
+is decrypted, its manifest checked and a restore dry-run prepared **before**
+anything is recorded, so a rejected upload — unsupported algorithm, excessive
+KDF costs, invalid scope, wrong password, mismatched checksum — leaves no
+backup record behind. Success stores the record (status `created`, file name
+sanitized to alphanumerics, `-`, `_` and `.`, at most 128 characters,
+`uploaded-backup.pwb.json` when nothing survives) and returns it with the
+dry-run preview:
+
+**Response (200):**
+```json
+{ "backup": { "id": "uuid", "status": "created", "…": "…" },
+  "preview": { "…": "…" } }
+```
+
+### POST /config-backups/{backup_id}/upload
+
+Upload an existing backup to `{ "target_id": "uuid" }` through a bounded
+background task (at most two concurrent uploads, an expiring lease — stale
+leases are reset at startup so a crash cannot wedge a record in `uploading`
+forever). The state transition is atomic: a backup already uploading or a
+full queue answers `400`, as do a missing or disabled target. Success returns
+`{ "status": "uploading" }`; the outcome lands in the record's `status` and
+`error`.
+
+### POST /config-backups/{backup_id}/preview
+
+`{ "password": "…" }`; decrypts the stored envelope and repeats the dry-run
+against the current state. Failures (unknown backup, wrong password) are
+`400`.
+
+### POST /config-backups/{backup_id}/restore
+
+`{ "password": "…" }`; creates a pre-restore encrypted backup and applies the
+replacement in the same serializable transaction. Any failure — including a
+concurrent edit, which surfaces as a serialization failure and a clean
+rollback — leaves no restored rows and no pre-restore record.
+
+**Response (200):**
+```json
+{
+  "restored": true,
+  "pre_restore_backup_id": "uuid",
+  "new_version": 418,
+  "warnings": []
+}
+```
+
+On success, affected agents are notified (including empty bundles) and
+notifications, API protection and TLS are refreshed where possible;
+post-commit refresh failures are returned as `warnings`, not misreported as a
+failed restore. `new_version` may be `null` when the history row could not be
+recorded — the restore itself still succeeded. The preview (from the upload
+or the `preview` endpoint) reports before/after counts, additions, removals,
+changes, owner mappings and warnings.
+
+A deployment restore requires a complete schema-2 snapshot. Missing tables are rejected, while an explicitly empty table means an empty configuration. Site ownership is restored when the original owner exists, otherwise the requesting administrator is used as the explicit default owner. Uploads claiming an unsupported algorithm, excessive KDF costs, an invalid scope, a wrong password or a mismatched checksum are refused.
+
+---
+
+## Control-plane certificate
+
+The certificate the dashboard and REST API are served with. Administrators
+only: the private key never leaves the server and no endpoint returns it.
+
+A self-signed pair (EC P-256, `CN=WAFred Control Plane`) is generated on first
+boot when TLS is enabled and nothing has been stored yet. Replacing it takes
+effect immediately — the listener swaps the pair in place, so no restart is
+needed. Passkeys require a secure origin, which is the reason this exists.
+
+### GET /system/tls
+
+Current status, including the active certificate's metadata.
+
+**Response (200):**
+```json
+{
+  "enabled": true,
+  "has_certificate": true,
+  "certificate": {
+    "id": "uuid",
+    "source": "self_signed",
+    "subject_dn": "CN=WAFred Control Plane",
+    "common_name": "WAFred Control Plane",
+    "sans": ["localhost", "127.0.0.1", "waf.example.com"],
+    "serial": "1f0c…",
+    "fingerprint_sha256": "3b1a…",
+    "not_before": "2026-09-30T00:00:00Z",
+    "not_after": "2028-12-30T00:00:00Z",
+    "created_at": "2026-09-30T00:00:00Z",
+    "expires_in_days": 821
+  },
+  "default_sans": ["localhost", "127.0.0.1", "waf.example.com"],
+  "max_validity_days": 3650
+}
+```
+
+`enabled` mirrors `tls_enabled`; `has_certificate` reports whether the running
+listener holds a usable pair. `certificate` is omitted when nothing is stored.
+
+### GET /system/tls/certificate
+
+Download the certificate in use (PEM, chain included) as
+`application/x-pem-file`. Handy for pinning or for installing the self-signed
+pair into a trust store.
+
+### PUT /system/tls/certificate
+
+Upload a certificate and its private key. The pair is validated before anything
+is written: a mismatched key or an unparsable chain returns `400` and the
+running listener keeps serving the previous certificate.
+
+**Request:**
+```json
+{
+  "cert_pem": "-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----\n",
+  "key_pem": "-----BEGIN PRIVATE KEY-----\n…\n-----END PRIVATE KEY-----\n"
+}
+```
+
+`cert_pem` carries the leaf first, then intermediates when the issuer is not a
+root. `key_pem` accepts PKCS#8, PKCS#1 or SEC1 (`RSA`, `EC` and `PKCS8`
+begin-lines are all understood).
+
+**Response (200):** the same shape as `GET /system/tls`.
+
+### POST /system/tls/certificate/self-signed
+
+Generate and install a fresh self-signed certificate.
+
+**Request** (every field optional):
+```json
+{
+  "common_name": "WAFred Control Plane",
+  "sans": ["waf.example.com", "10.0.0.5"],
+  "validity_days": 825
+}
+```
+
+Defaults: the configured console common name, the deployment's alternative
+names (configured `tls_sans` plus the host name, the passkey relying party,
+`localhost` and `127.0.0.1`, and the host the request arrived on), and 825 days
+(capped at `max_validity_days`, 3650).
+
+**Response (200):** the same shape as `GET /system/tls`.
+
+---
+
+## AI assistant
+
+The built-in assistant behind the console's **AI Assistant** page. A turn runs
+an OpenAI-compatible chat-completions loop (streaming when the provider
+supports it) and hands the model the same tool registry that backs the
+[MCP server](#mcp-server), so it can inspect sites, agents, certificates,
+traffic and logs — and, when allowed, change sites.
+
+Every endpoint in this section is administrators only: one provider key is
+shared across the fleet and the tools reach every site.
+
+### GET /settings/ai
+
+The assistant's configuration, stored as a single row. The row is created with
+the defaults shown below on first read.
+
+**Response (200):**
+```json
+{
+  "enabled": false,
+  "base_url": "https://api.openai.com/v1",
+  "api_key": "",
+  "model": "gpt-4o-mini",
+  "system_prompt": "You are the built-in assistant of WAFred, a reverse-proxy and web application firewall console. …",
+  "temperature": 0.2,
+  "max_tool_rounds": 5,
+  "allow_write_tools": false,
+  "updated_at": "2026-10-03T00:00:00Z"
+}
+```
+
+`api_key` is `***` when a key is stored and empty when none is; the stored key
+is never returned. `system_prompt` is the prompt in effect: the saved override,
+or the full built-in default (shown abbreviated above) when no override is
+stored.
+
+### PUT /settings/ai
+
+Update any subset of the settings; omitted fields keep their stored value.
+`api_key` follows the secret round-trip: omitted or `null` keeps the stored
+key, `***` keeps it too (what the dashboard sends when the field was left
+untouched), and `""` clears it. Enabling the assistant requires a `base_url`
+(http or https), a `model` and a key; an incomplete configuration is refused
+with `400`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `enabled` | bool | Master switch. While off, chat turns are refused with `409`. |
+| `base_url` | string | OpenAI-compatible API root, at most 500 characters. |
+| `api_key` | string | Provider key; see the round-trip rules above. |
+| `model` | string | Model name, at most 200 characters. |
+| `system_prompt` | string | Overrides the built-in prompt; `""` clears the override so the default applies again. |
+| `temperature` | number | 0–2. |
+| `max_tool_rounds` | int | Tool-calling rounds per answer, 1–10. |
+| `allow_write_tools` | bool | Let the assistant call the site-mutating tools. |
+
+**Response (200):** the same view as `GET`.
+
+### POST /settings/ai/test
+
+Probe a provider. The JSON body may hold any subset of the fields above;
+absent fields fall back to the stored row, and the probe runs with `enabled`
+forced on, so a draft can be tested before it is saved. The model is asked for
+a one-word reply.
+
+**Response (200):**
+```json
+{
+  "ok": true,
+  "model": "gpt-4o-mini",
+  "reply": "ok",
+  "error": null
+}
+```
+
+A reachable provider that answers with an error still returns `200` with
+`ok: false` and the provider's message in `error`; only an unusable
+configuration (missing URL or model) is a `400`.
+
+### GET /ai/conversations
+
+List conversations, newest first. Supports the standard pagination query
+(`page`, `page_size`).
+
+**Response (200):**
+```json
+{
+  "items": [
+    {
+      "id": "uuid",
+      "title": "Why is example.com returning 502s?",
+      "created_at": "2026-10-03T00:00:00Z",
+      "updated_at": "2026-10-03T00:05:00Z"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "page_size": 20
+}
+```
+
+The `title` is derived from the first message (first line, 60 characters,
+ellipsised) and stays empty until the first message is sent.
+
+### POST /ai/conversations
+
+Create an empty conversation. `title` is optional (at most 200 characters) and
+usually left out — the first message names the conversation.
+
+**Response (201):** the conversation summary.
+
+### GET /ai/conversations/{conversation_id}
+
+One conversation with its messages, oldest first, capped at the most recent
+500. `404` for an unknown id.
+
+**Response (200):**
+```json
+{
+  "id": "uuid",
+  "title": "Why is example.com returning 502s?",
+  "created_at": "2026-10-03T00:00:00Z",
+  "updated_at": "2026-10-03T00:05:00Z",
+  "messages": [
+    { "id": "uuid", "role": "user", "content": "…", "created_at": "…" },
+    {
+      "id": "uuid",
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "type": "function",
+          "function": {
+            "name": "query_access_logs",
+            "arguments": "{\"status_class\":5}"
+          }
+        }
+      ],
+      "created_at": "…"
+    },
+    {
+      "id": "uuid",
+      "role": "tool",
+      "content": "{\"rows\":[…]}",
+      "tool_call_id": "call_1",
+      "tool_name": "query_access_logs",
+      "created_at": "…"
+    }
+  ]
+}
+```
+
+`tool_calls` appears on assistant messages only, and `tool_call_id` /
+`tool_name` on tool messages only.
+
+### DELETE /ai/conversations/{conversation_id}
+
+Delete a conversation and its messages (cascade). **Response:** `204`.
+
+### POST /ai/conversations/{conversation_id}/messages
+
+Run one turn: the message is stored, then the model may call tools (at most
+`max_tool_rounds` rounds) before it answers.
+
+**Request:**
+```json
+{ "content": "Which sites returned 5xx in the last hour?" }
+```
+
+With `Accept: text/event-stream` the response is an SSE stream of JSON events,
+one `data:` line per event:
+
+| Event | Payload | Meaning |
+|-------|---------|---------|
+| `conversation` | `{"id","title"}` | Sent first when the first message names the conversation. |
+| `delta` | `{"text"}` | Incremental assistant text. |
+| `tool_call` | `{"id","name","arguments"}` | The model requested a tool call. |
+| `tool_result` | `{"id","name","result","is_error"}` | The tool answered; `result` is its raw JSON. |
+| `done` | `{"content"}` | The turn finished; `content` is the final answer. |
+| `error` | `{"message"}` | The turn failed; the message is safe to display. |
+
+Without that header the same events are folded into one buffered JSON
+response once the turn completes:
+
+```json
+{
+  "conversation_id": "uuid",
+  "content": "The final answer…",
+  "tool_calls": [
+    { "id": "call_1", "name": "query_access_logs", "arguments": {}, "result": {}, "is_error": false }
+  ]
+}
+```
+
+Errors: `400` for an empty or oversized message (8 000 characters), `404` for
+an unknown conversation, `409` when the assistant is disabled or its provider
+configuration is incomplete. A failure during the turn arrives as an `error`
+event in SSE mode and as `502 Bad Gateway` in buffered mode.
+
+## MCP server
+
+The control plane hosts an MCP (Model Context Protocol) endpoint at `/mcp` —
+note the path hangs off the root of the TLS listener, not under `/api/v1`. It
+speaks MCP over **Streamable HTTP**: clients `POST` JSON-RPC 2.0 messages and
+receive JSON responses; `GET` and `DELETE` answer `405` so probing clients
+fall back to POST. The endpoint is stateless — no `Mcp-Session-Id` is issued.
+
+Authentication reuses the console credentials: `Authorization: Bearer` with
+either a `pwk_…` API key or a user JWT. A key needs the `read` permission (and
+its owner must be an administrator) to be accepted at all; the write tools
+additionally require the `write` permission on the key. Revoked or disabled
+keys are rejected. JWT sessions run through the same account checks as the
+REST API — disabled accounts and stale tokens (superseded by a newer sign-in)
+are refused, and an account that must change its password at next sign-in is
+rejected outright since MCP offers no way to complete that flow.
+
+The endpoint sits outside the REST credential rate limiter, so it is capped
+for abuse resistance instead: a JSON-RPC batch may contain at most 16 calls
+(larger batches are rejected with `-32600`), and the request body is limited to
+256 KiB.
+
+Supported methods: `initialize`, `ping`, `tools/list`, `tools/call`,
+`resources/list`, `resources/read`, `resources/templates/list`,
+`prompts/list`, `prompts/get`, `logging/setLevel` (accepted, no-op), and
+JSON-RPC batches thereof. Notifications receive `202 Accepted`.
+
+Because the route hangs off the root router, the 9080 self-protection stack —
+access log, IP allowlist, WAF ([see API protection](#get-settingsapi-protection))
+— applies to `/mcp` exactly as it does to the REST API.
+
+### GET /settings/mcp
+
+Introspection for the MCP endpoint, used by the Settings card: where the
+endpoint lives and what this build exposes. Any authenticated console user
+(viewers included — they may connect read-only).
+
+**Response (200):**
+```json
+{
+  "path": "/mcp",
+  "transport": "streamable_http",
+  "tools": [
+    { "name": "list_sites", "write": false },
+    { "name": "set_site_status", "write": true }
+  ],
+  "prompts": 3,
+  "resources": 5
+}
+```
+
+`tools` lists the full catalogue in order, `write` marking the tools that
+require a write credential. `prompts` and `resources` count what
+`prompts/list` and `resources/list` will serve.
+
+### Connecting a client
+
+Point the client at `<console origin>/mcp` and authenticate with a `pwk_…`
+API key (create one under **Settings → API keys** with the `read` permission,
+plus `write` for the write tools). A generic Streamable HTTP client:
+
+```json
+{
+  "mcpServers": {
+    "wafred": {
+      "url": "https://waf.example.com:9080/mcp",
+      "headers": { "Authorization": "Bearer pwk_YOUR_KEY" }
+    }
+  }
+}
+```
+
+Claude Code takes the same settings in one command:
+
+```bash
+claude mcp add --transport http wafred https://waf.example.com:9080/mcp \
+  --header "Authorization: Bearer pwk_YOUR_KEY"
+```
+
+### Tools
+
+The registry is shared with the AI assistant; `tools/list` returns only the
+tools the calling credential may use (write tools are hidden from read-only
+credentials).
+
+| Tool | Write | Description |
+|------|-------|-------------|
+| `list_sites` | | Sites with status and online agent count. |
+| `list_agents` | | Agents with status, version, heartbeat, `hostname`, and the operator `display_name` (`name` falls back to the hostname). |
+| `certificate_summary` | | TLS certificate counts, including expiring-in-30-days. |
+| `query_access_logs` | | Recent proxied requests; the primary diagnosis tool. |
+| `query_waf_events` | | WAF detections with rule, request and action. |
+| `get_traffic_summary` | | Aggregated traffic for a window. |
+| `get_defense_status` | | Observation mode and the control plane's own guards. |
+| `list_ip_groups` | | Shared IP groups with size and sync state. |
+| `query_control_plane_logs` | | The 9080 access log, including allowlist/WAF verdicts. |
+| `set_observation_mode` | ✓ | Turn global observation mode on or off. |
+| `set_site_status` | ✓ | Activate or pause one site. |
+
+Errors follow the JSON-RPC convention: `-32601` for an unknown method,
+`-32602` for invalid parameters, and a tool's own failure is returned as a
+result with `isError: true` and the message in the content text.
+
+### Resources and prompts
+
+`resources/list` exposes the fleet's readable state as MCP resources, each
+with a `wafred://` URI:
+
+| Resource | Contents |
+|----------|----------|
+| `wafred://overview` | Platform snapshot: sites, agents, certificates and 24h traffic. |
+| `wafred://sites` | Every proxy site with status and online agent count. |
+| `wafred://agents` | Every data-plane agent with status, last heartbeat and display name. |
+| `wafred://defense` | Observation mode and the control plane's own protection settings. |
+| `wafred://ip-groups` | Shared IP groups with size, action and sync state. |
+
+`prompts/list` offers ready-made troubleshooting prompts — incident triage,
+traffic report, security review and certificate audit — that clients can
+surface as one-click actions.
+
+---
+
+## System Observation
+
+Read-only self-observation of the process (successor of the removed pprof
+endpoints — see [Profiling](profiling.md#what-changed-vs-pprof) for the
+migration table). Both endpoints require an admin token, work on every
+platform and in every build, and have no enable switch.
+
+### GET /system/status
+
+Degraded-mode flags for the console (admin only).
+
+**Response (200):**
+```json
+{"grpc_tls": true}
+```
+
+`grpc_tls: false` means the gRPC control plane serves plaintext traffic
+(degraded mode): agents connect unencrypted, and the console shows a warning
+on the agents page and the settings "About" card.
+
+### GET /system/nodes
+
+The fleet view in one request: the control-plane process's own counters plus
+one row per registered agent. It is the only endpoint that answers "how loaded
+is the fleet" in one call.
+
+**Response (200):**
+
+```json
+{
+  "control": {
+    "process_cpu_percent": 12.5,
+    "host_cpu_percent": 8.1,
+    "cores": 4,
+    "rss_bytes": 120258048,
+    "rss_peak_bytes": 154140467,
+    "requests": 980,
+    "avg_elapsed_ms": 0.4084
+  },
+  "agents": [
+    {
+      "id": "uuid",
+      "name": "edge-01",
+      "status": "online",
+      "cpu_percent": 23.4,
+      "cpu_source": "probe",
+      "memory_bytes": 1073741824,
+      "connections": 128,
+      "rps": null,
+      "sites": 1,
+      "last_seen": "2024-01-01T12:00:00Z"
+    }
+  ],
+  "boots": [
+    {
+      "booted_at": "2026-10-22T12:31:05Z",
+      "reason": "unclean",
+      "version": "0.29.3",
+      "hostname": "waf-1",
+      "previous_uptime_seconds": 12
+    },
+    {
+      "booted_at": "2026-10-22T12:30:53Z",
+      "reason": "fresh",
+      "version": "0.29.3",
+      "hostname": "waf-1",
+      "previous_uptime_seconds": null
+    }
+  ]
+}
+```
+
+(Values are illustrative.)
+
+**`control`** — the process serving the request:
+
+| Field | Meaning |
+|-------|---------|
+| `process_cpu_percent` | CPU used by this process, percent of one core (can exceed 100) |
+| `host_cpu_percent` | Machine-wide CPU usage, percent |
+| `cores` | Cores on the machine |
+| `rss_bytes` / `rss_peak_bytes` | Process RSS now / peak since start, bytes (`0` where the OS does not expose the peak) |
+| `requests` | Requests the profiler attributed to the `control` module (cumulative since start) |
+| `avg_elapsed_ms` | Mean wall-clock time per attributed control request, in milliseconds |
+
+The `control` CPU figures come from the same probe samples as
+`GET /system/metrics` (a ~5 s interval), **not** from the heartbeat counters
+an agent reports — those carry the average since boot instead, a different
+measure (see the caveat below).
+
+**`agents[]`** — one row per registered agent, ordered by `name` so the
+table does not reshuffle between polls:
+
+| Field | Meaning |
+|-------|---------|
+| `id` | Agent id |
+| `name` | Display name — the inventory keeps one identity per node, its `hostname` |
+| `status` | `online` / `offline` / `degraded`, as last reported |
+| `cpu_percent` | CPU load of the node, percent; `null` = no reading from either source |
+| `cpu_source` | Where `cpu_percent` came from: `probe` = the agent host probe's ~5 s delta sample, comparable across agent versions (values can move sharply between polls); `heartbeat` = no probe sample available, so the live heartbeat's value is used — for agents that have not reported a probe sample yet that figure can be an **average since boot**, a different measure; `none` = neither source carried a reading |
+| `memory_bytes` | Memory in use on the node, bytes; `null` = no sample retained yet |
+| `connections` | Connections currently handled by the edge process; `null` = never reported (e.g. metric shipping disabled) |
+| `rps` | Requests per second handled by the edge; **`null` for every node today** — the heartbeat carries the counter but the control plane retains no per-agent copy, so the field has no data source. It stays in the contract because it is the figure operators ask for first |
+| `sites` | Sites this agent serves: `1` for a bound agent; for a global (unbound) agent, every site of its API key's owner — the same visibility the config push uses |
+| `last_seen` | Last heartbeat, server time; `null` = never heard from |
+
+Fields the control plane does not know yet are `null` rather than `0`: a
+node that has never heartbeated reporting "0 %" would read as an idle node
+instead of an unknown one.
+
+**`boots[]`** — the newest control-plane starts, newest first (at most five),
+written by `control_plane_boots` (migration `000068`). One row per start; the
+gap between two rows is how long the previous process lived.
+
+| Field | Meaning |
+|-------|---------|
+| `booted_at` | When the process started, server time |
+| `reason` | `fresh` (no previous boot on record), `after_stop` (the previous process lived at least 60 s, so a planned stop fits), `unclean` (it lived less — the previous process was almost certainly killed without shutting down) |
+| `version` | The control plane's version at that start |
+| `hostname` | The machine it came up on |
+| `previous_uptime_seconds` | How long the previous process lived, in seconds; `null` for the first boot, and when the clock moved backwards between the two starts |
+
+**Why a start is recorded rather than a stop.** A process killed by the OOM
+killer (or `SIGKILL`, or a crash) runs no code, so it cannot write a "stopped"
+row. A start is the one moment it can speak, which is why the history is built
+from starts. The practical reading: **several boots minutes apart means the
+container is being killed in a loop**, whereas one boot a week ago means a
+normal deploy.
+
+**Replicas.** Several control-plane replicas may share one database; the table
+is shared, so `reason` and `previous_uptime_seconds` are always computed
+against the previous boot **of the same `hostname`** — another replica starting
+seconds later is never mistaken for this process's predecessor. The list itself
+is not host-scoped: it shows the newest starts across the fleet, which is what
+makes a rolling restart readable. The table keeps its newest 100 rows overall.
+
+Known caveats, unchanged behaviour the numbers must be read with:
+
+- The heartbeat's `cpu_usage_percent` is the **average since boot**; the
+  `cpu_percent` here prefers the agent's newest host probe sample (a ~5 s
+  interval measurement), so it can move sharply between polls. The
+  `cpu_source` field names the source the figure came from — `probe`,
+  `heartbeat` or `none` — so the two measures no longer have to be told
+  apart by guesswork.
+- `agents.memory_bytes` has a semantic drift: **before the agent's first
+  heartbeat** it carries the host's *total* memory (the registration
+  inventory value), afterwards the *used* memory from the probe samples.
+  This is not fixed yet — treat the first-poll value accordingly.
+
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://localhost:9080/api/v1/system/nodes"
+```
+
+### GET /system/metrics
+
+Point-in-time snapshot of process/host CPU and memory. No sampling and no
+state: the handler reads counters the OS already keeps (off the async runtime)
+and answers immediately.
+
+**Response (200):**
+```json
+{
+  "cpu": {
+    "process_cpu_percent": 12.5,
+    "host_cpu_percent": 8.1,
+    "cores": 4,
+    "collected_at_ms": 1760000000000
+  },
+  "memory": {
+    "rss_bytes": 120258048,
+    "virtual_bytes": 805984256,
+    "total_memory_bytes": 17179869184,
+    "used_memory_bytes": 9663676416,
+    "rss": "121.2 MB",
+    "total_memory": "16.0 GB",
+    "used_memory": "9.0 GB",
+    "collected_at_ms": 1727443200000,
+    "used_memory_scope": "system",
+    "process_memory_scope": "process",
+    "container_memory_used_bytes": 805306368,
+    "container_memory_limit_bytes": 1073741824,
+    "container_memory_used": "805.3 MB",
+    "container_memory_limit": "1.0 GB",
+    "container_memory_scope": "cgroup_v2",
+    "rss_peak_bytes": 154140467,
+    "rss_peak": "154.1 MB",
+    "swap_used_bytes": 0,
+    "swap_total_bytes": 2147483648,
+    "swap_used": "0 B",
+    "swap_total": "2.0 GB",
+    "mem_available_bytes": 6442450944,
+    "mem_available": "6.0 GB",
+    "memory_used_percent": 56.3,
+    "page_faults_minor": 482113,
+    "page_faults_major": 1024,
+    "cached_bytes": 3221225472,
+    "buffers_bytes": 268435456,
+    "cached": "3.0 GB",
+    "buffers": "256.0 MB"
+  }
+}
+```
+
+`cpu.process_cpu_percent` is percent of one core (multi-threaded work can
+exceed 100); `memory.total_memory_bytes` / `used_memory_bytes` are **host**
+figures, marked by `used_memory_scope: "system"` vs
+`process_memory_scope: "process"` for `rss`. The `container_memory_*` fields
+are present only when a container memory limit applies and match what
+`docker stats` reports — prefer them over the host totals in that case.
+The remaining `memory.*` fields come from `/proc` (or the cgroup equivalent):
+`rss_peak_bytes` is the high-water mark (`VmHWM`), `swap_*` the configured
+and in-use swap, `mem_available_bytes` the kernel's estimate of memory
+available for new work, `memory_used_percent` the host used/total ratio,
+`page_faults_*` the process's cumulative minor/major fault counts, and
+`cached_bytes` / `buffers_bytes` the kernel page cache and block-device
+buffers. A counter the platform does not expose (e.g. non-Linux, or a kernel
+without `MemAvailable`) is reported as `0`.
+
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://localhost:9080/api/v1/system/metrics"
+```
+
+### GET /system/profile
+
+Wall-clock time and memory attribution by module and method — pure Rust
+instrumentation (`pingwaf-profiler`), not a sampled profile: module-level
+atomic counters plus compile-time-registered method timers on instrumented
+hot paths. No sampling, no stack unwinding, no allocator hook, no external
+tool or image. Counters are cumulative since process start; take two
+snapshots and compare deltas for a live view.
+
+> **These numbers are wall-clock time, not CPU time.** Every timer is
+> `Instant`-based: a scope that awaits a database query, a lock or the
+> upstream reports that wait too. Shares are "of the attributed wall time",
+> not "of the CPU the process burned" — reading `cpu_ms` as CPU seconds is
+> the mistake that once made `control::http` look like 90 % CPU when it was
+> mostly waiting. Each figure is therefore published twice: under the
+> historical `cpu_ms` / `cpu_share` names (kept so existing dashboards keep
+> parsing) and under `elapsed_ms` / `elapsed_share`, which say what is
+> measured. Both pairs always carry the same value; prefer `elapsed_*` in
+> new consumers.
+
+**Response (200):**
+
+```json
+{
+  "collected_at_ms": 1760000000000,
+  "total_cpu_ms": 48213.4,
+  "total_elapsed_ms": 48213.4,
+  "modules": [
+    { "module": "proxy",  "cpu_ms": 30102.1, "cpu_share": 0.62, "elapsed_ms": 30102.1, "elapsed_share": 0.62, "mem_bytes": 41943040, "mem_share": 0.55, "mem_peak_bytes": 41943040, "mem_peak_share": 0.55, "disk_bytes": 0,       "disk_share": 0.00, "calls": 102341, "avg_us": 294.1 },
+    { "module": "waf",    "cpu_ms": 11101.2, "cpu_share": 0.23, "elapsed_ms": 11101.2, "elapsed_share": 0.23, "mem_bytes": 8388608,  "mem_share": 0.11, "mem_peak_bytes": 8388608,  "mem_peak_share": 0.11, "disk_bytes": 0,       "disk_share": 0.00, "calls": 98111,  "avg_us": 113.1 }
+  ],
+  "methods": [
+    { "method": "waf::handle_request",  "cpu_ms": 9200.4, "elapsed_ms": 9200.4, "calls": 98111, "avg_us": 93.8 },
+    { "method": "proxy::request_filter", "cpu_ms": 7100.9, "elapsed_ms": 7100.9, "calls": 88430, "avg_us": 80.3 }
+  ]
+}
+```
+
+- `modules` — always exactly 7 rows in fixed order: `proxy`, `waf`, `cache`,
+  `plugin`, `db`, `control`, `other` (anything not yet instrumented).
+  `cpu_share` / `elapsed_share` are the share of the total attributed
+  wall-clock time (`total_cpu_ms` / `total_elapsed_ms`, always equal);
+  `mem_bytes` is bytes the module currently reports as **held in memory**
+  (reported, not intercepted — no allocator hook), with `mem_share` its share
+  of the total; `mem_peak_bytes` / `mem_peak_share` are the **high-water
+  mark** of that gauge since process start (or the last reset) and its share
+  of the sum of all modules' peaks. A released buffer drops `mem_bytes` to
+  `0` but keeps the peak, so a module sampled between reports still shows
+  what it held — a momentary `mem_bytes` of `0` therefore does **not** mean
+  "no memory": to find the memory-heavy modules, read the peak fields, not
+  the instantaneous ones; `disk_bytes` / `disk_share` are the module's **on-disk**
+  footprint and its share — a separate figure reported only by the cache
+  module (every other module reports `0`), so a file-backed cache no longer
+  inflates the memory row. For the cache module `mem_bytes` is the on-disk
+  index plus the read buffers of objects being streamed out
+  (`in_flight_bytes`); see [Profiling](profiling.md#memory-vs-disk-in-the-cache-module)
+  for the exact accounting. `calls` / `avg_us` are the timed operation count
+  and average microseconds per operation.
+- `methods` — named call sites, hottest first, capped at 40 rows. Method
+  names come from a compile-time static enumeration (the instrumented call
+  sites: `proxy::request_filter`, `waf::handle_request`,
+  `cache::handle_request`, `plugin::rewrite`, `db::persist_heartbeat`,
+  `control::http`), so recording costs four relaxed atomic adds per request
+  (two for the method rows, two for the module row) — no hash lookup.
+  Otherwise the same semantics as the module rows.
+- `collected_at_ms` — Unix epoch milliseconds of the snapshot.
+
+**What the `control` row covers.** The control-plane timer books every
+`/api/v1` request once — the same timer fills both the `control` module row
+and the `control::http` method row. The module row was never recorded
+twice: before the refactor the module timer and the method timer each
+wrote their own row, one entry per request. If the `control` share drops
+noticeably after upgrading, the real causes are the narrowed
+instrumentation scope (root listener → `/api/v1` requests only, so MCP,
+`/healthz` and the SPA fallback are no longer attributed) and the removal
+of a per-request method-map hash — not a sudden performance change. The
+timer sits *inside* the CORS, compression,
+security-header and body-limit layers, so those middleware costs are not
+part of `control`.
+
+The response is bounded by construction (7 module rows, at most 40 method
+rows, KB-scale JSON) and computed from atomics, so polling it is cheap. See
+[Profiling](profiling.md#get-apiv1systemprofile) for field tables and the
+reading recipe.
+
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://localhost:9080/api/v1/system/profile"
+```
+
+---
+
+## Data-plane request boundaries
+
+The proxy edge (the data plane on the site ports, not the `/api/v1` control
+plane) rejects malformed request heads before any location matching, plugin
+execution or upstream contact:
+
+- **Missing `Host`** — an HTTP/1.1 (or later) request without a `Host`
+  header is answered `400`. The internal paths `/healthz`, `/ready` and
+  `/metrics` are exempt, and HTTP/1.0/0.9 requests without `Host` are still
+  allowed (per the RFC) and routed to the explicitly-configured default
+  site, producing a normal `request_id` and access-log row.
+- **Oversized header field** — a single header field (name + value) larger
+  than 8 KiB (`MAX_SINGLE_REQUEST_HEADER_BYTES`, mirroring nginx's default
+  `large_client_header_buffers` line size) is answered `431 Request Header
+  Fields Too Large`.
+- **Unknown method** — only the standard method set plus `PURGE` (GET,
+  HEAD, POST, PUT, DELETE, OPTIONS, PATCH, TRACE, CONNECT, PURGE) is
+  forwarded; anything else (e.g. `FOO`) is refused at the edge with
+  `405 Method Not Allowed` instead of being proxied verbatim.
+
+These responses are produced by the proxy itself; they do not appear in
+`/api/v1` error codes and do not consume an origin connection.
+
+## Error Responses
+
+**Every** `4xx`/`5xx` response from `/api/v1` follows one consistent format —
+including the framework-level rejections (bad query strings, malformed JSON
+bodies, unknown routes, wrong methods), which are rewritten into the same
+envelope while keeping their status codes:
+
+```json
+{
+  "error": {
+    "code": "not_found",
+    "message": "no route matches /api/v1/ip-access-rules"
+  }
+}
+```
+
+Consumers should branch on `code`, not on parsing the `message` text. For a
+`404` the message echoes the **full** request path including the `/api/v1`
+prefix, so a wrong resource name can be grepped directly.
+
+| HTTP Status | Code | Description |
+|-------------|------|-------------|
+| 400 | `bad_request` | Invalid input |
+| 400 | `invalid_query` | Query string failed deserialization (e.g. `?page=abc`) |
+| 400 | `invalid_body` | Request body is not valid JSON for the endpoint's schema |
+| 400 | `unknown_file` | `ai-crawl/preview` `file` parameter is not `robots` or `llms` |
+| 400 | `invalid_range` | Analytics `range` parameter is not `24h`, `7d` or `30d` |
+| 401 | `unauthorized` | Missing or invalid token |
+| 401 | `token_expired` | Access token passed its expiry; refresh or sign in again |
+| 403 | `forbidden` | Insufficient permissions |
+| 403 | `password_change_required` | Account still holds the seeded default password; only the auth endpoints are reachable |
+| 404 | `not_found` | Resource or route does not exist (message contains the full `/api/v1` path) |
+| 405 | `method_not_allowed` | Method not supported by the route |
+| 409 | `conflict` | Duplicate resource |
+| 422 | `unprocessable_entity` | Validation failed by a business rule |
+| 429 | `too_many_requests` | Rate limited: the credential limiter (`/auth/login`, `/auth/register`, `/auth/refresh`, `PUT /auth/password`, passkey login) answers with `Retry-After`; the separate passkey-ceremony budget (120 challenges per minute, process-wide) answers without it |
+| 500 | `internal_error` | Server error |
+| 501 | `not_implemented` | Feature disabled on this deployment (passkeys) |
+| 502 | `bad_gateway` | An upstream dependency answered with an error |
+| 503 | `service_unavailable` | A dependency or feature is unavailable right now |
+
+Rejections produced by a layer below the handlers (body-size limits, malformed
+query strings, …) are rewritten into the same envelope: `invalid_query` and
+`invalid_body` where axum's rejection text identifies them, `rate_limited` for
+a bare `429`, and `request_failed` for any other status without a more
+specific code.
+
+---
+
+## Pagination
+
+List endpoints support pagination:
+
+**Query:** `?page=1&page_size=50`
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `page` | int | Page number, 1-based (default: 1) |
+| `page_size` | int | Items per page (default: 50, maximum: 200) |
+
+**Response:**
+```json
+{
+  "items": [...],
+  "total": 100,
+  "page": 1,
+  "page_size": 50
+}
+```
+
+`total` is the number of rows matching the filters, not the size of `items`.
+
+## Log retention
+
+Log rows are swept automatically: the control plane deletes rows older than the
+configured windows (see `GET/PUT /settings/log-retention`, default `180` days
+for both tables) every six hours. `DELETE /logs/purge` remains available for an
+ad-hoc cleanup and deletes rows older than `older_than_days` (default 30) for
+one site or, for an administrator, for every site.
+
+The control plane's own access log has its own window,
+`access_log_retention_days` on `GET/PUT /settings/api-protection` (default
+`30` days). The scheduled sweep enforces it; an ad-hoc `DELETE /logs/purge`
+without `site_id` trims it with the same `older_than_days` as the site logs.

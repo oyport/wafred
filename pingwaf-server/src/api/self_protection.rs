@@ -1,0 +1,1069 @@
+//! Control plane self-protection: the 9080 listener's own access log, IP
+//! allowlist and WAF.
+//!
+//! Three middlewares guard the console and REST API, outermost first:
+//!
+//! 1. [`access_log`] — records one row per request into
+//!    `control_plane_access_logs` (when enabled) and stamps a request id on
+//!    the response.
+//! 2. [`ip_allowlist`] — refuses callers outside the configured ranges and
+//!    the referenced `ip_groups` row.
+//! 3. [`waf_guard`] — inspects the request with the embedded
+//!    [`pingwaf_waf`] engine and blocks (or only records, in `monitor` mode).
+//!
+//! Health probes (`/healthz`, `/api/v1/health`) are exempt from all three so
+//! container and load balancer probes keep working. The policy is loaded from
+//! `api_protection_settings` at boot and refreshed by a background task, so a
+//! change made through the API — or by the `wafred security` CLI on another
+//! process — takes effect within [`REFRESH_INTERVAL`] without a restart.
+//!
+//! The middlewares never trust forwarding headers for the client address:
+//! the allowlist and the log use the TCP peer. A console behind a reverse
+//! proxy therefore sees the proxy's address, and the proxy's range must be
+//! allowlisted.
+
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
+use std::str::FromStr;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use arc_swap::ArcSwap;
+use axum::extract::connect_info::ConnectInfo;
+use axum::extract::{Request, State};
+use axum::http::header::{HeaderMap, AUTHORIZATION, HOST, REFERER, USER_AGENT};
+use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::middleware::Next;
+use axum::response::Response;
+use chrono::{DateTime, Utc};
+use ipnet::IpNet;
+use sea_orm::sea_query::OnConflict;
+use sea_orm::{
+    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter,
+    QuerySelect, QueryTrait, Set,
+};
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+use pingwaf_waf::{
+    CategorySet, RequestData, StackSet, WafAction, WafEngine, WafEngineConfig,
+    WafLevel, WafMode,
+};
+
+use crate::api::error::error_response;
+use crate::api::state::AppState;
+use crate::auth::jwt::verify_user_token;
+use crate::models::api_protection::{action, waf_mode};
+use crate::models::{
+    api_protection_setting, control_plane_access_log, ip_groups,
+};
+use crate::tls::ConnInfo;
+
+/// Primary key of the single settings row.
+const SETTINGS_ID: i32 = 1;
+
+/// How often the background task re-reads the settings row.
+pub const REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Request-body prefix the WAF inspects. Bodies above this are refused with
+/// `413` while the WAF is enabled, so a truncated body can never slip past
+/// inspection.
+const WAF_BODY_LIMIT: usize = 128 * 1024;
+
+/// Paths whose handlers accept bodies far larger than [`WAF_BODY_LIMIT`].
+///
+/// The guard must not read these bodies: doing so answers 413 before the
+/// handler runs. They are inspected on metadata only and the body is passed
+/// through untouched (the route's own `DefaultBodyLimit` still applies).
+fn body_inspection_skipped(path: &str) -> bool {
+    path == "/api/v1/login-security/geoip"
+        || (path.starts_with("/api/v1/config-backups/")
+            && path.ends_with("/upload"))
+}
+
+/// Queue depth of the access-log writer. Logging never blocks the request
+/// path: a full queue drops records (with a warning) instead.
+const LOG_QUEUE_CAPACITY: usize = 4096;
+
+/// Upper bound on one insert statement.
+const LOG_INSERT_BATCH: usize = 200;
+
+/// Correlation header stamped on every response.
+const REQUEST_ID_HEADER: &str = "x-request-id";
+
+// ─────────────────────────────────────────────────────────────
+// Policy
+// ─────────────────────────────────────────────────────────────
+
+/// The allowlist: parsed ranges plus a set of single addresses.
+#[derive(Debug, Default, Clone)]
+pub struct Allowlist {
+    networks: Vec<IpNet>,
+    addresses: HashSet<IpAddr>,
+}
+
+/// Last allowlist that actually contained entries.
+///
+/// A referenced group can be disabled or deleted while the allowlist stays
+/// on; resolving to an empty set would then reject every API caller and lock
+/// the operator out. Keeping the previous set keeps the control plane
+/// reachable, and the warning says why the on-disk config no longer matches.
+static LAST_GOOD_ALLOWLIST: std::sync::LazyLock<Mutex<Option<Allowlist>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+
+impl Allowlist {
+    /// Parses every entry; entries that are neither an address nor a CIDR
+    /// network are returned as errors (callers decide to refuse or skip).
+    pub fn parse<I, S>(values: I) -> (Self, Vec<String>)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut networks = Vec::new();
+        let mut addresses = HashSet::new();
+        let mut invalid = Vec::new();
+        for value in values {
+            let value = value.as_ref().trim();
+            if value.is_empty() {
+                continue;
+            }
+            if let Ok(net) = IpNet::from_str(value) {
+                networks.push(net);
+            } else if let Ok(addr) = IpAddr::from_str(value) {
+                addresses.insert(normalize_ip(&addr));
+            } else {
+                invalid.push(value.to_string());
+            }
+        }
+        (
+            Self {
+                networks,
+                addresses,
+            },
+            invalid,
+        )
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.networks.is_empty() && self.addresses.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.networks.len() + self.addresses.len()
+    }
+
+    /// Whether `ip` is covered. IPv4-mapped IPv6 peers are folded to IPv4
+    /// first so `127.0.0.1` matches a `::ffff:127.0.0.1` connection, and an
+    /// IPv6-mapped network (`::ffff:0:0/96`) matches an IPv4 peer.
+    pub fn contains(&self, ip: &IpAddr) -> bool {
+        let ip = normalize_ip(ip);
+        self.addresses.contains(&ip)
+            || self.networks.iter().any(|net| match (net, &ip) {
+                (IpNet::V6(_), IpAddr::V4(v4)) => {
+                    net.contains(&IpAddr::V6(v4.to_ipv6_mapped()))
+                },
+                _ => net.contains(&ip),
+            })
+    }
+}
+
+/// Folds IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) onto their IPv4 form.
+pub fn normalize_ip(ip: &IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(*v6)),
+        other => *other,
+    }
+}
+
+/// Everything the middlewares enforce, rebuilt whenever the settings change.
+pub struct ProtectionPolicy {
+    pub access_log_enabled: bool,
+    pub allowlist_enabled: bool,
+    pub allowlist: Allowlist,
+    /// Read the client from `trusted_header` when the TCP peer is in
+    /// `trusted_proxies`. The allowlist deliberately keeps using the peer.
+    pub trust_proxy_headers: bool,
+    pub trusted_header: String,
+    pub trust_last_hop: bool,
+    pub trusted_proxies: Allowlist,
+    /// Built on the first request that needs it. The engine is immutable for
+    /// a given blocking mode, so deferring construction avoids compiling the
+    /// full managed-rule automaton in every process that never receives an
+    /// admin request (and lets a co-located edge build the shared base first).
+    pub waf: OnceLock<Arc<WafEngine>>,
+    /// Whether the WAF is enabled for this policy.
+    pub waf_enabled: bool,
+    /// True when the WAF answers blocks (vs. monitor mode).
+    pub waf_blocking: bool,
+    /// `updated_at` of the settings row this policy was built from.
+    pub settings_updated_at: DateTime<Utc>,
+}
+
+impl Default for ProtectionPolicy {
+    fn default() -> Self {
+        Self {
+            access_log_enabled: false,
+            allowlist_enabled: false,
+            allowlist: Allowlist::default(),
+            trust_proxy_headers: false,
+            trusted_header: crate::models::trusted_header::X_FORWARDED_FOR
+                .to_string(),
+            trust_last_hop: true,
+            trusted_proxies: Allowlist::default(),
+            waf: OnceLock::new(),
+            waf_enabled: false,
+            waf_blocking: false,
+            settings_updated_at: DateTime::<Utc>::MIN_UTC,
+        }
+    }
+}
+
+/// Read-mostly handle shared through [`AppState`].
+pub struct SelfProtection {
+    policy: ArcSwap<ProtectionPolicy>,
+    log_tx: mpsc::Sender<LogRecord>,
+    /// Parked here until [`SelfProtection::spawn_writer`] runs; the struct
+    /// itself only ever uses the sender.
+    log_rx: Mutex<Option<mpsc::Receiver<LogRecord>>>,
+}
+
+impl SelfProtection {
+    /// Creates the handle and the log channel. Call
+    /// [`SelfProtection::spawn_writer`] from an async context to start
+    /// persisting records; without it records queue up and are dropped.
+    pub fn new() -> Self {
+        let (log_tx, log_rx) = mpsc::channel(LOG_QUEUE_CAPACITY);
+        Self {
+            policy: ArcSwap::from_pointee(ProtectionPolicy::default()),
+            log_tx,
+            log_rx: Mutex::new(Some(log_rx)),
+        }
+    }
+
+    pub fn policy(&self) -> Arc<ProtectionPolicy> {
+        self.policy.load_full()
+    }
+
+    pub fn store(&self, policy: ProtectionPolicy) {
+        self.policy.store(Arc::new(policy));
+    }
+
+    /// Queues one access-log record; never blocks. A full queue drops the
+    /// record and says so — losing a log line beats stalling the request.
+    pub fn record(&self, record: LogRecord) {
+        if let Err(err) = self.log_tx.try_send(record) {
+            tracing::warn!(
+                error = %err,
+                "control plane access log queue is full, dropping record"
+            );
+        }
+    }
+
+    /// Starts the background writer over the given database connection.
+    /// A second call is a no-op.
+    pub fn spawn_writer(&self, db: DatabaseConnection) {
+        let rx = self.log_rx.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(rx) = rx {
+            tokio::spawn(write_logs(db, rx));
+        }
+    }
+}
+
+impl Default for SelfProtection {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Settings
+// ─────────────────────────────────────────────────────────────
+
+/// Reads the settings row, creating it with the defaults if it is missing.
+pub async fn load_settings(
+    db: &DatabaseConnection,
+) -> Result<api_protection_setting::Model, DbErr> {
+    if let Some(row) = api_protection_setting::Entity::find_by_id(SETTINGS_ID)
+        .one(db)
+        .await?
+    {
+        return Ok(row);
+    }
+
+    let now = Utc::now();
+    let insert = api_protection_setting::ActiveModel {
+        id: Set(SETTINGS_ID),
+        access_log_enabled: Set(true),
+        access_log_retention_days: Set(
+            crate::models::api_protection::DEFAULT_RETENTION_DAYS,
+        ),
+        ip_allowlist_enabled: Set(false),
+        ip_allowlist_ranges: Set(Vec::new()),
+        ip_allowlist_group_id: Set(None),
+        waf_enabled: Set(false),
+        waf_mode: Set(waf_mode::BLOCK.to_string()),
+        trust_proxy_headers: Set(false),
+        trusted_header: Set(
+            crate::models::trusted_header::X_FORWARDED_FOR.to_string()
+        ),
+        trust_last_hop: Set(true),
+        trusted_proxy_ranges: Set(Vec::new()),
+        updated_at: Set(now),
+    };
+    let ignore_conflict =
+        OnConflict::column(api_protection_setting::Column::Id)
+            .do_nothing()
+            .to_owned();
+    match api_protection_setting::Entity::insert(insert)
+        .on_conflict(ignore_conflict)
+        .exec(db)
+        .await
+    {
+        Ok(_) | Err(DbErr::RecordNotInserted) => {},
+        Err(err) => return Err(err),
+    }
+
+    api_protection_setting::Entity::find_by_id(SETTINGS_ID)
+        .one(db)
+        .await?
+        .ok_or_else(|| {
+            DbErr::RecordNotFound(
+                "api protection settings row vanished".to_string(),
+            )
+        })
+}
+
+/// The effective allowlist of a settings row: inline ranges plus the ranges
+/// of the referenced group (when it exists and is enabled — a disabled group
+/// is not deployed anywhere, so it contributes nothing here either).
+pub async fn effective_allowlist(
+    db: &DatabaseConnection,
+    settings: &api_protection_setting::Model,
+) -> Result<Allowlist, DbErr> {
+    let mut ranges = settings.ip_allowlist_ranges.clone();
+    let mut group_unavailable = false;
+    if let Some(group_id) = settings.ip_allowlist_group_id {
+        let group = ip_groups::Entity::find_by_id(group_id)
+            .filter(ip_groups::Column::Enabled.eq(true))
+            .one(db)
+            .await?;
+        match group {
+            Some(group) => ranges.extend(group.ip_ranges),
+            None => {
+                group_unavailable = true;
+                tracing::warn!(
+                    group_id = %group_id,
+                    "API allowlist references a missing or disabled ip group; only the inline ranges apply"
+                );
+            },
+        }
+    }
+    let (allowlist, invalid) = Allowlist::parse(ranges);
+    if !invalid.is_empty() {
+        tracing::warn!(
+            invalid = ?invalid,
+            "ignoring invalid API allowlist entries"
+        );
+    }
+    if allowlist.is_empty() && group_unavailable {
+        let previous = LAST_GOOD_ALLOWLIST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(previous) = previous {
+            tracing::warn!(
+                "API allowlist would be empty; keeping the last known-good entries to avoid locking the operator out"
+            );
+            return Ok(previous);
+        }
+    }
+    if !allowlist.is_empty() {
+        *LAST_GOOD_ALLOWLIST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(allowlist.clone());
+    }
+    Ok(allowlist)
+}
+
+/// The control-plane WAF engine is immutable for a given blocking mode: the
+/// level, stack set and rule list are compiled from constants. Refreshing the
+/// settings row every [`REFRESH_INTERVAL`] used to construct a new engine —
+/// and therefore re-walk the regex compilation path — even when nothing had
+/// changed. Keep the two variants alive instead.
+static CONTROL_PLANE_WAF: LazyLock<Mutex<HashMap<bool, Arc<WafEngine>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn control_plane_waf(blocking: bool) -> Arc<WafEngine> {
+    let mut cache = CONTROL_PLANE_WAF
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(engine) = cache.get(&blocking) {
+        return Arc::clone(engine);
+    }
+    let engine = Arc::new(WafEngine::new(&WafEngineConfig {
+        mode: if blocking {
+            WafMode::Block
+        } else {
+            WafMode::Monitor
+        },
+        level: WafLevel::default(),
+        stacks: StackSet::default(),
+        monitor_categories: CategorySet::EMPTY,
+        monitor_stacks: StackSet::EMPTY,
+        monitor_managed_rules: HashSet::new(),
+        disabled_managed_rules: HashSet::new(),
+        monitor_custom_rules: HashSet::new(),
+        threshold: 40,
+        paranoia_level: 2,
+        max_decode_layers: 3,
+        rules: Vec::new(),
+        enable_managed_rules: true,
+        fast_path_block_on_critical: true,
+    }));
+    cache.insert(blocking, Arc::clone(&engine));
+    engine
+}
+
+/// Builds the enforcement policy from the current settings row.
+pub async fn refresh(
+    db: &DatabaseConnection,
+) -> Result<ProtectionPolicy, DbErr> {
+    let settings = load_settings(db).await?;
+    let allowlist = effective_allowlist(db, &settings).await?;
+    let waf_blocking = settings.waf_mode == waf_mode::BLOCK;
+    let (trusted_proxies, invalid) =
+        Allowlist::parse(&settings.trusted_proxy_ranges);
+    if !invalid.is_empty() {
+        tracing::warn!(
+            entries = ?invalid,
+            "ignoring invalid control-plane trusted proxy ranges"
+        );
+    }
+
+    Ok(ProtectionPolicy {
+        access_log_enabled: settings.access_log_enabled,
+        allowlist_enabled: settings.ip_allowlist_enabled,
+        allowlist,
+        trust_proxy_headers: settings.trust_proxy_headers,
+        trusted_header: settings.trusted_header,
+        trust_last_hop: settings.trust_last_hop,
+        trusted_proxies,
+        waf: OnceLock::new(),
+        waf_enabled: settings.waf_enabled,
+        waf_blocking,
+        settings_updated_at: settings.updated_at,
+    })
+}
+
+/// Background task: re-read the settings every [`REFRESH_INTERVAL`] and swap
+/// the policy in when the row changed. Failures keep the previous policy.
+pub fn start_refresh_task(state: AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(REFRESH_INTERVAL).await;
+            match refresh(&state.db).await {
+                Ok(policy) => {
+                    let current = state.protection.policy();
+                    if policy.settings_updated_at != current.settings_updated_at
+                    {
+                        tracing::info!(
+                            allowlist_enabled = policy.allowlist_enabled,
+                            allowlist_entries = policy.allowlist.len(),
+                            waf_enabled = policy.waf_enabled,
+                            "control plane protection settings reloaded"
+                        );
+                        state.protection.store(policy);
+                    }
+                },
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "could not reload control plane protection settings"
+                ),
+            }
+        }
+    })
+}
+
+// ─────────────────────────────────────────────────────────────
+// Access log
+// ─────────────────────────────────────────────────────────────
+
+/// One pending access-log row.
+#[derive(Debug, Clone)]
+pub struct LogRecord {
+    pub request_id: Option<String>,
+    pub timestamp: DateTime<Utc>,
+    pub client_ip: String,
+    pub method: String,
+    pub host: Option<String>,
+    pub path: String,
+    pub query_string: Option<String>,
+    pub scheme: Option<String>,
+    pub protocol: Option<String>,
+    pub status_code: Option<i32>,
+    pub latency_ms: Option<i64>,
+    pub user_agent: Option<String>,
+    pub referer: Option<String>,
+    pub user_id: Option<Uuid>,
+    pub user_email: Option<String>,
+    pub action: String,
+    pub reason: Option<String>,
+}
+
+impl LogRecord {
+    fn into_active(self) -> control_plane_access_log::ActiveModel {
+        control_plane_access_log::ActiveModel {
+            id: sea_orm::NotSet,
+            request_id: Set(self.request_id),
+            timestamp: Set(self.timestamp),
+            client_ip: Set(self.client_ip),
+            method: Set(self.method),
+            host: Set(self.host),
+            path: Set(self.path),
+            query_string: Set(self.query_string),
+            scheme: Set(self.scheme),
+            protocol: Set(self.protocol),
+            status_code: Set(self.status_code),
+            latency_ms: Set(self.latency_ms),
+            user_agent: Set(self.user_agent),
+            referer: Set(self.referer),
+            user_id: Set(self.user_id),
+            user_email: Set(self.user_email),
+            action: Set(self.action),
+            reason: Set(self.reason),
+        }
+    }
+}
+
+/// Drains the channel into `control_plane_access_logs`, one insert per batch.
+async fn write_logs(db: DatabaseConnection, mut rx: mpsc::Receiver<LogRecord>) {
+    let mut batch: Vec<LogRecord> = Vec::with_capacity(LOG_INSERT_BATCH);
+    loop {
+        // Block for the first record, then take whatever else is queued.
+        let Some(first) = rx.recv().await else {
+            break;
+        };
+        batch.push(first);
+        while batch.len() < LOG_INSERT_BATCH {
+            match rx.try_recv() {
+                Ok(record) => batch.push(record),
+                Err(_) => break,
+            }
+        }
+        let models: Vec<_> =
+            batch.drain(..).map(LogRecord::into_active).collect();
+        if let Err(err) = control_plane_access_log::Entity::insert_many(models)
+            .exec(&db)
+            .await
+        {
+            tracing::warn!(
+                error = %err,
+                "failed to write control plane access log batch"
+            );
+        }
+    }
+}
+
+/// Marker the inner middlewares leave on the response, read back by
+/// [`access_log`] once the response is on its way out.
+#[derive(Debug, Clone)]
+pub struct ProtectionOutcome {
+    pub action: &'static str,
+    pub reason: Option<String>,
+}
+
+/// Rows deleted per statement by [`purge_access_logs`].
+const LOG_PURGE_BATCH_SIZE: u64 = 10_000;
+
+/// Deletes control plane log rows older than the given window, in bounded
+/// batches — the same shape as the site log sweep, so one statement never
+/// holds locks on the whole table.
+pub async fn purge_access_logs(
+    db: &DatabaseConnection,
+    older_than_days: i64,
+) -> Result<u64, DbErr> {
+    let cutoff = Utc::now() - chrono::Duration::days(older_than_days);
+    let mut deleted_total = 0_u64;
+    loop {
+        let batch = control_plane_access_log::Entity::find()
+            .select_only()
+            .column(control_plane_access_log::Column::Id)
+            .filter(control_plane_access_log::Column::Timestamp.lt(cutoff))
+            .limit(LOG_PURGE_BATCH_SIZE);
+        let deleted = control_plane_access_log::Entity::delete_many()
+            .filter(
+                control_plane_access_log::Column::Id
+                    .in_subquery(batch.into_query()),
+            )
+            .exec(db)
+            .await?;
+        deleted_total += deleted.rows_affected;
+        if deleted.rows_affected < LOG_PURGE_BATCH_SIZE {
+            break;
+        }
+    }
+    Ok(deleted_total)
+}
+
+/// `is_health_probe` decides exemption; shared so the middlewares agree with
+/// the redirect layer.
+fn exempt(path: &str) -> bool {
+    crate::api::is_health_probe(path)
+}
+
+/// The peer address of the connection, when the serve layer provided one.
+pub(crate) fn peer_addr(request: &Request) -> Option<std::net::SocketAddr> {
+    request
+        .extensions()
+        .get::<ConnectInfo<ConnInfo>>()
+        .map(|info| info.0.peer_addr)
+}
+
+/// Best-effort caller identity: a valid Bearer token on the request is
+/// decoded for the log only. The handler performs the real authentication.
+fn log_identity(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> (Option<Uuid>, Option<String>) {
+    let Some(token) = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return (None, None);
+    };
+    match verify_user_token(token, state.jwt_secret()) {
+        Ok(claims) => (claims.subject_id().ok(), Some(claims.email)),
+        Err(_) => (None, None),
+    }
+}
+
+fn header_text<K: axum::http::header::AsHeaderName>(
+    headers: &HeaderMap,
+    name: K,
+) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string())
+}
+
+/// Middleware 1/3: request/response logging for the control plane itself.
+pub async fn access_log(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if exempt(request.uri().path()) {
+        return next.run(request).await;
+    }
+
+    let started = Instant::now();
+    let request_id = header_text(request.headers(), REQUEST_ID_HEADER)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        request
+            .headers_mut()
+            .insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
+    }
+
+    let policy = state.protection.policy();
+    let enabled = policy.access_log_enabled;
+    // Identity is decoded before the request moves on; the body never needs
+    // it, so this stays on the cheap side of the middleware.
+    let (user_id, user_email) = if enabled {
+        log_identity(&state, request.headers())
+    } else {
+        (None, None)
+    };
+    let method = request.method().as_str().to_string();
+    let path = request.uri().path().to_string();
+    let query = request.uri().query().map(redact_query);
+    let host = header_text(request.headers(), HOST);
+    let user_agent = header_text(request.headers(), USER_AGENT);
+    let referer = header_text(request.headers(), REFERER);
+    let scheme = if request
+        .extensions()
+        .get::<ConnectInfo<ConnInfo>>()
+        .is_some_and(|info| info.0.tls)
+    {
+        "https"
+    } else {
+        "http"
+    };
+    let protocol = format!("{:?}", request.version());
+    let client_ip = client_ip(&request, &policy)
+        .map(|ip| ip.to_string())
+        .unwrap_or_default();
+
+    let mut response = next.run(request).await;
+
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
+    }
+    if !enabled {
+        return response;
+    }
+
+    let outcome = response
+        .extensions()
+        .get::<ProtectionOutcome>()
+        .cloned()
+        .unwrap_or(ProtectionOutcome {
+            action: action::ALLOWED,
+            reason: None,
+        });
+    state.protection.record(LogRecord {
+        request_id: Some(request_id),
+        timestamp: Utc::now(),
+        client_ip,
+        method,
+        host,
+        path,
+        query_string: query,
+        scheme: Some(scheme.to_string()),
+        protocol: Some(protocol),
+        status_code: Some(response.status().as_u16() as i32),
+        latency_ms: Some(started.elapsed().as_millis() as i64),
+        user_agent,
+        referer,
+        user_id,
+        user_email,
+        action: outcome.action.to_string(),
+        reason: outcome.reason,
+    });
+    response
+}
+
+// ─────────────────────────────────────────────────────────────
+// IP allowlist
+// ─────────────────────────────────────────────────────────────
+
+/// Middleware 2/3: refuses callers outside the allowlist.
+pub async fn ip_allowlist(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let policy = state.protection.policy();
+    if !policy.allowlist_enabled || exempt(request.uri().path()) {
+        return next.run(request).await;
+    }
+
+    let Some(addr) = peer_addr(&request) else {
+        // No peer information means the serve layer was not wired with
+        // connect info; refusing nothing would silently disable the gate, so
+        // refuse the request and say why.
+        tracing::error!(
+            "IP allowlist is enabled but the connection carries no peer address"
+        );
+        let mut response = error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no_peer_address",
+            "the control plane cannot determine your address",
+        );
+        response.extensions_mut().insert(ProtectionOutcome {
+            action: action::BLOCKED_ALLOWLIST,
+            reason: Some("peer address unavailable".to_string()),
+        });
+        return response;
+    };
+
+    if policy.allowlist.contains(&addr.ip()) {
+        return next.run(request).await;
+    }
+
+    let ip = addr.ip();
+    tracing::warn!(
+        client_ip = %ip,
+        path = %request.uri().path(),
+        "control plane request refused by the IP allowlist"
+    );
+    let mut response = error_response(
+        StatusCode::FORBIDDEN,
+        "ip_not_allowed",
+        "your address is not in the control plane allowlist",
+    );
+    response.extensions_mut().insert(ProtectionOutcome {
+        action: action::BLOCKED_ALLOWLIST,
+        reason: Some(format!("client ip {ip} is not allowlisted")),
+    });
+    response
+}
+
+/// Query parameter names whose values must never be persisted verbatim.
+///
+/// MCP and webhook clients routinely put credentials in the query string; a
+/// control-plane access log that stores it raw leaks them into every backup.
+const SENSITIVE_QUERY_KEYS: [&str; 6] = [
+    "token",
+    "access_token",
+    "api_key",
+    "key",
+    "secret",
+    "password",
+];
+
+/// Resolves the client address for logs and the WAF. The TCP peer is used
+/// unless the request came from a configured trusted proxy and the configured
+/// forwarded header carries a parseable address.
+fn client_ip(
+    request: &Request,
+    policy: &ProtectionPolicy,
+) -> Option<std::net::IpAddr> {
+    let peer = peer_addr(request)?.ip();
+    if !policy.trust_proxy_headers
+        || policy.trusted_proxies.is_empty()
+        || !policy.trusted_proxies.contains(&peer)
+    {
+        return Some(peer);
+    }
+    let raw = request.headers().get(policy.trusted_header.as_str())?;
+    forwarded_ip(raw.to_str().ok()?, policy.trust_last_hop, peer)
+}
+
+/// Picks the client address from a comma-separated forwarded header. Invalid
+/// entries are skipped; a header with no usable address falls back to the peer.
+fn forwarded_ip(
+    raw: &str,
+    last_hop: bool,
+    peer: std::net::IpAddr,
+) -> Option<std::net::IpAddr> {
+    let mut addresses = raw
+        .split(',')
+        .filter_map(|value| value.trim().parse::<std::net::IpAddr>().ok());
+    if last_hop {
+        addresses.next_back().or(Some(peer))
+    } else {
+        addresses.next().or(Some(peer))
+    }
+}
+
+/// Replaces the value of known-sensitive query parameters with `[redacted]`.
+fn redact_query(query: &str) -> String {
+    query
+        .split('&')
+        .map(|pair| {
+            let Some((name, _)) = pair.split_once('=') else {
+                return pair.to_string();
+            };
+            if SENSITIVE_QUERY_KEYS
+                .iter()
+                .any(|key| name.eq_ignore_ascii_case(key))
+            {
+                format!("{name}=[redacted]")
+            } else {
+                pair.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+// ─────────────────────────────────────────────────────────────
+// WAF
+// ─────────────────────────────────────────────────────────────
+
+/// Middleware 3/3: inspects API requests with the embedded WAF engine.
+pub async fn waf_guard(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let policy = state.protection.policy();
+    if !policy.waf_enabled {
+        return next.run(request).await;
+    }
+    let engine = policy
+        .waf
+        .get_or_init(|| control_plane_waf(policy.waf_blocking))
+        .clone();
+    if exempt(request.uri().path()) {
+        return next.run(request).await;
+    }
+
+    // Read the connection facts before the request is split: `Parts` is not
+    // cloneable, so this is the last chance to look at the extensions.
+    let client_ip = client_ip(&request, &policy)
+        .map(|ip| ip.to_string())
+        .unwrap_or_default();
+    let scheme = if request
+        .extensions()
+        .get::<ConnectInfo<ConnInfo>>()
+        .is_some_and(|info| info.0.tls)
+    {
+        "https".to_string()
+    } else {
+        "http".to_string()
+    };
+
+    let (parts, body) = request.into_parts();
+    // Upload routes accept bodies far larger than `WAF_BODY_LIMIT`; reading
+    // one here would answer 413 before the handler ever runs. Inspect their
+    // metadata only and hand the untouched body back to the handler.
+    let metadata_only = body_inspection_skipped(parts.uri.path());
+    let (bytes, replay) = if metadata_only {
+        (None, Some(body))
+    } else {
+        match axum::body::to_bytes(body, WAF_BODY_LIMIT).await {
+            Ok(bytes) => (Some(bytes), None),
+            Err(err) => {
+                tracing::warn!(error = %err, "control plane request body exceeded the WAF inspection limit");
+                let mut response = error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request_body_too_large",
+                    "request body exceeds the control plane WAF inspection limit",
+                );
+                response.extensions_mut().insert(ProtectionOutcome {
+                    action: action::BLOCKED_WAF,
+                    reason: Some(format!(
+                        "body larger than {WAF_BODY_LIMIT} bytes was not inspected"
+                    )),
+                });
+                return response;
+            },
+        }
+    };
+
+    let request_data = RequestData {
+        method: parts.method.as_str().to_string(),
+        path: parts.uri.path().to_string(),
+        query: parts.uri.query().unwrap_or_default().to_string(),
+        headers: parts
+            .headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect(),
+        body: bytes.as_ref().filter(|bytes| !bytes.is_empty()).cloned(),
+        client_ip,
+        country_code: None,
+        scheme,
+        protocol: format!("{:?}", parts.version),
+    };
+    let verdict = engine.inspect(&request_data);
+
+    let request = match replay {
+        Some(body) => Request::from_parts(parts, body),
+        None => Request::from_parts(
+            parts,
+            axum::body::Body::from(bytes.unwrap_or_default()),
+        ),
+    };
+    let blocking = policy.waf_blocking
+        && matches!(verdict.action, WafAction::Block | WafAction::Challenge);
+    if blocking {
+        tracing::warn!(
+            client_ip = %request_data.client_ip,
+            path = %request_data.path,
+            score = verdict.score,
+            rules = ?verdict.matched_rules,
+            "control plane WAF blocked a request"
+        );
+        let mut response = error_response(
+            StatusCode::FORBIDDEN,
+            "blocked_by_waf",
+            &format!(
+                "request blocked by the control plane WAF: {}",
+                verdict.details
+            ),
+        );
+        response.extensions_mut().insert(ProtectionOutcome {
+            action: action::BLOCKED_WAF,
+            reason: Some(verdict.details.clone()),
+        });
+        return response;
+    }
+
+    let mut response = next.run(request).await;
+    if verdict.action != WafAction::Pass {
+        tracing::info!(
+            client_ip = %request_data.client_ip,
+            path = %request_data.path,
+            score = verdict.score,
+            rules = ?verdict.matched_rules,
+            "control plane WAF match (not enforced)"
+        );
+        response.extensions_mut().insert(ProtectionOutcome {
+            action: action::OBSERVED_WAF,
+            reason: Some(format!(
+                "{} ({})",
+                verdict.details,
+                if policy.waf_blocking {
+                    "monitor verdict"
+                } else {
+                    "monitor mode"
+                }
+            )),
+        });
+    }
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{body_inspection_skipped, redact_query};
+
+    #[test]
+    fn large_upload_routes_skip_body_inspection() {
+        assert!(body_inspection_skipped("/api/v1/config-backups/upload"));
+        assert!(body_inspection_skipped("/api/v1/config-backups/abc/upload"));
+        assert!(body_inspection_skipped("/api/v1/login-security/geoip"));
+        assert!(!body_inspection_skipped("/api/v1/config-backups"));
+        assert!(!body_inspection_skipped(
+            "/api/v1/config-backups/abc/download"
+        ));
+        assert!(!body_inspection_skipped("/api/v1/sites"));
+    }
+
+    #[test]
+    fn sensitive_query_values_are_redacted() {
+        assert_eq!(
+            redact_query("a=1&token=secret&api_key=k"),
+            "a=1&token=[redacted]&api_key=[redacted]"
+        );
+        assert_eq!(redact_query("flag"), "flag");
+    }
+}
+#[cfg(test)]
+mod control_plane_waf_tests {
+    use super::{control_plane_waf, forwarded_ip};
+
+    #[test]
+    fn control_plane_engine_is_reused_per_mode() {
+        let blocking = control_plane_waf(true);
+        let blocking_again = control_plane_waf(true);
+        assert!(std::sync::Arc::ptr_eq(&blocking, &blocking_again));
+
+        let monitor = control_plane_waf(false);
+        assert!(!std::sync::Arc::ptr_eq(&blocking, &monitor));
+    }
+    #[test]
+    fn forwarded_ip_prefers_the_requested_hop_and_skips_garbage() {
+        let peer: std::net::IpAddr = "10.0.0.9".parse().unwrap();
+        assert_eq!(
+            forwarded_ip("203.0.113.7, 10.0.0.2", true, peer),
+            Some("10.0.0.2".parse().unwrap())
+        );
+        assert_eq!(
+            forwarded_ip("203.0.113.7, 10.0.0.2", false, peer),
+            Some("203.0.113.7".parse().unwrap())
+        );
+        assert_eq!(
+            forwarded_ip("not-an-ip, 10.0.0.2", false, peer),
+            Some("10.0.0.2".parse().unwrap())
+        );
+        assert_eq!(forwarded_ip("garbage", false, peer), Some(peer));
+    }
+}

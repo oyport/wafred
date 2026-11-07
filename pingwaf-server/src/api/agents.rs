@@ -1,0 +1,1274 @@
+//! Agent inventory: which agents are registered, whether they are currently
+//! connected, and the commands the dashboard can push at them.
+
+use axum::extract::{Path, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::Json;
+use axum::Router;
+use chrono::{DateTime, Utc};
+use pingwaf_proto::control_plane::{
+    BlockIpCommand, FlushLogsCommand, PurgeCacheCommand, RestartAgentCommand,
+    ServerCommand,
+};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, Set,
+};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::api::common::{
+    load_site_read, non_empty, parse_optional_datetime, parse_uuid,
+    require_write, scope_site, Page, Pagination, MAX_PURGE_URLS,
+};
+use crate::api::error::ApiError;
+use crate::api::keys::mint_key;
+use crate::api::state::AppState;
+use crate::auth::AuthUser;
+use crate::grpc::config::now_timestamp;
+use crate::models::{
+    agent, agent_status, api_key, host_sample, permission, site,
+};
+
+/// `wafred.CommandType` values, spelled out so the control plane does not depend
+/// on prost's enum variant naming.
+pub mod command_type {
+    pub const RULE_UPDATE: i32 = 1;
+    pub const CONFIG_RELOAD: i32 = 2;
+    pub const BLOCK_IP: i32 = 3;
+    pub const UNBLOCK_IP: i32 = 4;
+    pub const PURGE_CACHE: i32 = 5;
+    pub const UPDATE_SITE: i32 = 6;
+    pub const RESTART_AGENT: i32 = 7;
+    pub const FLUSH_LOGS: i32 = 8;
+}
+
+/// Upper bound on the `block_ip` duration a dashboard command may carry, in
+/// seconds (365 days). `0` keeps its protocol meaning of "until unblocked" and
+/// stays valid; anything beyond a year is a typo or an attempt to pin a block
+/// nobody will remember to remove. Negative values are refused rather than
+/// clamped, so a client that meant "forever" has to spell it `0`.
+const MAX_BLOCK_DURATION_SECONDS: i64 = 86_400 * 365;
+
+/// Cap on tag selectors in one command; nothing populates tags yet, so any
+/// non-trivial list is a mistake.
+const MAX_PURGE_TAGS: usize = 100;
+/// Cap on one url or tag selector. The longest legitimate entry is an absolute
+/// url with a long path and query string; 2 KiB is far past that and stops a
+/// single string from bloating a command that is mirrored to every agent.
+const MAX_PURGE_SELECTOR_LEN: usize = 2048;
+
+/// Cap on an operator-visible agent label. Long enough for a descriptive
+/// note, short enough that it cannot be used to smuggle a paragraph into the
+/// inventory table.
+const MAX_DISPLAY_NAME_LEN: usize = 100;
+
+/// Agent row enriched with live connection information.
+#[derive(Debug, Serialize)]
+pub struct AgentResponse {
+    pub id: Uuid,
+    pub site_id: Option<Uuid>,
+    pub site_domain: Option<String>,
+    pub hostname: String,
+    /// Operator-editable label; `null` means "use the hostname".
+    ///
+    /// The inventory stores one identity per row — `hostname` — and matches a
+    /// re-registration on it, so this is a label, never an identity.
+    pub display_name: Option<String>,
+    /// Display name of the node, falling back to `hostname`.
+    ///
+    /// Emitted because the node view (`GET /system/nodes`) names the field
+    /// `name`; carrying both keeps one shape for the console without breaking
+    /// callers that already read `hostname`.
+    pub name: String,
+    pub ip_address: String,
+    /// Egress address as seen from the public internet, empty when unknown.
+    pub public_ip: Option<String>,
+    /// First LAN address that is not loopback or a container/bridge interface.
+    pub private_ip: Option<String>,
+    pub version: Option<String>,
+    pub os_info: Option<String>,
+    pub cpu_cores: Option<i32>,
+    /// Legacy single figure, still emitted for callers that read it: the
+    /// capacity at registration, the usage from the first heartbeat on.
+    pub memory_bytes: Option<i64>,
+    /// RAM the node has, in bytes, as reported at registration. `None` for a
+    /// row that has not re-registered since migration 000064 and had no probe
+    /// sample to backfill from.
+    pub total_memory_bytes: Option<i64>,
+    /// RAM in use on the node, in bytes, as reported by the last heartbeat.
+    /// `None` until the first heartbeat after migration 000064.
+    pub used_memory_bytes: Option<i64>,
+    pub status: String,
+    pub api_key_id: Option<Uuid>,
+    pub config_hash: Option<String>,
+    pub last_heartbeat: Option<DateTime<Utc>>,
+    /// Same instant as `last_heartbeat`, under the name the node view
+    /// (`GET /system/nodes`) uses. `null` = the agent has never heartbeated.
+    pub last_seen: Option<DateTime<Utc>>,
+    /// When the agent last applied a full site config; null = never synced.
+    pub last_config_sync_at: Option<DateTime<Utc>>,
+    /// When the agent last applied a per-site rule bundle; null = never.
+    pub last_policy_sync_at: Option<DateTime<Utc>>,
+    pub registered_at: DateTime<Utc>,
+    /// True while the agent holds an open heartbeat stream.
+    pub connected: bool,
+    /// Commands waiting for the agent to reconnect.
+    pub pending_commands: usize,
+    /// Whether the gRPC control plane the agents connect to serves TLS.
+    /// `false` means plaintext traffic (degraded mode).
+    pub grpc_tls: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListQuery {
+    #[serde(flatten)]
+    pub pagination: Pagination,
+    pub site_id: Option<String>,
+    pub status: Option<String>,
+    pub search: Option<String>,
+}
+
+/// Window and paging for the probe history endpoint.
+#[derive(Debug, Deserialize)]
+pub struct SamplesQuery {
+    #[serde(flatten)]
+    pub pagination: Pagination,
+    /// Inclusive lower bound, RFC 3339.
+    pub from: Option<String>,
+    /// Exclusive upper bound, RFC 3339.
+    pub to: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommandRequest {
+    /// One of `restart`, `purge_cache`, `block_ip`, `unblock_ip`, `reload`.
+    pub command: String,
+    #[serde(default)]
+    pub site_id: Option<String>,
+    #[serde(default)]
+    pub ip_addresses: Vec<String>,
+    #[serde(default)]
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub duration_seconds: Option<i64>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default = "default_graceful")]
+    pub graceful: bool,
+}
+
+fn default_graceful() -> bool {
+    true
+}
+
+/// Rename request: `display_name` is the label shown instead of the hostname.
+///
+/// Omitting the field, sending `null`, or sending an empty/blank string all
+/// clear it, so the hostname shows again. The hostname itself is reported by
+/// the agent and cannot be changed here — registration matches on it.
+#[derive(Debug, Deserialize, Default)]
+pub struct UpdateAgentRequest {
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+/// Normalises an operator-supplied label: trimmed, blank becomes `None`, and
+/// the length/control-character limits are enforced. Returns the value to
+/// store.
+fn normalise_display_name(
+    raw: Option<String>,
+) -> Result<Option<String>, ApiError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > MAX_DISPLAY_NAME_LEN {
+        return Err(ApiError::BadRequest(format!(
+            "display_name must be at most {MAX_DISPLAY_NAME_LEN} characters"
+        )));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest(
+            "display_name must not contain control characters".to_string(),
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// Enrollment options. The minted key does not expire: a node is admitted as
+/// long as the token is valid, and it is revoked by deleting the key.
+#[derive(Debug, Deserialize, Default)]
+pub struct EnrollRequest {
+    /// Name recorded on the minted key, so it can be told apart in the key list.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Everything the operator needs to bring a node online: the key, the endpoint
+/// to connect to, and the command that uses both.
+#[derive(Debug, Serialize)]
+pub struct EnrollResponse {
+    pub key_id: Uuid,
+    /// Agent API key. Returned once — only its bcrypt hash is stored. It is
+    /// already part of `install_command`; the console does not display it
+    /// separately, but API callers may build their own command from it.
+    pub token: String,
+    /// gRPC endpoint the agent connects to.
+    pub server_url: String,
+    /// Installer one-liner: downloads the script, installs the node and
+    /// starts its service.
+    pub install_command: String,
+}
+
+/// Installer published with the repository root, fetched over HTTPS so a bare
+/// host needs nothing but `curl`.
+const INSTALL_SCRIPT_URL: &str =
+    "https://raw.githubusercontent.com/oyport/wafred/main/install.sh";
+
+/// Routes contributed to `/api/v1`.
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/agents", get(list))
+        .route("/agents/enroll", post(enroll))
+        .route("/agents/{agent_id}", get(show).patch(update).delete(remove))
+        .route("/agents/{agent_id}/samples", get(samples))
+        .route("/agents/{agent_id}/commands", post(send_command))
+        .route("/agents/flush-logs", post(flush_logs))
+}
+
+/// `POST /api/v1/agents/enroll` — mints an agent key and returns the command
+/// line that installs and starts a node with it.
+///
+/// The agent registers itself over gRPC on first connect, so running the command
+/// is all that is needed for the node to appear in the inventory.
+async fn enroll(
+    State(state): State<AppState>,
+    current: AuthUser,
+    headers: HeaderMap,
+    Json(payload): Json<EnrollRequest>,
+) -> Result<Response, ApiError> {
+    require_write(&current)?;
+
+    let name = non_empty(&payload.name).unwrap_or_else(|| {
+        format!("agent-enrollment-{}", Utc::now().format("%Y%m%d-%H%M%S"))
+    });
+    if name.len() > 100 {
+        return Err(ApiError::BadRequest(
+            "name must be at most 100 characters".to_string(),
+        ));
+    }
+
+    let (model, token) = mint_key(
+        &state,
+        current.id,
+        name,
+        vec![permission::AGENT.to_string(), permission::READ.to_string()],
+        None,
+    )
+    .await?;
+
+    let server_url = agent_server_url(&state, &headers);
+    let install_command = format!(
+        "curl -fsSL {INSTALL_SCRIPT_URL} | sudo bash -s -- --mode agent \
+         --server-url {server_url} --api-key {token}"
+    );
+
+    tracing::info!(key_id = %model.id, requested_by = %current.id, "agent enrollment created");
+
+    Ok((
+        StatusCode::CREATED,
+        Json(EnrollResponse {
+            key_id: model.id,
+            token,
+            server_url,
+            install_command,
+        }),
+    )
+        .into_response())
+}
+
+/// Best-effort gRPC endpoint for the agent to dial.
+///
+/// The control plane only knows its bind address (`0.0.0.0:9090`), which is not
+/// routable from another server, so the port is combined with the host the
+/// operator reached the dashboard on.
+fn agent_server_url(state: &AppState, headers: &HeaderMap) -> String {
+    let port = state
+        .config
+        .grpc_addr
+        .rsplit(':')
+        .next()
+        .filter(|raw| !raw.is_empty())
+        .unwrap_or("9090");
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(host_without_port)
+        .filter(|host| !host.is_empty() && *host != "localhost")
+        .unwrap_or("localhost");
+    let scheme = request_scheme(
+        headers,
+        state.control_tls.is_enabled(),
+        state.config.passkey_trust_forwarded_proto,
+    );
+    format!("{scheme}://{host}:{port}")
+}
+
+/// The scheme the browser used to reach the console.
+///
+/// The endpoint handed to an agent has to speak the same scheme the operator's
+/// browser used: the gRPC listener serves TLS by default, so a hard-coded
+/// `http://` produces a command whose plaintext h2 preface hits a TLS port and
+/// fails the handshake (the agent only shows a cryptic h2 error). A reverse
+/// proxy that terminates TLS hides the browser's scheme, so
+/// `X-Forwarded-Proto` is believed first and the `Referer` — which is the
+/// console page the operator is looking at — second. Only when neither is
+/// usable does the listener decide.
+///
+/// This value only shapes a piece of copyable text; it never decides how a
+/// connection is encrypted, and the endpoint still requires an authenticated
+/// caller with write access.
+///
+/// `X-Forwarded-Proto` is believed only when the deployment opted into
+/// trusting forwarded headers (`passkey_trust_forwarded_proto`), the same
+/// switch the passkey origin check uses: a direct caller must not be able to
+/// talk the control plane into advertising a scheme it never served.
+fn request_scheme(
+    headers: &HeaderMap,
+    tls_enabled: bool,
+    trust_forwarded_proto: bool,
+) -> &'static str {
+    fn known(raw: &str) -> Option<&'static str> {
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("https") {
+            Some("https")
+        } else if raw.eq_ignore_ascii_case("http") {
+            Some("http")
+        } else {
+            None
+        }
+    }
+
+    let forwarded = if trust_forwarded_proto {
+        headers
+            .get("x-forwarded-proto")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .and_then(known)
+    } else {
+        None
+    };
+    if let Some(scheme) = forwarded {
+        return scheme;
+    }
+    if let Some(scheme) = headers
+        .get(header::REFERER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once("://"))
+        .and_then(|(scheme, _)| known(scheme))
+    {
+        return scheme;
+    }
+    if tls_enabled {
+        "https"
+    } else {
+        "http"
+    }
+}
+
+/// Strips the port from a `Host` header value, keeping IPv6 literals intact.
+fn host_without_port(raw: &str) -> &str {
+    if let Some(end) = raw.find(']') {
+        return &raw[..=end];
+    }
+    match raw.rsplit_once(':') {
+        Some((host, _)) if !host.is_empty() => host,
+        _ => raw,
+    }
+}
+
+/// `GET /api/v1/agents`
+async fn list(
+    State(state): State<AppState>,
+    current: AuthUser,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<Page<AgentResponse>>, ApiError> {
+    let pagination = query.pagination.normalise();
+
+    let site_filter = match non_empty(&query.site_id) {
+        Some(raw) => Some(parse_uuid(&raw, "site id")?),
+        None => None,
+    };
+    if let Some(id) = site_filter {
+        // Enforces visibility even when the caller passes a site they cannot see.
+        load_site_read(&state.db, id, &current).await?;
+    }
+
+    let mut condition = Condition::all();
+    if !current.is_admin() {
+        let owned: Vec<Uuid> = site::Entity::find()
+            .filter(site::Column::UserId.eq(current.id))
+            .all(&state.db)
+            .await?
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        // Agents are visible to their owner, mirroring the config-push
+        // visibility (`agent_visible_site_ids`): a bound agent shows under the
+        // site it is bound to, and an unbound one — which serves every site of
+        // its API key's user — shows to that user as well.
+        let key_ids: Vec<Uuid> = api_key::Entity::find()
+            .filter(api_key::Column::UserId.eq(current.id))
+            .all(&state.db)
+            .await?
+            .into_iter()
+            .map(|key| key.id)
+            .collect();
+        condition = condition.add(
+            Condition::any()
+                .add(agent::Column::SiteId.is_in(owned))
+                .add(
+                    Condition::all()
+                        .add(agent::Column::SiteId.is_null())
+                        .add(agent::Column::ApiKeyId.is_in(key_ids)),
+                ),
+        );
+    }
+    if let Some(id) = site_filter {
+        condition = condition.add(agent::Column::SiteId.eq(id));
+    }
+    if let Some(status) = non_empty(&query.status) {
+        if !agent_status::is_valid(&status) {
+            return Err(ApiError::BadRequest(format!(
+                "unknown agent status '{status}'"
+            )));
+        }
+        condition = condition.add(agent::Column::Status.eq(status));
+    }
+    if let Some(search) = non_empty(&query.search) {
+        let pattern = format!("%{}%", search.to_lowercase());
+        condition = condition.add(
+            Condition::any()
+                .add(agent::Column::Hostname.like(&pattern))
+                .add(agent::Column::DisplayName.like(&pattern))
+                .add(agent::Column::IpAddress.like(&pattern)),
+        );
+    }
+
+    let paginator = agent::Entity::find()
+        .filter(condition)
+        .order_by_desc(agent::Column::RegisteredAt)
+        .paginate(&state.db, pagination.limit());
+
+    let total = paginator.num_items().await?;
+    let rows = paginator.fetch_page(pagination.index()).await?;
+    let items = enrich(&state, rows).await?;
+
+    Ok(Json(Page::new(items, total, pagination)))
+}
+
+/// `GET /api/v1/agents/{agent_id}`
+async fn show(
+    State(state): State<AppState>,
+    current: AuthUser,
+    Path(agent_id): Path<String>,
+) -> Result<Json<AgentResponse>, ApiError> {
+    let id = parse_uuid(&agent_id, "agent id")?;
+    let row = load_agent(&state, id, &current).await?;
+    let mut items = enrich(&state, vec![row]).await?;
+    Ok(Json(items.remove(0)))
+}
+
+/// `PATCH /api/v1/agents/{agent_id}` — set or clear the operator label.
+///
+/// Only the label changes: `hostname` is the agent's identity and stays as
+/// reported. An empty or missing value clears the label, so the console falls
+/// back to the hostname.
+async fn update(
+    State(state): State<AppState>,
+    current: AuthUser,
+    Path(agent_id): Path<String>,
+    Json(payload): Json<UpdateAgentRequest>,
+) -> Result<Json<AgentResponse>, ApiError> {
+    require_write(&current)?;
+    let id = parse_uuid(&agent_id, "agent id")?;
+    let row = load_agent(&state, id, &current).await?;
+
+    let display_name = normalise_display_name(payload.display_name)?;
+    let mut active: agent::ActiveModel = row.into();
+    active.display_name = Set(display_name.clone());
+    active.update(&state.db).await?;
+
+    tracing::info!(
+        agent_id = %id,
+        renamed = display_name.is_some(),
+        "agent display name updated"
+    );
+
+    let row = load_agent(&state, id, &current).await?;
+    let mut items = enrich(&state, vec![row]).await?;
+    Ok(Json(items.remove(0)))
+}
+
+/// `GET /api/v1/agents/{agent_id}/samples` — host probe history, newest first.
+///
+/// Cumulative counters (network and disk totals) are returned raw; the caller
+/// differences consecutive rows to obtain rates.
+async fn samples(
+    State(state): State<AppState>,
+    current: AuthUser,
+    Path(agent_id): Path<String>,
+    Query(query): Query<SamplesQuery>,
+) -> Result<Json<Page<host_sample::Model>>, ApiError> {
+    let id = parse_uuid(&agent_id, "agent id")?;
+    load_agent(&state, id, &current).await?;
+
+    let pagination = query.pagination.normalise();
+    let from = parse_optional_datetime(&query.from, "from")?;
+    let to = parse_optional_datetime(&query.to, "to")?;
+
+    let mut condition =
+        Condition::all().add(host_sample::Column::AgentId.eq(id));
+    if let Some(at) = from {
+        condition = condition.add(host_sample::Column::SampledAt.gte(at));
+    }
+    if let Some(at) = to {
+        condition = condition.add(host_sample::Column::SampledAt.lt(at));
+    }
+
+    let paginator = host_sample::Entity::find()
+        .filter(condition)
+        .order_by_desc(host_sample::Column::SampledAt)
+        .paginate(&state.db, pagination.limit());
+
+    let total = paginator.num_items().await?;
+    let items = paginator.fetch_page(pagination.index()).await?;
+
+    Ok(Json(Page::new(items, total, pagination)))
+}
+
+/// `DELETE /api/v1/agents/{agent_id}` — de-registers an agent.
+async fn remove(
+    State(state): State<AppState>,
+    current: AuthUser,
+    Path(agent_id): Path<String>,
+) -> Result<Response, ApiError> {
+    require_write(&current)?;
+    let id = parse_uuid(&agent_id, "agent id")?;
+    load_agent(&state, id, &current).await?;
+
+    agent::Entity::delete_by_id(id).exec(&state.db).await?;
+    state.agents.force_disconnect(&id).await;
+    // The row is gone, so nothing will ever connect under this id again:
+    // drop its queued commands now instead of waiting for a sweep that only
+    // looks at rows which still exist (2026-10-19 review).
+    state.agents.forget(&[id]).await;
+
+    tracing::info!(agent_id = %id, requested_by = %current.id, "agent de-registered");
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `POST /api/v1/agents/{agent_id}/commands`
+async fn send_command(
+    State(state): State<AppState>,
+    current: AuthUser,
+    Path(agent_id): Path<String>,
+    Json(payload): Json<CommandRequest>,
+) -> Result<Response, ApiError> {
+    require_write(&current)?;
+    let id = parse_uuid(&agent_id, "agent id")?;
+    load_agent(&state, id, &current).await?;
+
+    let site_id = match non_empty(&payload.site_id) {
+        Some(raw) => {
+            let parsed = parse_uuid(&raw, "site id")?;
+            load_site_read(&state.db, parsed, &current).await?;
+            Some(parsed)
+        },
+        None => None,
+    };
+
+    let command = build_command(&payload, site_id)?;
+    let delivered = state.agents.send_command(&id, command).await;
+
+    tracing::info!(
+        agent_id = %id,
+        command = %payload.command,
+        delivered,
+        requested_by = %current.id,
+        "command issued to agent"
+    );
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "agent_id": id,
+            "command": payload.command,
+            "delivered": delivered,
+            "queued": !delivered,
+        })),
+    )
+        .into_response())
+}
+
+/// `POST /api/v1/agents/flush-logs`
+///
+/// Asks every connected agent to flush its in-memory log buffer now. Offline
+/// agents are counted but not queued: replaying "flush" after a reconnect has
+/// no value and would only occupy a pending-command slot.
+async fn flush_logs(
+    State(state): State<AppState>,
+    current: AuthUser,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_write(&current)?;
+
+    let payload = CommandRequest {
+        command: "flush_logs".to_string(),
+        site_id: None,
+        ip_addresses: Vec::new(),
+        urls: Vec::new(),
+        tags: Vec::new(),
+        duration_seconds: None,
+        reason: Some("requested from the log page".to_string()),
+        graceful: true,
+    };
+
+    let connected = state.agents.snapshot().await;
+    let mut delivered = 0usize;
+    for agent in &connected {
+        let command = build_command(&payload, None)?;
+        if state.agents.send_command_now(&agent.id, command).await {
+            delivered += 1;
+        }
+    }
+
+    let registered = agent::Entity::find().count(&state.db).await? as usize;
+    let offline = registered.saturating_sub(connected.len());
+    tracing::info!(
+        delivered,
+        offline,
+        requested_by = %current.email,
+        "log flush broadcast"
+    );
+
+    Ok(Json(serde_json::json!({
+        "delivered": delivered,
+        "offline": offline,
+    })))
+}
+
+/// Loads an agent and checks that `current` may see it.
+pub async fn load_agent(
+    state: &AppState,
+    id: Uuid,
+    current: &AuthUser,
+) -> Result<agent::Model, ApiError> {
+    let row = agent::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("agent {id} not found")))?;
+
+    if !current.is_admin() {
+        if let Some(site_id) = row.site_id {
+            // `load_site_read` hides sites owned by somebody else behind a 404.
+            load_site_read(&state.db, site_id, current).await?;
+        } else {
+            // An unbound agent serves every site of its API key's owner —
+            // visible only to that owner (mirrors `agent_visible_site_ids`).
+            let owned_by_caller = match row.api_key_id {
+                Some(key_id) => api_key::Entity::find_by_id(key_id)
+                    .one(&state.db)
+                    .await?
+                    .map(|key| key.user_id == current.id)
+                    .unwrap_or(false),
+                None => false,
+            };
+            if !owned_by_caller {
+                return Err(ApiError::NotFound(format!(
+                    "agent {id} not found"
+                )));
+            }
+        }
+    }
+    Ok(row)
+}
+
+/// Attaches live connection state and site domain to agent rows.
+async fn enrich(
+    state: &AppState,
+    rows: Vec<agent::Model>,
+) -> Result<Vec<AgentResponse>, ApiError> {
+    let domains: std::collections::HashMap<Uuid, String> = {
+        let ids: Vec<Uuid> =
+            rows.iter().filter_map(|row| row.site_id).collect();
+        if ids.is_empty() {
+            Default::default()
+        } else {
+            site::Entity::find()
+                .filter(site::Column::Id.is_in(ids))
+                .all(&state.db)
+                .await?
+                .into_iter()
+                .map(|row| (row.id, row.domain))
+                .collect()
+        }
+    };
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let connected = state.agents.is_connected(&row.id).await;
+        out.push(AgentResponse {
+            id: row.id,
+            site_domain: row.site_id.and_then(|id| domains.get(&id).cloned()),
+            site_id: row.site_id,
+            name: row
+                .display_name
+                .clone()
+                .unwrap_or_else(|| row.hostname.clone()),
+            display_name: row.display_name,
+            hostname: row.hostname,
+            ip_address: row.ip_address,
+            public_ip: row.public_ip,
+            private_ip: row.private_ip,
+            version: row.version,
+            os_info: row.os_info,
+            cpu_cores: row.cpu_cores,
+            memory_bytes: row.memory_bytes,
+            total_memory_bytes: row.total_memory_bytes,
+            used_memory_bytes: row.used_memory_bytes,
+            status: row.status,
+            api_key_id: row.api_key_id,
+            config_hash: row.config_hash,
+            last_heartbeat: row.last_heartbeat,
+            last_seen: row.last_heartbeat,
+            last_config_sync_at: row.last_config_sync_at,
+            last_policy_sync_at: row.last_policy_sync_at,
+            registered_at: row.registered_at,
+            connected,
+            pending_commands: state.agents.pending_count(&row.id).await,
+            grpc_tls: state.config.grpc_tls_enabled(),
+        });
+    }
+    Ok(out)
+}
+
+/// Bounds the `block_ip` duration (D12).
+///
+/// `None` and `0` both mean "permanent" in the protocol; a negative value used
+/// to reach the agent as-is, and an absurdly large one pinned a block for
+/// centuries. The value is rejected rather than clamped so a caller never gets
+/// a silently different block lifetime than it asked for.
+fn validate_block_duration(duration: Option<i64>) -> Result<i64, ApiError> {
+    let duration = duration.unwrap_or(0);
+    if !(0..=MAX_BLOCK_DURATION_SECONDS).contains(&duration) {
+        return Err(ApiError::BadRequest(format!(
+            "duration_seconds must be between 0 (permanent) and \
+             {MAX_BLOCK_DURATION_SECONDS} (one year), got {duration}"
+        )));
+    }
+    Ok(duration)
+}
+
+/// Bounds the url and tag selectors of a `purge_cache` command (D12).
+///
+/// The list is copied into one command per agent, so an unbounded list is
+/// amplified by the fleet size. Blank entries are dropped (same tolerance as
+/// `POST /cache/purge`), and the count and per-entry length are capped.
+fn validate_purge_selectors(
+    urls: &[String],
+    tags: &[String],
+) -> Result<(Vec<String>, Vec<String>), ApiError> {
+    let clean = |items: &[String]| -> Vec<String> {
+        items
+            .iter()
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect()
+    };
+    let urls = clean(urls);
+    let tags = clean(tags);
+
+    if urls.len() > MAX_PURGE_URLS {
+        return Err(ApiError::BadRequest(format!(
+            "at most {MAX_PURGE_URLS} urls can be purged in one command"
+        )));
+    }
+    if tags.len() > MAX_PURGE_TAGS {
+        return Err(ApiError::BadRequest(format!(
+            "at most {MAX_PURGE_TAGS} tags can be purged in one command"
+        )));
+    }
+    for item in urls.iter().chain(tags.iter()) {
+        if item.len() > MAX_PURGE_SELECTOR_LEN {
+            return Err(ApiError::BadRequest(format!(
+                "a url or tag may be at most {MAX_PURGE_SELECTOR_LEN} \
+                 characters, got {}",
+                item.len()
+            )));
+        }
+    }
+    Ok((urls, tags))
+}
+
+/// Turns a dashboard command request into the protocol message.
+pub fn build_command(
+    payload: &CommandRequest,
+    site_id: Option<Uuid>,
+) -> Result<ServerCommand, ApiError> {
+    let site = site_id.map(|id| id.to_string()).unwrap_or_default();
+    let (kind, body) = match payload.command.as_str() {
+        "restart" => (
+            command_type::RESTART_AGENT,
+            Some(server_command_payload::RestartAgent(RestartAgentCommand {
+                reason: payload.reason.clone().unwrap_or_else(|| "requested from dashboard".to_string()),
+                graceful: payload.graceful,
+            })),
+        ),
+        "reload" => (command_type::CONFIG_RELOAD, None),
+        "flush_logs" => (
+            command_type::FLUSH_LOGS,
+            Some(server_command_payload::FlushLogs(FlushLogsCommand {
+                reason: payload
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "requested from dashboard".to_string()),
+            })),
+        ),
+        "purge_cache" => {
+            let (urls, tags) =
+                validate_purge_selectors(&payload.urls, &payload.tags)?;
+            (
+                command_type::PURGE_CACHE,
+                Some(server_command_payload::PurgeCache(PurgeCacheCommand {
+                    site_id: site.clone(),
+                    urls,
+                    tags,
+                })),
+            )
+        },
+        "block_ip" => {
+            if payload.ip_addresses.is_empty() {
+                return Err(ApiError::BadRequest(
+                    "ip_addresses must not be empty".to_string(),
+                ));
+            }
+            // Reuse the manual-block guard: every entry goes through the
+            // same /16 (v4) and /32 (v6) ceiling as `POST /blocked-ips/block`,
+            // so a command can never blanket-ban `0.0.0.0/0`, and each entry
+            // is written back in its normalised (host bits truncated,
+            // mapped-v6 collapsed) form so agents key on one canonical
+            // string.
+            let normalized: Vec<String> = payload
+                .ip_addresses
+                .iter()
+                .map(|raw| {
+                    crate::api::blocked_ips::parse_block_target(raw)
+                        .map(|target| target.as_stored())
+                })
+                .collect::<Result<_, _>>()?;
+            (
+                command_type::BLOCK_IP,
+                Some(server_command_payload::BlockIp(BlockIpCommand {
+                    site_id: site.clone(),
+                    ip_addresses: normalized,
+                    duration_seconds: validate_block_duration(
+                        payload.duration_seconds,
+                    )?,
+                    reason: payload
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "blocked from dashboard".to_string()),
+                })),
+            )
+        }
+        "unblock_ip" => {
+            if payload.ip_addresses.is_empty() {
+                return Err(ApiError::BadRequest(
+                    "ip_addresses must not be empty".to_string(),
+                ));
+            }
+            // No width guard here — unblocking must never be stricter than
+            // blocking — but the same normalisation, so the key matches the
+            // one the block was stored under and the agent's exact removal
+            // hits.
+            let normalized: Vec<String> = payload
+                .ip_addresses
+                .iter()
+                .map(|raw| crate::api::blocked_ips::parse_unblock_target(raw))
+                .collect::<Result<_, _>>()?;
+            (
+                command_type::UNBLOCK_IP,
+                Some(server_command_payload::UnblockIp(
+                    pingwaf_proto::control_plane::UnblockIpCommand {
+                        site_id: site.clone(),
+                        ip_addresses: normalized,
+                    },
+                )),
+            )
+        }
+        other => {
+            return Err(ApiError::BadRequest(format!(
+                "unknown command '{other}'; expected restart, reload, purge_cache, block_ip, \
+                 unblock_ip or flush_logs"
+            )))
+        }
+    };
+
+    Ok(ServerCommand {
+        command_id: Uuid::new_v4().to_string(),
+        r#type: kind,
+        issued_at: now_timestamp(),
+        payload: body,
+    })
+}
+
+/// The generated `oneof payload` module of `ServerCommand`.
+mod server_command_payload {
+    pub use pingwaf_proto::control_plane::server_command::Payload::{
+        BlockIp, FlushLogs, PurgeCache, RestartAgent, UnblockIp,
+    };
+}
+
+/// Filters a site scope for the log endpoints, shared with [`crate::api::logs`].
+pub fn resolve_site_scope(
+    requested: &Option<String>,
+    current: &AuthUser,
+) -> Result<Option<Uuid>, ApiError> {
+    let parsed = match non_empty(requested) {
+        Some(raw) => Some(parse_uuid(&raw, "site id")?),
+        None => None,
+    };
+    scope_site(parsed, current)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::HeaderValue;
+
+    use super::*;
+
+    fn request(command: &str) -> CommandRequest {
+        CommandRequest {
+            command: command.to_string(),
+            site_id: None,
+            ip_addresses: Vec::new(),
+            urls: Vec::new(),
+            tags: Vec::new(),
+            duration_seconds: None,
+            reason: None,
+            graceful: true,
+        }
+    }
+
+    #[test]
+    fn known_commands_build_messages() {
+        let site = Uuid::new_v4();
+        let command = build_command(&request("restart"), Some(site)).unwrap();
+        assert_eq!(command.r#type, command_type::RESTART_AGENT);
+        assert!(!command.command_id.is_empty());
+
+        let command = build_command(&request("reload"), None).unwrap();
+        assert_eq!(command.r#type, command_type::CONFIG_RELOAD);
+        assert!(command.payload.is_none());
+    }
+
+    #[test]
+    fn ip_commands_require_addresses() {
+        assert!(build_command(&request("block_ip"), None).is_err());
+        assert!(build_command(&request("unblock_ip"), None).is_err());
+
+        let mut with_ips = request("block_ip");
+        with_ips.ip_addresses = vec!["10.0.0.1".to_string()];
+        let command = build_command(&with_ips, None).unwrap();
+        assert_eq!(command.r#type, command_type::BLOCK_IP);
+    }
+
+    #[test]
+    fn unknown_commands_are_rejected() {
+        assert!(build_command(&request("self-destruct"), None).is_err());
+    }
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, HeaderValue::from_str(value).unwrap());
+        }
+        map
+    }
+
+    #[test]
+    fn enrollment_scheme_follows_the_browser() {
+        // A trusted TLS-terminating proxy is authoritative about the scheme.
+        assert_eq!(
+            request_scheme(
+                &headers(&[("x-forwarded-proto", "https")]),
+                false,
+                true
+            ),
+            "https"
+        );
+        // A proxy chain reports the client-facing scheme first.
+        assert_eq!(
+            request_scheme(
+                &headers(&[("x-forwarded-proto", "https, http")]),
+                false,
+                true
+            ),
+            "https"
+        );
+        // Header values are case-insensitive, like the tokens they carry.
+        assert_eq!(
+            request_scheme(
+                &headers(&[("x-forwarded-proto", "HTTPS")]),
+                false,
+                true
+            ),
+            "https"
+        );
+        // Without the trust opt-in the same header must not be believed.
+        assert_eq!(
+            request_scheme(
+                &headers(&[("x-forwarded-proto", "https")]),
+                false,
+                false
+            ),
+            "http"
+        );
+        // The console page the operator is looking at decides even when the
+        // forwarded header is not trusted — a proxy may not set it at all.
+        assert_eq!(
+            request_scheme(
+                &headers(&[("referer", "https://waf.example.com:9080/agents")]),
+                false,
+                false
+            ),
+            "https"
+        );
+        assert_eq!(
+            request_scheme(
+                &headers(&[("referer", "http://10.0.0.5:9080/agents")]),
+                false,
+                true
+            ),
+            "http"
+        );
+        // Junk in a header is ignored instead of being echoed into the command.
+        assert_eq!(
+            request_scheme(
+                &headers(&[
+                    ("x-forwarded-proto", "ftp"),
+                    ("referer", "https://waf.example.com/")
+                ]),
+                false,
+                true
+            ),
+            "https"
+        );
+        assert_eq!(
+            request_scheme(&headers(&[("referer", "not a url")]), false, true),
+            "http"
+        );
+        // Nothing usable: fall back to whether this listener serves TLS.
+        assert_eq!(request_scheme(&HeaderMap::new(), true, false), "https");
+        assert_eq!(request_scheme(&HeaderMap::new(), false, false), "http");
+    }
+
+    fn ips(command: &str, addresses: &[&str]) -> CommandRequest {
+        let mut req = request(command);
+        req.ip_addresses = addresses.iter().map(|s| s.to_string()).collect();
+        req
+    }
+
+    fn block_payload(req: &CommandRequest) -> Vec<String> {
+        match build_command(req, None).unwrap().payload.unwrap() {
+            server_command_payload::BlockIp(cmd) => cmd.ip_addresses,
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    fn unblock_payload(req: &CommandRequest) -> Vec<String> {
+        match build_command(req, None).unwrap().payload.unwrap() {
+            server_command_payload::UnblockIp(cmd) => cmd.ip_addresses,
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_ip_rejects_cidrs_wider_than_the_manual_block_guard() {
+        for raw in [
+            "0.0.0.0/0",
+            "::/0",
+            "10.0.0.0/8",
+            "2001:db8::/16",
+            // /96 v6 numerically covers the whole IPv4-mapped space; it is
+            // the mapped spelling of 0.0.0.0/0 and must hit the same guard.
+            "::ffff:0:0/96",
+        ] {
+            let err = build_command(&ips("block_ip", &[raw]), None)
+                .err()
+                .unwrap_or_else(|| panic!("{raw} must be rejected"));
+            assert!(err.to_string().contains("too broad"), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn block_ip_normalises_targets_like_the_manual_block_path() {
+        assert_eq!(
+            block_payload(&ips("block_ip", &["203.0.113.99/24"])),
+            vec!["203.0.113.0/24".to_string()]
+        );
+        assert_eq!(
+            block_payload(&ips("block_ip", &[" 203.0.113.7 "])),
+            vec!["203.0.113.7".to_string()]
+        );
+        assert_eq!(
+            block_payload(&ips(
+                "block_ip",
+                &["::ffff:203.0.113.0/120", "2001:db8::/32"]
+            )),
+            vec!["203.0.113.0/24".to_string(), "2001:db8::/32".to_string()]
+        );
+        // /104 on a mapped address maps to a v4 /8 — beyond the v4 ceiling.
+        assert!(build_command(
+            &ips("block_ip", &["::ffff:10.0.0.0/104"]),
+            None
+        )
+        .is_err());
+    }
+
+    fn purge_payload(req: &CommandRequest) -> PurgeCacheCommand {
+        match build_command(req, None).unwrap().payload.unwrap() {
+            server_command_payload::PurgeCache(cmd) => cmd,
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    fn block_duration(req: &CommandRequest) -> i64 {
+        match build_command(req, None).unwrap().payload.unwrap() {
+            server_command_payload::BlockIp(cmd) => cmd.duration_seconds,
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    /// D12: a negative duration used to reach the agent verbatim, and an
+    /// absurd one pinned a block for centuries. `0` stays "permanent".
+    #[test]
+    fn block_ip_duration_is_bounded() {
+        let mut req = ips("block_ip", &["203.0.113.7"]);
+
+        req.duration_seconds = None;
+        assert_eq!(block_duration(&req), 0, "absent means permanent");
+        req.duration_seconds = Some(0);
+        assert_eq!(block_duration(&req), 0, "zero means permanent");
+        req.duration_seconds = Some(3600);
+        assert_eq!(block_duration(&req), 3600);
+        req.duration_seconds = Some(MAX_BLOCK_DURATION_SECONDS);
+        assert_eq!(block_duration(&req), MAX_BLOCK_DURATION_SECONDS);
+
+        for bad in [-1, -86_400, MAX_BLOCK_DURATION_SECONDS + 1, i64::MAX] {
+            let mut req = ips("block_ip", &["203.0.113.7"]);
+            req.duration_seconds = Some(bad);
+            match build_command(&req, None) {
+                Err(ApiError::BadRequest(message)) => {
+                    assert!(
+                        message.contains("duration_seconds"),
+                        "{bad}: {message}"
+                    );
+                },
+                other => panic!("{bad} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// D12: the url/tag lists are copied into one command per agent, so an
+    /// unbounded list is amplified by the fleet. Blank entries are dropped,
+    /// matching `POST /cache/purge`.
+    #[test]
+    fn purge_cache_selectors_are_bounded() {
+        let mut req = request("purge_cache");
+        req.urls = vec![" /a ".into(), "".into(), "/b".into()];
+        req.tags = vec![" tag1 ".into()];
+        let cmd = purge_payload(&req);
+        assert_eq!(cmd.urls, vec!["/a".to_string(), "/b".to_string()]);
+        assert_eq!(cmd.tags, vec!["tag1".to_string()]);
+
+        let mut overflow = request("purge_cache");
+        overflow.urls =
+            (0..=MAX_PURGE_URLS).map(|_| "/x".to_string()).collect();
+        assert!(matches!(
+            build_command(&overflow, None),
+            Err(ApiError::BadRequest(_))
+        ));
+
+        let mut too_many_tags = request("purge_cache");
+        too_many_tags.tags =
+            (0..=MAX_PURGE_TAGS).map(|i| format!("t{i}")).collect();
+        assert!(matches!(
+            build_command(&too_many_tags, None),
+            Err(ApiError::BadRequest(_))
+        ));
+
+        let mut long_url = request("purge_cache");
+        long_url.urls = vec!["a".repeat(MAX_PURGE_SELECTOR_LEN + 1)];
+        assert!(matches!(
+            build_command(&long_url, None),
+            Err(ApiError::BadRequest(_))
+        ));
+
+        // Exactly at the limits is still accepted.
+        let mut at_limit = request("purge_cache");
+        at_limit.urls = vec!["a".repeat(MAX_PURGE_SELECTOR_LEN)];
+        at_limit.tags = (0..MAX_PURGE_TAGS).map(|i| format!("t{i}")).collect();
+        assert!(build_command(&at_limit, None).is_ok());
+    }
+
+    #[test]
+    fn unblock_ip_is_normalised_but_not_width_guarded() {
+        // Same normalisation as blocking, so the exact key matches.
+        assert_eq!(
+            unblock_payload(&ips(
+                "unblock_ip",
+                &["203.0.113.99/24", "::ffff:203.0.113.5"]
+            )),
+            vec!["203.0.113.0/24".to_string(), "203.0.113.5".to_string()]
+        );
+        // Invalid input is still rejected.
+        assert!(build_command(&ips("unblock_ip", &["nonsense"]), None).is_err());
+    }
+
+    #[test]
+    fn display_names_are_trimmed_and_bounded() {
+        assert_eq!(normalise_display_name(None).unwrap(), None);
+        assert_eq!(
+            normalise_display_name(Some("   ".to_string())).unwrap(),
+            None
+        );
+        assert_eq!(
+            normalise_display_name(Some("  edge-hk-01  ".to_string())).unwrap(),
+            Some("edge-hk-01".to_string())
+        );
+        // Exactly at the limit is accepted; one more is refused.
+        let at_limit = "a".repeat(MAX_DISPLAY_NAME_LEN);
+        assert_eq!(
+            normalise_display_name(Some(at_limit)).unwrap(),
+            Some("a".repeat(MAX_DISPLAY_NAME_LEN))
+        );
+        assert!(matches!(
+            normalise_display_name(Some("a".repeat(MAX_DISPLAY_NAME_LEN + 1))),
+            Err(ApiError::BadRequest(_))
+        ));
+        // Control characters would break the table and the access log.
+        assert!(matches!(
+            normalise_display_name(Some("edge\nhk".to_string())),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+}

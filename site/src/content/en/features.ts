@@ -1,0 +1,205 @@
+import type { FeaturesContent } from "../schema";
+
+const features = {
+  meta: {
+    title: "Features — WAFred",
+    description:
+      "Semantic WAF detection, CC and bot defense, IP and geo access control, origin pools, edge caching, automatic TLS and full observability — all controlled from one console.",
+  },
+  hero: {
+    eyebrow: "Capabilities",
+    title: "Everything an edge WAF needs, nothing switched on for you",
+    lead: "WAFred ships protections disabled per site. Enable what your traffic needs, in the order you need it, and every change is versioned.",
+    toc: [
+      { id: "waf-engine", label: "WAF engine" },
+      { id: "cc-bot", label: "CC & bot" },
+      { id: "access-control", label: "Access control" },
+      { id: "traffic-caching", label: "Traffic & cache" },
+      { id: "tls", label: "TLS" },
+      { id: "observability", label: "Observability" },
+      { id: "operations", label: "Operations" },
+    ],
+  },
+  metrics: {
+    eyebrow: "Measured effectiveness",
+    title: "Numbers from a public corpus",
+    lead: "33 877 blazehttp samples replayed byte for byte against a release build — strict calibre: only 403 block pages and 503 challenge pages count.",
+    items: [
+      { value: "96.6%", label: "Attack interception", note: "Effective · 638 decidable samples" },
+      { value: "0.06%", label: "False positives", note: "19 of 33 219 benign samples" },
+      { value: "1–2 ms", label: "Static-tier p95", note: "loopback replay / release build" },
+    ],
+    link: { label: "Read the full test report", path: "/docs/waf-test-report/" },
+  },
+  groups: [
+    {
+      id: "waf-engine",
+      icon: "shield",
+      kicker: "Detection",
+      title: "A semantic engine, not a regex list",
+      lead: "Requests are normalized first, then scored by signatures, heuristics and expressions before a verdict is produced.",
+      points: [
+        "Normalization runs before any rule, so encoding tricks cannot hide a payload.",
+        "libinjection heuristics for SQLi and XSS plus Aho-Corasick multi-pattern matching for the rest.",
+        "Cloudflare-style expressions such as http.request.uri.path contains \"/admin\" and ip.src in {10.0.0.0/8}.",
+        "Anomaly scoring aggregates every match into one verdict per request.",
+      ],
+      note: "normalize → signatures → expression → anomaly score",
+      scene: {
+        id: "waf",
+        caption: "Custom rules and managed rule sets are toggled per site.",
+        alt: "WAF rule editor in the WAFred console",
+      },
+    },
+    {
+      id: "cc-bot",
+      icon: "bot",
+      kicker: "Availability",
+      title: "Absorb floods, keep humans moving",
+      lead: "Layered challenges stop request floods without a CAPTCHA wall in front of your users.",
+      points: [
+        "JavaScript 5-second shield, proof of work and interactive challenges.",
+        "Clearance cookies are HMAC-signed, so a pass cannot be forged or replayed elsewhere.",
+        "Verified-bot allow lists and known-browser pass-through keep crawlers and monitoring working.",
+        "Challenges apply per site, so a strict policy on one hostname does not affect another.",
+      ],
+      note: "TLS fingerprinting and behavioural analysis are on the roadmap.",
+      scene: {
+        id: "bot",
+        caption: "Bot policy, verified bots and challenge actions per site.",
+        alt: "Bot protection settings in the WAFred console",
+      },
+    },
+    {
+      id: "access-control",
+      icon: "key",
+      kicker: "Access",
+      title: "Decide who reaches the origin",
+      lead: "Block, allow or challenge by address and region, and cap abuse per request dimension.",
+      points: [
+        "IP access rules with block, allow, challenge and js_challenge actions, CIDR ranges, CSV bulk import and named rules.",
+        "Global IP groups built from plain-text, JSON or Cloudflare IP-range subscriptions, synced on a schedule with error reporting.",
+        "Geo restrictions by country and ASN, including an optional block-unknown-countries policy.",
+        "Rate limiting by IP, host, path, ASN, country, header, cookie or query parameter.",
+      ],
+      scene: {
+        id: "access",
+        caption: "IP rules and geo policy side by side on a site.",
+        alt: "Access control page with IP rules and geo restrictions",
+      },
+    },
+    {
+      id: "traffic-caching",
+      icon: "route",
+      kicker: "Traffic",
+      title: "Route, balance and cache at the edge",
+      lead: "Origin pools, routes and the cache live next to the security policy, so a rule and a route change together.",
+      points: [
+        "Origin pools with round-robin, least connections, random, and consistent hashing by IP, URL, path, header, cookie or query.",
+        "Routes by prefix, exact match or regex — optionally limited to an IP group so a path can serve office and partner networks differently.",
+        "Edge cache with per-site disk quotas, LRU eviction, stale-while-revalidate and browser TTL control.",
+        "Header, path, query and body rewriting, Tera error pages, and a per-site pause that serves 503 while the certificate keeps working.",
+      ],
+      scene: {
+        id: "caching",
+        caption: "Cache rules, TTLs and per-site quota.",
+        alt: "Edge caching configuration in the WAFred console",
+      },
+    },
+    {
+      id: "tls",
+      icon: "lock",
+      kicker: "TLS",
+      title: "Certificates issued and rotated at the edge",
+      lead: "ACME runs on the data plane, and the control plane always knows what each agent currently holds.",
+      points: [
+        "Automatic ACME / Let's Encrypt issuance and renewal with HTTP-01 and DNS-01 challenges.",
+        "DNS-01 through Aliyun, Cloudflare, Tencent Cloud DNSPod, Huawei Cloud or manual DNS.",
+        "Per-site certificate status (valid, expiring soon, expired) reported over heartbeats, plus a searchable ACME event log.",
+        "HSTS and forced HTTPS at the edge, mutual TLS with console-issued client certificates and immediate revocation.",
+      ],
+      note: "Origin certificate verification is an explicit switch, deployment-wide or per pool.",
+      scene: {
+        id: "tls",
+        caption: "Certificate state and ACME history for one site.",
+        alt: "TLS page showing certificate status and ACME events",
+      },
+    },
+    {
+      id: "observability",
+      icon: "activity",
+      kicker: "Observability",
+      title: "Every verdict leaves a trail",
+      lead: "Logs are stored where your existing tooling can query them, and a blocked request can be replayed as a curl command.",
+      points: [
+        "Full request logging to Elasticsearch with body truncation and a WAL buffer for reliability.",
+        "Raw request and response capture in PostgreSQL — headers verbatim, body prefixes, real sizes and truncation flags.",
+        "Traffic and attack analytics dashboards built from the metrics agents ship on every heartbeat.",
+        "Agent health, cache hit rates and eviction counters visible from the control plane.",
+      ],
+      scene: {
+        id: "logs",
+        caption: "Searchable request log with verdicts and matched rules.",
+        alt: "Request log list with verdicts, scores and matched rules",
+      },
+    },
+    {
+      id: "operations",
+      icon: "sliders",
+      kicker: "Operations",
+      title: "Run the fleet from one console",
+      lead: "Configuration is versioned, agents are observable, and the console itself is compiled into the binary.",
+      points: [
+        "JWT + bcrypt authentication, multi-tenant isolation and passkey (WebAuthn) sign-in.",
+        "Configuration versioning: list snapshots with filters, diff a version against its predecessor table by table, roll back behind a confirmation.",
+        "Embedded English, 简体中文 and 日本語 console built with rust-embed — no separate frontend deployment.",
+        "Agent fleet view with live status, plus in-process CPU and memory attribution from the system endpoints.",
+      ],
+      scene: {
+        id: "agents",
+        caption: "Agent fleet status and heartbeat activity.",
+        alt: "Agent fleet page showing connected edge agents",
+      },
+    },
+  ],
+  verdicts: {
+    eyebrow: "Scoring",
+    title: "From anomaly score to a single verdict",
+    lead: "Each request leaves the pipeline with exactly one verdict, and that verdict is what the log records.",
+    columns: ["Verdict", "What it means", "What the edge does"],
+    rows: [
+      {
+        verdict: "pass",
+        label: "Pass",
+        meaning: "No rule crossed the threshold.",
+        action: "Forwarded to the origin untouched.",
+      },
+      {
+        verdict: "monitor",
+        label: "Monitor",
+        meaning: "Suspicious, but below the blocking threshold.",
+        action: "Forwarded and recorded so you can tune the rule before enforcing it.",
+      },
+      {
+        verdict: "block",
+        label: "Block",
+        meaning: "The score crossed the blocking threshold.",
+        action: "Rejected with a WAF block page and logged with the matched rules.",
+      },
+      {
+        verdict: "challenge",
+        label: "Challenge",
+        meaning: "The request must prove it is a browser.",
+        action: "Served a JS or proof-of-work challenge; on success the client continues with a clearance cookie.",
+      },
+    ],
+  },
+  cta: {
+    title: "See how a verdict is produced",
+    lead: "The architecture and WAF engine documents walk through the request lifecycle, rule evaluation and scoring.",
+    primary: { label: "WAF engine docs", path: "/docs/waf-engine/" },
+    secondary: { label: "Quick start", path: "/quickstart/" },
+  },
+} satisfies FeaturesContent;
+
+export default features;

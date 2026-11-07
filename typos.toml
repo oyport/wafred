@@ -1,0 +1,38 @@
+[default]
+extend-ignore-re = [
+    "(?Rm)^.*(#|//)\\s*spellchecker:disable-line$",
+    "(?s)(#|//)\\s*spellchecker:off.*?\\n\\s*(#|//)\\s*spellchecker:on",
+]
+# 'BA' is the ISO 3166-1 alpha-2 country code for Bosnia and Herzegovina
+# (web/src/api/geo.ts country table), not a typo for BY/BE.
+# 'COSE' is CBOR Object Signing and Encryption (RFC 9052), the key format
+# WebAuthn authenticators report (pingwaf-server/src/models/passkeys.rs).
+# 'FO' (Faroe Islands) and 'PN' (Pitcairn Islands) are ISO 3166-1 alpha-2
+# codes in web/src/components/charts/isoNumeric.ts.
+[default.extend-words]
+# pingora BError::esource() — method name, not "resource".
+esource = "esource"
+BA = "BA"
+COSE = "COSE"
+FO = "FO"
+PN = "PN"
+# Spanish/French SEO copy in site/src/i18n/seo.ts: real words, not English
+# misspellings. The content directories are excluded, but this typed module is
+# not, and typos has no language model to tell them apart.
+informe = "informe"
+interactivo = "interactivo"
+moteur = "moteur"
+
+[files]
+# The portal ships translated copy; the spell checker only understands English.
+# `*.md` already covers the documentation markdown, so only the typed content
+# modules and the shared UI dictionary need explicit exclusions.
+extend-exclude = [
+  "*.md",
+  "*.toml",
+  "site/src/i18n/ui.ts",
+  "site/src/content/es/**",
+  "site/src/content/fr/**",
+  "site/src/content/ja/**",
+  "site/src/content/zh/**",
+]

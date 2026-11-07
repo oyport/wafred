@@ -1,0 +1,101 @@
+# WAFred Configuration
+# This file configures the WAFred all-in-one instance.
+#
+# Usage:
+#   wafred all-in-one --config wafred.toml
+#
+# Keys are the command-line flags with dashes replaced by underscores
+# (`--admin-addr` is `admin_addr`), in the table of the mode they belong to.
+# All of them can also be set through WAFRED_* environment variables or CLI
+# flags; precedence is this file, then the environment, then the command line.
+# Unknown keys are reported at startup and ignored.
+
+[server]
+# PostgreSQL connection string
+db_url = "postgres://wafred:wafred@localhost:5432/wafred"
+# REST API + dashboard listen address (served over HTTPS when tls_enabled)
+admin_addr = "0.0.0.0:9080"
+# Serve the REST API and dashboard over TLS (required by passkeys).
+# A self-signed certificate is generated on first boot; replace it from
+# Settings → Control plane HTTPS once a real certificate is available.
+tls_enabled = true
+# Names the generated self-signed certificate covers. Add the hostname you
+# open the dashboard on, otherwise the browser warns about a name mismatch.
+# tls_sans = ["waf.example.com"]
+# Host the dashboard is reached under from the outside (optionally with port).
+# Pinned into the HTTP-to-HTTPS redirect instead of the client's Host header.
+# public_host = "waf.example.com"
+# gRPC control plane listen address (agents connect here)
+grpc_addr = "0.0.0.0:9090"
+# TLS for the gRPC control plane: "tls" (default) serves agents over TLS,
+# reusing the dashboard certificate — self-signed on first boot unless the
+# optional grpc_tls_cert/key below are configured. "off" serves plaintext
+# and is logged as degraded; agents then connect via http://.
+# grpc_tls_mode = "tls"
+# Explicit certificate pair (PEM paths; both must be set). When set, these
+# take precedence over the dashboard certificate.
+# grpc_tls_cert = "/etc/wafred/certs/grpc.pem"
+# grpc_tls_key = "/etc/wafred/certs/grpc-key.pem"
+# JWT signing secret (must be >= 16 characters, change in production!)
+jwt_secret = "change-me-in-production"
+# Default admin account seeded on first boot
+admin_email = "admin@wafred.local"
+admin_password = "wafred123"
+# Serve the embedded dashboard (SPA) from this process
+serve_frontend = true
+# Settings with no command-line flag stay in the environment, e.g.
+#   WAFRED_ALLOW_REGISTRATION=true       WAFRED_JWT_EXPIRATION_HOURS=12
+#   WAFRED_CORS_ORIGINS=https://ui...    WAFRED_DB_MAX_CONNECTIONS=20
+#   WAFRED_METRIC_RETENTION_DAYS=30      WAFRED_WEBHOOK_URL=https://...
+#   WAFRED_PASSKEY_ENABLED=true          WAFRED_ES_ENABLED=true
+
+[agent]
+# Control plane gRPC URL — set by the `agent` mode; the all-in-one mode talks
+# to its own loopback gRPC address (`grpc_addr` above) instead. The control
+# plane serves TLS by default, so agents use https:// (all-in-one pins the
+# certificate automatically).
+# server_url = "https://127.0.0.1:9090"
+# CA (or chain) that signed the control plane's gRPC certificate — download
+# it from Settings → Control plane HTTPS. Without it the bundled webpki
+# roots apply (i.e. a real, publicly trusted certificate just works).
+# server_ca_cert = "/etc/wafred/certs/grpc-ca.pem"
+# API key for agent authentication (generated on first registration)
+api_key = ""
+# Local rule cache directory (persisted across restarts)
+cache_dir = "./data/cache"
+# Heartbeat interval in seconds — fallback only: the control plane hands
+# agents its own interval at registration and that value takes precedence
+heartbeat_interval_secs = 30
+# Log shipping
+log_batch_size = 100
+log_flush_interval_secs = 5
+max_body_log_size = 8192
+# Local fallback while disconnected from the control plane: `true` keeps
+# serving with the last synced rules (fail-open, default); `false` answers 503
+# for any host without synced rules until the connection is back. Per-site
+# failover policies and the control-plane default (console → settings) take
+# precedence once synced; this only applies standalone or before first sync.
+fail_open = true
+# Metrics shipping interval in seconds (0 disables metric shipping)
+metrics_ship_interval_secs = 30
+
+# ─── Proxy configuration (pingap mode) ───────────────────────────────────
+# The sections below are read by the same binary when it runs as pingap —
+# `wafred -c wafred.toml`, with no WAFred subcommand — not by the
+# `server`/`agent`/`all-in-one` modes above.
+#
+# [basic]
+# log_level = "INFO"
+# name = "wafred"
+# threads = 4
+#
+# [upstreams.backend]
+# addrs = ["127.0.0.1:3000"]
+#
+# [locations.main]
+# path = "/"
+# upstream = "backend"
+#
+# [servers.http]
+# addr = "0.0.0.0:80"
+# locations = ["main"]

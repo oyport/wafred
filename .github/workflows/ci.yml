@@ -1,0 +1,480 @@
+name: CI
+
+# Continuous integration for the WAFred workspace.
+#
+#   - push to `main`  -> full gate (rust matrix + rustls + web + docker)
+#   - pull_request    -> rust matrix + rustls + web (docker only runs on main)
+#
+# The `rust` job runs the test suite on two toolchains - the MSRV (1.96.0) and
+# stable - against the default OpenSSL backend and the `full` feature set (the
+# configuration the release pipeline and the Dockerfile use). The former
+# middle leg (1.97.0) carried no independent signal (covered by both stable
+# and the MSRV leg) and was dropped to shorten the matrix's critical path.
+# Formatting, clippy (whose MSRV is enforced via clippy.toml) and typos run
+# once, on stable. The `rustls` job exercises the alternative TLS backend with
+# the same clippy gate and the full test suite - the CI equivalents of
+# `make lint-rustls` / `make test-rustls`. Tests run under nextest (doctests
+# still go through `cargo test --doc`, which nextest does not execute).
+# `--all-features` is deliberately NOT used anywhere: `openssl` and
+# `tls-rustls` are mutually exclusive TLS backends and enabling both fails to
+# link, which is why the backends live in separate jobs with separate caches.
+#
+# Docs-only changes skip the rust/rustls/web jobs entirely via the `changes`
+# paths-filter job; the `docs` job always runs so its static checks stay
+# enforced on every PR. The :main Docker image build lives in its own
+# `release-binary` job so it no longer sits inside the test matrix.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One run per ref; a newer push to the same branch/PR cancels the older run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: only the docker job needs to push to GHCR.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # CI runs tests in batches rather than in an edit loop: incremental caches
+  # only add I/O and rust-cache upload weight, and dropping test-binary debug
+  # info cuts link times and target/ size.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  # Docs-only PRs skip the heavy jobs below but never the `docs` job, so the
+  # static checks stay enforced on every run.
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read # dorny/paths-filter reads PR files via the API
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Check paths
+        uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            code:
+              - '**'
+              - '!docs/**'
+              - '!**/*.md'
+
+  rust:
+    name: Rust ${{ matrix.toolchain }} (test)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # MSRV + stable only: the 1.97.0 leg carried no independent signal
+        # (stable is a superset, the MSRV leg guards the floor).
+        toolchain: ["1.96.0", stable]
+    env:
+      # pingwaf-proto/build.rs honours PROTOC; point it at the apt-installed
+      # protoc so the tonic/prost gRPC stubs are generated instead of the empty
+      # placeholder build.rs writes when protoc is missing.
+      PROTOC: /usr/bin/protoc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          # SYNC: keep this list in lockstep with Dockerfile / release.yml
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler \
+            libprotobuf-dev \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            libssl-dev \
+            nasm
+
+      - name: Install Rust toolchain
+        # Expressions are not allowed in a step-level `uses:` ref, so the
+        # action ref stays fixed and the toolchain arrives via the input.
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          # Lint components are only *used* on the stable leg (fmt/clippy run
+          # there); installing them on the pinned legs is harmless, whereas a
+          # conditional here would make those legs fall back to the runner's
+          # default toolchain and silently void the MSRV matrix.
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # One cache per toolchain: a shared one would thrash between the
+          # matrix legs' differing metadata.
+          key: ${{ matrix.toolchain }}
+
+      # pingwaf-server embeds ../web/dist/ at compile time via rust-embed. The
+      # folder has to exist for the crate to build; the `web` job below verifies
+      # the real bundle, so an empty placeholder is enough here.
+      - name: Ensure embedded frontend directory exists
+        run: mkdir -p web/dist
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: Check formatting
+        if: matrix.toolchain == 'stable'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        if: matrix.toolchain == 'stable'
+        run: cargo clippy --locked --all-targets --features full -- -D warnings
+
+      - name: Test (workspace, nextest)
+        run: cargo nextest run --locked --workspace --features full --no-fail-fast
+
+      # nextest deliberately does not run doctests; cover them separately.
+      - name: Test (workspace doc tests)
+        run: cargo test --locked --workspace --features full --doc
+
+      - name: Typos
+        if: matrix.toolchain == 'stable' && always()
+        uses: crate-ci/typos@v1.51.1
+
+  # The alternative TLS backend gets the same clippy gate and the full test
+  # suite, in its own job: `openssl` and `tls-rustls` are mutually exclusive
+  # features, so sharing a cache with the openssl matrix would thrash.
+  rustls:
+    name: Rust rustls backend (clippy / test)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    env:
+      PROTOC: /usr/bin/protoc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          # SYNC: keep this list in lockstep with Dockerfile / release.yml
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler \
+            libprotobuf-dev \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            libssl-dev \
+            nasm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: rustls
+
+      - name: Ensure embedded frontend directory exists
+        run: mkdir -p web/dist
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: Clippy (rustls backend)
+        run: cargo clippy --locked --no-default-features --features=tls-rustls,full --all-targets --all -- --deny=warnings
+
+      - name: Test (workspace, nextest, rustls backend)
+        run: cargo nextest run --locked --workspace --no-default-features --features=tls-rustls,full --no-fail-fast
+
+      - name: Test (workspace doc tests, rustls backend)
+        run: cargo test --locked --workspace --no-default-features --features=tls-rustls,full --doc
+
+  web:
+    name: Web (lint / build)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 26.12.1
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # Reused by release-binary on main pushes (rust-embed reads ../web/dist
+      # at compile time); building the dashboard once here instead of inside
+      # the binary job keeps npm out of the release-build critical path.
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 1
+
+  # The official portal (`site/`) is deployed by Cloudflare from its own build,
+  # so nothing else here would catch a broken content contract, an Astro type
+  # error or a dead internal link before it reaches the live site. `npm run
+  # verify` is the same gate contributors run locally: content parity across the
+  # five locales, `astro check`, the production build, then the link check.
+  site:
+    name: Site (content / build / links)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Node 22 LTS matches the Cloudflare Workers Builds default, so the gate
+      # runs the same runtime the deploy does (the `--experimental-strip-types`
+      # flag used by `check:content` exists on both 22 and 26, but only one of
+      # them is also what production builds with).
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify (content, types, build, links)
+        run: npm run verify
+
+  # Nothing else builds the source `Dockerfile`: CI and the release pipeline
+  # build `Dockerfile.runtime` from a prebuilt binary, and `Dockerfile.perf`
+  # only on a manual dispatch of release-perf.yml. A broken COPY or a bumped
+  # base image in `Dockerfile` therefore reached `main` unverified. This builds
+  # only the `frontend-builder` stage — the part that is cheap and that catches
+  # exactly those mistakes (the `.npmrc` COPY, the pinned Node tag, `npm ci`
+  # under `engine-strict`) — instead of the full Rust build, which the rust
+  # job and release.yml already cover. `Dockerfile.perf` shares the same stage
+  # byte for byte, so one build covers both.
+  dockerfile:
+    name: Dockerfile (source build, frontend stage)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          # Same reason as the docker job below: a flaky Docker Hub pull of
+          # buildkit; mirror.gcr.io serves the identical image anonymously.
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
+
+      - name: Build the frontend stage
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: frontend-builder
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=dockerfile-frontend
+          cache-to: type=gha,scope=dockerfile-frontend,mode=max
+
+      # `Dockerfile.perf` must stay in lockstep with `Dockerfile` (only the
+      # cargo profile differs). Building its frontend stage catches the drift
+      # that a comment cannot.
+      - name: Build the frontend stage of Dockerfile.perf
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.perf
+          target: frontend-builder
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=dockerfile-frontend
+
+  # Packs the release binary for the :main Docker image (Dockerfile.runtime,
+  # same pattern as release.yml) instead of rebuilding everything from source
+  # in-container. Runs on main pushes only: a PR run would burn a lot of
+  # minutes for little signal — clippy + nextest already cover compile
+  # correctness, and release-profile risk is exercised by release.yml. Needs
+  # the real dashboard, so it consumes the `web-dist` artifact instead of
+  # rebuilding the frontend. The :latest tag belongs to the release pipeline,
+  # which publishes a multi-arch manifest — tagging it here would clobber it.
+  release-binary:
+    name: Release binary (wafred, full)
+    needs: [changes, web]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    env:
+      # Same reason as in the rust job: pingwaf-proto/build.rs honours PROTOC.
+      PROTOC: /usr/bin/protoc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          # SYNC: keep this list in lockstep with Dockerfile / release.yml
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler \
+            libprotobuf-dev \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            libssl-dev \
+            nasm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-binary
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: Build (release, wafred, full)
+        run: cargo build --locked --release --bin wafred --features full
+
+      - name: Upload release binary for :main image
+        uses: actions/upload-artifact@v4
+        with:
+          name: wafred-main-binary
+          path: target/release/wafred
+          retention-days: 1
+
+  # Static consistency checks for docs and agent prompts (frontmatter, model
+  # names, cross references, relative links). Pure bash, no toolchain, so it
+  # adds seconds, not minutes, to a PR run. Deliberately NOT gated on the
+  # paths filter: it stays green/loud on docs-only PRs too.
+  docs:
+    name: Docs & agent prompts (static checks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # .codebuddy/ holds IDE-session data (plans, agent prompts, rules) and is
+      # local-only by design — see .gitignore and scripts/hooks/pre-commit.
+      # Fail loudly if it ever sneaks back into the index.
+      - name: Guard — .codebuddy must not be tracked
+        run: |
+          if [ -n "$(git ls-files .codebuddy)" ]; then
+            echo "::error::.codebuddy/ is local-only and must never be committed:"
+            git ls-files .codebuddy
+            exit 1
+          fi
+
+      - name: Check docs & agent prompts
+        run: ./scripts/check-docs-prompts.sh
+
+      # Every axum route must have a `### METHOD /path` section in
+      # docs/api.md. Pure static check (python3 is preinstalled on the runner).
+      - name: Check API reference covers every route
+        run: python3 ./scripts/check-api-docs.py
+
+  # Packs the :main snapshot image from the binary built by the
+  # `release-binary` job. Only on main (and only when code changed): a PR run
+  # would burn a lot of minutes for little signal.
+  docker:
+    name: Docker build & push :main
+    needs: release-binary
+    # `needs` alone would skip this on a docs-only push; state the condition
+    # so a future change to the dependency list cannot make it run without an
+    # artifact.
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.release-binary.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: wafred-main-binary
+          path: docker-context/
+
+      - name: Prepare build context
+        run: |
+          chmod +x docker-context/wafred
+          cp wafred.toml docker-context/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          # GHA runners intermittently time out pulling moby/buildkit from
+          # Docker Hub (same flakiness as the 429s that moved the base
+          # images to public.ecr.aws); mirror.gcr.io serves the identical
+          # image anonymously.
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-context/
+          file: ./Dockerfile.runtime
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/oyport/wafred:main
+          cache-from: type=gha,scope=docker
+          cache-to: type=gha,scope=docker,mode=max

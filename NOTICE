@@ -1,0 +1,11 @@
+WAFred
+
+WAFred is an independent project derived from the Apache-2.0-licensed PingWAF
+codebase: https://github.com/shuaiZend/PingWAF
+
+The original PingWAF copyright and attribution notices remain in the source.
+WAFred-specific modifications are maintained by the WAFred contributors.
+
+WAFred is not affiliated with or endorsed by the former PingWAF maintainers,
+Cloudflare, or the pingap maintainers. Third-party components retain their own
+copyright and license notices.

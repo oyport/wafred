@@ -1,0 +1,3379 @@
+//! Implementation of the `wafred.ControlPlane` gRPC service.
+//!
+//! Authentication on this plane is API-key based for registration and JWT based
+//! afterwards: `register_agent` trades a long-lived API key for an agent token,
+//! and every other RPC verifies that token before touching the database.
+
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+
+use chrono::{DateTime, Utc};
+use pingwaf_proto::control_plane::{
+    control_plane_server::ControlPlane as ControlPlaneTrait, AgentHeartbeat,
+    BlockedIp, CertEventAck, CertEventEntry, GetSiteConfigRequest, HostSample,
+    LogAck, LogEntry, Metric, MetricAck, MetricBatch, RegisterAgentRequest,
+    RegisterAgentResponse, RuleBundle, ServerCommand, SiteConfig, SiteStatus,
+    SyncRulesRequest, UpstreamHealth, VisitorChallengeRequest,
+    VisitorChallengeResponse, VisitorChangePasswordRequest,
+    VisitorChangePasswordResponse, VisitorGrantsRequest, VisitorGrantsResponse,
+    VisitorLoginRequest, VisitorLoginResponse, VisitorLogoutRequest,
+    VisitorLogoutResponse, VisitorPasskeyBeginRequest,
+    VisitorPasskeyFinishRequest, VisitorPasskeyFinishResponse,
+    VisitorPasskeyListResponse, VisitorPasskeyOptionsResponse,
+    VisitorSetVisibleRequest, VisitorSetVisibleResponse,
+    VisitorValidateRequest, VisitorValidateResponse,
+};
+use sea_orm::sea_query::Expr;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait,
+    QueryFilter, QuerySelect, Set, UpdateMany,
+};
+use tokio::sync::mpsc;
+use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
+use tonic::{Request, Response, Status, Streaming};
+use uuid::Uuid;
+
+use crate::api::keys::{authenticate_api_key, key_allows_agent};
+use crate::api::ssl::cert_status;
+use crate::auth::jwt::{create_agent_token, verify_agent_token};
+use crate::config::ServerConfig;
+use crate::es::{
+    AccessLogDocument, ElasticsearchClient, SecurityEventDocument,
+};
+use crate::grpc::cache_status::CacheStatusRegistry;
+use crate::grpc::config::{
+    build_rule_bundle, build_site_config, from_timestamp,
+};
+use crate::grpc::registry::{
+    AgentRegistry, HeartbeatMetrics, COMMAND_CHANNEL_CAPACITY,
+};
+use crate::models::{
+    access_log, action, agent, agent_blocked_ip, agent_metric, agent_status,
+    api_key, certificate_events, certificate_links, host_sample,
+    security_event, site, site_certificates,
+};
+
+/// Stream type returned by the server-streaming RPCs.
+type BoxedStream<T> =
+    Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
+
+/// gRPC status codes are deliberately coarse: agents must never learn whether an
+/// API key exists but is wrong, or does not exist at all.
+const INVALID_CREDENTIALS: &str = "invalid credentials";
+
+/// Fixed reply for a row the database reports as missing. The `DbErr` carries
+/// the lookup text, which can name the table, so it stays in the log (R-02).
+const NOT_FOUND_MESSAGE: &str = "not found";
+
+/// Fixed reply for every other storage failure (R-02).
+const INTERNAL_MESSAGE: &str = "internal error";
+
+/// Column widths from the migrations; longer values are truncated instead of
+/// failing the whole batch.
+const MAX_REQUEST_ID: usize = 36;
+const MAX_CLIENT_IP: usize = 45;
+const MAX_METHOD: usize = 10;
+const MAX_HOST: usize = 255;
+const MAX_RULE_ID: usize = 100;
+const MAX_RULE_NAME: usize = 200;
+const MAX_ACTION: usize = 30;
+const MAX_COUNTRY: usize = 2;
+const MAX_CACHE_STATUS: usize = 20;
+const MAX_TLS_VERSION: usize = 10;
+const MAX_UPSTREAM: usize = 255;
+/// Matches the `user_identity` column (migration 000071). The agent is a
+/// separate process and an OIDC `sub` is provider-defined, so an oversized
+/// one has to be cut here: a value longer than the column would fail the
+/// whole batch insert and cost the log entries either side of it.
+const MAX_USER_IDENTITY: usize = 255;
+const MAX_METRIC_NAME: usize = 200;
+
+/// Probe samples are kept for a day: at a 5-second cadence a single agent
+/// writes roughly 17k rows a day, so expired rows are pruned while ingesting.
+const HOST_SAMPLE_RETENTION_HOURS: i64 = 24;
+
+/// Spacing enforced between persisted probe samples, per agent. The agent
+/// probes every few seconds but only one row per interval is worth keeping:
+/// the probe panel plots the newest points, and a minute of resolution covers
+/// hours of history while cutting the table to a fraction of its raw volume.
+const SAMPLE_PERSIST_INTERVAL_SECS: i64 = 60;
+
+/// Last 60-second bucket persisted per agent, so downsampling holds across
+/// heartbeat batches rather than restarting with each message. One entry per
+/// agent ever seen; agents are few and the value is 8 bytes.
+static LAST_PERSISTED_BUCKET: LazyLock<Mutex<HashMap<Uuid, i64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Agent rows offline for longer than this are dropped from the inventory:
+/// decommissioned nodes and renamed hosts would otherwise survive as
+/// permanently-offline ghosts on the dashboard.
+const OFFLINE_AGENT_RETENTION_DAYS: i64 = 7;
+
+/// Epoch seconds of the last retention sweep, so that a busy fleet does not
+/// pay for a `DELETE` on every heartbeat.
+static LAST_SAMPLE_SWEEP: AtomicI64 = AtomicI64::new(0);
+
+/// Epoch seconds of the last offline-agent sweep, throttled the same way.
+static LAST_AGENT_SWEEP: AtomicI64 = AtomicI64::new(0);
+
+/// Epoch seconds of the last metric-retention sweep, throttled the same way.
+static LAST_METRIC_SWEEP: AtomicI64 = AtomicI64::new(0);
+
+/// Epoch seconds of the last stale-pending certificate sweep, throttled the
+/// same way.
+static LAST_CERT_SWEEP: AtomicI64 = AtomicI64::new(0);
+
+/// The gRPC control plane service.
+pub struct ControlPlaneService {
+    /// `pub(crate)` so the visitor-auth RPCs in `grpc/visitor_auth.rs` can
+    /// reach the same connection; everything else stays private to this file.
+    pub(crate) db: DatabaseConnection,
+    config: Arc<ServerConfig>,
+    agents: AgentRegistry,
+    /// Optional Elasticsearch shipper. When present, every streamed log entry is
+    /// also indexed for full-text search and long-term retention; the
+    /// PostgreSQL insert always remains the source of truth for recent logs.
+    es: Option<Arc<ElasticsearchClient>>,
+    /// Latest per-site edge cache usage, fed from the heartbeat stream and read
+    /// by `/api/v1/cache/status`.
+    cache_status: CacheStatusRegistry,
+}
+
+impl ControlPlaneService {
+    pub fn new(
+        db: DatabaseConnection,
+        config: Arc<ServerConfig>,
+        agents: AgentRegistry,
+        es: Option<Arc<ElasticsearchClient>>,
+        cache_status: CacheStatusRegistry,
+    ) -> Self {
+        Self {
+            db,
+            config,
+            agents,
+            es,
+            cache_status,
+        }
+    }
+
+    /// Verifies an agent token and returns the matching row.
+    ///
+    /// `pub(crate)` because the visitor-auth RPCs in `grpc/visitor_auth.rs`
+    /// authenticate the same way.
+    pub(crate) async fn authorize(
+        &self,
+        token: &str,
+    ) -> Result<agent::Model, Status> {
+        if token.trim().is_empty() {
+            return Err(Status::unauthenticated(INVALID_CREDENTIALS));
+        }
+        let claims = verify_agent_token(token, &self.config.jwt_secret)
+            .map_err(|err| Status::unauthenticated(err.to_string()))?;
+        let agent_id = claims
+            .subject_id()
+            .map_err(|_| Status::unauthenticated(INVALID_CREDENTIALS))?;
+
+        let row = agent::Entity::find_by_id(agent_id)
+            .one(&self.db)
+            .await
+            .map_err(db_status)?
+            .ok_or_else(|| {
+                Status::unauthenticated("agent is no longer registered")
+            })?;
+
+        // Re-check the key the token was minted from on every call: a key can
+        // be deleted or lose the agent permission while the token is still
+        // inside its (long) lifetime, and that must take effect immediately.
+        let Some(key_id) = row.api_key_id else {
+            return Err(Status::unauthenticated(INVALID_CREDENTIALS));
+        };
+        let key = api_key::Entity::find_by_id(key_id)
+            .one(&self.db)
+            .await
+            .map_err(db_status)?
+            .ok_or_else(|| {
+                Status::unauthenticated("the API key was revoked")
+            })?;
+        if !key_allows_agent(&key) {
+            return Err(Status::permission_denied(
+                "this API key is no longer allowed to act as an agent",
+            ));
+        }
+        Ok(row)
+    }
+
+    /// Reads the agent token from the `x-agent-token` request metadata, the
+    /// transport-level credential for the client-streaming ship RPCs (their
+    /// message bodies carry no token field).
+    fn metadata_token<T>(request: &Request<T>) -> String {
+        request
+            .metadata()
+            .get("x-agent-token")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Sites this agent is allowed to see: its own binding, or every site owned
+    /// by the user that issued its API key.
+    ///
+    /// `pub(crate)` because the visitor-auth RPCs in `grpc/visitor_auth.rs`
+    /// scope their answers by the same set.
+    pub(crate) async fn visible_sites(
+        &self,
+        row: &agent::Model,
+    ) -> Result<Vec<site::Model>, Status> {
+        if let Some(site_id) = row.site_id {
+            let owned = site::Entity::find_by_id(site_id)
+                .one(&self.db)
+                .await
+                .map_err(db_status)?;
+            return Ok(owned.into_iter().collect());
+        }
+
+        let Some(key_id) = row.api_key_id else {
+            return Ok(Vec::new());
+        };
+        let key = api_key::Entity::find_by_id(key_id)
+            .one(&self.db)
+            .await
+            .map_err(db_status)?
+            .ok_or_else(|| Status::unauthenticated("API key was revoked"))?;
+
+        site::Entity::find()
+            .filter(site::Column::UserId.eq(key.user_id))
+            .all(&self.db)
+            .await
+            .map_err(db_status)
+    }
+
+    /// Builds the configuration an agent should be running right now.
+    async fn site_config_for(
+        &self,
+        row: &agent::Model,
+    ) -> Result<SiteConfig, Status> {
+        let sites = self.visible_sites(row).await?;
+        let ids: Vec<Uuid> = sites.iter().map(|site| site.id).collect();
+        build_site_config(&self.db, Some(&ids))
+            .await
+            .map_err(db_status)
+    }
+}
+
+#[tonic::async_trait]
+impl ControlPlaneTrait for ControlPlaneService {
+    async fn register_agent(
+        &self,
+        request: Request<RegisterAgentRequest>,
+    ) -> Result<Response<RegisterAgentResponse>, Status> {
+        // The RPC is unauthenticated until the key is verified; cap attempts
+        // per peer so the DB lookup plus bcrypt cannot be driven unbounded.
+        if let Some(addr) = request.remote_addr() {
+            if let Err(retry_after) =
+                crate::api::rate_limit::consume_agent_registration(addr.ip())
+            {
+                return Err(Status::resource_exhausted(format!(
+                    "too many registration attempts; retry in {retry_after} seconds"
+                )));
+            }
+        }
+        let payload = request.into_inner();
+        if payload.hostname.trim().is_empty() {
+            return Err(Status::invalid_argument("hostname is required"));
+        }
+
+        // The API key is only ever presented here; everything afterwards uses the
+        // agent token minted below.
+        let (key, _owner) = authenticate_api_key(&self.db, &payload.api_key)
+            .await
+            .map_err(|err| {
+                tracing::warn!(error = %err, hostname = %payload.hostname, "agent registration rejected");
+                Status::unauthenticated(INVALID_CREDENTIALS)
+            })?;
+        if !key_allows_agent(&key) {
+            return Err(Status::permission_denied(
+                "this API key is not allowed to register agents",
+            ));
+        }
+
+        // Re-registering the same host updates the existing row instead of
+        // creating a new one, so a restart does not inflate the inventory. The
+        // match ignores the reported IP on purpose: an agent whose address
+        // changed (DHCP, migration) must reclaim its row rather than orphan
+        // the old one as a permanently-offline ghost.
+        let existing = agent::Entity::find()
+            .filter(agent::Column::Hostname.eq(payload.hostname.clone()))
+            .filter(agent::Column::ApiKeyId.eq(Some(key.id)))
+            .one(&self.db)
+            .await
+            .map_err(db_status)?;
+
+        let now = Utc::now();
+        let status = agent_status::ONLINE.to_string();
+        // Agents are never auto-bound to a site: a binding narrows
+        // `visible_sites` to that single site, so an agent registered while its
+        // owner had one site silently stopped receiving every later site — the
+        // new site's config push found no bound agent and was skipped, leaving
+        // certificates pending with nothing on the edge to issue them. An
+        // unbound agent serves all of the owner's sites; a future manual
+        // binding API can narrow the scope explicitly.
+        let site_id = None;
+
+        let row = match existing {
+            Some(row) => {
+                let agent_id = row.id;
+                let mut active: agent::ActiveModel = row.into();
+                active.site_id = Set(site_id);
+                active.version = Set(optional(&payload.version));
+                active.os_info = Set(optional(&payload.os_info));
+                active.cpu_cores = Set(positive_i32(payload.cpu_cores as i64));
+                // Registration reports the RAM the node has, never the usage:
+                // `memory_bytes` keeps receiving it (unchanged behaviour) and
+                // `total_memory_bytes` is the unambiguous copy the API reads.
+                // The heartbeat owns `used_memory_bytes` from here on.
+                let total_memory = positive_i64(payload.memory_bytes as i64);
+                active.memory_bytes = Set(total_memory);
+                active.total_memory_bytes = Set(total_memory);
+                active.status = Set(status);
+                active.api_key_id = Set(Some(key.id));
+                active.ip_address = Set(payload.ip_address.clone());
+                active.last_heartbeat = Set(Some(now));
+                active.public_ip = Set(optional(&payload.public_ip));
+                active.private_ip = Set(optional(&payload.private_ip));
+                let updated =
+                    active.update(&self.db).await.map_err(db_status)?;
+                tracing::info!(%agent_id, hostname = %payload.hostname, "agent re-registered");
+                updated
+            },
+            None => {
+                let agent_id = Uuid::new_v4();
+                let total_memory = positive_i64(payload.memory_bytes as i64);
+                let created = agent::ActiveModel {
+                    id: Set(agent_id),
+                    site_id: Set(site_id),
+                    hostname: Set(payload.hostname.clone()),
+                    // The label is the operator's: a registering agent never
+                    // supplies or clears it.
+                    display_name: Set(None),
+                    ip_address: Set(payload.ip_address.clone()),
+                    version: Set(optional(&payload.version)),
+                    os_info: Set(optional(&payload.os_info)),
+                    cpu_cores: Set(positive_i32(payload.cpu_cores as i64)),
+                    memory_bytes: Set(total_memory),
+                    total_memory_bytes: Set(total_memory),
+                    // Usage starts unknown: the first heartbeat fills it.
+                    used_memory_bytes: Set(None),
+                    status: Set(status),
+                    api_key_id: Set(Some(key.id)),
+                    config_hash: Set(None),
+                    last_heartbeat: Set(Some(now)),
+                    registered_at: Set(now),
+                    last_config_sync_at: Set(None),
+                    last_policy_sync_at: Set(None),
+                    public_ip: Set(optional(&payload.public_ip)),
+                    private_ip: Set(optional(&payload.private_ip)),
+                }
+                .insert(&self.db)
+                .await
+                .map_err(db_status)?;
+                tracing::info!(%agent_id, hostname = %payload.hostname, "agent registered");
+                created
+            },
+        };
+
+        let token = create_agent_token(
+            row.id,
+            &self.config.jwt_secret,
+            self.config.refresh_token_expiration_hours,
+        )
+        .map_err(|err| Status::internal(err.to_string()))?;
+
+        let initial_config = self.site_config_for(&row).await?;
+
+        Ok(Response::new(RegisterAgentResponse {
+            agent_id: row.id.to_string(),
+            agent_token: token,
+            heartbeat_interval_seconds: self.config.heartbeat_interval_seconds,
+            initial_config: Some(initial_config),
+        }))
+    }
+
+    type HeartbeatStream = BoxedStream<ServerCommand>;
+
+    async fn heartbeat(
+        &self,
+        request: Request<Streaming<AgentHeartbeat>>,
+    ) -> Result<Response<Self::HeartbeatStream>, Status> {
+        let mut inbound = request.into_inner();
+
+        // The first message identifies the agent; refusing to open a stream
+        // before authentication keeps unauthenticated peers cheap.
+        let first = inbound.message().await?.ok_or_else(|| {
+            Status::invalid_argument("heartbeat stream closed immediately")
+        })?;
+
+        let claims =
+            verify_agent_token(&first.agent_token, &self.config.jwt_secret)
+                .map_err(|err| Status::unauthenticated(err.to_string()))?;
+        let agent_id = claims
+            .subject_id()
+            .map_err(|_| Status::unauthenticated(INVALID_CREDENTIALS))?;
+        if !first.agent_id.is_empty() && first.agent_id != agent_id.to_string()
+        {
+            return Err(Status::permission_denied(
+                "agent_id does not match the presented token",
+            ));
+        }
+        if agent::Entity::find_by_id(agent_id)
+            .one(&self.db)
+            .await
+            .map_err(db_status)?
+            .is_none()
+        {
+            return Err(Status::unauthenticated(
+                "agent is no longer registered",
+            ));
+        }
+
+        let (sender, receiver) =
+            mpsc::channel::<ServerCommand>(COMMAND_CHANNEL_CAPACITY);
+        let (generation, queued) = self.agents.connect(agent_id, sender).await;
+        for command in queued {
+            // The registry owns the sender now, so replay through it.
+            self.agents.send_command(&agent_id, command).await;
+        }
+
+        let db = self.db.clone();
+        let registry = self.agents.clone();
+        let cache_status = self.cache_status.clone();
+        // The opening message already carries metrics; recording it means a
+        // freshly connected edge shows up before its second heartbeat.
+        cache_status
+            .record_heartbeat(agent_id, &first.site_statuses)
+            .await;
+        registry
+            .record_heartbeat(agent_id, heartbeat_metrics(&first))
+            .await;
+        tokio::spawn(async move {
+            persist_heartbeat(&db, agent_id, &first, &registry).await;
+            persist_host_samples(&db, agent_id, &first.host_samples).await;
+            persist_blocked_ips(
+                &db,
+                agent_id,
+                &first.blocked_ips,
+                first.blocked_ips_truncated,
+            )
+            .await;
+            record_upstream_health(&db, agent_id, &first.upstream_health).await;
+            while let Some(message) = match inbound.message().await {
+                Ok(Some(message)) => Some(message),
+                Ok(None) => None,
+                Err(err) => {
+                    tracing::debug!(%agent_id, error = %err, "heartbeat stream error");
+                    None
+                },
+            } {
+                cache_status
+                    .record_heartbeat(agent_id, &message.site_statuses)
+                    .await;
+                // Retained before the (awaited, database-bound) persist so the
+                // node view reflects this heartbeat even if the row update is
+                // slow or fails.
+                registry
+                    .record_heartbeat(agent_id, heartbeat_metrics(&message))
+                    .await;
+                persist_heartbeat(&db, agent_id, &message, &registry).await;
+                persist_host_samples(&db, agent_id, &message.host_samples)
+                    .await;
+                persist_blocked_ips(
+                    &db,
+                    agent_id,
+                    &message.blocked_ips,
+                    message.blocked_ips_truncated,
+                )
+                .await;
+                record_upstream_health(&db, agent_id, &message.upstream_health)
+                    .await;
+            }
+            mark_offline(&db, agent_id).await;
+            registry.disconnect(&agent_id, generation).await;
+            tracing::info!(%agent_id, "agent heartbeat stream ended");
+        });
+
+        tracing::info!(%agent_id, "agent heartbeat stream opened");
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(receiver).map(Ok))
+                as Self::HeartbeatStream,
+        ))
+    }
+
+    type SyncRulesStream = BoxedStream<RuleBundle>;
+
+    async fn sync_rules(
+        &self,
+        request: Request<SyncRulesRequest>,
+    ) -> Result<Response<Self::SyncRulesStream>, Status> {
+        let payload = request.into_inner();
+        let row = self.authorize(&payload.agent_token).await?;
+
+        let sites = self.visible_sites(&row).await?;
+        let requested = payload.site_id.trim();
+        let selected: Vec<site::Model> = if requested.is_empty() {
+            sites
+        } else {
+            let id = Uuid::parse_str(requested).map_err(|_| {
+                Status::invalid_argument("site_id is not a UUID")
+            })?;
+            if !sites.iter().any(|site| site.id == id) {
+                return Err(Status::permission_denied(
+                    "agent is not allowed to sync this site",
+                ));
+            }
+            sites.into_iter().filter(|site| site.id == id).collect()
+        };
+
+        let current_hash = payload.current_config_hash.trim().to_string();
+        let mut bundles = Vec::with_capacity(selected.len());
+        let mut skipped = 0usize;
+        for site_row in &selected {
+            match build_rule_bundle(&self.db, site_row).await {
+                Ok(bundle) => {
+                    // Delta sync: the agent already runs this exact configuration.
+                    if !current_hash.is_empty()
+                        && bundle.config_hash == current_hash
+                    {
+                        skipped += 1;
+                        continue;
+                    }
+                    bundles.push(Ok(bundle));
+                },
+                Err(err) => {
+                    tracing::error!(site_id = %site_row.id, error = %err, "could not build rule bundle");
+                    crate::notify::emit(crate::notify::AlertEvent {
+                        event_type:
+                            crate::models::event_type::CONFIG_SYNC_FAILED
+                                .to_string(),
+                        severity: crate::models::severity::CRITICAL,
+                        title: format!(
+                            "Configuration sync failed for site {}",
+                            site_row.domain
+                        ),
+                        message: format!(
+                            "The rule bundle for site '{}' could not be \
+                             built; agents keep running their last synced \
+                             configuration. Error: {err}",
+                            site_row.domain
+                        ),
+                        details: Some(serde_json::json!({
+                            "site_id": site_row.id,
+                            "domain": site_row.domain,
+                            "agent_id": row.id,
+                            "error": err.to_string(),
+                        })),
+                        dedup_key: Some(site_row.id.to_string()),
+                    })
+                    .await;
+                    // The peer is told only that the bundle is unavailable;
+                    // the `DbErr` (table names, SQL) went to the log above.
+                    bundles.push(Err(db_status(err)));
+                },
+            }
+        }
+
+        tracing::info!(
+            agent_id = %row.id,
+            sites = selected.len(),
+            delivered = bundles.len(),
+            skipped,
+            "rule sync served"
+        );
+
+        // Record the hash the agent claims to run so the dashboard can show drift.
+        if !current_hash.is_empty() {
+            let mut active: agent::ActiveModel = row.into();
+            active.config_hash = Set(Some(current_hash));
+            active.last_heartbeat = Set(Some(Utc::now()));
+            if let Err(err) = active.update(&self.db).await {
+                tracing::warn!(error = %err, "could not persist agent config hash");
+            }
+        }
+
+        Ok(Response::new(
+            Box::pin(tokio_stream::iter(bundles)) as Self::SyncRulesStream
+        ))
+    }
+
+    async fn ship_logs(
+        &self,
+        request: Request<Streaming<LogEntry>>,
+    ) -> Result<Response<LogAck>, Status> {
+        let agent = self.authorize(&Self::metadata_token(&request)).await?;
+        let authenticated_id = agent.id;
+        // The sites this agent serves, resolved once per stream: every entry's
+        // `site_id` is checked against it below (D10).
+        let visible_sites: Vec<Uuid> = self
+            .visible_sites(&agent)
+            .await?
+            .iter()
+            .map(|row| row.id)
+            .collect();
+        let mut inbound = request.into_inner();
+        let batch_size = self.config.log_batch_size.max(1);
+
+        let mut received: u64 = 0;
+        let mut dropped: u64 = 0;
+        let mut access_batch: Vec<access_log::ActiveModel> =
+            Vec::with_capacity(batch_size);
+        let mut event_batch: Vec<security_event::ActiveModel> =
+            Vec::with_capacity(batch_size);
+        let mut batch_bytes: usize = 0;
+
+        loop {
+            let message = match inbound.message().await {
+                Ok(Some(message)) => message,
+                Ok(None) => break,
+                Err(err) => {
+                    tracing::warn!(error = %err, received, "log stream aborted");
+                    return Ok(Response::new(LogAck {
+                        received_count: received,
+                        success: false,
+                        error_message: err.to_string(),
+                    }));
+                },
+            };
+            if !message.agent_id.is_empty()
+                && message.agent_id != authenticated_id.to_string()
+            {
+                // A foreign stamp is dropped rather than persisted under the
+                // authenticated identity; the rest of the batch continues.
+                tracing::warn!(
+                    claimed = %message.agent_id,
+                    agent_id = %authenticated_id,
+                    "log entry stamped with a foreign agent_id"
+                );
+                continue;
+            }
+            if !site_stamp_is_visible(&message.site_id, &visible_sites) {
+                // The agent may only write history for the sites it serves.
+                // The entry is dropped rather than answered with an error: a
+                // misbehaving edge would otherwise retry the whole batch
+                // forever, and the batch also carries legitimate entries.
+                dropped += 1;
+                tracing::warn!(
+                    site_id = %message.site_id,
+                    agent_id = %authenticated_id,
+                    dropped,
+                    "log entry stamped with a site this agent does not serve"
+                );
+                continue;
+            }
+            received += 1;
+            batch_bytes =
+                batch_bytes.saturating_add(estimate_log_entry_bytes(&message));
+
+            let site_id = parse_optional_uuid(&message.site_id);
+            let agent_id = parse_optional_uuid(&message.agent_id);
+            let timestamp = from_timestamp(message.timestamp.as_ref());
+            let waf_event = is_waf_event(&message);
+
+            // WAF-decision entries are routed to `security_events` only: the
+            // agent always emits a second, access-shaped entry for the same
+            // request (at deny time or response time), so writing both would
+            // duplicate every blocked or monitored request in `access_logs`.
+            if !waf_event {
+                access_batch.push(access_log_row(
+                    &message, site_id, agent_id, timestamp,
+                ));
+            }
+            if let Some(event) =
+                security_event_row(&message, site_id, agent_id, timestamp)
+            {
+                event_batch.push(event);
+            }
+
+            // Two OIDC failures are operational events, not traffic: a login
+            // that cannot be completed (a wrong client secret, a replayed code)
+            // and a provider that cannot be reached (which makes the protected
+            // part of the site unreachable). They are the only security events
+            // that also raise an alert — a generic bridge would turn every
+            // blocked request into a notification.
+            if let Some((event_type, severity)) =
+                oidc_alert_for(&message.waf_event_type)
+            {
+                crate::notify::emit(crate::notify::AlertEvent {
+                    event_type: event_type.to_string(),
+                    severity,
+                    title: oidc_alert_title(event_type, &message.host),
+                    message: oidc_alert_message(
+                        event_type,
+                        &message.host,
+                        &message.waf_details,
+                    ),
+                    details: Some(serde_json::json!({
+                        "site_id": message.site_id,
+                        "host": message.host,
+                        "path": message.path,
+                        "client_ip": message.client_ip,
+                        "reason": message.waf_details,
+                        "agent_id": message.agent_id,
+                    })),
+                    // Keyed on the site, not the client: an attacker cycling
+                    // through addresses must not be able to flood the channels,
+                    // and "this site's logins are all failing" is the useful
+                    // signal. The dedup window then collapses a burst into one
+                    // alert per channel.
+                    dedup_key: Some(message.site_id.clone()),
+                })
+                .await;
+            }
+
+            // Mirror the entry into Elasticsearch for full-text search and long
+            // retention. Both calls are non-blocking `try_send`s, so a slow or
+            // down ES cluster can never apply back-pressure to the agent stream.
+            if let Some(es) = &self.es {
+                if !waf_event {
+                    es.index_access_log(access_log_document(
+                        es, &message, timestamp,
+                    ));
+                }
+                if let Some(event) =
+                    security_event_document(es, &message, timestamp)
+                {
+                    es.index_security_event(event);
+                }
+            }
+
+            // Flush on either table: a WAF-only stream never grows
+            // access_batch, so keying the flush solely on it let event_batch
+            // grow without bound for the life of the stream
+            // (2026-10-18 audit).
+            if access_batch.len() >= batch_size
+                || event_batch.len() >= batch_size
+                || batch_bytes >= LOG_BATCH_BYTES
+            {
+                flush(&self.db, &mut access_batch, &mut event_batch).await?;
+                batch_bytes = 0;
+            }
+        }
+
+        flush(&self.db, &mut access_batch, &mut event_batch).await?;
+
+        if dropped > 0 {
+            tracing::warn!(
+                agent_id = %authenticated_id,
+                received,
+                dropped,
+                "log stream finished with entries dropped for a foreign site"
+            );
+        }
+        tracing::debug!(received, dropped, "log batch persisted");
+        Ok(Response::new(LogAck {
+            received_count: received,
+            success: true,
+            error_message: String::new(),
+        }))
+    }
+
+    async fn ship_cert_events(
+        &self,
+        request: Request<Streaming<CertEventEntry>>,
+    ) -> Result<Response<CertEventAck>, Status> {
+        let agent = self.authorize(&Self::metadata_token(&request)).await?;
+        let authenticated_id = agent.id;
+        // Same tenancy check as `ship_logs`: a certificate event drives a
+        // state transition on the site's certificate, so a foreign `site_id`
+        // here would let an edge fail another tenant's renewal (D10).
+        let visible_sites: Vec<Uuid> = self
+            .visible_sites(&agent)
+            .await?
+            .iter()
+            .map(|row| row.id)
+            .collect();
+        let mut inbound = request.into_inner();
+        let batch_size = self.config.log_batch_size.max(1);
+        let mut received: u64 = 0;
+        let mut dropped: u64 = 0;
+        let mut batch: Vec<certificate_events::ActiveModel> =
+            Vec::with_capacity(batch_size);
+
+        loop {
+            let message = match inbound.message().await {
+                Ok(Some(message)) => message,
+                Ok(None) => break,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        received,
+                        "certificate event stream aborted"
+                    );
+                    return Ok(Response::new(CertEventAck {
+                        received_count: received,
+                        success: false,
+                        error_message: err.to_string(),
+                    }));
+                },
+            };
+            if !message.agent_id.is_empty()
+                && message.agent_id != authenticated_id.to_string()
+            {
+                tracing::warn!(
+                    claimed = %message.agent_id,
+                    agent_id = %authenticated_id,
+                    "certificate event stamped with a foreign agent_id"
+                );
+                continue;
+            }
+            if !site_stamp_is_visible(&message.site_id, &visible_sites) {
+                // Dropped, not rejected: see `ship_logs`. The alert and the
+                // certificate state transition below both act on the site, so
+                // the check has to happen before either.
+                dropped += 1;
+                tracing::warn!(
+                    site_id = %message.site_id,
+                    agent_id = %authenticated_id,
+                    dropped,
+                    "certificate event stamped with a site this agent does not serve"
+                );
+                continue;
+            }
+            received += 1;
+            // A terminal ACME failure is both an alertable log line and a
+            // state transition; parse it once so the row update and the
+            // stored event type agree on what the line means.
+            let failure = parse_acme_failure(&message.message);
+            let is_failure = failure.is_some();
+            // ACME failures surface as raw ERROR-level events: raise an
+            // alert so a renewal that keeps failing is not discovered
+            // through an expired certificate.
+            if message.level.eq_ignore_ascii_case("error") {
+                crate::notify::emit(crate::notify::AlertEvent {
+                    event_type: crate::models::event_type::CERT_RENEWAL_FAILED
+                        .to_string(),
+                    severity: crate::models::severity::CRITICAL,
+                    title: "Certificate renewal failed".to_string(),
+                    message: if message.message.is_empty() {
+                        "An ACME issuance or renewal attempt failed on the \
+                         edge; see the certificate events for details."
+                            .to_string()
+                    } else {
+                        message.message.clone()
+                    },
+                    details: Some(serde_json::json!({
+                        "agent_id": message.agent_id,
+                        "site_id": message.site_id,
+                        "certificate_id": message.certificate_id,
+                        "target": message.target,
+                    })),
+                    dedup_key: Some(format!(
+                        "{}:{}",
+                        message.site_id, message.target
+                    )),
+                })
+                .await;
+            }
+            if let Some(failure) = &failure {
+                fail_certificate_from_event(&self.db, &message, failure).await;
+            }
+            batch.push(certificate_events::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                certificate_id: Set(parse_optional_uuid(
+                    &message.certificate_id,
+                )),
+                site_id: Set(parse_optional_uuid(&message.site_id)),
+                event_type: Set(if is_failure {
+                    ACME_FAILED_EVENT.to_string()
+                } else if message.event_type.is_empty() {
+                    "acme_raw".to_string()
+                } else {
+                    message.event_type.chars().take(30).collect()
+                }),
+                message: Set(message.message),
+                details: Set(Some(serde_json::json!({
+                    "level": message.level,
+                    "target": message.target,
+                    "agent_id": message.agent_id,
+                }))),
+                created_at: Set(from_timestamp(message.timestamp.as_ref())),
+            });
+            if batch.len() >= batch_size {
+                flush_cert_events(&self.db, &mut batch).await?;
+            }
+        }
+
+        flush_cert_events(&self.db, &mut batch).await?;
+        if dropped > 0 {
+            tracing::warn!(
+                agent_id = %authenticated_id,
+                received,
+                dropped,
+                "certificate event stream finished with entries dropped for a foreign site"
+            );
+        }
+        tracing::debug!(received, dropped, "certificate events persisted");
+        Ok(Response::new(CertEventAck {
+            received_count: received,
+            success: true,
+            error_message: String::new(),
+        }))
+    }
+
+    async fn ship_metrics(
+        &self,
+        request: Request<Streaming<MetricBatch>>,
+    ) -> Result<Response<MetricAck>, Status> {
+        let agent = self.authorize(&Self::metadata_token(&request)).await?;
+        let authenticated_id = agent.id;
+        let mut inbound = request.into_inner();
+        let batch_size = self.config.log_batch_size.max(1);
+
+        let mut received: u64 = 0;
+        let mut metrics: u64 = 0;
+        let mut rows: Vec<agent_metric::ActiveModel> =
+            Vec::with_capacity(batch_size);
+
+        while let Some(batch) = inbound.message().await? {
+            received += 1;
+            metrics += batch.metrics.len() as u64;
+            let Some(agent_id) = parse_optional_uuid(&batch.agent_id) else {
+                continue;
+            };
+            if agent_id != authenticated_id {
+                tracing::warn!(
+                    claimed = %batch.agent_id,
+                    agent_id = %authenticated_id,
+                    "metric batch stamped with a foreign agent_id"
+                );
+                continue;
+            }
+
+            // Metrics double as liveness proof: touching the heartbeat keeps an
+            // agent that only ships metrics from being marked offline, and the
+            // rows-affected check drops batches for unknown agents before they
+            // reach the foreign key. Server time, not the agent-reported
+            // timestamp: liveness thresholds compare against Utc::now(), so
+            // trusting a skewed client clock would mark healthy agents offline.
+            let known = agent::Entity::update_many()
+                .col_expr(
+                    agent::Column::LastHeartbeat,
+                    sea_orm::sea_query::Expr::value(Utc::now()),
+                )
+                .filter(agent::Column::Id.eq(agent_id))
+                .exec(&self.db)
+                .await
+                .map_err(db_status)?;
+            if known.rows_affected == 0 {
+                continue;
+            }
+
+            let now = Utc::now();
+            let reported = from_timestamp(batch.timestamp.as_ref());
+            let retention =
+                chrono::Duration::days(self.config.metric_retention_days);
+            let recorded_at = if reported <= now && reported > now - retention {
+                reported
+            } else {
+                now
+            };
+
+            for metric in &batch.metrics {
+                rows.push(metric_row(agent_id, metric, recorded_at));
+            }
+            if rows.len() >= batch_size {
+                flush_metrics(&self.db, &mut rows).await?;
+            }
+        }
+
+        flush_metrics(&self.db, &mut rows).await?;
+        sweep_agent_metrics(&self.db, self.config.metric_retention_days).await;
+
+        tracing::trace!(batches = received, metrics, "metrics persisted");
+        Ok(Response::new(MetricAck {
+            received_count: metrics,
+            success: true,
+        }))
+    }
+
+    async fn get_site_config(
+        &self,
+        request: Request<GetSiteConfigRequest>,
+    ) -> Result<Response<SiteConfig>, Status> {
+        let payload = request.into_inner();
+        let row = self.authorize(&payload.agent_token).await?;
+
+        let requested = payload.site_id.trim();
+        let config = if requested.is_empty() {
+            self.site_config_for(&row).await?
+        } else {
+            let id = Uuid::parse_str(requested).map_err(|_| {
+                Status::invalid_argument("site_id is not a UUID")
+            })?;
+            let visible = self.visible_sites(&row).await?;
+            if !visible.iter().any(|site| site.id == id) {
+                return Err(Status::permission_denied(
+                    "agent is not allowed to read this site",
+                ));
+            }
+            build_site_config(&self.db, Some(&[id]))
+                .await
+                .map_err(db_status)?
+        };
+
+        tracing::debug!(
+            agent_id = %row.id,
+            sites = config.sites.len(),
+            config_hash = %config.config_hash,
+            "site configuration served"
+        );
+
+        // The caller echoed no hash here, but recording the served one lets the
+        // dashboard detect drift on the next heartbeat.
+        let mut active: agent::ActiveModel = row.into();
+        active.config_hash = Set(Some(config.config_hash.clone()));
+        active.last_heartbeat = Set(Some(Utc::now()));
+        if let Err(err) = active.update(&self.db).await {
+            tracing::warn!(error = %err, "could not persist served config hash");
+        }
+
+        Ok(Response::new(config))
+    }
+
+    // ── Visitor authentication ─────────────────────────────────────────
+    //
+    // The bodies live in `grpc/visitor_auth.rs`; the trait requires them
+    // here. Each is a thin forward so the implementation stays in one file
+    // with its tests, while the service keeps one `impl` block per trait.
+
+    async fn visitor_login_challenge(
+        &self,
+        request: Request<VisitorChallengeRequest>,
+    ) -> Result<Response<VisitorChallengeResponse>, Status> {
+        crate::grpc::visitor_auth::visitor_login_challenge(self, request).await
+    }
+
+    async fn visitor_login(
+        &self,
+        request: Request<VisitorLoginRequest>,
+    ) -> Result<Response<VisitorLoginResponse>, Status> {
+        crate::grpc::visitor_auth::visitor_login(self, request).await
+    }
+
+    async fn visitor_logout(
+        &self,
+        request: Request<VisitorLogoutRequest>,
+    ) -> Result<Response<VisitorLogoutResponse>, Status> {
+        crate::grpc::visitor_auth::visitor_logout(self, request).await
+    }
+
+    async fn visitor_change_password(
+        &self,
+        request: Request<VisitorChangePasswordRequest>,
+    ) -> Result<Response<VisitorChangePasswordResponse>, Status> {
+        crate::grpc::visitor_auth::visitor_change_password(self, request).await
+    }
+
+    async fn visitor_grants(
+        &self,
+        request: Request<VisitorGrantsRequest>,
+    ) -> Result<Response<VisitorGrantsResponse>, Status> {
+        crate::grpc::visitor_auth::visitor_grants(self, request).await
+    }
+
+    async fn visitor_set_site_visible(
+        &self,
+        request: Request<VisitorSetVisibleRequest>,
+    ) -> Result<Response<VisitorSetVisibleResponse>, Status> {
+        crate::grpc::visitor_auth::visitor_set_site_visible(self, request).await
+    }
+
+    async fn visitor_passkey_register_begin(
+        &self,
+        request: Request<VisitorPasskeyBeginRequest>,
+    ) -> Result<Response<VisitorPasskeyOptionsResponse>, Status> {
+        crate::grpc::visitor_auth::visitor_passkey_begin(self, request, false)
+            .await
+    }
+
+    async fn visitor_passkey_register_finish(
+        &self,
+        request: Request<VisitorPasskeyFinishRequest>,
+    ) -> Result<Response<VisitorPasskeyFinishResponse>, Status> {
+        crate::grpc::visitor_auth::visitor_passkey_register_finish(
+            self, request,
+        )
+        .await
+    }
+
+    async fn visitor_passkey_login_begin(
+        &self,
+        request: Request<VisitorPasskeyBeginRequest>,
+    ) -> Result<Response<VisitorPasskeyOptionsResponse>, Status> {
+        crate::grpc::visitor_auth::visitor_passkey_begin(self, request, true)
+            .await
+    }
+
+    async fn visitor_passkey_login_finish(
+        &self,
+        request: Request<VisitorPasskeyFinishRequest>,
+    ) -> Result<Response<VisitorLoginResponse>, Status> {
+        crate::grpc::visitor_auth::visitor_passkey_login_finish(self, request)
+            .await
+    }
+
+    async fn visitor_passkey_list(
+        &self,
+        request: Request<VisitorGrantsRequest>,
+    ) -> Result<Response<VisitorPasskeyListResponse>, Status> {
+        crate::grpc::visitor_auth::visitor_passkey_list(self, request).await
+    }
+
+    async fn visitor_validate_session(
+        &self,
+        request: Request<VisitorValidateRequest>,
+    ) -> Result<Response<VisitorValidateResponse>, Status> {
+        crate::grpc::visitor_auth::visitor_validate_session(self, request).await
+    }
+}
+
+/// Feeds the per-upstream health report of one heartbeat into the
+/// notification monitor. Absent on older agents — an empty report is a
+/// no-op.
+async fn record_upstream_health(
+    db: &DatabaseConnection,
+    agent_id: Uuid,
+    health: &[UpstreamHealth],
+) {
+    if health.is_empty() {
+        return;
+    }
+    let reports: Vec<_> = health
+        .iter()
+        .map(|entry| crate::notify::upstream_monitor::UpstreamReport {
+            upstream_name: entry.upstream_name.clone(),
+            healthy_backends: entry.healthy_backends,
+            total_backends: entry.total_backends,
+            unhealthy_backends: entry.unhealthy_backends.clone(),
+        })
+        .collect();
+    crate::notify::upstream_monitor::record_heartbeat(db, agent_id, &reports)
+        .await;
+}
+
+/// Counters of one heartbeat in the shape [`crate::grpc::registry`] retains for
+/// the node view. The memory figure is the usage the agent reported; the total
+/// is a registration value (`agents.total_memory_bytes`).
+fn heartbeat_metrics(message: &AgentHeartbeat) -> HeartbeatMetrics {
+    HeartbeatMetrics {
+        cpu_percent: message.cpu_usage_percent,
+        memory_bytes: message.memory_usage_bytes,
+        connections: message.active_connections,
+        rps: message.requests_per_second,
+    }
+}
+
+/// Persists the runtime counters of one heartbeat.
+async fn persist_heartbeat(
+    db: &DatabaseConnection,
+    agent_id: Uuid,
+    message: &AgentHeartbeat,
+    registry: &AgentRegistry,
+) {
+    // Method attribution (see pingwaf-profiler): the timer books the `db`
+    // module row as well.
+    let _profile = pingwaf_profiler::timed_method(
+        pingwaf_profiler::Method::DbPersistHeartbeat,
+    );
+    // Server time, not the agent's clock: liveness thresholds compare
+    // `last_heartbeat` against Utc::now(), so trusting the reported timestamp
+    // would let a skewed client clock mark healthy agents offline.
+    let health = agent_status::from_proto_health(message.health);
+
+    // Rule-cache disk health: absent on older agents (treat as healthy).
+    // A false means the edge could not load any usable snapshot and runs on
+    // empty rules until the next sync — surface it loudly, it is exactly the
+    // fail-open state an operator must know about. A non-empty reason with
+    // healthy=true is a backup restore worth a line, not an alarm.
+    if let Some(cache_healthy) = message.cache_persist_healthy {
+        if !cache_healthy {
+            tracing::warn!(
+                %agent_id,
+                reason = %message.cache_status_reason,
+                "agent rule cache is unhealthy; running on empty rules until the next sync"
+            );
+        } else if !message.cache_status_reason.is_empty() {
+            tracing::info!(
+                %agent_id,
+                reason = %message.cache_status_reason,
+                "agent restored its rule cache from backup"
+            );
+        }
+    }
+
+    let mut active = agent::ActiveModel {
+        id: Set(agent_id),
+        ..Default::default()
+    };
+    active.status = Set(health.to_string());
+    active.last_heartbeat = Set(Some(Utc::now()));
+    if !message.config_hash.trim().is_empty() {
+        active.config_hash = Set(Some(message.config_hash.clone()));
+    }
+    if message.memory_usage_bytes > 0 {
+        let used = message.memory_usage_bytes as i64;
+        // The heartbeat reports memory *in use*. `memory_bytes` keeps getting
+        // that figure (unchanged behaviour for old readers); the split column
+        // is the unambiguous copy (migration 000064).
+        active.memory_bytes = Set(Some(used));
+        active.used_memory_bytes = Set(Some(used));
+    }
+    // Sync timestamps come from the agent's own clock, but they only feed
+    // the dashboard's "last synced" display, so a skewed clock cannot make
+    // a healthy agent look offline.
+    if let Some(ts) = message.last_config_sync_at {
+        if let Some(at) =
+            DateTime::from_timestamp(ts.seconds, ts.nanos.max(0) as u32)
+        {
+            active.last_config_sync_at = Set(Some(at));
+        }
+    }
+    if let Some(ts) = message.last_policy_sync_at {
+        if let Some(at) =
+            DateTime::from_timestamp(ts.seconds, ts.nanos.max(0) as u32)
+        {
+            active.last_policy_sync_at = Set(Some(at));
+        }
+    }
+
+    if let Err(err) = active.update(db).await {
+        tracing::warn!(%agent_id, error = %err, "could not persist heartbeat");
+    }
+
+    persist_site_certificates(db, &message.site_statuses).await;
+
+    // This sweep scans for stale pending rows; it is not part of liveness and
+    // must not run on every agent heartbeat. One attempt per hour is enough.
+    let now = Utc::now().timestamp();
+    let previous = LAST_CERT_SWEEP.load(Ordering::Relaxed);
+    if now.saturating_sub(previous) >= 3600
+        && LAST_CERT_SWEEP
+            .compare_exchange(
+                previous,
+                now,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    {
+        sweep_stale_pending_certificates(db).await;
+    }
+
+    sweep_offline_agents(db, registry).await;
+}
+
+/// Writes the per-site certificate state reported by the edge back onto its
+/// certificate rows.
+///
+/// Only rows without a PEM are touched: those are the ACME-managed ones, whose
+/// issuance happens entirely on the edge — the control plane never sees the
+/// certificate, so without this write-back the row would read "pending" with no
+/// expiry forever, even after the certificate went live.
+type CertStateBySite = HashMap<Uuid, Vec<(String, Option<DateTime<Utc>>)>>;
+
+async fn persist_site_certificates(
+    db: &DatabaseConnection,
+    statuses: &[SiteStatus],
+) {
+    let now = Utc::now();
+    if !statuses.is_empty() {
+        tracing::debug!(
+            site_statuses = statuses.len(),
+            "persisting edge certificate state"
+        );
+    }
+
+    // A steady fleet reports the same certificate on every heartbeat. One
+    // batched read lets us skip the per-site UPDATE statements entirely; the previous
+    // shape issued one UPDATE per site per heartbeat even when nothing
+    // changed. The UPDATE guard below still protects against a concurrent
+    // change after this snapshot.
+    // `certificate_id` identifies the exact row: one certificate can be shared
+    // by several sites, so matching on `site_id` alone would update whichever
+    // pending row happens to belong to the reporting site.
+    let targets: Vec<(Uuid, Option<Uuid>, &str, DateTime<Utc>)> = statuses
+        .iter()
+        .filter_map(|status| {
+            let row_status = match status.ssl_status.as_str() {
+                "valid" | "expiring_soon" => cert_status::ACTIVE,
+                "expired" => cert_status::EXPIRED,
+                _ => return None,
+            };
+            let site_id = Uuid::parse_str(&status.site_id).ok()?;
+            let certificate_id = Uuid::parse_str(&status.certificate_id).ok();
+            let expires_at = status
+                .ssl_expires_at
+                .and_then(|ts| DateTime::from_timestamp(ts.seconds, 0))?;
+            Some((site_id, certificate_id, row_status, expires_at))
+        })
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+
+    let site_ids: Vec<Uuid> = targets.iter().map(|(id, _, _, _)| *id).collect();
+    let current = match site_certificates::Entity::find()
+        .filter(site_certificates::Column::SiteId.is_in(site_ids))
+        .filter(site_certificates::Column::CertPem.is_null())
+        .all(db)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            // Fall back to the guarded per-site UPDATE statements: correctness does not
+            // depend on this optional read.
+            tracing::warn!(error = %err, "could not read current certificate state");
+            Vec::new()
+        },
+    };
+    let mut current_by_site: CertStateBySite = HashMap::new();
+    for row in current {
+        if let Some(site_id) = row.site_id {
+            current_by_site
+                .entry(site_id)
+                .or_default()
+                .push((row.status, row.expires_at));
+        }
+    }
+
+    for (site_id, certificate_id, row_status, expires_at) in targets {
+        // The agent names the certificate row it observed. Accept it only when
+        // the reporting site owns or is linked to that row: an agent must not
+        // be able to rewrite another site's issuance state by reporting a
+        // foreign id.
+        if let Some(cert_id) = certificate_id {
+            let owned = site_certificates::Entity::find_by_id(cert_id)
+                .filter(site_certificates::Column::SiteId.eq(site_id))
+                .one(db)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+            let linked = if owned {
+                true
+            } else {
+                certificate_links::Entity::find()
+                    .filter(certificate_links::Column::SiteId.eq(site_id))
+                    .filter(
+                        certificate_links::Column::CertificateId.eq(cert_id),
+                    )
+                    .one(db)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+            };
+            if !linked {
+                tracing::warn!(
+                    %site_id,
+                    %cert_id,
+                    "ignoring certificate status for a certificate this site does not own or link"
+                );
+                continue;
+            }
+        }
+        if certificate_id.is_none()
+            && current_by_site.get(&site_id).is_some_and(|rows| {
+                rows.iter().all(|(status, expiry)| {
+                    status == row_status && *expiry == Some(expires_at)
+                })
+            })
+        {
+            continue;
+        }
+
+        // The guard keeps a steady fleet from writing the same values every
+        // heartbeat: only rows whose status or expiry actually change match.
+        // A live certificate also clears whatever failure the stale-pending
+        // sweep recorded for the order that produced it.
+        let result = site_certificates::Entity::update_many()
+            .col_expr(
+                site_certificates::Column::Status,
+                Expr::value(row_status),
+            )
+            .col_expr(
+                site_certificates::Column::ExpiresAt,
+                Expr::value(expires_at),
+            )
+            .col_expr(
+                site_certificates::Column::FailureReason,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(site_certificates::Column::UpdatedAt, Expr::value(now))
+            .filter(match certificate_id {
+                Some(id) => site_certificates::Column::Id.eq(id),
+                None => site_certificates::Column::SiteId.eq(site_id),
+            })
+            .filter(site_certificates::Column::CertPem.is_null())
+            .filter(
+                Condition::any()
+                    .add(site_certificates::Column::Status.ne(row_status))
+                    .add(site_certificates::Column::ExpiresAt.is_null())
+                    .add(site_certificates::Column::ExpiresAt.ne(expires_at)),
+            )
+            .exec(db)
+            .await;
+        match result {
+            Ok(result) if result.rows_affected > 0 => {
+                tracing::info!(
+                    %site_id,
+                    status = row_status,
+                    %expires_at,
+                    "recorded edge certificate state"
+                );
+                notify_certificate_state(
+                    site_id,
+                    row_status,
+                    expires_at,
+                    now,
+                    crate::notify::global()
+                        .map(|manager| manager.settings().cert_expiry_warn_days)
+                        .unwrap_or(30),
+                )
+                .await;
+            },
+            Ok(_) => {},
+            Err(err) => {
+                tracing::warn!(
+                    %site_id,
+                    error = %err,
+                    "could not persist certificate state"
+                );
+            },
+        }
+    }
+}
+
+/// Marker the edge prefixes a terminal ACME failure with. The raw ACME
+/// capture channel ships message text only, so the prefix is what tells the
+/// control plane a log line is also a certificate state transition.
+const ACME_FAILED_EVENT: &str = "acme_failed";
+
+/// Cap on the failure text stored on the certificate row. The CA's problem
+/// document names every identifier and its subproblems, so an uncapped value
+/// would turn the dashboard's status column into a wall of text.
+const MAX_FAILURE_REASON_CHARS: usize = 500;
+
+/// Reason recorded when a pending order outlives the grace window. The
+/// detailed explanation goes to the certificate event instead, keeping the
+/// status field a status.
+const ISSUANCE_TIMED_OUT_REASON: &str = "issuance timed out";
+
+/// A terminal issuance failure parsed out of an edge event.
+#[derive(Debug, PartialEq)]
+struct AcmeFailure<'a> {
+    /// Hostnames the order covers, used to attribute the event when the agent
+    /// could not (and to pick the right row when a site has several orders).
+    domains: Vec<&'a str>,
+    /// The CA/client error text, i.e. the real reason issuance failed.
+    reason: &'a str,
+}
+
+/// Recognises the edge's one-line failure event:
+/// `acme_failed domain=<d1,d2> reason=<error>`.
+///
+/// Anything else - including raw ACME logs that merely mention a failure - is
+/// not a state transition: a line without the marker or without a reason must
+/// never fail a certificate row.
+fn parse_acme_failure(message: &str) -> Option<AcmeFailure<'_>> {
+    let rest = message.strip_prefix(ACME_FAILED_EVENT)?;
+    let (head, reason) = rest.strip_prefix(' ')?.split_once(" reason=")?;
+    let domains = head.strip_prefix("domain=")?;
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return None;
+    }
+    Some(AcmeFailure {
+        domains: domains
+            .split(',')
+            .map(str::trim)
+            .filter(|domain| !domain.is_empty())
+            .collect(),
+        reason,
+    })
+}
+
+/// Caps the failure reason at [`MAX_FAILURE_REASON_CHARS`] characters without
+/// splitting a multi-byte character (the column is `text`; the cap keeps the
+/// dashboard readable).
+fn truncate_failure_reason(reason: &str) -> String {
+    reason
+        .trim()
+        .chars()
+        .take(MAX_FAILURE_REASON_CHARS)
+        .collect()
+}
+
+/// The values a terminal failure writes onto the certificate row. Split from
+/// the query so the policy - `failed`, capped reason, fresh `updated_at` - is
+/// testable without a database.
+#[derive(Debug, PartialEq)]
+struct CertificateFailureUpdate {
+    status: String,
+    failure_reason: String,
+    updated_at: DateTime<Utc>,
+}
+
+fn certificate_failure_update(
+    reason: &str,
+    now: DateTime<Utc>,
+) -> CertificateFailureUpdate {
+    CertificateFailureUpdate {
+        status: cert_status::FAILED.to_string(),
+        failure_reason: truncate_failure_reason(reason),
+        updated_at: now,
+    }
+}
+
+/// Builds the update that fails the row a terminal event belongs to, or
+/// `None` when the event cannot be attributed to one.
+///
+/// The reported certificate is not necessarily the pending row: the site's
+/// TLS posture can still point at the certificate this order is replacing.
+/// So the event matches either that id or a pending row of the same site
+/// covering one of the reported domains, and the base filters decide which
+/// rows are the control plane's to fail at all. Only pending, PEM-less ACME
+/// rows are touched: a manual upload or a certificate the edge already
+/// reported live is not this event's to fail.
+fn certificate_failure_query(
+    update: &CertificateFailureUpdate,
+    certificate_id: Option<Uuid>,
+    site_id: Option<Uuid>,
+    domains: &[&str],
+) -> Option<UpdateMany<site_certificates::Entity>> {
+    let mut target = Condition::any();
+    let mut attributable = false;
+    if let Some(certificate_id) = certificate_id {
+        target = target.add(site_certificates::Column::Id.eq(certificate_id));
+        attributable = true;
+    }
+    if let Some(site_id) = site_id {
+        if domains.is_empty() {
+            // A bare site id is not enough to pick between its orders.
+            if !attributable {
+                return None;
+            }
+        } else {
+            target = target.add(
+                Condition::all()
+                    .add(site_certificates::Column::SiteId.eq(site_id))
+                    .add(site_certificates::Column::Domain.is_in(
+                        domains.iter().map(|domain| domain.to_string()),
+                    )),
+            );
+            attributable = true;
+        }
+    }
+    if !attributable {
+        return None;
+    }
+    let condition = Condition::all()
+        .add(site_certificates::Column::Status.eq(cert_status::PENDING))
+        .add(site_certificates::Column::CertPem.is_null())
+        .add(site_certificates::Column::AcmeEmail.is_not_null())
+        .add(target);
+    Some(
+        site_certificates::Entity::update_many()
+            .col_expr(
+                site_certificates::Column::Status,
+                Expr::value(update.status.clone()),
+            )
+            .col_expr(
+                site_certificates::Column::FailureReason,
+                Expr::value(Some(update.failure_reason.clone())),
+            )
+            .col_expr(
+                site_certificates::Column::UpdatedAt,
+                Expr::value(update.updated_at),
+            )
+            .filter(condition),
+    )
+}
+
+/// Applies a terminal ACME failure event to the certificate row it names.
+/// Best-effort like every other write driven by an event stream: a database
+/// error is logged, never propagated into the agent's stream.
+async fn fail_certificate_from_event(
+    db: &DatabaseConnection,
+    event: &CertEventEntry,
+    failure: &AcmeFailure<'_>,
+) {
+    let now = Utc::now();
+    let update = certificate_failure_update(failure.reason, now);
+    let certificate_id = parse_optional_uuid(&event.certificate_id);
+    let site_id = parse_optional_uuid(&event.site_id);
+    let Some(query) = certificate_failure_query(
+        &update,
+        certificate_id,
+        site_id,
+        &failure.domains,
+    ) else {
+        tracing::debug!(
+            site_id = %event.site_id,
+            certificate_id = %event.certificate_id,
+            "ACME failure event cannot be attributed to a certificate"
+        );
+        return;
+    };
+    match query.exec(db).await {
+        Ok(result) if result.rows_affected > 0 => {
+            tracing::info!(
+                certificate_id = ?certificate_id,
+                site_id = ?site_id,
+                rows = result.rows_affected,
+                "certificate marked failed from edge event"
+            );
+        },
+        Ok(_) => {
+            tracing::debug!(
+                certificate_id = ?certificate_id,
+                site_id = ?site_id,
+                "ACME failure event matched no pending certificate"
+            );
+        },
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "could not persist ACME failure event"
+            );
+        },
+    }
+}
+
+/// How long an ACME order may sit in `pending` with no sign of life before
+/// the control plane gives up on it and marks the row `failed`.
+const PENDING_CERTIFICATE_GRACE: chrono::Duration =
+    chrono::Duration::minutes(30);
+
+/// The instant a pending row must predate to be considered timed out. Pure so
+/// the grace boundary is testable without a database.
+fn pending_certificate_cutoff(now: DateTime<Utc>) -> DateTime<Utc> {
+    now - PENDING_CERTIFICATE_GRACE
+}
+
+/// What the sweep writes on a timed-out row: the short reason the dashboard
+/// shows, with the full explanation left to the certificate event.
+fn stale_pending_failure(now: DateTime<Utc>) -> CertificateFailureUpdate {
+    certificate_failure_update(ISSUANCE_TIMED_OUT_REASON, now)
+}
+
+/// Marks ACME certificate rows `failed` when their order has been pending
+/// longer than [`PENDING_CERTIFICATE_GRACE`], recording [`ISSUANCE_TIMED_OUT_REASON`]
+/// on the row and the full explanation in a certificate event.
+///
+/// Issuance runs entirely on the edge, so a wedged order — the CA
+/// unreachable, a stalled DNS provider, a challenge that never validates —
+/// otherwise leaves the row in `pending` forever and the dashboard spins
+/// with no explanation. Only ACME rows (no stored PEM, an ACME email set)
+/// are swept: an uploaded certificate can be marked pending by hand and is
+/// not the control plane's to fail. `updated_at` is the last time anyone
+/// touched the row — the request that (re)armed the order — which is what
+/// the grace window is measured from.
+async fn sweep_stale_pending_certificates(db: &DatabaseConnection) {
+    let now = Utc::now();
+    let cutoff = pending_certificate_cutoff(now);
+    let stale = match site_certificates::Entity::find()
+        .filter(site_certificates::Column::Status.eq(cert_status::PENDING))
+        .filter(site_certificates::Column::CertPem.is_null())
+        .filter(site_certificates::Column::AcmeEmail.is_not_null())
+        .filter(site_certificates::Column::UpdatedAt.lt(cutoff))
+        .all(db)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "could not sweep stale pending certificates"
+            );
+            return;
+        },
+    };
+
+    for row in stale {
+        let failure = stale_pending_failure(now);
+        let detail = format!(
+            "ACME issuance did not finish within {} minutes of the last \
+             request. The edge may be offline, the CA or DNS provider may \
+             be unreachable, or the challenge never validated - see the \
+             certificate events for the raw ACME log.",
+            PENDING_CERTIFICATE_GRACE.num_minutes(),
+        );
+        let cert_id = row.id;
+        let site_id = row.site_id;
+        let mut active: site_certificates::ActiveModel = row.into();
+        active.status = Set(failure.status);
+        active.failure_reason = Set(Some(failure.failure_reason));
+        active.updated_at = Set(failure.updated_at);
+        if let Err(err) = active.update(db).await {
+            tracing::warn!(
+                %cert_id,
+                error = %err,
+                "could not fail stale pending certificate"
+            );
+            continue;
+        }
+        tracing::info!(
+            cert_id = ?cert_id,
+            site_id = ?site_id,
+            "stale pending certificate marked failed"
+        );
+        // Best-effort, like every certificate event: recording must never
+        // break the sweep.
+        let event = certificate_events::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            certificate_id: Set(Some(cert_id)),
+            site_id: Set(site_id),
+            event_type: Set("issuance_failed".to_string()),
+            message: Set(detail),
+            details: Set(None),
+            created_at: Set(now),
+        };
+        if let Err(err) = event.insert(db).await {
+            tracing::warn!(%err, "failed to write certificate event");
+        }
+    }
+}
+
+/// Raises certificate alerts when the edge reports a state transition:
+/// expiry inside the configurable warning window, or a certificate that
+/// has expired. Repeats are suppressed by the notification dedup.
+async fn notify_certificate_state(
+    site_id: Uuid,
+    status: &str,
+    expires_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    warn_days: u32,
+) {
+    if status == cert_status::EXPIRED {
+        crate::notify::emit(crate::notify::AlertEvent {
+            event_type: crate::models::event_type::CERT_EXPIRED.to_string(),
+            severity: crate::models::severity::CRITICAL,
+            title: format!("Certificate for {site_id} has expired"),
+            message: format!(
+                "The certificate of site {site_id} expired at {expires_at}. \
+                 Browsers will refuse connections until it is renewed."
+            ),
+            details: Some(serde_json::json!({
+                "site_id": site_id,
+                "expires_at": expires_at.to_rfc3339(),
+            })),
+            // Same shape as the hourly scanner's key, so a heartbeat and a
+            // sweep describing the same expiry suppress each other.
+            dedup_key: Some(format!("{site_id}:{}", expires_at.date_naive())),
+        })
+        .await;
+        return;
+    }
+
+    let warn_from = now + chrono::Duration::days(i64::from(warn_days));
+    if status == cert_status::ACTIVE && expires_at <= warn_from {
+        let days_left = (expires_at - now).num_days().max(0);
+        crate::notify::emit(crate::notify::AlertEvent {
+            event_type: crate::models::event_type::CERT_EXPIRING.to_string(),
+            severity: crate::models::severity::WARNING,
+            title: format!(
+                "Certificate for {site_id} expires in {days_left} day(s)"
+            ),
+            message: format!(
+                "The certificate of site {site_id} expires on {expires_at} \
+                 ({days_left} day(s) left). Check that automatic renewal is \
+                 succeeding; a failed renewal leads to an outage."
+            ),
+            details: Some(serde_json::json!({
+                "site_id": site_id,
+                "expires_at": expires_at.to_rfc3339(),
+                "days_left": days_left,
+            })),
+            // One alert per site and expiry date, not per heartbeat.
+            dedup_key: Some(format!("{site_id}:{}", expires_at.date_naive())),
+        })
+        .await;
+    }
+}
+
+/// Persists the probe samples carried by one heartbeat and prunes expired rows.
+///
+/// The agent samples every few seconds and buffers locally, so a single message
+/// normally carries several points; only the first sample of each
+/// [`SAMPLE_PERSIST_INTERVAL_SECS`] bucket survives (see the constant's docs).
+async fn persist_host_samples(
+    db: &DatabaseConnection,
+    agent_id: Uuid,
+    samples: &[HostSample],
+) {
+    if samples.is_empty() {
+        return;
+    }
+    let now = Utc::now();
+    let kept: Vec<&HostSample> = {
+        let mut last_buckets = LAST_PERSISTED_BUCKET
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        samples
+            .iter()
+            .filter(|sample| {
+                let at = sample_time(sample.ts_millis, now);
+                let bucket = at.timestamp() / SAMPLE_PERSIST_INTERVAL_SECS;
+                if last_buckets.get(&agent_id) == Some(&bucket) {
+                    return false;
+                }
+                last_buckets.insert(agent_id, bucket);
+                true
+            })
+            .collect()
+    };
+    let latest = kept.last().copied();
+    let rows: Vec<host_sample::ActiveModel> = kept
+        .into_iter()
+        .map(|sample| host_sample::ActiveModel {
+            agent_id: Set(agent_id),
+            sampled_at: Set(sample_time(sample.ts_millis, now)),
+            cpu_usage_percent: Set(Some(sample.cpu_usage_percent)),
+            load1: Set(Some(sample.load1)),
+            load5: Set(Some(sample.load5)),
+            load15: Set(Some(sample.load15)),
+            memory_total_bytes: Set(sample_i64(sample.memory_total_bytes)),
+            memory_used_bytes: Set(sample_i64(sample.memory_used_bytes)),
+            memory_available_bytes: Set(sample_i64(
+                sample.memory_available_bytes,
+            )),
+            swap_total_bytes: Set(sample_i64(sample.swap_total_bytes)),
+            swap_used_bytes: Set(sample_i64(sample.swap_used_bytes)),
+            disk_total_bytes: Set(sample_i64(sample.disk_total_bytes)),
+            disk_used_bytes: Set(sample_i64(sample.disk_used_bytes)),
+            net_rx_bytes: Set(sample_i64(sample.net_rx_bytes)),
+            net_tx_bytes: Set(sample_i64(sample.net_tx_bytes)),
+            disk_read_bytes: Set(sample_i64(sample.disk_read_bytes)),
+            disk_write_bytes: Set(sample_i64(sample.disk_write_bytes)),
+            process_count: Set(i32::try_from(sample.process_count).ok()),
+            tcp_connections: Set(i32::try_from(sample.tcp_connections).ok()),
+            uptime_secs: Set(sample_i64(sample.uptime_secs)),
+            created_at: Set(now),
+            ..Default::default()
+        })
+        .collect();
+
+    if rows.is_empty() {
+        // Every sample landed in a bucket that already has its row.
+        return;
+    }
+
+    if let Err(err) = host_sample::Entity::insert_many(rows).exec(db).await {
+        tracing::warn!(%agent_id, error = %err, "could not persist host samples");
+        return;
+    }
+
+    // Threshold check on the newest sample of the batch.
+    if let Some(sample) = latest {
+        check_agent_resources(agent_id, sample).await;
+    }
+
+    sweep_host_samples(db).await;
+}
+
+/// Consecutive over-threshold samples per agent and metric, so a single busy
+/// moment does not page anyone. Two samples in a row must breach.
+static RESOURCE_STRIKES: LazyLock<Mutex<HashMap<(Uuid, &'static str), u8>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Evaluates one agent sample against the notification thresholds and raises
+/// `agent.resource` alerts for metrics that stayed over for two samples.
+async fn check_agent_resources(agent_id: Uuid, sample: &HostSample) {
+    let Some(manager) = crate::notify::global() else {
+        return;
+    };
+    let settings = manager.settings();
+
+    let memory_percent = if sample.memory_total_bytes > 0 {
+        (sample.memory_used_bytes as f32 / sample.memory_total_bytes as f32)
+            * 100.0
+    } else {
+        0.0
+    };
+    let disk_percent = if sample.disk_total_bytes > 0 {
+        (sample.disk_used_bytes as f32 / sample.disk_total_bytes as f32) * 100.0
+    } else {
+        0.0
+    };
+    let metrics: [(&'static str, f32, u8); 3] = [
+        ("cpu", sample.cpu_usage_percent as f32, settings.cpu_percent),
+        ("memory", memory_percent, settings.memory_percent),
+        ("disk", disk_percent, settings.disk_percent),
+    ];
+
+    for (metric, value, threshold) in metrics {
+        let key = (agent_id, metric);
+        let over = value >= f32::from(threshold);
+        let strikes = {
+            let mut map =
+                RESOURCE_STRIKES.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = map.entry(key).or_insert(0);
+            if over {
+                *entry = entry.saturating_add(1);
+            } else {
+                *entry = 0;
+            }
+            *entry
+        };
+        if over && strikes == 2 {
+            let severity = if value >= f32::from(threshold) + 5.0 {
+                crate::models::severity::CRITICAL
+            } else {
+                crate::models::severity::WARNING
+            };
+            manager
+                .dispatch(crate::notify::AlertEvent {
+                    event_type: crate::models::event_type::AGENT_RESOURCE
+                        .to_string(),
+                    severity,
+                    title: format!("Agent {agent_id}: {metric} usage high"),
+                    message: format!(
+                        "Agent {agent_id} reports {metric} usage at \
+                         {value:.1}% (threshold {threshold}%)."
+                    ),
+                    details: Some(serde_json::json!({
+                        "agent_id": agent_id,
+                        "metric": metric,
+                        "value_percent": format!("{value:.1}"),
+                        "threshold_percent": threshold,
+                    })),
+                    dedup_key: Some(format!("{agent_id}:{metric}")),
+                })
+                .await;
+        }
+    }
+}
+
+/// Ages out samples past the retention window, at most once an hour.
+async fn sweep_host_samples(db: &DatabaseConnection) {
+    let now = Utc::now();
+    let previous = LAST_SAMPLE_SWEEP.swap(now.timestamp(), Ordering::Relaxed);
+    let swept_recently = DateTime::from_timestamp(previous, 0)
+        .is_some_and(|at| at > now - chrono::Duration::hours(1));
+    if swept_recently {
+        return;
+    }
+
+    let cutoff = now - chrono::Duration::hours(HOST_SAMPLE_RETENTION_HOURS);
+    match host_sample::Entity::delete_many()
+        .filter(host_sample::Column::SampledAt.lt(cutoff))
+        .exec(db)
+        .await
+    {
+        Ok(result) if result.rows_affected > 0 => {
+            tracing::info!(
+                deleted = result.rows_affected,
+                %cutoff,
+                "pruned expired host samples"
+            );
+        },
+        Ok(_) => {},
+        Err(err) => {
+            tracing::warn!(error = %err, "could not prune host samples");
+        },
+    }
+}
+
+/// Reconciles the control plane's mirror of one agent's dynamic IP blocks.
+///
+/// The heartbeat carries the agent's *complete* list, so the ingest replaces
+/// rather than appends: rows the agent no longer reports are deleted, known
+/// keys are refreshed in place, and new keys inserted. Entries whose site id
+/// does not parse as a UUID are skipped — the edge only blocks synced sites.
+async fn persist_blocked_ips(
+    db: &DatabaseConnection,
+    agent_id: Uuid,
+    blocked_ips: &[BlockedIp],
+    truncated: bool,
+) {
+    use std::collections::HashSet;
+
+    // Empty is the common steady state. It means "no blocks": clear the
+    // mirror with one DELETE instead of reading every row and then deleting
+    // the stale set on every heartbeat.
+    if blocked_ips.is_empty() {
+        if let Err(err) = agent_blocked_ip::Entity::delete_many()
+            .filter(agent_blocked_ip::Column::AgentId.eq(agent_id))
+            .exec(db)
+            .await
+        {
+            tracing::warn!(%agent_id, error = %err, "could not clear blocked IPs");
+        }
+        return;
+    }
+
+    let now = Utc::now();
+    let mut reported: HashSet<(Uuid, String)> = HashSet::new();
+    let mut rows: Vec<agent_blocked_ip::ActiveModel> = Vec::new();
+    for entry in blocked_ips {
+        let Ok(site_id) = Uuid::parse_str(entry.site_id.trim()) else {
+            continue;
+        };
+        if site_id.is_nil()
+            || entry.ip.trim().is_empty()
+            || !reported.insert((site_id, entry.ip.clone()))
+        {
+            continue;
+        }
+        rows.push(agent_blocked_ip::ActiveModel {
+            agent_id: Set(agent_id),
+            site_id: Set(site_id),
+            ip: Set(entry.ip.trim().chars().take(MAX_CLIENT_IP).collect()),
+            reason: Set(Some(
+                entry.reason.trim().chars().take(500).collect::<String>(),
+            )),
+            blocked_at: Set(from_timestamp(entry.blocked_at.as_ref())),
+            expires_at: Set(entry
+                .expires_at
+                .as_ref()
+                .map(|exp| from_timestamp(Some(exp)))),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        });
+    }
+
+    let existing = match agent_blocked_ip::Entity::find()
+        .filter(agent_blocked_ip::Column::AgentId.eq(agent_id))
+        .all(db)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(%agent_id, error = %err, "could not load blocked IPs");
+            return;
+        },
+    };
+
+    // A truncated report is a bounded prefix, not the agent's full set:
+    // deleting the rows it did not mention would revoke blocks the edge is
+    // still enforcing. Only a complete report reconciles deletions.
+    let stale: Vec<i64> = if truncated {
+        Vec::new()
+    } else {
+        existing
+            .iter()
+            .filter(|row| !reported.contains(&(row.site_id, row.ip.clone())))
+            .map(|row| row.id)
+            .collect()
+    };
+    if !stale.is_empty() {
+        if let Err(err) = agent_blocked_ip::Entity::delete_many()
+            .filter(agent_blocked_ip::Column::Id.is_in(stale))
+            .exec(db)
+            .await
+        {
+            tracing::warn!(%agent_id, error = %err, "could not prune blocked IPs");
+        }
+    }
+
+    if rows.is_empty() {
+        return;
+    }
+    if let Err(err) = agent_blocked_ip::Entity::insert_many(rows)
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::columns([
+                agent_blocked_ip::Column::AgentId,
+                agent_blocked_ip::Column::SiteId,
+                agent_blocked_ip::Column::Ip,
+            ])
+            .update_columns([
+                agent_blocked_ip::Column::Reason,
+                agent_blocked_ip::Column::BlockedAt,
+                agent_blocked_ip::Column::ExpiresAt,
+                agent_blocked_ip::Column::UpdatedAt,
+            ])
+            .to_owned(),
+        )
+        .exec(db)
+        .await
+    {
+        tracing::warn!(%agent_id, error = %err, "could not persist blocked IPs");
+    }
+}
+
+/// Builds one `agent_metrics` row from a streamed metric point.
+fn metric_row(
+    agent_id: Uuid,
+    metric: &Metric,
+    recorded_at: DateTime<Utc>,
+) -> agent_metric::ActiveModel {
+    agent_metric::ActiveModel {
+        agent_id: Set(agent_id),
+        name: Set(metric.name.trim().chars().take(MAX_METRIC_NAME).collect()),
+        labels: Set(serde_json::Value::Object(
+            metric
+                .labels
+                .iter()
+                .map(|(key, value)| {
+                    (key.clone(), serde_json::Value::String(value.clone()))
+                })
+                .collect(),
+        )),
+        value: Set(metric.value),
+        metric_type: Set(metric.r#type),
+        recorded_at: Set(recorded_at),
+        created_at: Set(Utc::now()),
+        ..Default::default()
+    }
+}
+
+/// Writes the accumulated metric rows.
+async fn flush_metrics(
+    db: &DatabaseConnection,
+    rows: &mut Vec<agent_metric::ActiveModel>,
+) -> Result<(), Status> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let rows = std::mem::take(rows);
+    if let Err(err) = agent_metric::Entity::insert_many(rows).exec(db).await {
+        tracing::error!(error = %err, "failed to persist agent metrics");
+        return Err(db_status(err));
+    }
+    Ok(())
+}
+
+/// Ages out metric points past the retention window, at most once an hour.
+async fn sweep_agent_metrics(db: &DatabaseConnection, retention_days: i64) {
+    let now = Utc::now();
+    let previous = LAST_METRIC_SWEEP.swap(now.timestamp(), Ordering::Relaxed);
+    let swept_recently = DateTime::from_timestamp(previous, 0)
+        .is_some_and(|at| at > now - chrono::Duration::hours(1));
+    if swept_recently {
+        return;
+    }
+
+    let cutoff = now - chrono::Duration::days(retention_days);
+    match agent_metric::Entity::delete_many()
+        .filter(agent_metric::Column::RecordedAt.lt(cutoff))
+        .exec(db)
+        .await
+    {
+        Ok(result) if result.rows_affected > 0 => {
+            tracing::info!(
+                deleted = result.rows_affected,
+                %cutoff,
+                "pruned expired agent metrics"
+            );
+        },
+        Ok(_) => {},
+        Err(err) => {
+            tracing::warn!(error = %err, "could not prune agent metrics");
+        },
+    }
+}
+
+/// Deletes agent rows that have been offline beyond the retention window, at
+/// most once an hour. Child rows are safe: host samples cascade, log rows
+/// keep their agent_id only as a nullable reference.
+async fn sweep_offline_agents(
+    db: &DatabaseConnection,
+    registry: &AgentRegistry,
+) {
+    let now = Utc::now();
+    let previous = LAST_AGENT_SWEEP.swap(now.timestamp(), Ordering::Relaxed);
+    let swept_recently = DateTime::from_timestamp(previous, 0)
+        .is_some_and(|at| at > now - chrono::Duration::hours(1));
+    if swept_recently {
+        return;
+    }
+
+    let cutoff = now - chrono::Duration::days(OFFLINE_AGENT_RETENTION_DAYS);
+    // Collect the ids first: the in-memory per-agent tables below are keyed
+    // by agent id, and `delete_many` only reports a count. Without this the
+    // two maps grew forever for agents whose rows were pruned
+    // (2026-10-18 audit).
+    let stale: Vec<Uuid> = match agent::Entity::find()
+        .select_only()
+        .column(agent::Column::Id)
+        .filter(agent::Column::Status.eq(agent_status::OFFLINE.to_string()))
+        .filter(agent::Column::LastHeartbeat.lt(cutoff))
+        .into_tuple::<Uuid>()
+        .all(db)
+        .await
+    {
+        Ok(ids) => ids,
+        Err(err) => {
+            tracing::warn!(error = %err, "could not list stale agents");
+            return;
+        },
+    };
+    if stale.is_empty() {
+        return;
+    }
+    let pruned = match agent::Entity::delete_many()
+        .filter(agent::Column::Id.is_in(stale.clone()))
+        .exec(db)
+        .await
+    {
+        Ok(result) => result.rows_affected,
+        Err(err) => {
+            tracing::warn!(error = %err, "could not prune offline agents");
+            return;
+        },
+    };
+    if pruned == 0 {
+        return;
+    }
+    tracing::info!(deleted = pruned, %cutoff, "pruned long-offline agents");
+
+    // Drop the matching in-memory state so the maps stay proportional to
+    // the live inventory rather than to every agent ever seen.
+    let stale_set: std::collections::HashSet<Uuid> =
+        stale.iter().copied().collect();
+    if let Ok(mut buckets) = LAST_PERSISTED_BUCKET.lock() {
+        buckets.retain(|id, _| !stale_set.contains(id));
+    }
+    if let Ok(mut strikes) = RESOURCE_STRIKES.lock() {
+        strikes.retain(|(id, _), _| !stale_set.contains(id));
+    }
+    // Queued commands would otherwise stay forever for agents whose rows are
+    // gone (2026-10-18 audit).
+    registry.forget(&stale).await;
+}
+
+/// Timestamps come from the agent's own clock. Anything outside the retention
+/// window — including a clock that runs ahead — is stored as `now`, so that the
+/// row still ages out instead of becoming unprunable.
+fn sample_time(ts_millis: i64, now: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(ts_millis)
+        .filter(|ts| {
+            *ts <= now
+                && *ts
+                    > now - chrono::Duration::hours(HOST_SAMPLE_RETENTION_HOURS)
+        })
+        .unwrap_or(now)
+}
+
+/// Cumulative counters arrive as `u64`; zero means "not reported".
+fn sample_i64(value: u64) -> Option<i64> {
+    (value > 0).then(|| value.min(i64::MAX as u64) as i64)
+}
+
+/// Flips an agent to `offline` when its stream ends, unless a newer heartbeat has
+/// already arrived (which happens when the agent reconnects quickly).
+async fn mark_offline(db: &DatabaseConnection, agent_id: Uuid) {
+    // Keep the freshness guard in the WHERE clause. Reading the row first and
+    // writing it back as a full ActiveModel races a new heartbeat and can
+    // resurrect old status/config values.
+    let threshold = Utc::now() - chrono::Duration::seconds(2);
+    if let Err(err) = agent::Entity::update_many()
+        .col_expr(agent::Column::Status, Expr::value(agent_status::OFFLINE))
+        .filter(agent::Column::Id.eq(agent_id))
+        .filter(
+            agent::Column::LastHeartbeat
+                .is_null()
+                .or(agent::Column::LastHeartbeat.lt(threshold)),
+        )
+        .filter(agent::Column::Status.ne(agent_status::OFFLINE))
+        .exec(db)
+        .await
+    {
+        tracing::warn!(%agent_id, error = %err, "could not mark agent offline");
+    }
+}
+
+/// Soft byte budget for one in-flight log batch. The row-count limit alone
+/// lets a handful of large bodies pin far more memory than intended.
+const LOG_BATCH_BYTES: usize = 4 * 1024 * 1024;
+/// `insert_many` builds one SQL statement per call; cap the row count so a
+/// large batch does not produce an oversized parameter buffer.
+const LOG_INSERT_CHUNK: usize = 64;
+
+/// Rough wire size of one entry. Exact serialization is not needed: this only
+/// decides when to flush, and over-counting is safer than under-counting.
+fn estimate_log_entry_bytes(entry: &LogEntry) -> usize {
+    let headers: usize = entry
+        .request_headers
+        .iter()
+        .chain(entry.response_headers.iter())
+        .map(|(k, v)| k.len() + v.len())
+        .sum();
+    let tags: usize = entry.waf_matched_tags.iter().map(String::len).sum();
+    256 + entry.client_ip.len()
+        + entry.method.len()
+        + entry.scheme.len()
+        + entry.host.len()
+        + entry.path.len()
+        + entry.query_string.len()
+        + entry.protocol.len()
+        + entry.request_body.len()
+        + entry.response_body.len()
+        + entry.upstream_addr.len()
+        + entry.waf_action.len()
+        + entry.waf_rule_id.len()
+        + entry.waf_details.len()
+        + entry.waf_rule_name.len()
+        + entry.waf_event_type.len()
+        + headers
+        + tags
+}
+
+/// Inserts access rows in bounded chunks, moving each chunk out of the Vec.
+async fn insert_access_chunks(
+    db: &DatabaseConnection,
+    mut rows: Vec<access_log::ActiveModel>,
+) -> Result<(), Status> {
+    while rows.len() > LOG_INSERT_CHUNK {
+        let tail = rows.split_off(LOG_INSERT_CHUNK);
+        if let Err(err) = access_log::Entity::insert_many(rows).exec(db).await {
+            tracing::error!(error = %err, "failed to persist access logs");
+            return Err(db_status(err));
+        }
+        rows = tail;
+    }
+    if !rows.is_empty() {
+        if let Err(err) = access_log::Entity::insert_many(rows).exec(db).await {
+            tracing::error!(error = %err, "failed to persist access logs");
+            return Err(db_status(err));
+        }
+    }
+    Ok(())
+}
+
+/// Inserts security-event rows in the same bounded chunks as access logs.
+async fn insert_event_chunks(
+    db: &DatabaseConnection,
+    mut rows: Vec<security_event::ActiveModel>,
+) -> Result<(), Status> {
+    while rows.len() > LOG_INSERT_CHUNK {
+        let tail = rows.split_off(LOG_INSERT_CHUNK);
+        if let Err(err) =
+            security_event::Entity::insert_many(rows).exec(db).await
+        {
+            tracing::error!(error = %err, "failed to persist security events");
+            return Err(db_status(err));
+        }
+        rows = tail;
+    }
+    if !rows.is_empty() {
+        if let Err(err) =
+            security_event::Entity::insert_many(rows).exec(db).await
+        {
+            tracing::error!(error = %err, "failed to persist security events");
+            return Err(db_status(err));
+        }
+    }
+    Ok(())
+}
+
+/// Writes the accumulated rows, clearing both buffers.
+async fn flush(
+    db: &DatabaseConnection,
+    access: &mut Vec<access_log::ActiveModel>,
+    events: &mut Vec<security_event::ActiveModel>,
+) -> Result<(), Status> {
+    if !access.is_empty() {
+        let rows = std::mem::take(access);
+        let _timer = pingwaf_profiler::timed_method(
+            pingwaf_profiler::Method::DbPersistLogs,
+        );
+        insert_access_chunks(db, rows).await?;
+    }
+    if !events.is_empty() {
+        let rows = std::mem::take(events);
+        let _timer = pingwaf_profiler::timed_method(
+            pingwaf_profiler::Method::DbPersistEvents,
+        );
+        insert_event_chunks(db, rows).await?;
+    }
+    Ok(())
+}
+
+/// Persists one batch of certificate events. Failures are logged and dropped:
+/// a transient database hiccup must not tear down the agent's stream.
+async fn flush_cert_events(
+    db: &DatabaseConnection,
+    batch: &mut Vec<certificate_events::ActiveModel>,
+) -> Result<(), Status> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let rows = std::mem::take(batch);
+    if let Err(err) =
+        certificate_events::Entity::insert_many(rows).exec(db).await
+    {
+        tracing::error!(error = %err, "failed to persist certificate events");
+    }
+    Ok(())
+}
+
+/// Maps a shipped log entry onto the `access_logs` row.
+fn access_log_row(
+    entry: &LogEntry,
+    site_id: Option<Uuid>,
+    agent_id: Option<Uuid>,
+    timestamp: DateTime<Utc>,
+) -> access_log::ActiveModel {
+    access_log::ActiveModel {
+        // Auto-increment primary key: leave it unset.
+        site_id: Set(site_id),
+        agent_id: Set(agent_id),
+        request_id: Set(truncate(&entry.request_id, MAX_REQUEST_ID)),
+        timestamp: Set(timestamp),
+        client_ip: Set(truncate(&entry.client_ip, MAX_CLIENT_IP)
+            .unwrap_or_else(|| "0.0.0.0".to_string())),
+        method: Set(truncate(&entry.method, MAX_METHOD)
+            .unwrap_or_else(|| "GET".to_string())),
+        host: Set(truncate(&entry.host, MAX_HOST)),
+        path: Set(optional(&entry.path)),
+        query_string: Set(optional(&entry.query_string)),
+        status_code: Set(if entry.response_status == 0 {
+            None
+        } else {
+            Some(entry.response_status as i32)
+        }),
+        response_size: Set(positive_i64(entry.response_body_size as i64)),
+        upstream_addr: Set(truncate(&entry.upstream_addr, MAX_UPSTREAM)),
+        upstream_latency_ms: Set(positive_i64(
+            entry.upstream_latency_ms as i64,
+        )),
+        total_latency_ms: Set(positive_i64(entry.total_latency_ms as i64)),
+        cache_status: Set(truncate(&entry.cache_status, MAX_CACHE_STATUS)),
+        user_agent: Set(optional(&entry.user_agent)),
+        referer: Set(optional(&entry.referer)),
+        country_code: Set(truncate(&entry.country_code, MAX_COUNTRY)),
+        tls_version: Set(truncate(&entry.tls_version, MAX_TLS_VERSION)),
+        // Who made the request, when the site authenticated them. `optional`
+        // maps an empty string to NULL: the column means "no identity", and a
+        // stored `""` would read as an identified caller with no name.
+        user_identity: Set(truncate(&entry.user_identity, MAX_USER_IDENTITY)),
+        request_headers: Set(headers_json(&entry.request_headers)),
+        request_body: Set(body_text(&entry.request_body)),
+        request_body_size: Set(positive_i64(entry.request_body_size as i64)),
+        request_body_truncated: Set(Some(entry.request_body_truncated)),
+        scheme: Set(optional(&entry.scheme)),
+        protocol: Set(optional(&entry.protocol)),
+        response_headers: Set(response_headers_json(&entry.response_headers)),
+        response_body: Set(body_text(&entry.response_body)),
+        response_body_size: Set(positive_i64(entry.response_body_size as i64)),
+        response_body_truncated: Set(Some(entry.response_body_truncated)),
+        ..Default::default()
+    }
+}
+
+/// Lossily decodes a body prefix kept for the PostgreSQL row. The agent
+/// already caps the payload at its configured limit; this is a defensive
+/// second cap for older or misconfigured agents.
+fn body_text(body: &[u8]) -> Option<String> {
+    const MAX_STORED_BODY: usize = 65536;
+    if body.is_empty() {
+        return None;
+    }
+    let capped = &body[..body.len().min(MAX_STORED_BODY)];
+    Some(String::from_utf8_lossy(capped).into_owned())
+}
+
+/// True when the entry carries a WAF decision and belongs in
+/// `security_events`. The same condition gates every consumer (PostgreSQL and
+/// Elasticsearch) so the two stores never disagree on routing.
+fn is_waf_event(entry: &LogEntry) -> bool {
+    !entry.waf_action.trim().is_empty()
+        || entry.waf_score != 0
+        || !entry.waf_rule_id.trim().is_empty()
+}
+
+/// The alert an OIDC security event raises, if it raises one.
+///
+/// The data plane reports two kinds of OIDC failure and both are worth a
+/// notification; everything else it sends through the same channel (there is
+/// nothing else today) is not. Matching on the exact strings the `oidc` plugin
+/// writes is deliberate: a new event type has to be added here to alert, so a
+/// noisy one cannot slip into the alert stream by accident.
+fn oidc_alert_for(event_type: &str) -> Option<(&'static str, &'static str)> {
+    match event_type.trim() {
+        "oidc_login_failed" => Some((
+            crate::models::event_type::SITE_OIDC_LOGIN_FAILED,
+            crate::models::severity::WARNING,
+        )),
+        "oidc_idp_unavailable" => Some((
+            crate::models::event_type::SITE_OIDC_IDP_UNAVAILABLE,
+            crate::models::severity::CRITICAL,
+        )),
+        _ => None,
+    }
+}
+
+/// The subject line of an OIDC alert.
+fn oidc_alert_title(event_type: &str, host: &str) -> String {
+    let host = if host.trim().is_empty() { "?" } else { host };
+    if event_type == crate::models::event_type::SITE_OIDC_IDP_UNAVAILABLE {
+        format!("OIDC provider unreachable for site {host}")
+    } else {
+        format!("OIDC login failed for site {host}")
+    }
+}
+
+/// The body of an OIDC alert: what failed and where, without the query string
+/// (which carries the authorization code and the state).
+fn oidc_alert_message(event_type: &str, host: &str, details: &str) -> String {
+    let host = if host.trim().is_empty() { "?" } else { host };
+    let reason = details.trim();
+    let reason = if reason.is_empty() { "unknown" } else { reason };
+    if event_type == crate::models::event_type::SITE_OIDC_IDP_UNAVAILABLE {
+        format!(
+            "Site '{host}' could not reach its OIDC provider ({reason}). \
+             Unauthenticated visitors cannot complete the login flow, so the \
+             protected part of the site is unreachable."
+        )
+    } else {
+        format!(
+            "A login on site '{host}' could not be completed ({reason}). \
+             Repeated failures usually mean a wrong client secret or redirect \
+             URL, or a replayed authorization code."
+        )
+    }
+}
+
+/// Maps a shipped log entry onto a `security_events` row, or `None` when the
+/// request was clean and produced no WAF decision.
+fn security_event_row(
+    entry: &LogEntry,
+    site_id: Option<Uuid>,
+    agent_id: Option<Uuid>,
+    timestamp: DateTime<Utc>,
+) -> Option<security_event::ActiveModel> {
+    if !is_waf_event(entry) {
+        return None;
+    }
+    let waf_action = entry.waf_action.trim();
+
+    Some(security_event::ActiveModel {
+        site_id: Set(site_id),
+        agent_id: Set(agent_id),
+        request_id: Set(truncate(&entry.request_id, MAX_REQUEST_ID)),
+        timestamp: Set(timestamp),
+        client_ip: Set(truncate(&entry.client_ip, MAX_CLIENT_IP)
+            .unwrap_or_else(|| "0.0.0.0".to_string())),
+        method: Set(truncate(&entry.method, MAX_METHOD)
+            .unwrap_or_else(|| "GET".to_string())),
+        host: Set(truncate(&entry.host, MAX_HOST)),
+        path: Set(optional(&entry.path)),
+        // The engine reports both the detection signature and, when they
+        // differ, the rule that actually enforced the block. Statistics and
+        // `rule_id` filters must key on the enforcer: recording the signature
+        // made a log-only rule look like the blocker (L3-006).
+        rule_id: Set(truncate(
+            if entry.waf_enforced_rule_id.is_empty() {
+                &entry.waf_rule_id
+            } else {
+                &entry.waf_enforced_rule_id
+            },
+            MAX_RULE_ID,
+        )),
+        rule_name: Set(truncate(&entry.waf_rule_name, MAX_RULE_NAME)),
+        event_type: Set(optional(&entry.waf_event_type)),
+        action: Set(truncate(waf_action, MAX_ACTION)
+            .unwrap_or_else(|| action::LOG.to_string())),
+        score: Set(if entry.waf_score == 0 {
+            None
+        } else {
+            Some(entry.waf_score as i32)
+        }),
+        waf_details: Set(optional(&entry.waf_details)),
+        country_code: Set(truncate(&entry.country_code, MAX_COUNTRY)),
+        user_agent: Set(optional(&entry.user_agent)),
+        // Who made the request, when the site authenticated them. `optional`
+        // maps an empty string to NULL: the column means "no identity", and a
+        // stored `""` would read as an identified caller with no name.
+        user_identity: Set(truncate(&entry.user_identity, MAX_USER_IDENTITY)),
+        created_at: Set(Utc::now()),
+        ..Default::default()
+    })
+}
+
+/// Maps a shipped log entry onto the Elasticsearch access log document.
+///
+/// Unlike the PostgreSQL row, this keeps the fields Postgres drops (bodies,
+/// headers, JA3, city, ASN), because ES is the full-text/forensic store. Bodies
+/// are re-truncated to the server's `max_body_size` and the agent's own
+/// truncation flag is preserved so the two never contradict each other.
+fn access_log_document(
+    es: &ElasticsearchClient,
+    entry: &LogEntry,
+    timestamp: DateTime<Utc>,
+) -> AccessLogDocument {
+    let (request_body, mut request_body_truncated) =
+        es.truncate_body_to_string(&entry.request_body);
+    request_body_truncated |= entry.request_body_truncated;
+    let (response_body, mut response_body_truncated) =
+        es.truncate_body_to_string(&entry.response_body);
+    response_body_truncated |= entry.response_body_truncated;
+
+    AccessLogDocument {
+        timestamp,
+        site_id: entry.site_id.clone(),
+        site_domain: entry.host.clone(),
+        agent_id: entry.agent_id.clone(),
+        request_id: entry.request_id.clone(),
+
+        client_ip: entry.client_ip.clone(),
+        method: entry.method.clone(),
+        scheme: optional(&entry.scheme),
+        host: entry.host.clone(),
+        path: entry.path.clone(),
+        query_string: optional(&entry.query_string),
+        protocol: optional(&entry.protocol),
+        request_headers: headers_json(&entry.request_headers),
+        request_body,
+        request_body_size: positive_u64(entry.request_body_size),
+        request_body_truncated,
+
+        response_status: if entry.response_status == 0 {
+            None
+        } else {
+            Some(entry.response_status as u16)
+        },
+        response_headers: response_headers_json(&entry.response_headers),
+        response_body,
+        response_body_size: positive_u64(entry.response_body_size),
+        response_body_truncated,
+
+        upstream_addr: optional(&entry.upstream_addr),
+        upstream_latency_ms: positive_u64(entry.upstream_latency_ms),
+
+        waf_score: positive_u32(entry.waf_score),
+        waf_action: optional(&entry.waf_action),
+        waf_rule_id: optional(&entry.waf_rule_id),
+        waf_details: optional(&entry.waf_details),
+
+        total_latency_ms: positive_u64(entry.total_latency_ms),
+        cache_status: optional(&entry.cache_status),
+
+        tls_version: optional(&entry.tls_version),
+        ja3_hash: optional(&entry.ja3_hash),
+        country_code: optional(&entry.country_code),
+        city: optional(&entry.city),
+        asn: positive_u32(entry.asn),
+
+        user_agent: optional(&entry.user_agent),
+        referer: optional(&entry.referer),
+    }
+}
+
+/// Maps a shipped log entry onto an Elasticsearch security event, or `None`
+/// when the request produced no WAF decision — the same condition that gates the
+/// PostgreSQL `security_events` row, so the two stores stay consistent.
+fn security_event_document(
+    es: &ElasticsearchClient,
+    entry: &LogEntry,
+    timestamp: DateTime<Utc>,
+) -> Option<SecurityEventDocument> {
+    if !is_waf_event(entry) {
+        return None;
+    }
+    let waf_action = entry.waf_action.trim();
+
+    let (request_body, mut request_body_truncated) =
+        es.truncate_body_to_string(&entry.request_body);
+    request_body_truncated |= entry.request_body_truncated;
+
+    Some(SecurityEventDocument {
+        timestamp,
+        site_id: entry.site_id.clone(),
+        site_domain: entry.host.clone(),
+        agent_id: entry.agent_id.clone(),
+        request_id: entry.request_id.clone(),
+
+        client_ip: entry.client_ip.clone(),
+        method: entry.method.clone(),
+        host: entry.host.clone(),
+        path: entry.path.clone(),
+        query_string: optional(&entry.query_string),
+
+        rule_id: entry.waf_rule_id.clone(),
+        rule_name: optional(&entry.waf_rule_name),
+        event_type: optional(&entry.waf_event_type),
+        action: if waf_action.is_empty() {
+            action::LOG.to_string()
+        } else {
+            waf_action.to_string()
+        },
+        score: entry.waf_score,
+        attack_category: entry.waf_matched_tags.first().cloned(),
+        details: optional(&entry.waf_details),
+        severity: None,
+
+        user_agent: optional(&entry.user_agent),
+        user_identity: optional(&entry.user_identity),
+        country_code: optional(&entry.country_code),
+        asn: positive_u32(entry.asn),
+
+        request_headers: headers_json(&entry.request_headers),
+        request_body,
+        request_body_truncated,
+    })
+}
+
+/// Response-header variant of [`headers_json`]: always drops
+/// `content-security-policy-report-only` before the map is stored.
+///
+/// That header is produced by the upstream application (WAFred never sets
+/// it), is often kilobytes long, and has no forensic value for attack
+/// tracing — its only effect here is log bloat. `cookie`/`set-cookie` are
+/// deliberately kept: site-level logs need them for attack tracing (session
+/// replay, hijack detection).
+///
+/// Note on the control plane's own traffic (9080): the console is a plain
+/// Axum listener started by `start_server`, not a pingap service, so its
+/// requests never enter the plugin log pipeline and are never shipped via
+/// `ShipLogs`. Its access log (`control_plane_access_logs`, written by
+/// `self_protection.rs`) stores only UA/referer — it has never stored
+/// cookies — so no cookie stripping is needed for control-plane traffic.
+fn response_headers_json(
+    headers: &std::collections::HashMap<String, String>,
+) -> Option<serde_json::Value> {
+    const CSP_REPORT_ONLY: &str = "content-security-policy-report-only";
+    // Single pass: drop the report-only CSP while building the map. An empty
+    // result falls through to `headers_json`, which returns `None`.
+    let filtered: std::collections::HashMap<String, String> = headers
+        .iter()
+        .filter(|(key, _)| !key.eq_ignore_ascii_case(CSP_REPORT_ONLY))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    headers_json(&filtered)
+}
+
+/// Converts a protocol header map into an indexable JSON object, or `None` when
+/// empty. The ES mapping stores these as non-indexed objects, so arbitrary keys
+/// cannot cause a mapping explosion.
+fn headers_json(
+    headers: &std::collections::HashMap<String, String>,
+) -> Option<serde_json::Value> {
+    if headers.is_empty() {
+        return None;
+    }
+    let map = headers
+        .iter()
+        .map(|(key, value)| {
+            (key.clone(), serde_json::Value::String(value.clone()))
+        })
+        .collect::<serde_json::Map<String, serde_json::Value>>();
+    Some(serde_json::Value::Object(map))
+}
+
+fn positive_u64(value: u64) -> Option<u64> {
+    if value > 0 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn positive_u32(value: u32) -> Option<u32> {
+    if value > 0 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Maps a SeaORM error onto a `tonic::Status`, logging the detail server side.
+///
+/// The detail never reaches the peer: `DbErr::RecordNotFound` carries whatever
+/// text the lookup used (a generated `find_related` / `update` path puts the
+/// table name in it), and the other variants name tables, columns and
+/// connection strings just as readily. Both bodies are therefore fixed
+/// strings — the 404 says only that the row is gone, everything else answers
+/// `internal error` after the full error has been logged here.
+///
+/// `NotFound` is deliberately not logged at `error` level: a missing row is a
+/// routine race (an agent deleted between two statements), not an incident.
+fn db_status(err: sea_orm::DbErr) -> Status {
+    match err {
+        sea_orm::DbErr::RecordNotFound(detail) => {
+            tracing::debug!(error = %detail, "grpc storage lookup found no row");
+            Status::not_found(NOT_FOUND_MESSAGE)
+        },
+        other => {
+            tracing::error!(error = %other, "grpc storage error");
+            Status::internal(INTERNAL_MESSAGE)
+        },
+    }
+}
+
+/// Decides whether an agent-reported `site_id` may be persisted (D10).
+///
+/// `authorize()` proves *which* agent is talking, and the `agent_id` stamp
+/// check proves the entry is not impersonating another agent — but neither
+/// says the entry's `site_id` is a site the agent serves. Without this, a
+/// compromised or merely buggy edge could write log lines and certificate
+/// events into another tenant's history (and, for certificate events, drive a
+/// state transition on a foreign certificate).
+///
+/// The comparison is deliberately against the *agent's own* binding rather
+/// than the site's owner, so a global agent still needs its caller's scoping
+/// applied elsewhere. `visible` is the set computed once per stream by
+/// [`ControlPlaneService::visible_sites`].
+///
+/// A missing or unparsable stamp is refused as well: an unattributed entry
+/// cannot be proven to belong to the reporting agent.
+fn site_stamp_is_visible(stamped: &str, visible: &[Uuid]) -> bool {
+    match parse_optional_uuid(stamped) {
+        Some(id) => visible.contains(&id),
+        None => false,
+    }
+}
+
+fn parse_optional_uuid(raw: &str) -> Option<Uuid> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    match Uuid::parse_str(raw) {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::debug!(value = %raw, error = %err, "ignoring malformed UUID in log entry");
+            None
+        },
+    }
+}
+
+/// Blank protocol strings become SQL NULLs.
+fn optional(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Same as [`optional`] but bounded by a column width.
+fn truncate(value: &str, max: usize) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() <= max {
+        return Some(trimmed.to_string());
+    }
+    let mut end = max;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(trimmed[..end].to_string())
+}
+
+/// Zero and negative protocol integers become SQL NULLs.
+fn positive_i64(value: i64) -> Option<i64> {
+    if value > 0 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn positive_i32(value: i64) -> Option<i32> {
+    if value > 0 {
+        Some(value.min(i64::from(i32::MAX)) as i32)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The OIDC alerts are raised from inside the ingest loop, which drops any
+    /// entry stamped with a site the agent does not serve — an entry with an
+    /// empty stamp included. A plugin that reported an empty `site_id` would
+    /// therefore be silently discarded, and neither the `security_events` row
+    /// nor the alert would ever appear. The plugin resolves the real id from
+    /// the rule cache; this pins the ingest-side half of that contract.
+    #[test]
+    fn an_entry_without_a_visible_site_is_dropped_before_any_alert() {
+        let site = Uuid::new_v4();
+        assert!(site_stamp_is_visible(&site.to_string(), &[site]));
+        // The failure mode the OIDC plugin had: an empty stamp is not visible,
+        // so the entry never reaches `security_event_row` or the alert branch.
+        assert!(!site_stamp_is_visible("", &[site]));
+        assert!(!site_stamp_is_visible("   ", &[site]));
+        assert!(!site_stamp_is_visible("not-a-uuid", &[site]));
+        assert!(!site_stamp_is_visible(&Uuid::new_v4().to_string(), &[site]));
+    }
+
+    /// D03: an `acme_failed` event from the edge turns the certificate row
+    /// `failed` with the real reason, without touching anything else.
+    #[test]
+    fn simulated_failure_event_fails_the_pending_certificate() {
+        let event = "acme_failed domain=mirror.liveflowhub.com,www.mirror.liveflowhub.com \
+                     reason=ACME instant error: API error: Invalid response from \
+                     http://mirror.liveflowhub.com/.well-known/acme-challenge/abc: 404 \
+                     (urn:ietf:params:acme:error:unauthorized)";
+        let failure = parse_acme_failure(event).expect("D03 event must parse");
+        assert_eq!(
+            failure.domains,
+            vec!["mirror.liveflowhub.com", "www.mirror.liveflowhub.com"]
+        );
+        assert!(failure.reason.contains("404"), "{}", failure.reason);
+
+        let now = Utc::now();
+        let update = certificate_failure_update(failure.reason, now);
+        assert_eq!(update.status, cert_status::FAILED);
+        assert_eq!(update.status, "failed");
+        assert!(update.failure_reason.contains("404"));
+        assert_eq!(update.updated_at, now);
+
+        // The query that lands in PostgreSQL writes those values onto a
+        // pending ACME row...
+        let query = certificate_failure_query(
+            &update,
+            None,
+            Some(Uuid::new_v4()),
+            &failure.domains,
+        )
+        .expect("a site-attributed event is actionable");
+        let sql =
+            sea_orm::QueryTrait::build(&query, sea_orm::DbBackend::Postgres)
+                .sql;
+        assert!(sql.contains("UPDATE \"site_certificates\""), "{sql}");
+        for column in ["\"status\"", "\"failure_reason\"", "\"updated_at\""] {
+            assert!(sql.contains(column), "{sql}");
+        }
+        assert!(sql.contains("\"cert_pem\" IS NULL"), "{sql}");
+        assert!(sql.contains("\"acme_email\" IS NOT NULL"), "{sql}");
+        assert!(sql.contains("\"site_id\" = "), "{sql}");
+        assert!(sql.contains("\"domain\" IN ("), "{sql}");
+
+        // The agent may report the certificate the site still serves instead
+        // of the pending replacement; the id branch covers that.
+        let query =
+            certificate_failure_query(&update, Some(Uuid::new_v4()), None, &[])
+                .expect("a certificate id is actionable on its own");
+        let sql =
+            sea_orm::QueryTrait::build(&query, sea_orm::DbBackend::Postgres)
+                .sql;
+        assert!(sql.contains("\"id\" = "), "{sql}");
+
+        // Without a certificate or site id the event cannot be attributed.
+        assert!(certificate_failure_query(&update, None, None, &[]).is_none());
+    }
+
+    /// D03: only the marked line is a state transition. The edge's own 404
+    /// warning carries a token, not a site, and must never fail a row; the
+    /// reason is capped so a large CA problem document cannot fill the row.
+    #[test]
+    fn raw_acme_logs_are_not_certificate_failures() {
+        assert!(parse_acme_failure("let's encrypt http-01 token not found")
+            .is_none());
+        assert!(parse_acme_failure("acme_failed domain=example.com").is_none());
+        assert!(parse_acme_failure("acme_failed while polling").is_none());
+
+        let capped = truncate_failure_reason(&"é".repeat(700));
+        assert_eq!(capped.chars().count(), MAX_FAILURE_REASON_CHARS);
+        assert_eq!(capped, "é".repeat(MAX_FAILURE_REASON_CHARS));
+    }
+
+    /// D03: a pending order that outlives the grace window is failed with
+    /// `issuance timed out`, so the dashboard stops spinning.
+    #[test]
+    fn pending_certificate_past_grace_fails_with_reason() {
+        let now = Utc::now();
+        let cutoff = pending_certificate_cutoff(now);
+        assert_eq!(cutoff, now - chrono::Duration::minutes(30));
+        // Last touched 29 minutes ago: still inside the window.
+        assert!(now - chrono::Duration::minutes(29) >= cutoff);
+        // Last touched 31 minutes ago: the sweep picks it up.
+        assert!(now - chrono::Duration::minutes(31) < cutoff);
+
+        let update = stale_pending_failure(now);
+        assert_eq!(update.status, cert_status::FAILED);
+        assert_eq!(update.failure_reason, "issuance timed out");
+        assert_eq!(update.updated_at, now);
+    }
+
+    #[test]
+    fn metadata_token_reads_the_x_agent_token_header() {
+        let mut request = tonic::Request::new(());
+        request
+            .metadata_mut()
+            .insert("x-agent-token", "abc.def.ghi".parse().unwrap());
+        assert_eq!(
+            ControlPlaneService::metadata_token(&request),
+            "abc.def.ghi"
+        );
+        assert_eq!(
+            ControlPlaneService::metadata_token(&tonic::Request::new(())),
+            ""
+        );
+    }
+
+    #[test]
+    fn blanks_become_nulls() {
+        assert_eq!(optional("  "), None);
+        assert_eq!(optional(" x ").as_deref(), Some("x"));
+        assert_eq!(truncate("", 10), None);
+        assert_eq!(truncate("12345678", 4).as_deref(), Some("1234"));
+    }
+
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        // Each 'é' is two bytes: a four byte cap must not split one.
+        let truncated = truncate(&"é".repeat(10), 5).unwrap();
+        assert_eq!(truncated.len(), 4);
+        assert_eq!(truncated, "éé");
+    }
+
+    #[test]
+    fn zero_values_become_nulls() {
+        assert_eq!(positive_i64(0), None);
+        assert_eq!(positive_i64(-3), None);
+        assert_eq!(positive_i64(42), Some(42));
+        assert_eq!(positive_i32(0), None);
+        assert_eq!(positive_i32(7), Some(7));
+        assert_eq!(positive_i32(i64::MAX), Some(i32::MAX));
+    }
+
+    /// D10: an agent may only stamp entries with a site it serves. A foreign
+    /// site, an absent stamp and a malformed one are all refused — dropping
+    /// them is what keeps one tenant's logs and certificate state out of
+    /// another's history.
+    #[test]
+    fn site_stamps_must_belong_to_the_reporting_agent() {
+        let own = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let visible = [own];
+
+        assert!(site_stamp_is_visible(&own.to_string(), &visible));
+        assert!(
+            site_stamp_is_visible(&format!(" {} ", own), &visible),
+            "surrounding blanks are tolerated"
+        );
+
+        assert!(!site_stamp_is_visible(&other.to_string(), &visible));
+        assert!(!site_stamp_is_visible("", &visible));
+        assert!(!site_stamp_is_visible("   ", &visible));
+        assert!(!site_stamp_is_visible("not-a-uuid", &visible));
+        // An agent that serves no site can write for none of them.
+        assert!(!site_stamp_is_visible(&own.to_string(), &[]));
+    }
+
+    #[test]
+    fn uuids_are_parsed_leniently() {
+        assert_eq!(parse_optional_uuid(""), None);
+        assert_eq!(parse_optional_uuid("nope"), None);
+        let id = Uuid::new_v4();
+        assert_eq!(parse_optional_uuid(&id.to_string()), Some(id));
+    }
+
+    #[test]
+    fn response_headers_drop_csp_report_only_but_keep_cookies() {
+        let headers = [
+            ("content-type", "text/html"),
+            ("Content-Security-Policy-Report-Only", "default-src 'self'"),
+            ("set-cookie", "sid=abc"),
+            ("cookie", "sid=abc"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect::<std::collections::HashMap<_, _>>();
+
+        let json = response_headers_json(&headers).unwrap();
+        let map = json.as_object().unwrap();
+        assert!(!map.contains_key("content-security-policy-report-only"));
+        assert!(!map.contains_key("Content-Security-Policy-Report-Only"));
+        assert_eq!(
+            map.get("set-cookie").and_then(|v| v.as_str()),
+            Some("sid=abc")
+        );
+        assert_eq!(map.get("cookie").and_then(|v| v.as_str()), Some("sid=abc"));
+        assert_eq!(
+            map.get("content-type").and_then(|v| v.as_str()),
+            Some("text/html")
+        );
+
+        // Request headers keep everything, including CSP report-only.
+        assert!(headers_json(&headers).is_some());
+    }
+
+    #[test]
+    fn response_headers_all_filtered_become_none() {
+        let headers = [(
+            "Content-Security-Policy-Report-Only".to_string(),
+            "x".to_string(),
+        )]
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(response_headers_json(&headers), None);
+        assert_eq!(response_headers_json(&Default::default()), None);
+    }
+
+    #[test]
+    fn clean_requests_produce_no_security_event() {
+        let entry = LogEntry {
+            agent_id: String::new(),
+            site_id: String::new(),
+            request_id: String::new(),
+            timestamp: None,
+            client_ip: "10.0.0.1".into(),
+            method: "GET".into(),
+            host: "example.com".into(),
+            path: "/".into(),
+            ..Default::default()
+        };
+        assert!(security_event_row(&entry, None, None, Utc::now()).is_none());
+        assert!(access_log_row(&entry, None, None, Utc::now())
+            .timestamp
+            .is_set());
+
+        let mut blocked = entry.clone();
+        blocked.waf_action = action::BLOCK.into();
+        blocked.waf_score = 42;
+        blocked.waf_rule_id = "sqli-942100".into();
+        blocked.waf_details = "matched rule".into();
+        let event = security_event_row(&blocked, None, None, Utc::now())
+            .expect("event");
+        assert!(event.action.is_set());
+        assert_eq!(event.score.unwrap(), Some(42));
+    }
+
+    /// The identity is stored on both tables, an absent one stays NULL, and an
+    /// oversized one is cut rather than allowed to fail the batch insert.
+    #[test]
+    fn the_user_identity_is_stored_and_bounded() {
+        let mut entry = LogEntry {
+            client_ip: "10.0.0.1".into(),
+            method: "GET".into(),
+            host: "example.com".into(),
+            path: "/".into(),
+            waf_action: action::BLOCK.into(),
+            waf_rule_id: "sqli-942100".into(),
+            user_identity: "user-1234".into(),
+            ..Default::default()
+        };
+
+        let event = security_event_row(&entry, None, None, Utc::now())
+            .expect("a blocked request produces an event");
+        assert_eq!(event.user_identity.unwrap(), Some("user-1234".into()));
+        assert_eq!(
+            access_log_row(&entry, None, None, Utc::now())
+                .user_identity
+                .unwrap(),
+            Some("user-1234".into())
+        );
+
+        // Anonymous traffic stores NULL, not "": the column means "no
+        // identity", and a stored empty string would read as an identified
+        // caller with no name.
+        entry.user_identity = String::new();
+        assert_eq!(
+            security_event_row(&entry, None, None, Utc::now())
+                .unwrap()
+                .user_identity
+                .unwrap(),
+            None
+        );
+
+        // An OIDC `sub` is provider-defined, and the agent is a separate
+        // process: a value longer than the column must be cut here or the
+        // whole batch insert fails and takes the surrounding entries with it.
+        entry.user_identity = "x".repeat(MAX_USER_IDENTITY + 50);
+        let stored = security_event_row(&entry, None, None, Utc::now())
+            .unwrap()
+            .user_identity
+            .unwrap()
+            .expect("a truncated value is still stored");
+        assert_eq!(MAX_USER_IDENTITY, stored.chars().count());
+    }
+
+    #[test]
+    fn waf_decisions_are_not_routed_to_access_logs() {
+        // A blocked request arrives as two entries: the WAF decision (which
+        // carries no request detail) and the access entry with detail and the
+        // real status. Storing the decision in `access_logs` too would
+        // duplicate every blocked or monitored request.
+        let decision = LogEntry {
+            waf_action: action::BLOCK.into(),
+            waf_rule_id: "sqli-942100".into(),
+            ..Default::default()
+        };
+        assert!(is_waf_event(&decision));
+
+        let access = LogEntry {
+            request_id: "abc".into(),
+            ..Default::default()
+        };
+        assert!(!is_waf_event(&access));
+
+        // Monitored requests carry no action, only a score or rule id.
+        let monitored = LogEntry {
+            waf_score: 7,
+            ..Default::default()
+        };
+        assert!(is_waf_event(&monitored));
+    }
+
+    /// Only the two OIDC failures raise an alert. Everything else the data
+    /// plane sends — every blocked request — must not, or the notification
+    /// channels become a firehose.
+    #[test]
+    fn only_the_oidc_failures_raise_alerts() {
+        use crate::models::{event_type, severity};
+
+        assert_eq!(
+            oidc_alert_for("oidc_login_failed"),
+            Some((event_type::SITE_OIDC_LOGIN_FAILED, severity::WARNING))
+        );
+        assert_eq!(
+            oidc_alert_for("oidc_idp_unavailable"),
+            Some((event_type::SITE_OIDC_IDP_UNAVAILABLE, severity::CRITICAL))
+        );
+        // Padded values still match: the agent may trim or pad a string.
+        assert!(oidc_alert_for(" oidc_login_failed ").is_some());
+
+        for other in [
+            "",
+            "block",
+            "challenge",
+            "rate_limit",
+            "managed",
+            "waf",
+            "basic_auth",
+            // A prefix is not a match.
+            "oidc_login_failed_extra",
+        ] {
+            assert_eq!(None, oidc_alert_for(other), "{other} must not alert");
+        }
+    }
+
+    /// The alert body must never carry the query string: it holds the
+    /// authorization code and the state.
+    #[test]
+    fn oidc_alerts_name_the_site_and_never_the_query() {
+        use crate::models::event_type;
+
+        let failed = oidc_alert_message(
+            event_type::SITE_OIDC_LOGIN_FAILED,
+            "app.example.com",
+            "reason=token_exchange_failed",
+        );
+        assert!(failed.contains("app.example.com"));
+        assert!(failed.contains("token_exchange_failed"));
+
+        let unreachable = oidc_alert_message(
+            event_type::SITE_OIDC_IDP_UNAVAILABLE,
+            "app.example.com",
+            "endpoint=discovery status=timeout",
+        );
+        assert!(unreachable.contains("unreachable"));
+
+        // An absent host and reason still render something readable.
+        let bare =
+            oidc_alert_message(event_type::SITE_OIDC_LOGIN_FAILED, "", "");
+        assert!(bare.contains('?'));
+        assert!(bare.contains("unknown"));
+
+        assert!(
+            oidc_alert_title(event_type::SITE_OIDC_LOGIN_FAILED, "a.test")
+                .contains("a.test")
+        );
+        assert!(oidc_alert_title(event_type::SITE_OIDC_IDP_UNAVAILABLE, "")
+            .contains('?'));
+    }
+
+    #[test]
+    fn long_values_are_clamped_to_the_column_widths() {
+        let entry = LogEntry {
+            client_ip: "x".repeat(200),
+            method: "GET".into(),
+            country_code: "ZZZZ".into(),
+            ..Default::default()
+        };
+        let row = access_log_row(&entry, None, None, Utc::now());
+        assert_eq!(row.client_ip.clone().unwrap().len(), MAX_CLIENT_IP);
+        assert_eq!(
+            row.country_code.clone().unwrap().unwrap().len(),
+            MAX_COUNTRY
+        );
+    }
+
+    /// R-02: a missing row answers a fixed 404. The `DbErr` text names the
+    /// table the generated lookup searched, so none of it may reach the peer.
+    #[test]
+    fn record_not_found_answers_a_generic_404() {
+        let status = db_status(sea_orm::DbErr::RecordNotFound(
+            "sites: no row for id 7".to_string(),
+        ));
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert_eq!(status.message(), "not found");
+        for leak in ["sites", "SELECT", "relation", "id 7"] {
+            assert!(!status.message().contains(leak), "{leak}");
+        }
+    }
+
+    /// R-02: every other storage failure — a SQL error naming the table and
+    /// the connection, say — answers a bare `internal error`.
+    #[test]
+    fn other_storage_errors_answer_a_generic_internal_error() {
+        let err = sea_orm::DbErr::Query(sea_orm::RuntimeErr::Internal(
+            "SELECT * FROM \"site_certificates\": relation does not exist"
+                .to_string(),
+        ));
+        let status = db_status(err);
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert_eq!(status.message(), "internal error");
+        for leak in ["SELECT", "relation", "site_certificates", "\""] {
+            assert!(!status.message().contains(leak), "{leak}");
+        }
+    }
+
+    /// The stale-pending certificate sweep must run at most once per hour
+    /// even when several agents heartbeat concurrently: the CAS in
+    /// `persist_heartbeat` must admit exactly one winner per window (the old
+    /// `swap`-based throttle could double-run after a clock-step backwards).
+    #[test]
+    fn concurrent_heartbeats_admit_one_sweep_per_window() {
+        use std::sync::atomic::AtomicUsize;
+
+        let sweep = AtomicI64::new(0);
+        let winners = AtomicUsize::new(0);
+        let now: i64 = 10_000;
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let previous = sweep.load(Ordering::Relaxed);
+                    if now.saturating_sub(previous) >= 3600
+                        && sweep
+                            .compare_exchange(
+                                previous,
+                                now,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            )
+                            .is_ok()
+                    {
+                        winners.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        assert_eq!(winners.load(Ordering::Relaxed), 1);
+        // Within the window nobody sweeps again — not even concurrently.
+        let previous = sweep.load(Ordering::Relaxed);
+        assert!(now.saturating_sub(previous) < 3600);
+    }
+    #[test]
+    fn log_batch_estimate_tracks_large_bodies() {
+        let mut entry = LogEntry::default();
+        assert!(estimate_log_entry_bytes(&entry) < 1024);
+
+        entry.response_body = vec![b'x'; LOG_BATCH_BYTES];
+        assert!(
+            estimate_log_entry_bytes(&entry) >= LOG_BATCH_BYTES,
+            "a body larger than the batch budget must trigger a flush"
+        );
+    }
+}

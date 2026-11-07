@@ -1,0 +1,112 @@
+[package]
+name = "pingwaf-server"
+version.workspace = true
+edition = "2021"
+description = "WAFred control plane: REST API for the dashboard, gRPC control plane for agents"
+license = "Apache-2.0"
+
+[dependencies]
+regex = { workspace = true, features = ["std", "unicode-case", "unicode-perl"] }
+pingwaf-proto = { path = "../pingwaf-proto" }
+# The control plane validates the built-in rule expressions with the same
+# parser the data plane evaluates them with.
+pingwaf-waf = { path = "../pingwaf-waf" }
+pingwaf-system = { path = "../pingwaf-system" }
+pingwaf-profiler = { path = "../pingwaf-profiler" }
+# The visitor login challenge is verified with the same proof-of-work the WAF
+# challenge uses. Sharing the function rather than reimplementing it is a
+# correctness requirement, not tidiness: two implementations that drift by one
+# bit would fail every login with no error to explain it.
+pingwaf-challenge = { path = "../pingwaf-challenge" }
+anyhow = { workspace = true }
+# Lock-free policy swap for the control plane's self-protection middlewares,
+# which reload their settings without blocking the request path.
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+# Encodes the stored basic-auth passwords into the `Authorization` payload the
+# data plane compares against.
+base64 = { workspace = true }
+bcrypt = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+# Drives the provider response streams and the SSE chat endpoint.
+futures-util = { workspace = true }
+hex = { workspace = true }
+# HMAC-SHA256 signing of DingTalk webhook payloads.
+hmac = { workspace = true }
+# AES-256-GCM at-rest sealing of notification channel secrets.
+ring = { workspace = true }
+# Password-based configuration backup encryption and compression.
+argon2 = "0.5.3"
+zstd = { workspace = true }
+thiserror = "2.0.17"
+urlencoding = "2.1.3"
+# GeoIP lookup for login anomaly detection (uploaded mmdb + fallback db).
+maxminddb = { workspace = true }
+# SMTP client behind the notification system's e-mail channel.
+lettre = { workspace = true }
+jsonwebtoken = { workspace = true }
+# Parses the API allowlist entries (addresses and CIDR ranges).
+ipnet = { workspace = true }
+# Used to encode `RuleBundle`/`SiteConfig` so their bytes can be fingerprinted
+# into the `config_hash` agents compare for delta synchronisation.
+prost = { workspace = true }
+# Needed to build the `google.protobuf.Timestamp` fields of the control plane
+# protocol; tonic-prost-build maps well-known types onto this crate by default.
+prost-types = { workspace = true }
+# HTTP client used by the Elasticsearch log shipper and the AI assistant's
+# provider calls; `stream` adds `bytes_stream()` for the streaming
+# chat-completions endpoint. In reqwest 0.13 the workspace's `default-tls`
+# already maps to rustls, so no OpenSSL is pulled in.
+reqwest = { workspace = true, features = ["stream"] }
+rust-embed = { version = "8.12.0", features = ["mime-guess"], default-features = false }
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Certificate generation and parsing for the managed mTLS CAs. `rcgen` carries
+# its own crypto backend, so no TLS stack is pulled into the control plane.
+# WebAuthn (passkey) ceremony handling. Pure Rust (p256/coset/ciborium), so the
+# control plane stays free of an OpenSSL dependency; `send` switches the store
+# trait to a `Send` future, which is what the Axum handlers need.
+passkey-server = { version = "0.1.4", features = ["send"] }
+rcgen = { workspace = true }
+sha2 = { workspace = true }
+# Control plane self-monitoring: CPU, memory and disk utilisation samples.
+sysinfo = { workspace = true }
+time = { workspace = true }
+x509-parser = { workspace = true }
+# TLS termination for the dashboard listener. Inherits the workspace's rustls
+# requirement (security floor + explicit feature set) and adds `ring`, the
+# provider this crate pins for the dashboard listener and the pingora data
+# plane alike — see `pki::tls::crypto_provider`, which is what actually keeps
+# the process off `aws-lc-rs`'s default provider.
+rustls = { workspace = true, features = ["ring"] }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "logging",
+    "tls12",
+] }
+tokio = { workspace = true, features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-stream = { workspace = true, features = ["sync"] }
+tonic = { workspace = true, features = ["tls-ring"] }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+pretty_assertions = { workspace = true }
+# Drives `ServiceExt::oneshot` requests through middleware in unit tests.
+tower = { workspace = true }

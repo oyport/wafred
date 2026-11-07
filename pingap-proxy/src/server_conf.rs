@@ -1,0 +1,573 @@
+// Copyright 2024-2025 Tree xie.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use pingap_config::PingapConfig;
+use pingora::protocols::l4::ext::TcpKeepalive;
+use std::fmt;
+use std::time::Duration;
+
+static ERROR_TEMPLATE: &str = include_str!("error.html");
+
+// ServerConf struct represents the configuration for a server instance
+const DEFAULT_PUBLIC_DOWNSTREAM_READ_TIMEOUT: Duration =
+    Duration::from_secs(60);
+const DEFAULT_PUBLIC_DOWNSTREAM_WRITE_TIMEOUT: Duration =
+    Duration::from_secs(60);
+const DEFAULT_PUBLIC_H2_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_PUBLIC_KEEPALIVE_REQUEST_LIMIT: u32 = 1000;
+
+/// Public HTTP listeners must not inherit the historic "unlimited" downstream
+/// policy. Generic/internal listeners keep the operator's explicit value (and
+/// Pingora's own default when unset).
+fn is_public_listener(addr: &str) -> bool {
+    addr.split(',').any(|addr| {
+        let addr = addr.trim();
+        let host = addr
+            .rsplit_once(':')
+            .map(|(host, _)| host.trim_matches(['[', ']']))
+            .unwrap_or(addr);
+        // "Public" is about where the socket is bound, not which port it uses:
+        // 127.0.0.1:443 is loopback-only, while 0.0.0.0:8443 is exposed.
+        !matches!(host, "127.0.0.1" | "::1" | "localhost")
+    })
+}
+#[derive(Debug, Default)]
+pub struct ServerConf {
+    // Whether this server instance handles admin-related functionality
+    pub admin: bool,
+
+    // Unique identifier for this server instance
+    pub name: String,
+
+    // Comma-separated list of IP:port combinations where the server will listen
+    // Example: "127.0.0.1:3000,127.0.0.1:3001"
+    pub addr: String,
+
+    // Access log configuration string. Supports formats like "combined", "tiny", etc.
+    // None means access logging is disabled
+    pub access_log: Option<String>,
+
+    // List of location route identifiers that this server will handle
+    pub locations: Vec<String>,
+
+    // OpenSSL cipher list string for TLS versions below 1.3
+    // Example: "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256"
+    pub tls_cipher_list: Option<String>,
+
+    // TLS 1.3 specific cipher suite configuration
+    // Example: "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
+    pub tls_ciphersuites: Option<String>,
+
+    // Minimum TLS version the server will accept
+    // Common values: "TLSv1.2", "TLSv1.3"
+    pub tls_min_version: Option<String>,
+
+    // Maximum TLS version the server will support
+    // Common values: "TLSv1.2", "TLSv1.3"
+    pub tls_max_version: Option<String>,
+
+    // Number of worker threads for handling connections
+    // None means use system default
+    pub threads: Option<usize>,
+
+    // HTML template used for displaying error pages to clients
+    // Will use default template if not specified
+    pub error_template: String,
+
+    // TCP keepalive configuration for maintaining persistent connections
+    // Includes idle time, probe count, and interval settings
+    pub tcp_keepalive: Option<TcpKeepalive>,
+
+    // TCP Fast Open queue size for improved connection establishment
+    // None means TCP Fast Open is disabled
+    pub tcp_fastopen: Option<usize>,
+
+    /// Enable SO_REUSEPORT to allow multiple sockets to bind to the same address and port.
+    /// This is useful for load balancing across multiple worker processes.
+    /// See the [man page](https://man7.org/linux/man-pages/man7/socket.7.html) for more information.
+    pub reuse_port: Option<bool>,
+
+    // Whether to use globally configured TLS certificates
+    // False means the server is using http protocol
+    pub global_certificates: bool,
+
+    // PEM bundle of CAs trusted for downstream client certificates. None
+    // leaves client certificate verification off.
+    pub client_ca_pem: Option<String>,
+
+    // Whether HTTP/2 protocol support is enabled for this server
+    // The http protocol is using h2c
+    pub enabled_h2: bool,
+    // Whether HTTP/1.1 stays advertised over TLS. Turning it off together
+    // with `enabled_h2` makes the listener ALPN h2-only; turning both off is
+    // rejected by `pingap-config`.
+    pub http1_enabled: bool,
+    // Downstream HTTP/2 SETTINGS overrides. None keeps pingora's bounded
+    // defaults (100 concurrent streams, 64 KiB header list, h2's own
+    // 64 KiB windows) - see `Server::new_h2_options`.
+    pub h2_max_concurrent_streams: Option<u32>,
+    pub h2_max_header_list_size: Option<u32>,
+    pub h2_initial_window_size: Option<u32>,
+    pub h2_initial_connection_window_size: Option<u32>,
+    // Idle timeout for downstream HTTP/2 connections; None never closes
+    pub h2_idle_timeout: Option<Duration>,
+    // Serve HTTP/1.1 pipelined requests instead of closing after the first
+    pub h1_pipelining: bool,
+
+    // Endpoint path for exposing Prometheus metrics
+    // None means metrics collection is disabled
+    pub prometheus_metrics: Option<String>,
+
+    // OpenTelemetry exporter configuration string
+    // Used for distributed tracing support
+    pub otlp_exporter: Option<String>,
+
+    // List of enabled module names for this server instance
+    // Allows for dynamic functionality extension
+    pub modules: Option<Vec<String>>,
+
+    // Whether to enable server-timing header
+    pub enable_server_timing: bool,
+
+    // downstream read timeout
+    pub downstream_read_timeout: Option<Duration>,
+
+    // downstream write timeout
+    pub downstream_write_timeout: Option<Duration>,
+
+    // Maximum requests on one downstream keep-alive connection
+    pub keepalive_request_limit: Option<u32>,
+}
+
+impl fmt::Display for ServerConf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Helper closure to format optional values consistently
+        let format_opt_usize = |opt: &Option<usize>| {
+            opt.map_or("default".to_string(), |v| v.to_string())
+        };
+        let format_opt_duration = |opt: &Option<Duration>| {
+            opt.map_or("default".to_string(), |v| format!("{v:?}"))
+        };
+
+        // Main Server Identity
+        writeln!(f, "Server Configuration: '{}'", self.name)?;
+        writeln!(f, "  Listen Addresses: {}", self.addr)?;
+
+        // --- General ---
+        writeln!(f, "  - General Settings:")?;
+        writeln!(f, "    Admin Role: {}", self.admin)?;
+        writeln!(
+            f,
+            "    Access Log: {}",
+            self.access_log.as_deref().unwrap_or("disabled")
+        )?;
+        if !self.locations.is_empty() {
+            writeln!(f, "    Locations: {}", self.locations.join(", "))?;
+        }
+        writeln!(f, "    Worker Threads: {}", format_opt_usize(&self.threads))?;
+
+        // --- Protocols & Timeouts ---
+        writeln!(f, "  - Protocols & Timeouts:")?;
+        writeln!(f, "    HTTP/2 Enabled: {}", self.enabled_h2)?;
+        let format_opt_u32 = |opt: &Option<u32>| {
+            opt.map_or("default".to_string(), |v| v.to_string())
+        };
+        writeln!(
+            f,
+            "    HTTP/2 Limits: streams={}, header_list={}, window={}, conn_window={}, idle={}",
+            format_opt_u32(&self.h2_max_concurrent_streams),
+            format_opt_u32(&self.h2_max_header_list_size),
+            format_opt_u32(&self.h2_initial_window_size),
+            format_opt_u32(&self.h2_initial_connection_window_size),
+            format_opt_duration(&self.h2_idle_timeout)
+        )?;
+        writeln!(f, "    HTTP/1.1 Pipelining: {}", self.h1_pipelining)?;
+        writeln!(
+            f,
+            "    Downstream Read Timeout: {}",
+            format_opt_duration(&self.downstream_read_timeout)
+        )?;
+        writeln!(
+            f,
+            "    Downstream Write Timeout: {}",
+            format_opt_duration(&self.downstream_write_timeout)
+        )?;
+
+        // --- TLS ---
+        writeln!(f, "  - TLS Settings:")?;
+        writeln!(f, "    Global Certificates: {}", self.global_certificates)?;
+        writeln!(
+            f,
+            "    Client Certificate Verification: {}",
+            if self.client_ca_pem.is_some() {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        )?;
+        writeln!(
+            f,
+            "    Min Version: {}",
+            self.tls_min_version.clone().unwrap_or_default()
+        )?;
+        writeln!(
+            f,
+            "    Max Version: {}",
+            self.tls_max_version.clone().unwrap_or_default()
+        )?;
+        writeln!(
+            f,
+            "    Cipher List (TLS <1.3): {}",
+            self.tls_cipher_list.clone().unwrap_or_default()
+        )?;
+        writeln!(
+            f,
+            "    Ciphersuites (TLS 1.3): {}",
+            self.tls_ciphersuites.clone().unwrap_or_default()
+        )?;
+
+        // --- TCP ---
+        writeln!(f, "  - TCP Settings:")?;
+        if let Some(keepalive) = &self.tcp_keepalive {
+            // Assuming TcpKeepalive has a readable Debug format
+            writeln!(
+                f,
+                "    Keepalive: idle={:?}, interval={:?}, count={:?}",
+                keepalive.idle, keepalive.interval, keepalive.count
+            )?;
+        } else {
+            writeln!(f, "    Keepalive: disabled")?;
+        }
+        writeln!(f, "    Fast Open: {}", format_opt_usize(&self.tcp_fastopen))?;
+        writeln!(f, "    Reuse Port: {}", self.reuse_port.unwrap_or(false))?;
+
+        // --- Observability ---
+        writeln!(f, "  - Observability:")?;
+        writeln!(
+            f,
+            "    Prometheus Endpoint: {}",
+            self.prometheus_metrics.as_deref().unwrap_or("disabled")
+        )?;
+        writeln!(
+            f,
+            "    OTLP Exporter: {}",
+            self.otlp_exporter.as_deref().unwrap_or("disabled")
+        )?;
+        writeln!(f, "    Server-Timing Header: {}", self.enable_server_timing)?;
+
+        // --- Extensibility ---
+        if let Some(modules) = &self.modules
+            && !modules.is_empty()
+        {
+            writeln!(f, "  - Enabled Modules:")?;
+            writeln!(f, "    {}", modules.join(", "))?;
+        }
+
+        Ok(())
+    }
+}
+// Conversion implementation from PingapConfig to Vec<ServerConf>
+pub fn parse_from_conf(conf: PingapConfig) -> Vec<ServerConf> {
+    let mut servers = vec![];
+    for (name, item) in conf.servers {
+        // Set up error template, using default if none specified
+        let mut error_template =
+            conf.basic.error_template.clone().unwrap_or_default();
+        if error_template.is_empty() {
+            error_template = ERROR_TEMPLATE.to_string();
+        }
+
+        // Configure TCP keepalive only if all required parameters are present
+        let tcp_keepalive = if (item.tcp_idle.is_some()
+            && item.tcp_probe_count.is_some()
+            && item.tcp_interval.is_some())
+            || item.tcp_user_timeout.is_some()
+        {
+            Some(TcpKeepalive {
+                idle: item.tcp_idle.unwrap_or_default(),
+                count: item.tcp_probe_count.unwrap_or_default(),
+                interval: item.tcp_interval.unwrap_or_default(),
+                #[cfg(target_os = "linux")]
+                user_timeout: item.tcp_user_timeout.unwrap_or_default(),
+            })
+        } else {
+            None
+        };
+
+        // Create server configuration with all settings
+        let public_listener = is_public_listener(&item.addr);
+        // The connection/handshake timeout bounds the first read (pingora
+        // has no separate handshake knob); a shorter read timeout wins. For
+        // public listeners a missing value must not become `None`: that would
+        // override Pingora's 60s session default and enable Slowloris.
+        let downstream_read_timeout = match (
+            item.downstream_connection_timeout,
+            item.downstream_read_timeout,
+        ) {
+            (Some(connect), Some(read)) => Some(connect.min(read)),
+            (Some(connect), None) => Some(connect),
+            (None, Some(read)) => Some(read),
+            (None, None) if public_listener => {
+                Some(DEFAULT_PUBLIC_DOWNSTREAM_READ_TIMEOUT)
+            },
+            (None, None) => None,
+        };
+        let downstream_write_timeout =
+            item.downstream_write_timeout.or(public_listener
+                .then_some(DEFAULT_PUBLIC_DOWNSTREAM_WRITE_TIMEOUT));
+        let h2_idle_timeout = item
+            .h2_idle_timeout
+            .or(public_listener.then_some(DEFAULT_PUBLIC_H2_IDLE_TIMEOUT));
+        let keepalive_request_limit =
+            item.keepalive_request_limit.or(public_listener
+                .then_some(DEFAULT_PUBLIC_KEEPALIVE_REQUEST_LIMIT));
+
+        servers.push(ServerConf {
+            name,
+            admin: false,
+            tls_cipher_list: item.tls_cipher_list.clone(),
+            tls_ciphersuites: item.tls_ciphersuites.clone(),
+            tls_min_version: item.tls_min_version.clone(),
+            tls_max_version: item.tls_max_version.clone(),
+            addr: item.addr,
+            access_log: item.access_log,
+            locations: item.locations.unwrap_or_default(),
+            threads: item.threads,
+            global_certificates: item.global_certificates.unwrap_or_default(),
+            client_ca_pem: item.client_ca_pem.clone(),
+            enabled_h2: item.enabled_h2.unwrap_or_default(),
+            // Serving HTTP/1.1 is the historical default, so an unset switch
+            // keeps it on.
+            http1_enabled: item.http1_enabled.unwrap_or(true),
+            h2_max_concurrent_streams: item.h2_max_concurrent_streams,
+            // Validated to fit u32 by pingap-config; the fallback only
+            // guards the cast.
+            h2_max_header_list_size: item
+                .h2_max_header_list_size
+                .map(|v| u32::try_from(v.as_u64()).unwrap_or(u32::MAX)),
+            h2_initial_window_size: item
+                .h2_initial_window_size
+                .map(|v| u32::try_from(v.as_u64()).unwrap_or(u32::MAX)),
+            h2_initial_connection_window_size: item
+                .h2_initial_connection_window_size
+                .map(|v| u32::try_from(v.as_u64()).unwrap_or(u32::MAX)),
+            h2_idle_timeout,
+            h1_pipelining: item.h1_pipelining.unwrap_or_default(),
+            tcp_keepalive,
+            tcp_fastopen: item.tcp_fastopen,
+            reuse_port: item.reuse_port,
+            prometheus_metrics: item.prometheus_metrics,
+            otlp_exporter: item.otlp_exporter.clone(),
+            modules: item.modules.clone(),
+            enable_server_timing: item.enable_server_timing.unwrap_or_default(),
+            error_template,
+            downstream_read_timeout,
+            downstream_write_timeout,
+            keepalive_request_limit,
+        });
+    }
+
+    servers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_PUBLIC_DOWNSTREAM_READ_TIMEOUT,
+        DEFAULT_PUBLIC_DOWNSTREAM_WRITE_TIMEOUT,
+        DEFAULT_PUBLIC_H2_IDLE_TIMEOUT, DEFAULT_PUBLIC_KEEPALIVE_REQUEST_LIMIT,
+        ServerConf, parse_from_conf,
+    };
+    use pingap_config::{PingapConfig, ServerConf as PingapServerConf};
+    use pingora::protocols::l4::ext::TcpKeepalive;
+    use pretty_assertions::assert_eq;
+    use std::time::Duration;
+
+    #[test]
+    fn test_server_conf() {
+        let conf = ServerConf {
+            name: "pingap".to_string(),
+            addr: "127.0.0.1:3000,127.0.0.1:3001".to_string(),
+            access_log: Some("combined".to_string()),
+
+            locations: vec!["charts-location".to_string()],
+            threads: Some(4),
+            error_template: "<html></html>".to_string(),
+            tcp_keepalive: Some(TcpKeepalive {
+                idle: Duration::from_secs(10),
+                interval: Duration::from_secs(5),
+                count: 10,
+                #[cfg(target_os = "linux")]
+                user_timeout: Duration::from_secs(0),
+            }),
+            tcp_fastopen: Some(10),
+            enabled_h2: true,
+            ..Default::default()
+        };
+
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            r#"Server Configuration: 'pingap'
+  Listen Addresses: 127.0.0.1:3000,127.0.0.1:3001
+  - General Settings:
+    Admin Role: false
+    Access Log: combined
+    Locations: charts-location
+    Worker Threads: 4
+  - Protocols & Timeouts:
+    HTTP/2 Enabled: true
+    HTTP/2 Limits: streams=default, header_list=default, window=default, conn_window=default, idle=default
+    HTTP/1.1 Pipelining: false
+    Downstream Read Timeout: default
+    Downstream Write Timeout: default
+  - TLS Settings:
+    Global Certificates: false
+    Client Certificate Verification: disabled
+    Min Version: 
+    Max Version: 
+    Cipher List (TLS <1.3): 
+    Ciphersuites (TLS 1.3): 
+  - TCP Settings:
+    Keepalive: idle=10s, interval=5s, count=10
+    Fast Open: 10
+    Reuse Port: false
+  - Observability:
+    Prometheus Endpoint: disabled
+    OTLP Exporter: disabled
+    Server-Timing Header: false
+"#,
+            conf.to_string()
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            r#"Server Configuration: 'pingap'
+  Listen Addresses: 127.0.0.1:3000,127.0.0.1:3001
+  - General Settings:
+    Admin Role: false
+    Access Log: combined
+    Locations: charts-location
+    Worker Threads: 4
+  - Protocols & Timeouts:
+    HTTP/2 Enabled: true
+    HTTP/2 Limits: streams=default, header_list=default, window=default, conn_window=default, idle=default
+    HTTP/1.1 Pipelining: false
+    Downstream Read Timeout: default
+    Downstream Write Timeout: default
+  - TLS Settings:
+    Global Certificates: false
+    Client Certificate Verification: disabled
+    Min Version: 
+    Max Version: 
+    Cipher List (TLS <1.3): 
+    Ciphersuites (TLS 1.3): 
+  - TCP Settings:
+    Keepalive: idle=10s, interval=5s, count=10
+    Fast Open: 10
+    Reuse Port: false
+  - Observability:
+    Prometheus Endpoint: disabled
+    OTLP Exporter: disabled
+    Server-Timing Header: false
+"#,
+            conf.to_string()
+        );
+    }
+
+    #[test]
+    fn public_listeners_get_safe_downstream_defaults() {
+        let conf = PingapConfig {
+            servers: [(
+                "app".to_string(),
+                PingapServerConf {
+                    addr: "0.0.0.0:80".to_string(),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let servers = parse_from_conf(conf);
+        let server = servers.first().expect("server");
+        assert_eq!(
+            server.downstream_read_timeout,
+            Some(DEFAULT_PUBLIC_DOWNSTREAM_READ_TIMEOUT),
+            "a public listener must not run without a read timeout"
+        );
+        assert_eq!(
+            server.downstream_write_timeout,
+            Some(DEFAULT_PUBLIC_DOWNSTREAM_WRITE_TIMEOUT)
+        );
+        assert_eq!(
+            server.h2_idle_timeout,
+            Some(DEFAULT_PUBLIC_H2_IDLE_TIMEOUT)
+        );
+        assert_eq!(
+            server.keepalive_request_limit,
+            Some(DEFAULT_PUBLIC_KEEPALIVE_REQUEST_LIMIT)
+        );
+    }
+
+    #[test]
+    fn explicit_settings_win_over_public_defaults() {
+        let conf = PingapConfig {
+            servers: [(
+                "app".to_string(),
+                PingapServerConf {
+                    addr: "0.0.0.0:443".to_string(),
+                    downstream_read_timeout: Some(Duration::from_secs(5)),
+                    downstream_write_timeout: Some(Duration::from_secs(7)),
+                    h2_idle_timeout: Some(Duration::from_secs(30)),
+                    keepalive_request_limit: Some(10),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let server = parse_from_conf(conf).pop().expect("exactly one server");
+        assert_eq!(
+            server.downstream_read_timeout,
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            server.downstream_write_timeout,
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(server.h2_idle_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(server.keepalive_request_limit, Some(10));
+    }
+
+    #[test]
+    fn internal_listeners_keep_unset_timeouts() {
+        let conf = PingapConfig {
+            servers: [(
+                "internal".to_string(),
+                PingapServerConf {
+                    addr: "127.0.0.1:9090".to_string(),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let server = parse_from_conf(conf).pop().expect("server");
+        assert_eq!(server.downstream_read_timeout, None);
+        assert_eq!(server.downstream_write_timeout, None);
+        assert_eq!(server.h2_idle_timeout, None);
+        assert_eq!(server.keepalive_request_limit, None);
+    }
+}

@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="560" viewBox="0 0 1000 560" role="img" aria-labelledby="title desc">
+  <title id="title">WAFred architecture</title>
+  <desc id="desc">Clients send requests through edge agents. Agents synchronize policies and telemetry with the WAFred control plane and forward clean traffic to origins.</desc>
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0H0V40" fill="none" stroke="#171717" stroke-width="1"/></pattern>
+    <filter id="glow"><feGaussianBlur stdDeviation="4" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+  <rect width="1000" height="560" fill="#101010"/><rect width="1000" height="560" fill="url(#grid)"/>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+    <text x="30" y="38" fill="#e8e8e8" font-size="12" letter-spacing="2">WAFRED · CONTROL PLANE + EDGE AGENTS</text>
+    <g font-size="10" fill="#8d8d8d"><circle cx="760" cy="34" r="4" fill="#d8324f"/><text x="771" y="38">request</text><circle cx="840" cy="34" r="4" fill="#30a46c"/><text x="851" y="38">safe traffic</text><circle cx="940" cy="34" r="4" fill="#52a9ff"/><text x="951" y="38">gRPC</text></g>
+    <g fill="none" stroke="#303030" stroke-width="1.5"><rect x="220" y="100" width="300" height="292" rx="10"/><rect x="550" y="100" width="420" height="292" rx="10"/></g>
+    <text x="240" y="126" fill="#8d8d8d" font-size="10" letter-spacing="1.5">DATA PLANE · AGENTS</text>
+    <text x="570" y="126" fill="#8d8d8d" font-size="10" letter-spacing="1.5">WAFRED CONTROL PLANE</text>
+    <g fill="#191919" stroke="#343434">
+      <rect x="30" y="198" width="150" height="90" rx="9"/>
+      <rect x="240" y="150" width="260" height="88" rx="9"/><rect x="240" y="270" width="260" height="88" rx="9"/>
+      <rect x="570" y="150" width="380" height="72" rx="9"/><rect x="570" y="246" width="180" height="112" rx="9"/><rect x="770" y="246" width="180" height="112" rx="9"/>
+      <rect x="820" y="455" width="150" height="76" rx="9"/>
+    </g>
+    <g fill="#8d8d8d" font-size="9" letter-spacing="1"><text x="46" y="220">CLIENT</text><text x="256" y="173">EDGE AGENT A</text><text x="256" y="293">EDGE AGENT B</text><text x="586" y="173">DASHBOARD + REST API</text><text x="586" y="268">POSTGRESQL</text><text x="786" y="268">ELASTICSEARCH</text><text x="836" y="477">ORIGIN</text></g>
+    <g fill="#e8e8e8" font-size="14"><text x="46" y="247">Browser / API</text><text x="256" y="199">WAF engine · cache</text><text x="256" y="319">WAF engine · cache</text><text x="586" y="199">Sites · rules · fleet</text><text x="586" y="300">State</text><text x="786" y="300">Optional logs</text><text x="836" y="504">upstream pool</text></g>
+    <g fill="#8d8d8d" font-size="10"><text x="46" y="268">HTTP · HTTPS</text><text x="256" y="219">:80 / :443</text><text x="256" y="339">:80 / :443</text><text x="586" y="342">optional</text><text x="836" y="520">clean traffic only</text></g>
+    <g fill="none" stroke-linecap="round" stroke-width="2">
+      <path d="M180 226C204 226 216 194 240 194" stroke="#d8324f"/><path d="M180 256C204 256 216 314 240 314" stroke="#d8324f"/>
+      <path d="M500 187C528 187 540 205 570 205" stroke="#52a9ff"/><path d="M570 210C540 210 528 224 500 224" stroke="#52a9ff"/>
+      <path d="M500 307C528 307 540 218 570 218" stroke="#52a9ff"/><path d="M570 216C540 216 528 324 500 324" stroke="#52a9ff"/>
+      <path d="M500 228C626 415 730 422 820 488" stroke="#30a46c"/><path d="M500 349C644 437 742 447 820 493" stroke="#30a46c"/>
+    </g>
+    <g filter="url(#glow)"><circle cx="204" cy="214" r="3" fill="#d8324f"/><circle cx="535" cy="196" r="3" fill="#52a9ff"/><circle cx="652" cy="394" r="3" fill="#30a46c"/></g>
+  </g>
+</svg>
