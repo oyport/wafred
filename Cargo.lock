@@ -6108,12 +6108,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rangemap"
-version = "1.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a611d15b50743feb4c76b7d03edcb0e64f399c26961e4efe6975bc398be6aa3d"
-
-[[package]]
 name = "rav1e"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8163,12 +8157,11 @@ dependencies = [
 
 [[package]]
 name = "tor-geoip"
-version = "0.46.0"
+version = "0.48.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44edc23691fc20335a864ab721993735258ccd38125100dbd9fc94cd4ae35384"
+checksum = "47730256944e36d5043c9c53df46c8dbf1061805e10d2b7140999b1e84a3779e"
 dependencies = [
  "derive_more",
- "rangemap",
  "thiserror 2.0.21",
  "tor-geoip-db",
 ]
