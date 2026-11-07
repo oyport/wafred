@@ -310,7 +310,7 @@ jobs:
           driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
 
       - name: Build the frontend stage
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -324,7 +324,7 @@ jobs:
       # cargo profile differs). Building its frontend stage catches the drift
       # that a comment cannot.
       - name: Build the frontend stage of Dockerfile.perf
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile.perf
@@ -469,7 +469,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: docker-context/
           file: ./Dockerfile.runtime
