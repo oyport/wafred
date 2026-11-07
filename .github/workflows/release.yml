@@ -136,7 +136,7 @@ jobs:
           npm run build
 
       - name: Upload dist artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: web-dist
           path: web/dist
@@ -252,7 +252,7 @@ jobs:
                  "$ASSET.tar.xz.sha256" "$ASSET.tar.gz.sha256"
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wafred-binary-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release/wafred

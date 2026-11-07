@@ -243,7 +243,7 @@ jobs:
       # at compile time); building the dashboard once here instead of inside
       # the binary job keeps npm out of the release-build critical path.
       - name: Upload dist artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: web-dist
           path: web/dist
@@ -384,7 +384,7 @@ jobs:
         run: cargo build --locked --release --bin wafred --features full
 
       - name: Upload release binary for :main image
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wafred-main-binary
           path: target/release/wafred

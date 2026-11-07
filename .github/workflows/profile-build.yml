@@ -67,7 +67,7 @@ jobs:
           cp target/release-perf/wafred wafred-dhat-linux-amd64
 
       - name: Upload dhat binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wafred-dhat-linux-amd64
           path: wafred-dhat-linux-amd64
