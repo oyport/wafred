@@ -3,8 +3,8 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait,
+    QueryFilter, Set,
 };
 use uuid::Uuid;
 
@@ -35,8 +35,9 @@ fn parse_enabled(value: &str) -> Result<bool> {
 }
 
 fn validate_credentials(email: &str, password: String) -> Result<Credentials> {
-    let email = normalise_email(email)
-        .map_err(|_| anyhow::anyhow!("{EMAIL_ENV} is not a valid e-mail address"))?;
+    let email = normalise_email(email).map_err(|_| {
+        anyhow::anyhow!("{EMAIL_ENV} is not a valid e-mail address")
+    })?;
     // bcrypt only considers the first 72 bytes. Refuse a silently truncated
     // showcase credential and require more than the regular account minimum.
     if password.chars().count() < 12 || password.len() > 72 {
@@ -51,10 +52,12 @@ fn credentials_from_env() -> Result<Option<Credentials>> {
         return Ok(None);
     }
 
-    let email = std::env::var(EMAIL_ENV)
-        .with_context(|| format!("{EMAIL_ENV} is required when {ENABLED_ENV} is set"))?;
-    let password = std::env::var(PASSWORD_ENV)
-        .with_context(|| format!("{PASSWORD_ENV} is required when {ENABLED_ENV} is set"))?;
+    let email = std::env::var(EMAIL_ENV).with_context(|| {
+        format!("{EMAIL_ENV} is required when {ENABLED_ENV} is set")
+    })?;
+    let password = std::env::var(PASSWORD_ENV).with_context(|| {
+        format!("{PASSWORD_ENV} is required when {ENABLED_ENV} is set")
+    })?;
     Ok(Some(validate_credentials(&email, password)?))
 }
 
@@ -92,10 +95,8 @@ pub async fn sync_account(db: &DatabaseConnection) -> Result<()> {
             }
         }
 
-        let password_matches = verify_password(
-            &credentials.password,
-            &account.password_hash,
-        )?;
+        let password_matches =
+            verify_password(&credentials.password, &account.password_hash)?;
         let changed_credentials =
             account.email != credentials.email || !password_matches;
         let changed = changed_credentials
@@ -108,7 +109,8 @@ pub async fn sync_account(db: &DatabaseConnection) -> Result<()> {
             let mut active: user::ActiveModel = account.into();
             active.email = Set(credentials.email);
             if !password_matches {
-                active.password_hash = Set(hash_password(&credentials.password)?);
+                active.password_hash =
+                    Set(hash_password(&credentials.password)?);
             }
             active.name = Set(Some("WAFred Demo".to_string()));
             active.role = Set(role::AUDITOR.to_string());
@@ -174,12 +176,20 @@ mod tests {
         assert!(!parse_enabled("off").unwrap());
         assert!(parse_enabled(" TRUE ").unwrap());
         assert!(parse_enabled("unexpected").is_err());
-        assert!(validate_credentials("invalid", "long enough password".into()).is_err());
-        assert!(validate_credentials("demo@example.com", "too-short".into()).is_err());
-        assert!(validate_credentials("demo@example.com", "x".repeat(73)).is_err());
-        let valid =
-            validate_credentials(" Demo@Example.COM ", "long enough password".into())
-                .unwrap();
+        assert!(
+            validate_credentials("invalid", "long enough password".into())
+                .is_err()
+        );
+        assert!(validate_credentials("demo@example.com", "too-short".into())
+            .is_err());
+        assert!(
+            validate_credentials("demo@example.com", "x".repeat(73)).is_err()
+        );
+        let valid = validate_credentials(
+            " Demo@Example.COM ",
+            "long enough password".into(),
+        )
+        .unwrap();
         assert_eq!(valid.email, "demo@example.com");
     }
 }

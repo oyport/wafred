@@ -30,7 +30,9 @@ impl MigrationTrait for Migration {
             .await?;
         manager
             .get_connection()
-            .execute_unprepared("ALTER TABLE users DROP COLUMN IF EXISTS is_demo")
+            .execute_unprepared(
+                "ALTER TABLE users DROP COLUMN IF EXISTS is_demo",
+            )
             .await?;
         Ok(())
     }

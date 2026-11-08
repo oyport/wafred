@@ -281,7 +281,9 @@ pub async fn require_password_change(
 }
 
 fn demo_method_allowed(method: &Method) -> bool {
-    method == &Method::GET || method == &Method::HEAD || method == &Method::OPTIONS
+    method == Method::GET
+        || method == Method::HEAD
+        || method == Method::OPTIONS
 }
 
 /// Covers every API route, including self-service credential endpoints and
@@ -446,14 +448,16 @@ mod tests {
         for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
             assert!(demo_method_allowed(&method));
         }
-        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE]
+        {
             assert!(!demo_method_allowed(&method));
         }
     }
 
     #[test]
     fn showcase_account_sees_sites_without_becoming_an_administrator() {
-        let mut demo = AuthUser::new(Uuid::new_v4(), "demo@example.com", role::AUDITOR);
+        let mut demo =
+            AuthUser::new(Uuid::new_v4(), "demo@example.com", role::AUDITOR);
         demo.is_demo = true;
         assert!(demo.can_view_all_sites());
         assert!(!demo.is_admin());
@@ -478,7 +482,8 @@ mod tests {
                 enforce_demo_read_only,
             ))
             .with_state(state);
-        let mut demo = AuthUser::new(Uuid::new_v4(), "demo@example.com", role::AUDITOR);
+        let mut demo =
+            AuthUser::new(Uuid::new_v4(), "demo@example.com", role::AUDITOR);
         demo.is_demo = true;
 
         let write = Request::builder()
@@ -487,7 +492,10 @@ mod tests {
             .extension(demo.clone())
             .body(axum::body::Body::empty())
             .unwrap();
-        assert_eq!(app.clone().oneshot(write).await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            app.clone().oneshot(write).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
 
         let read = Request::builder()
             .method(Method::GET)

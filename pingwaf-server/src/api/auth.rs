@@ -260,7 +260,9 @@ async fn login(
     if account.disabled {
         tracing::debug!(%email, "login failed: account disabled");
         if account.is_demo {
-            return Err(ApiError::Unauthorized(INVALID_CREDENTIALS.to_string()));
+            return Err(ApiError::Unauthorized(
+                INVALID_CREDENTIALS.to_string(),
+            ));
         }
         return Err(ApiError::Unauthorized("account is disabled".to_string()));
     }
@@ -398,7 +400,9 @@ async fn refresh(
 
     if account.disabled {
         if account.is_demo {
-            return Err(ApiError::Unauthorized(INVALID_CREDENTIALS.to_string()));
+            return Err(ApiError::Unauthorized(
+                INVALID_CREDENTIALS.to_string(),
+            ));
         }
         return Err(ApiError::Unauthorized("account is disabled".to_string()));
     }
