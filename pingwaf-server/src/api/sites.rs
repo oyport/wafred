@@ -9,8 +9,8 @@ use axum::Router;
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::{Expr, Func};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DbErr,
-    EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection,
+    DbErr, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder,
     QuerySelect, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
@@ -1129,7 +1129,7 @@ async fn list(
     let pagination = query.pagination.normalise();
 
     let mut condition = Condition::all();
-    if !current.can_view_all_sites() {
+    if !current.is_admin() {
         condition = condition.add(site::Column::UserId.eq(current.id));
     }
     if let Some(status) = non_empty(&query.status) {
@@ -1200,7 +1200,16 @@ async fn create(
     AppJson(payload): AppJson<CreateSiteRequest>,
 ) -> Result<Response, ApiError> {
     require_write(&current)?;
+    let model = create_site_for_user(&state.db, current.id, payload).await?;
+    notify_config_changed(&state, model.id, Some(&current.email)).await;
+    Ok((StatusCode::CREATED, Json(SiteResponse::from(model))).into_response())
+}
 
+pub(crate) async fn create_site_for_user(
+    db: &DatabaseConnection,
+    owner_id: Uuid,
+    payload: CreateSiteRequest,
+) -> Result<site::Model, ApiError> {
     let name = payload.name.trim().to_string();
     if name.is_empty() || name.len() > 100 {
         return Err(ApiError::BadRequest(
@@ -1214,7 +1223,7 @@ async fn create(
     )?;
     let mut all_domains = vec![domain.clone()];
     all_domains.extend(alternate_domains.iter().cloned());
-    ensure_domains_available(&state.db, &all_domains, None).await?;
+    ensure_domains_available(db, &all_domains, None).await?;
 
     let upstream_address = normalize_origin_address(&payload.upstream_address)?;
     validate_upstream(&upstream_address, default_weight())?;
@@ -1242,7 +1251,7 @@ async fn create(
     let id = Uuid::new_v4();
     let model = site::ActiveModel {
         id: Set(id),
-        user_id: Set(current.id),
+        user_id: Set(owner_id),
         name: Set(name),
         domain: Set(domain.clone()),
         alternate_domains: Set(alternate_domains),
@@ -1266,7 +1275,7 @@ async fn create(
         created_at: Set(timestamp),
         updated_at: Set(timestamp),
     }
-    .insert(&state.db)
+    .insert(db)
     // The pre-check above is not atomic: a racing create can slip through it.
     // The unique index and the conflicts trigger on `sites` are the backstop.
     .await
@@ -1301,7 +1310,7 @@ async fn create(
         is_default: Set(true),
         created_at: Set(timestamp),
     }
-    .insert(&state.db)
+    .insert(db)
     .await?;
 
     site_upstreams::ActiveModel {
@@ -1316,11 +1325,11 @@ async fn create(
         health_status: Set("unknown".to_string()),
         created_at: Set(timestamp),
     }
-    .insert(&state.db)
+    .insert(db)
     .await?;
 
     // Built-in WAF (monitor mode) and cache rules ship with every new site.
-    if let Err(err) = crate::defaults::seed_site_defaults(&state.db, id).await {
+    if let Err(err) = crate::defaults::seed_site_defaults(db, id).await {
         tracing::error!(%id, error = %err, "failed to seed built-in rules");
     }
 
@@ -1358,13 +1367,12 @@ async fn create(
         http2_enabled: Set(true),
         created_at: Set(timestamp),
     }
-    .insert(&state.db)
+    .insert(db)
     .await?;
 
-    tracing::info!(%id, %domain, upstream = %upstream_address, owner = %current.id, "site created");
-    notify_config_changed(&state, id, Some(&current.email)).await;
+    tracing::info!(%id, %domain, upstream = %upstream_address, owner = %owner_id, "site created");
 
-    Ok((StatusCode::CREATED, Json(SiteResponse::from(model))).into_response())
+    Ok(model)
 }
 
 /// `POST /api/v1/sites/{site_id}/clone`

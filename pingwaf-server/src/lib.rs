@@ -144,6 +144,9 @@ pub async fn start_server(mut config: ServerConfig) -> anyhow::Result<()> {
     // ── 4. Seed default admin ────────────────────────────────────────────────
     seed_admin(&db, &config).await?;
     demo::sync_account(&db).await?;
+    if demo::enabled() {
+        tokio::spawn(demo::run_sample_refresh(db.clone()));
+    }
     // Best-effort like every seed: boot must not fail over the default group.
     if let Err(err) = defaults::seed_ip_group_defaults(&db).await {
         tracing::warn!(

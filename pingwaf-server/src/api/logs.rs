@@ -168,7 +168,7 @@ async fn resolve_scope(
         let site = load_site_read(db, id, current).await?;
         return Ok(Some(vec![site.id]));
     }
-    if current.can_view_all_sites() {
+    if current.is_admin() {
         return Ok(None);
     }
 
@@ -614,7 +614,7 @@ async fn get_access(
     // Same visibility as the list endpoint: administrators see everything;
     // everyone else only rows belonging to sites they own, and "unassigned"
     // rows are an administrator-only concern.
-    if !current.can_view_all_sites() {
+    if !current.is_admin() {
         match row.site_id {
             Some(site_id) => {
                 let owned = site::Entity::find()

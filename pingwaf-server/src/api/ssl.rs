@@ -1994,7 +1994,7 @@ async fn visible_sites(
     current: &AuthUser,
 ) -> Result<VisibleSites, ApiError> {
     let mut condition = Condition::all();
-    if !current.can_view_all_sites() {
+    if !current.is_admin() {
         condition = condition.add(site::Column::UserId.eq(current.id));
     }
     let rows = site::Entity::find()
@@ -2642,12 +2642,12 @@ async fn certificate_summary(
         expired: 0,
         expiring_soon: 0,
     };
-    if !current.can_view_all_sites() && sites.is_empty() {
+    if !current.is_admin() && sites.is_empty() {
         return Ok(Json(summary));
     }
 
     let mut condition = Condition::all();
-    if !current.can_view_all_sites() {
+    if !current.is_admin() {
         condition = condition.add(
             site_certificates::Column::SiteId.is_in(sites.keys().copied()),
         );
@@ -2793,7 +2793,7 @@ async fn list_all_events(
     let pagination = query.pagination.normalise();
 
     let mut condition = Condition::all();
-    if !current.can_view_all_sites() {
+    if !current.is_admin() {
         condition = condition.add(
             certificate_events::Column::SiteId.is_in(sites.keys().copied()),
         );

@@ -400,7 +400,7 @@ async fn global_list(
         let id = parse_uuid(raw, "site id")?;
         load_site_read(&state.db, id, &current).await?;
         Some(vec![id])
-    } else if current.can_view_all_sites() {
+    } else if current.is_admin() {
         None
     } else {
         Some(

@@ -1,20 +1,24 @@
 //! Private, deployment-only showcase account. No public API or dashboard setting.
 
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait,
-    QueryFilter, Set,
+    QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 use uuid::Uuid;
 
 use crate::api::auth::normalise_email;
+use crate::api::sites::{create_site_for_user, CreateSiteRequest};
 use crate::auth::password::{hash_password, verify_password};
-use crate::models::{api_key, passkey_credential, role, user};
+use crate::models::security_events::{access_logs, security_events};
+use crate::models::{api_key, passkey_credential, role, site, site_status, user};
 
 const ENABLED_ENV: &str = "WAFRED_DEMO_ENABLED";
 const EMAIL_ENV: &str = "WAFRED_DEMO_EMAIL";
 const PASSWORD_ENV: &str = "WAFRED_DEMO_PASSWORD";
+const SAMPLE_DOMAIN: &str = "demo.example.com";
+const SAMPLE_AGENT: &str = "Mozilla/5.0 (WAFred Showcase Sample)";
 
 struct Credentials {
     email: String,
@@ -132,6 +136,8 @@ pub async fn sync_account(db: &DatabaseConnection) -> Result<()> {
             active.update(db).await?;
         }
         remove_secondary_credentials(db, id).await?;
+        let site_id = sync_site(db, id).await?;
+        refresh_sample_data(db, site_id).await?;
         tracing::info!("showcase account enabled");
         return Ok(());
     }
@@ -157,9 +163,163 @@ pub async fn sync_account(db: &DatabaseConnection) -> Result<()> {
         created_at: Set(now),
         updated_at: Set(now),
     };
-    account.insert(db).await?;
+    let account = account.insert(db).await?;
+    let site_id = sync_site(db, account.id).await?;
+    refresh_sample_data(db, site_id).await?;
     tracing::info!("showcase account created");
     Ok(())
+}
+
+async fn sync_site(db: &DatabaseConnection, owner_id: Uuid) -> Result<Uuid> {
+    let owned = site::Entity::find()
+        .filter(site::Column::UserId.eq(owner_id))
+        .all(db)
+        .await?;
+    if owned.iter().any(|row| row.domain != SAMPLE_DOMAIN) {
+        bail!("the showcase account owns a non-showcase site");
+    }
+    let existing = owned.into_iter().next();
+    if let Some(existing) = existing {
+        return Ok(existing.id);
+    }
+
+    let site = create_site_for_user(
+        db,
+        owner_id,
+        CreateSiteRequest {
+            name: "WAFred 示例商店".to_string(),
+            domain: SAMPLE_DOMAIN.to_string(),
+            alternate_domains: None,
+            upstream_address: "127.0.0.1:8081".to_string(),
+            upstream_tls: Some(false),
+            status: Some(site_status::PAUSED.to_string()),
+            plan: Some("demo".to_string()),
+            downstream_timeout_secs:
+                crate::defaults::DEFAULT_SITE_DOWNSTREAM_TIMEOUT_SECS as u32,
+        },
+    )
+    .await
+    .context("could not create the showcase site")?;
+    Ok(site.id)
+}
+
+/// Replaces only marked sample rows for the designated site. The periodic
+/// refresh keeps the dashboard's rolling 24-hour charts populated.
+pub async fn refresh_sample_data(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+) -> Result<()> {
+    let latest = access_logs::Entity::find()
+        .filter(access_logs::Column::SiteId.eq(site_id))
+        .filter(access_logs::Column::UserAgent.eq(SAMPLE_AGENT))
+        .order_by_desc(access_logs::Column::Timestamp)
+        .one(db)
+        .await?;
+    let now = Utc::now();
+    if latest.is_some_and(|row| row.timestamp > now - Duration::minutes(10)) {
+        return Ok(());
+    }
+
+    let txn = db.begin().await?;
+    access_logs::Entity::delete_many()
+        .filter(access_logs::Column::SiteId.eq(site_id))
+        .filter(access_logs::Column::UserAgent.eq(SAMPLE_AGENT))
+        .exec(&txn)
+        .await?;
+    security_events::Entity::delete_many()
+        .filter(security_events::Column::SiteId.eq(site_id))
+        .filter(security_events::Column::UserAgent.eq(SAMPLE_AGENT))
+        .exec(&txn)
+        .await?;
+
+    let mut requests = Vec::with_capacity(96);
+    let mut events = Vec::new();
+    for index in 0..96 {
+        let timestamp = now - Duration::minutes(1 + (95 - index) * 15);
+        let path = ["/", "/products", "/products/42", "/api/search", "/login"]
+            [index as usize % 5];
+        let client_ip = ["192.0.2.24", "198.51.100.18", "203.0.113.42"]
+            [index as usize % 3];
+        let country_code = ["US", "DE", "JP"][index as usize % 3];
+        let status = if index % 17 == 0 {
+            429
+        } else if index % 9 == 0 {
+            403
+        } else {
+            200
+        };
+        let request_id = Uuid::new_v4().to_string();
+        requests.push(access_logs::ActiveModel {
+            site_id: Set(Some(site_id)),
+            request_id: Set(Some(request_id.clone())),
+            timestamp: Set(timestamp),
+            client_ip: Set(client_ip.to_string()),
+            method: Set("GET".to_string()),
+            host: Set(Some(SAMPLE_DOMAIN.to_string())),
+            path: Set(Some(path.to_string())),
+            status_code: Set(Some(status)),
+            response_size: Set(Some(if status == 200 { 4096 } else { 512 })),
+            upstream_latency_ms: Set(Some(20 + i64::from(index % 15))),
+            total_latency_ms: Set(Some(30 + i64::from(index % 20))),
+            cache_status: Set(Some(if index % 3 == 0 { "hit" } else { "miss" }.to_string())),
+            user_agent: Set(Some(SAMPLE_AGENT.to_string())),
+            country_code: Set(Some(country_code.to_string())),
+            tls_version: Set(Some("TLSv1.3".to_string())),
+            scheme: Set(Some("https".to_string())),
+            protocol: Set(Some("HTTP/2".to_string())),
+            ..Default::default()
+        });
+        if status != 200 {
+            let rate_limited = status == 429;
+            events.push(security_events::ActiveModel {
+                site_id: Set(Some(site_id)),
+                request_id: Set(Some(request_id)),
+                timestamp: Set(timestamp),
+                client_ip: Set(client_ip.to_string()),
+                method: Set("GET".to_string()),
+                host: Set(Some(SAMPLE_DOMAIN.to_string())),
+                path: Set(Some(path.to_string())),
+                rule_id: Set(Some(if rate_limited { "WAFRED-DEMO-RATE" } else { "WAFRED-DEMO-WAF" }.to_string())),
+                rule_name: Set(Some(if rate_limited { "示例频率限制" } else { "示例 Web 防护规则" }.to_string())),
+                event_type: Set(Some(if rate_limited { "rate_limit" } else { "waf" }.to_string())),
+                action: Set("block".to_string()),
+                score: Set(Some(if rate_limited { 70 } else { 90 })),
+                country_code: Set(Some(country_code.to_string())),
+                user_agent: Set(Some(SAMPLE_AGENT.to_string())),
+                created_at: Set(timestamp),
+                ..Default::default()
+            });
+        }
+    }
+    access_logs::Entity::insert_many(requests).exec(&txn).await?;
+    security_events::Entity::insert_many(events).exec(&txn).await?;
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Keeps synthetic activity current without making the sample site live.
+pub async fn run_sample_refresh(db: DatabaseConnection) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let result = async {
+            let account = user::Entity::find()
+                .filter(user::Column::IsDemo.eq(true))
+                .filter(user::Column::Disabled.eq(false))
+                .one(&db)
+                .await?;
+            if let Some(account) = account {
+                let site_id = sync_site(&db, account.id).await?;
+                refresh_sample_data(&db, site_id).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(err) = result {
+            tracing::warn!(error = %err, "showcase sample refresh failed");
+        }
+    }
 }
 
 async fn remove_secondary_credentials(

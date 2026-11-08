@@ -54,12 +54,6 @@ impl AuthUser {
         self.role == role::ADMIN && !self.is_demo
     }
 
-    /// The showcase account can inspect all sites on its dedicated instance
-    /// while retaining the auditor role for every mutation check.
-    pub fn can_view_all_sites(&self) -> bool {
-        self.is_admin() || self.is_demo
-    }
-
     /// Fails with `403` unless the caller is an administrator.
     pub fn require_admin(&self) -> Result<(), AuthError> {
         if self.is_admin() {
@@ -284,6 +278,25 @@ fn demo_method_allowed(method: &Method) -> bool {
     method == Method::GET || method == Method::HEAD || method == Method::OPTIONS
 }
 
+fn demo_read_allowed(path: &str) -> bool {
+    let path = path.strip_prefix("/api/v1").unwrap_or(path);
+    matches!(
+        path,
+        "/auth/me"
+            | "/auth/status"
+            | "/health"
+            | "/version"
+            | "/sites"
+            | "/blocked-ips"
+            | "/logs/access"
+            | "/logs/security"
+            | "/managed-rules"
+            | "/ai-crawl/catalog"
+    ) || path.starts_with("/sites/")
+        || path.starts_with("/analytics/")
+        || path.starts_with("/logs/access/")
+}
+
 /// Covers every API route, including self-service credential endpoints and
 /// future routes that may forget to enforce the auditor role themselves.
 pub async fn enforce_demo_read_only(
@@ -291,18 +304,18 @@ pub async fn enforce_demo_read_only(
     request: Request,
     next: Next,
 ) -> Response {
-    if demo_method_allowed(request.method()) {
-        return next.run(request).await;
-    }
-
     let (mut parts, body) = request.into_parts();
     if let Ok(user) = AuthUser::from_request_parts(&mut parts, &state).await {
         if user.is_demo {
-            return error_response(
-                StatusCode::FORBIDDEN,
-                "forbidden",
-                "this account is read-only",
-            );
+            if !demo_method_allowed(&parts.method)
+                || !demo_read_allowed(parts.uri.path())
+            {
+                return error_response(
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "this account can only view the showcase site",
+                );
+            }
         }
         parts.extensions.insert(user);
     }
@@ -453,13 +466,13 @@ mod tests {
     }
 
     #[test]
-    fn showcase_account_sees_sites_without_becoming_an_administrator() {
-        let mut demo =
-            AuthUser::new(Uuid::new_v4(), "demo@example.com", role::AUDITOR);
-        demo.is_demo = true;
-        assert!(demo.can_view_all_sites());
-        assert!(!demo.is_admin());
-        assert!(demo.require_admin().is_err());
+    fn showcase_reads_are_limited_to_site_data() {
+        assert!(demo_read_allowed("/api/v1/sites"));
+        assert!(demo_read_allowed("/api/v1/sites/any/rules"));
+        assert!(demo_read_allowed("/api/v1/analytics/summary"));
+        assert!(!demo_read_allowed("/api/v1/users"));
+        assert!(!demo_read_allowed("/api/v1/settings/defense"));
+        assert!(!demo_read_allowed("/api/v1/system/status"));
     }
 
     #[tokio::test]
