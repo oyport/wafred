@@ -65,6 +65,17 @@ fn credentials_from_env() -> Result<Option<Credentials>> {
 /// access and refresh tokens through the existing disabled/token-version checks.
 pub async fn sync_account(db: &DatabaseConnection) -> Result<()> {
     let credentials = credentials_from_env()?;
+    if credentials.is_some() {
+        let unfinished_admin = user::Entity::find()
+            .filter(user::Column::Role.eq(role::ADMIN))
+            .filter(user::Column::Disabled.eq(false))
+            .filter(user::Column::MustChangePassword.eq(true))
+            .one(db)
+            .await?;
+        if unfinished_admin.is_some() {
+            bail!("complete the initial administrator password change before enabling the showcase account");
+        }
+    }
     let existing = user::Entity::find()
         .filter(user::Column::IsDemo.eq(true))
         .one(db)
