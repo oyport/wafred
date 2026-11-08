@@ -14,6 +14,7 @@ import {
   Pulse,
   Globe,
   GithubLogo,
+  WarningCircle,
 } from '@phosphor-icons/react'
 import { cn } from '@/lib/utils'
 import { Sidebar } from '@/components/ui/Sidebar'
@@ -81,6 +82,7 @@ export function AppLayout() {
   const { resolved, toggle } = useThemeStore()
   const user = useAuthStore((s) => s.user)
   const isAdmin = user?.role === 'admin'
+  const isDemo = Boolean(user?.is_demo)
   const logout = useAuthStore((s) => s.logout)
   const toggleAssistant = useAssistantWidgetStore((s) => s.toggle)
 
@@ -390,6 +392,16 @@ export function AppLayout() {
 
         <main className="flex-1 overflow-y-auto">
           <div className="mx-auto w-full max-w-[1400px] px-4 py-6 sm:px-6 lg:px-8">
+            {isDemo && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="mb-5 flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2.5 text-[13px] text-fg"
+              >
+                <WarningCircle weight="fill" className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+                <span>{t('demo.readOnlyNotice')}</span>
+              </div>
+            )}
             <Outlet />
           </div>
         </main>

@@ -51,7 +51,7 @@ impl AuthUser {
     }
 
     pub fn is_admin(&self) -> bool {
-        self.role == role::ADMIN && !self.is_demo
+        self.role == role::ADMIN || self.is_demo
     }
 
     /// Fails with `403` unless the caller is an administrator.
@@ -278,23 +278,22 @@ fn demo_method_allowed(method: &Method) -> bool {
     method == Method::GET || method == Method::HEAD || method == Method::OPTIONS
 }
 
-fn demo_read_allowed(path: &str) -> bool {
-    let path = path.strip_prefix("/api/v1").unwrap_or(path);
-    matches!(
-        path,
-        "/auth/me"
-            | "/auth/status"
-            | "/health"
-            | "/version"
-            | "/sites"
-            | "/blocked-ips"
-            | "/logs/access"
-            | "/logs/security"
-            | "/managed-rules"
-            | "/ai-crawl/catalog"
-    ) || path.starts_with("/sites/")
-        || path.starts_with("/analytics/")
-        || path.starts_with("/logs/access/")
+pub const DEMO_READ_ONLY_MESSAGE: &str = "演示账号无法保存修改";
+
+fn demo_request_allowed(method: &Method, path: &str) -> bool {
+    let path = path.strip_prefix(crate::api::API_PREFIX).unwrap_or(path);
+    if demo_method_allowed(method) {
+        return true;
+    }
+    if method != Method::POST {
+        return false;
+    }
+    path == "/auth/refresh"
+        || path == "/ai/conversations"
+        || path
+            .strip_prefix("/ai/conversations/")
+            .and_then(|value| value.strip_suffix("/messages"))
+            .is_some_and(|id| Uuid::parse_str(id).is_ok())
 }
 
 /// Covers every API route, including self-service credential endpoints and
@@ -304,16 +303,15 @@ pub async fn enforce_demo_read_only(
     request: Request,
     next: Next,
 ) -> Response {
+    let path = request_path(&request);
+    let method = request.method().clone();
     let (mut parts, body) = request.into_parts();
     if let Ok(user) = AuthUser::from_request_parts(&mut parts, &state).await {
-        if user.is_demo
-            && (!demo_method_allowed(&parts.method)
-                || !demo_read_allowed(parts.uri.path()))
-        {
+        if user.is_demo && !demo_request_allowed(&method, &path) {
             return error_response(
                 StatusCode::FORBIDDEN,
-                "forbidden",
-                "this account can only view the showcase site",
+                "demo_read_only",
+                DEMO_READ_ONLY_MESSAGE,
             );
         }
         parts.extensions.insert(user);
@@ -454,24 +452,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn showcase_account_only_uses_safe_http_methods() {
+    fn showcase_account_allows_reads_and_blocks_mutations() {
         for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
-            assert!(demo_method_allowed(&method));
+            assert!(demo_request_allowed(&method, "/api/v1/users"));
         }
         for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE]
         {
-            assert!(!demo_method_allowed(&method));
+            assert!(!demo_request_allowed(&method, "/api/v1/settings/defense"));
         }
-    }
-
-    #[test]
-    fn showcase_reads_are_limited_to_site_data() {
-        assert!(demo_read_allowed("/api/v1/sites"));
-        assert!(demo_read_allowed("/api/v1/sites/any/rules"));
-        assert!(demo_read_allowed("/api/v1/analytics/summary"));
-        assert!(!demo_read_allowed("/api/v1/users"));
-        assert!(!demo_read_allowed("/api/v1/settings/defense"));
-        assert!(!demo_read_allowed("/api/v1/system/status"));
+        assert!(demo_request_allowed(
+            &Method::POST,
+            "/api/v1/auth/refresh"
+        ));
+        assert!(!demo_request_allowed(&Method::POST, "/api/v1/sites"));
     }
 
     #[tokio::test]
@@ -526,6 +519,11 @@ mod tests {
         let admin = AuthUser::new(Uuid::new_v4(), "a@example.com", role::ADMIN);
         assert!(admin.is_admin());
         assert!(admin.require_admin().is_ok());
+
+        let mut demo =
+            AuthUser::new(Uuid::new_v4(), "demo@example.com", role::AUDITOR);
+        demo.is_demo = true;
+        assert!(demo.is_admin());
     }
 
     /// The path as the client sends it: the API prefix plus an inner route.

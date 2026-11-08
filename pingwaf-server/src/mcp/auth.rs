@@ -149,16 +149,15 @@ fn key_principal(
         key_id: Some(key.id),
         // A writer can always read; `write` keys are the broader grant.
         can_read: true,
-        can_write: has_write && owner.role == role::ADMIN,
+        can_write: has_write
+            && owner.role == role::ADMIN
+            && !owner.is_demo,
         is_admin: owner.role == role::ADMIN,
     })
 }
 
 /// Builds the principal for a JWT caller from the freshly loaded account.
 fn jwt_principal(user: &AuthUser) -> Result<McpPrincipal, McpAuthError> {
-    if user.is_demo {
-        return Err(McpAuthError::forbidden("this account cannot use MCP"));
-    }
     if user.must_change_password {
         return Err(McpAuthError::forbidden(
             "replace the initial password before using MCP",
@@ -170,7 +169,7 @@ fn jwt_principal(user: &AuthUser) -> Result<McpPrincipal, McpAuthError> {
         label: user.email.clone(),
         key_id: None,
         can_read: true,
-        can_write: user.is_admin(),
+        can_write: user.is_admin() && !user.is_demo,
         is_admin: user.is_admin(),
     })
 }
@@ -308,14 +307,14 @@ mod tests {
     }
 
     #[test]
-    fn showcase_account_cannot_use_mcp() {
+    fn showcase_account_has_read_only_mcp_access() {
         let mut demo =
             AuthUser::new(Uuid::new_v4(), "demo@example.com", role::AUDITOR);
         demo.is_demo = true;
-        assert_eq!(
-            jwt_principal(&demo).unwrap_err().status,
-            StatusCode::FORBIDDEN
-        );
+        let principal = jwt_principal(&demo).unwrap();
+        assert!(principal.can_read);
+        assert!(!principal.can_write);
+        assert!(principal.is_admin);
     }
 
     /// D06: the storage error used to be the 401 body, table names included.

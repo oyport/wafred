@@ -34,6 +34,8 @@ export interface User {
   email: string
   name: string | null
   role: UserRole | string
+  /** Private showcase account; the server rejects all persistent changes. */
+  is_demo?: boolean
   /** First sign-in gate: the account must replace its password. */
   must_change_password: boolean
   /** Disabled accounts cannot sign in (admin user list only). */

@@ -69,6 +69,9 @@
     "name": "WAFred",
     "tagline": "Web Application Firewall Control Plane"
   },
+  "demo": {
+    "readOnlyNotice": "Demo account: You can explore all features, but changes cannot be saved."
+  },
   "nav": {
     "dashboard": "Dashboard",
     "sites": "Sites",

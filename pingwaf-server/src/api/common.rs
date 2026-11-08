@@ -268,6 +268,11 @@ pub fn parse_optional_datetime(
 /// Accounts flagged `must_change_password` are also refused: the console
 /// walks them through the password change first.
 pub fn require_write(user: &AuthUser) -> Result<(), ApiError> {
+    if user.is_demo {
+        return Err(ApiError::Forbidden(
+            crate::auth::middleware::DEMO_READ_ONLY_MESSAGE.to_string(),
+        ));
+    }
     if !user.is_admin() {
         return Err(ApiError::Forbidden(
             "this account cannot modify resources".to_string(),
@@ -299,6 +304,11 @@ pub async fn load_site(
             ApiError::NotFound(format!("site {site_id} not found"))
         })?;
 
+    if user.is_demo && write {
+        return Err(ApiError::Forbidden(
+            crate::auth::middleware::DEMO_READ_ONLY_MESSAGE.to_string(),
+        ));
+    }
     if !user.is_admin() {
         if model.user_id != user.id {
             return Err(ApiError::NotFound(format!(

@@ -90,6 +90,8 @@ pub struct UserResponse {
     pub email: String,
     pub name: Option<String>,
     pub role: String,
+    /// Marks the private, read-only showcase account.
+    pub is_demo: bool,
     /// The console walks first-login accounts through a password change.
     pub must_change_password: bool,
     /// Disabled accounts cannot sign in; shown in the admin user list.
@@ -110,7 +112,12 @@ impl From<user::Model> for UserResponse {
             id: model.id,
             email: model.email,
             name: model.name,
-            role: model.role,
+            role: if model.is_demo {
+                role::ADMIN.to_string()
+            } else {
+                model.role
+            },
+            is_demo: model.is_demo,
             must_change_password: model.must_change_password,
             disabled: model.disabled,
             created_at: model.created_at,

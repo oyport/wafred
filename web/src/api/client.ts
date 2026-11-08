@@ -16,6 +16,7 @@ export type ApiErrorCode =
   | 'bad_request'
   | 'unauthorized'
   | 'forbidden'
+  | 'demo_read_only'
   | 'not_found'
   | 'conflict'
   | 'unprocessable_entity'
