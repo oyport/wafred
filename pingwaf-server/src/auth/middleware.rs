@@ -306,16 +306,15 @@ pub async fn enforce_demo_read_only(
 ) -> Response {
     let (mut parts, body) = request.into_parts();
     if let Ok(user) = AuthUser::from_request_parts(&mut parts, &state).await {
-        if user.is_demo {
-            if !demo_method_allowed(&parts.method)
-                || !demo_read_allowed(parts.uri.path())
-            {
-                return error_response(
-                    StatusCode::FORBIDDEN,
-                    "forbidden",
-                    "this account can only view the showcase site",
-                );
-            }
+        if user.is_demo
+            && (!demo_method_allowed(&parts.method)
+                || !demo_read_allowed(parts.uri.path()))
+        {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "this account can only view the showcase site",
+            );
         }
         parts.extensions.insert(user);
     }

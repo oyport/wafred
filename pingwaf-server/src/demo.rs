@@ -12,7 +12,9 @@ use crate::api::auth::normalise_email;
 use crate::api::sites::{create_site_for_user, CreateSiteRequest};
 use crate::auth::password::{hash_password, verify_password};
 use crate::models::security_events::{access_logs, security_events};
-use crate::models::{api_key, passkey_credential, role, site, site_status, user};
+use crate::models::{
+    api_key, passkey_credential, role, site, site_status, user,
+};
 
 const ENABLED_ENV: &str = "WAFRED_DEMO_ENABLED";
 const EMAIL_ENV: &str = "WAFRED_DEMO_EMAIL";
@@ -238,8 +240,8 @@ pub async fn refresh_sample_data(
         let timestamp = now - Duration::minutes(1 + (95 - index) * 15);
         let path = ["/", "/products", "/products/42", "/api/search", "/login"]
             [index as usize % 5];
-        let client_ip = ["192.0.2.24", "198.51.100.18", "203.0.113.42"]
-            [index as usize % 3];
+        let client_ip =
+            ["192.0.2.24", "198.51.100.18", "203.0.113.42"][index as usize % 3];
         let country_code = ["US", "DE", "JP"][index as usize % 3];
         let status = if index % 17 == 0 {
             429
@@ -259,9 +261,11 @@ pub async fn refresh_sample_data(
             path: Set(Some(path.to_string())),
             status_code: Set(Some(status)),
             response_size: Set(Some(if status == 200 { 4096 } else { 512 })),
-            upstream_latency_ms: Set(Some(20 + i64::from(index % 15))),
-            total_latency_ms: Set(Some(30 + i64::from(index % 20))),
-            cache_status: Set(Some(if index % 3 == 0 { "hit" } else { "miss" }.to_string())),
+            upstream_latency_ms: Set(Some(20 + index % 15)),
+            total_latency_ms: Set(Some(30 + index % 20)),
+            cache_status: Set(Some(
+                if index % 3 == 0 { "hit" } else { "miss" }.to_string(),
+            )),
             user_agent: Set(Some(SAMPLE_AGENT.to_string())),
             country_code: Set(Some(country_code.to_string())),
             tls_version: Set(Some("TLSv1.3".to_string())),
@@ -271,6 +275,11 @@ pub async fn refresh_sample_data(
         });
         if status != 200 {
             let rate_limited = status == 429;
+            let (rule_id, rule_name, event_type) = if rate_limited {
+                ("WAFRED-DEMO-RATE", "示例频率限制", "rate_limit")
+            } else {
+                ("WAFRED-DEMO-WAF", "示例 Web 防护规则", "waf")
+            };
             events.push(security_events::ActiveModel {
                 site_id: Set(Some(site_id)),
                 request_id: Set(Some(request_id)),
@@ -279,9 +288,9 @@ pub async fn refresh_sample_data(
                 method: Set("GET".to_string()),
                 host: Set(Some(SAMPLE_DOMAIN.to_string())),
                 path: Set(Some(path.to_string())),
-                rule_id: Set(Some(if rate_limited { "WAFRED-DEMO-RATE" } else { "WAFRED-DEMO-WAF" }.to_string())),
-                rule_name: Set(Some(if rate_limited { "示例频率限制" } else { "示例 Web 防护规则" }.to_string())),
-                event_type: Set(Some(if rate_limited { "rate_limit" } else { "waf" }.to_string())),
+                rule_id: Set(Some(rule_id.to_string())),
+                rule_name: Set(Some(rule_name.to_string())),
+                event_type: Set(Some(event_type.to_string())),
                 action: Set("block".to_string()),
                 score: Set(Some(if rate_limited { 70 } else { 90 })),
                 country_code: Set(Some(country_code.to_string())),
@@ -291,15 +300,20 @@ pub async fn refresh_sample_data(
             });
         }
     }
-    access_logs::Entity::insert_many(requests).exec(&txn).await?;
-    security_events::Entity::insert_many(events).exec(&txn).await?;
+    access_logs::Entity::insert_many(requests)
+        .exec(&txn)
+        .await?;
+    security_events::Entity::insert_many(events)
+        .exec(&txn)
+        .await?;
     txn.commit().await?;
     Ok(())
 }
 
 /// Keeps synthetic activity current without making the sample site live.
 pub async fn run_sample_refresh(db: DatabaseConnection) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+    let mut interval =
+        tokio::time::interval(std::time::Duration::from_secs(15 * 60));
     interval.tick().await;
     loop {
         interval.tick().await;

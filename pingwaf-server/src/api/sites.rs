@@ -9,9 +9,9 @@ use axum::Router;
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::{Expr, Func};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection,
-    DbErr, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait,
+    DatabaseConnection, DbErr, EntityTrait, FromQueryResult, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1228,8 +1228,7 @@ pub(crate) async fn create_site_for_user(
     let upstream_address = normalize_origin_address(&payload.upstream_address)?;
     validate_upstream(&upstream_address, default_weight())?;
 
-    // New sites are live immediately; the dashboard toggles them between
-    // active and paused afterwards.
+    // New sites default to active; internal seeders may create them paused.
     let status = payload
         .status
         .unwrap_or_else(|| site_status::ACTIVE.to_string());

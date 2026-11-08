@@ -1,0 +1,36 @@
+name: Demo image
+
+on:
+  push:
+    tags:
+      - demo
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: Build and push demo image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/oyport/wafred:demo
+          labels: |
+            org.opencontainers.image.source=https://github.com/oyport/wafred
+            org.opencontainers.image.revision=${{ github.sha }}
