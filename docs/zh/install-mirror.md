@@ -7,6 +7,8 @@ https://raw.githubusercontent.com/oyport/wafred/main/install.sh
 → https://mirror.example.com/raw.githubusercontent.com/oyport/wafred/main/install.sh
 ```
 
+Compose 安装脚本在 Debian/Ubuntu 缺少 Docker Engine 或 Compose v2 时，会从当前系统的软件源安装并启动服务；该步骤需要 root 或免密码 sudo。其他发行版请先自行安装。若不希望脚本安装软件包，可加 `--no-install-docker`，缺少依赖时会直接报错。
+
 如果加速站在同一前缀提供 OCI 镜像服务，Compose 安装脚本还会把 `ghcr.io/oyport/wafred` 映射为 `mirror.example.com/ghcr.io/oyport/wafred`，并把 `WAFRED_IMAGE` 写入 `.env`。之后运行 `docker compose pull` 会继续使用该镜像地址。
 
 有些服务对文件和镜像使用不同的地址规则。例如 [GH-Proxy 的 GitHub 文件说明](https://gh-proxy.com/docs/github-accelerator)使用完整 URL 前缀，[Docker 镜像说明](https://gh-proxy.com/docs/docker-mirror)使用 `/docker/` 前缀。此时分别指定 `--mirror-mode full-url` 与 `--image-mirror`：

@@ -33,6 +33,8 @@ docker compose up -d
 
 The compose file starts `ghcr.io/oyport/wafred:latest` in all-in-one mode next to `postgres:16-alpine`, publishing `80`, `443`, `9080` and `9090`. The database port is bound to `127.0.0.1` by default.
 
+On Debian/Ubuntu, the Compose installer installs missing Docker Engine or Compose v2 from the configured OS repositories and starts Docker. This requires root or passwordless sudo. Use `--no-install-docker` to disable automatic package installation; other distributions need Docker and Compose v2 installed first.
+
 ### GitHub and GHCR mirrors
 
 The installers accept `--mirror` for GitHub file downloads and the Compose installer accepts `--image-mirror` for the OCI image path. The default `host-path` mode appends `raw.githubusercontent.com/...` to the mirror; use `--mirror-mode full-url` when the proxy expects the complete original URL. For example, [GH-Proxy's file guide](https://gh-proxy.com/docs/github-accelerator) and [image guide](https://gh-proxy.com/docs/docker-mirror) document different prefixes:

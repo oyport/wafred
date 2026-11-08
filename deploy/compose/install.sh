@@ -4,8 +4,9 @@
 #   curl -fsSL https://raw.githubusercontent.com/oyport/wafred/main/deploy/compose/install.sh | bash
 #
 # Downloads the official compose file into ./wafred, writes a private .env with
-# the values below, then runs `docker compose up -d`. It never needs root and
-# preserves an existing .env: a second run is an upgrade, not a reset.
+# the values below, then runs `docker compose up -d`. A missing Docker Engine
+# requires root or passwordless sudo for package installation. Existing .env
+# settings are preserved on a second run.
 set -euo pipefail
 
 REPO="${WAFRED_REPO:-oyport/wafred}"
@@ -24,6 +25,7 @@ ADMIN_PORT="${WAFRED_ADMIN_PORT:-9080}"
 GRPC_PORT="${WAFRED_GRPC_PORT:-9090}"
 FORCE=false
 DRY_RUN=false
+AUTO_INSTALL_DOCKER=true
 
 usage() {
     cat <<'EOF'
@@ -48,6 +50,7 @@ Options:
   --admin-port <port>      Host port for the console/API (default: 9080)
   --grpc-port <port>       Host port for the agent gRPC endpoint (default: 9090)
   --force                  Rewrite an existing .env (keeps the data volumes)
+  --no-install-docker      Do not install missing Docker/Compose packages
   --dry-run                Print the resolved plan and exit
   -h, --help               Show this help
 
@@ -119,6 +122,82 @@ mirror_url() { # $1 official HTTPS URL
     fi
 }
 
+compose_package() {
+    local package version
+    for package in docker-compose-plugin docker-compose-v2; do
+        if apt-cache show "$package" >/dev/null 2>&1; then
+            printf '%s' "$package"
+            return 0
+        fi
+    done
+    version="$(apt-cache show docker-compose 2>/dev/null | sed -n 's/^Version: //p' | head -n1 || true)"
+    if [[ "$version" == 2.* ]]; then
+        printf 'docker-compose'
+        return 0
+    fi
+    return 1
+}
+
+ensure_docker() {
+    local -a admin=() packages=()
+    local distro compose_pkg
+
+    if ! command -v docker >/dev/null 2>&1 ||
+       ! command -v dockerd >/dev/null 2>&1 ||
+       ! docker compose version >/dev/null 2>&1; then
+        [[ "$AUTO_INSTALL_DOCKER" == "true" ]] ||
+            die "Docker Engine and Compose v2 are required; install them or remove --no-install-docker"
+        [[ -r /etc/os-release ]] || die "cannot identify this OS; install Docker Engine and Compose v2 manually"
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        distro="${ID:-}"
+        [[ "$distro" == debian || "$distro" == ubuntu ]] ||
+            die "automatic Docker installation supports Debian/Ubuntu; install Docker Engine and Compose v2 manually on ${distro:-this OS}"
+        command -v apt-get >/dev/null 2>&1 || die "apt-get is required to install Docker automatically"
+        if (( EUID != 0 )); then
+            command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1 ||
+                die "Docker is missing; run this installer as root or with passwordless sudo, or install Docker first"
+            admin=(sudo -n)
+        fi
+
+        printf 'Installing Docker Engine and Compose v2 from the %s package repository...\n' "$distro"
+        "${admin[@]}" apt-get update || die "apt-get update failed; check your package mirror"
+        if ! command -v dockerd >/dev/null 2>&1; then packages+=(docker.io); fi
+        if ! command -v docker >/dev/null 2>&1; then
+            # Debian 13 splits the CLI out of docker.io. On releases where
+            # docker.io still owns /usr/bin/docker, docker-cli is unavailable.
+            if apt-cache show docker-cli >/dev/null 2>&1; then packages+=(docker-cli); fi
+        fi
+        if ! docker compose version >/dev/null 2>&1; then
+            compose_pkg="$(compose_package)" ||
+                die "this package repository has no Compose v2 plugin; install it using https://docs.docker.com/compose/install/linux/"
+            packages+=("$compose_pkg")
+        fi
+        "${admin[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}" ||
+            die "Docker package installation failed; check the apt output above"
+    fi
+
+    command -v docker >/dev/null 2>&1 || die "Docker CLI is still unavailable after installation"
+    docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is still unavailable after installation"
+    if ! docker info >/dev/null 2>&1; then
+        if command -v systemctl >/dev/null 2>&1 && ! systemctl is-active --quiet docker; then
+            if (( EUID == 0 )); then
+                systemctl enable --now docker || die "could not start the Docker service"
+            elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+                sudo -n systemctl enable --now docker || die "could not start the Docker service"
+            fi
+        fi
+    fi
+    DOCKER=(docker)
+    if ! docker info >/dev/null 2>&1; then
+        if (( EUID != 0 )) && command -v sudo >/dev/null 2>&1 && sudo -n docker info >/dev/null 2>&1; then
+            DOCKER=(sudo -n docker)
+        else
+            die "cannot access the Docker daemon; start docker.service and run as root or with passwordless sudo"
+        fi
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --tag) require_value "$1" "${2:-}"; TAG="$2"; shift 2 ;;
@@ -135,6 +214,7 @@ while [[ $# -gt 0 ]]; do
         --admin-port) require_value "$1" "${2:-}"; ADMIN_PORT="$2"; shift 2 ;;
         --grpc-port) require_value "$1" "${2:-}"; GRPC_PORT="$2"; shift 2 ;;
         --force) FORCE=true; shift ;;
+        --no-install-docker) AUTO_INSTALL_DOCKER=false; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option '$1' (use --help)" ;;
@@ -192,14 +272,18 @@ WAFred Docker Compose install plan
   tls sans     : ${TLS_SANS:-none (covers the hostname used to reach the console)}
   ports        : http ${HTTP_PORT}, https ${HTTPS_PORT}, admin ${ADMIN_PORT}, grpc ${GRPC_PORT}
 EOF
+    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+        echo "  Docker      : already installed"
+    else
+        echo "  Docker      : $([[ "$AUTO_INSTALL_DOCKER" == "true" ]] && echo 'install on Debian/Ubuntu (needs root or passwordless sudo)' || echo 'required before running')"
+    fi
     if [[ -f "$DIR/.env" && "$FORCE" != "true" ]]; then
         echo "  existing .env: kept (only WAFRED_IMAGE changes when an image proxy is configured)"
     fi
     exit 0
 fi
 
-command -v docker >/dev/null 2>&1 || die "docker is not installed"
-docker compose version >/dev/null 2>&1 || die "docker compose v2 is required (the 'docker compose' plugin, not docker-compose)"
+ensure_docker
 
 mkdir -p "$DIR"
 cd "$DIR"
@@ -248,11 +332,11 @@ else
     chmod 600 .env
 fi
 
-docker compose config -q || die "downloaded compose file or .env is invalid"
+"${DOCKER[@]}" compose config -q || die "downloaded compose file or .env is invalid"
 
 printf 'Starting WAFred with the image settings in .env\n'
-if ! docker compose up -d; then
-    die "docker compose failed; if using an image proxy, check its OCI registry path: ${IMAGE_REPO}"
+if ! "${DOCKER[@]}" compose up -d; then
+    die "docker compose failed. For 'address already in use', choose free host ports in .env (WAFRED_HTTP_PORT, WAFRED_HTTPS_PORT, WAFRED_ADMIN_PORT, WAFRED_GRPC_PORT); for pull errors, check the image source: ${IMAGE_REPO}"
 fi
 
 cat <<EOF

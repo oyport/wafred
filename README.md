@@ -201,7 +201,7 @@ manual migration; the old runtime identifiers are not read automatically.
 Two typical paths: **Docker Compose** (one command, `all-in-one` mode with PostgreSQL; prebuilt binaries are published for Linux amd64/arm64 only — see the [releases page](https://github.com/oyport/wafred/releases)), or **build from source** (Rust 1.96+, Node.js 26.12.1+, `protoc`).
 
 ```bash
-# Path A — Docker Compose (recommended; no clone, no root)
+# Path A — Docker Compose (recommended; no clone; root/sudo only if Docker is missing)
 curl -fsSL https://raw.githubusercontent.com/oyport/wafred/main/deploy/compose/install.sh | bash
 # …or, after cloning this repository:
 docker compose up -d

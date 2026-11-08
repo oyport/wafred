@@ -177,7 +177,7 @@ WAFred 的操作入口使用 `wafred` 命令、`WAFRED_*` 环境变量、`wafred
 两条典型路径：**Docker Compose**（一条命令，`all-in-one` 模式 + PostgreSQL；预编译二进制仅提供 Linux amd64/arm64——见 [Releases 页面](https://github.com/oyport/wafred/releases)），或**源码构建**（Rust 1.96+、Node.js 26.12.1+、`protoc`）。
 
 ```bash
-# 路径 A —— Docker Compose（推荐；无需克隆仓库、无需 root）
+# 路径 A —— Docker Compose（推荐；无需克隆仓库；缺少 Docker 时需 root/sudo）
 curl -fsSL https://raw.githubusercontent.com/oyport/wafred/main/deploy/compose/install.sh | bash
 # 或克隆本仓库后执行：
 docker compose up -d

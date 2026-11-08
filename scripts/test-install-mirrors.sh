@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Exercise URL mapping and .env preservation without network, Docker, or root.
+# Exercise installer behavior with mocked network, Docker, and package commands.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -64,10 +64,42 @@ EOF
 cat > "$TMP/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 printf 'docker %s\n' "$*" >> "$MOCK_LOG"
-[[ "$1" == compose ]]
+case "$1" in
+    info) exit 0 ;;
+    compose)
+        if [[ "${2:-}" == version && "${MOCK_COMPOSE_MISSING:-}" == 1 && ! -f "$MOCK_DOCKER_READY" ]]; then
+            exit 1
+        fi
+        exit 0 ;;
+esac
+exit 1
 EOF
-chmod +x "$TMP/bin/curl" "$TMP/bin/docker"
-export PATH="$TMP/bin:$PATH" MOCK_LOG="$TMP/requests.log" FIXTURE_COMPOSE="$ROOT/docker-compose.yml"
+cat > "$TMP/bin/apt-cache" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == show && "$2" == docker-compose-plugin ]]
+EOF
+cat > "$TMP/bin/apt-get" <<'EOF'
+#!/usr/bin/env bash
+printf 'apt-get %s\n' "$*" >> "$MOCK_LOG"
+if [[ "$1" == install ]]; then touch "$MOCK_DOCKER_READY"; fi
+EOF
+cat > "$TMP/bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == -n ]] && shift
+"$@"
+EOF
+chmod +x "$TMP/bin/curl" "$TMP/bin/docker" "$TMP/bin/apt-cache" "$TMP/bin/apt-get" "$TMP/bin/sudo"
+export PATH="$TMP/bin:$PATH" MOCK_LOG="$TMP/requests.log" FIXTURE_COMPOSE="$ROOT/docker-compose.yml" MOCK_DOCKER_READY="$TMP/docker-ready"
+
+export MOCK_COMPOSE_MISSING=1
+if bash "$ROOT/deploy/compose/install.sh" --no-install-docker --dir "$TMP/no-docker" >/dev/null 2>&1; then
+    echo '--no-install-docker accepted missing Compose' >&2; exit 1
+fi
+[[ ! -e "$MOCK_DOCKER_READY" ]]
+bash "$ROOT/deploy/compose/install.sh" --dir "$TMP/auto-compose" >/dev/null
+grep -Fq 'apt-get update' "$MOCK_LOG"
+grep -Fq 'apt-get install -y --no-install-recommends docker-compose-plugin' "$MOCK_LOG"
+unset MOCK_COMPOSE_MISSING
 
 bash "$ROOT/deploy/compose/install.sh" --dir "$TMP/compose" --admin-password custom-secret \
     --mirror https://gh-proxy.org --mirror-mode full-url \

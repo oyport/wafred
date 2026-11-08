@@ -12,7 +12,8 @@
 
 ## Quick Start (Docker Compose)
 
-The fastest way to get WAFred running — one command, no clone, no root:
+The fastest way to get WAFred running — one command, no clone (root or
+passwordless sudo is needed only if Docker/Compose must be installed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/oyport/wafred/main/deploy/compose/install.sh | bash
@@ -24,6 +25,12 @@ settings are preserved, except `WAFRED_IMAGE` when an image proxy is supplied).
 Add `--tag`, `--admin-email`, `--tls-sans` or the
 port flags to customise, or use the generator at
 <https://waf.red/install/> (Chinese: <https://waf.red/zh/install/>).
+
+On Debian/Ubuntu, the installer installs missing Docker Engine and Compose v2
+from the configured OS package repositories, then starts `docker.service`.
+This requires root or passwordless sudo; it never runs a remote Docker
+convenience script. Use `--no-install-docker` to make missing packages an
+explicit error. On other distributions, install Docker and Compose v2 first.
 
 ### GitHub and GHCR mirrors
 

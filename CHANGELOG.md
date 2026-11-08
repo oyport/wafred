@@ -12,11 +12,15 @@ older `pingap` history is retained as the proxy layer's inherited history.
 - Both shell installers accept a configurable HTTPS GitHub mirror in host-path
   or full-URL mode. The Compose installer also accepts a separate OCI image
   mirror and persists the chosen WAFred image path in `.env` for later pulls.
+- On Debian/Ubuntu, the Compose installer can install a missing Docker Engine
+  and Compose v2 from the configured distribution package repository.
 
 ### Fixed
 
 - Re-running the Compose installer preserves existing credentials and settings;
   choosing a new image mirror updates only `WAFRED_IMAGE`.
+- Compose startup failures now distinguish host-port conflicts from image pull
+  errors in the troubleshooting message.
 
 ## [WAFred 1.0.0] - 2026-11-08
 

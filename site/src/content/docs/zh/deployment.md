@@ -33,6 +33,8 @@ docker compose up -d
 
 compose 文件以 all-in-one 模式启动 `ghcr.io/oyport/wafred:latest`，并与 `postgres:16-alpine` 一起运行，发布 `80`、`443`、`9080` 与 `9090`。数据库端口默认只绑定 `127.0.0.1`。
 
+使用 Compose 安装脚本时，Debian/Ubuntu 若缺少 Docker Engine 或 Compose v2，脚本会从当前系统的软件源安装并启动 Docker。此时需要 root 或免密码 sudo；`--no-install-docker` 可禁止自动安装。其他发行版需先自行安装 Docker 与 Compose v2。
+
 ### GitHub / GHCR 下载加速
 
 安装脚本支持 `--mirror`（GitHub 文件前缀）和 `--image-mirror`（OCI 镜像前缀）。默认的 `--mirror-mode host-path` 适用于把 `raw.githubusercontent.com/...` 接在加速站后面的服务；若服务要求保留完整原始 URL，则使用 `--mirror-mode full-url`。例如 [GH-Proxy 的文件规则](https://gh-proxy.com/docs/github-accelerator)和[镜像规则](https://gh-proxy.com/docs/docker-mirror)分别使用完整 URL 和 `/docker/` 路径：
