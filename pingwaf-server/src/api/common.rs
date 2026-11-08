@@ -300,9 +300,7 @@ pub async fn load_site(
         })?;
 
     if !user.can_view_all_sites() && model.user_id != user.id {
-        return Err(ApiError::NotFound(format!(
-            "site {site_id} not found"
-        )));
+        return Err(ApiError::NotFound(format!("site {site_id} not found")));
     }
     if write {
         require_write(user)?;

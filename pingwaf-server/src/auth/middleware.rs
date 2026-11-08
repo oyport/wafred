@@ -281,9 +281,7 @@ pub async fn require_password_change(
 }
 
 fn demo_method_allowed(method: &Method) -> bool {
-    method == Method::GET
-        || method == Method::HEAD
-        || method == Method::OPTIONS
+    method == Method::GET || method == Method::HEAD || method == Method::OPTIONS
 }
 
 /// Covers every API route, including self-service credential endpoints and
