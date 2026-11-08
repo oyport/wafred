@@ -19,10 +19,59 @@ curl -fsSL https://raw.githubusercontent.com/oyport/wafred/main/deploy/compose/i
 ```
 
 It creates `./wafred`, downloads [`docker-compose.yml`](../docker-compose.yml),
-writes a private `.env` and starts the stack. Re-run it to upgrade (an existing
-`.env` is never overwritten). Add `--tag`, `--admin-email`, `--tls-sans` or the
+writes a private `.env` and starts the stack. Re-run it to upgrade (existing
+settings are preserved, except `WAFRED_IMAGE` when an image proxy is supplied).
+Add `--tag`, `--admin-email`, `--tls-sans` or the
 port flags to customise, or use the generator at
 <https://waf.red/install/> (Chinese: <https://waf.red/zh/install/>).
+
+### GitHub and GHCR mirrors
+
+Both installers accept `--mirror` (or `WAFRED_MIRROR`) for GitHub downloads.
+The default `--mirror-mode host-path` maps an official URL such as
+`https://raw.githubusercontent.com/oyport/wafred/main/install.sh` to
+`https://mirror.example.com/raw.githubusercontent.com/oyport/wafred/main/install.sh`.
+This also maps the Compose image to
+`mirror.example.com/ghcr.io/oyport/wafred:latest` when the mirror implements an
+OCI registry at the same prefix. A mirror must be HTTPS and trusted by the
+operator; the installer does not bypass TLS verification.
+
+Some services use different formats for GitHub files and container images.
+For example, [GH-Proxy's GitHub guide](https://gh-proxy.com/docs/github-accelerator)
+documents a full-URL prefix, while its
+[Docker guide](https://gh-proxy.com/docs/docker-mirror) documents a separate
+`/docker/` prefix. Use `--mirror-mode full-url` and `--image-mirror` for that
+layout:
+
+```bash
+curl -fsSL https://gh-proxy.org/https://raw.githubusercontent.com/oyport/wafred/main/deploy/compose/install.sh \
+  | bash -s -- --mirror https://gh-proxy.org --mirror-mode full-url \
+      --image-mirror https://gh-proxy.org/docker
+```
+
+The command above sends the script and Compose file through the GitHub proxy,
+and writes `WAFRED_IMAGE=gh-proxy.org/docker/ghcr.io/oyport/wafred` to `.env`.
+Later `docker compose pull` uses that image path. The installer preserves an
+existing `.env`; supplying a new image mirror on a later run changes only
+`WAFRED_IMAGE`. `--force` rewrites the full `.env` using the supplied options.
+The PostgreSQL image still comes from Docker Hub.
+
+For the binary/systemd installer, the same GitHub mirror options cover the
+latest-release API request and release archive download (no image proxy is
+needed):
+
+```bash
+curl -fsSL https://gh-proxy.org/https://raw.githubusercontent.com/oyport/wafred/main/install.sh \
+  | sudo bash -s -- --mirror https://gh-proxy.org --mirror-mode full-url \
+      --mode all-in-one
+```
+
+If a chosen proxy does not support `api.github.com`, add `--version 1.0.0` (or
+another published version) to skip the latest-release lookup. The initial
+`curl` URL must also use the proxy; a script option cannot redirect the request
+that fetched the script itself. Mirrors can serve different content from the
+official source, so use one you trust and verify its URL layout before
+installing.
 
 Prefer to inspect the files first? Clone the repository and run the same compose
 file manually:

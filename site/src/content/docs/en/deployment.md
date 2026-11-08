@@ -33,6 +33,18 @@ docker compose up -d
 
 The compose file starts `ghcr.io/oyport/wafred:latest` in all-in-one mode next to `postgres:16-alpine`, publishing `80`, `443`, `9080` and `9090`. The database port is bound to `127.0.0.1` by default.
 
+### GitHub and GHCR mirrors
+
+The installers accept `--mirror` for GitHub file downloads and the Compose installer accepts `--image-mirror` for the OCI image path. The default `host-path` mode appends `raw.githubusercontent.com/...` to the mirror; use `--mirror-mode full-url` when the proxy expects the complete original URL. For example, [GH-Proxy's file guide](https://gh-proxy.com/docs/github-accelerator) and [image guide](https://gh-proxy.com/docs/docker-mirror) document different prefixes:
+
+```bash
+curl -fsSL https://gh-proxy.org/https://raw.githubusercontent.com/oyport/wafred/main/deploy/compose/install.sh \
+  | bash -s -- --mirror https://gh-proxy.org --mirror-mode full-url \
+      --image-mirror https://gh-proxy.org/docker
+```
+
+The image path is saved as `WAFRED_IMAGE` in `.env`, so later `docker compose pull` calls use it too. The binary installer accepts the same GitHub mirror options; pin `--version` if a chosen proxy does not support the GitHub API. The first `curl` must also use the proxy. PostgreSQL still pulls from Docker Hub. See the [full mirror guide](https://github.com/oyport/wafred/blob/main/docs/deployment.md#github-and-ghcr-mirrors).
+
 > Keep `hostname` stable. The control plane matches re-registrations by hostname plus API key, so a changing container ID leaves ghost offline agents behind.
 
 ## Source build

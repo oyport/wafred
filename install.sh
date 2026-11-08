@@ -10,6 +10,8 @@
 #
 # Options:
 #   --version         Install a specific version (default: latest)
+#   --mirror          HTTPS prefix for GitHub API and release downloads
+#   --mirror-mode     host-path (default) or full-url
 #   --mode            Operating mode: all-in-one, server, agent (default: all-in-one)
 #   --server-url      Control plane gRPC URL (agent mode)
 #   --api-key         Agent enrollment token (agent mode)
@@ -73,10 +75,36 @@ DATA_DIR="/var/lib/wafred"
 SERVICE_NAME="wafred"
 SUPPORTED_PLATFORMS="linux/amd64 linux/arm64"
 
+normalize_mirror() {
+    while [[ "$MIRROR" == */ ]]; do MIRROR="${MIRROR%/}"; done
+    [[ "$MIRROR_MODE" == "host-path" || "$MIRROR_MODE" == "full-url" ]] ||
+        fatal "--mirror-mode must be host-path or full-url"
+    if [[ -z "$MIRROR" ]]; then
+        [[ "$MIRROR_MODE" == "host-path" ]] || fatal "--mirror-mode requires --mirror"
+        return 0
+    fi
+    [[ "$MIRROR" =~ ^https://[a-z0-9][a-z0-9.-]*(:[0-9]+)?(/[a-z0-9._-]+)*$ ]] ||
+        fatal "--mirror must be an HTTPS URL with a lowercase host and optional lowercase path (for example https://mirror.example.com)"
+}
+
+mirror_url() { # $1 official HTTPS URL
+    if [[ -n "$MIRROR" ]]; then
+        if [[ "$MIRROR_MODE" == "full-url" ]]; then
+            printf '%s/%s' "$MIRROR" "$1"
+        else
+            printf '%s/%s' "$MIRROR" "${1#https://}"
+        fi
+    else
+        printf '%s' "$1"
+    fi
+}
+
 # ─── Default Configuration ────────────────────────────────────────────────────
 # Empty on purpose: WAFRED_* environment fallbacks are applied after prompts,
 # so explicit command-line options take precedence.
 VERSION=""
+MIRROR=""
+MIRROR_MODE=""
 MODE=""
 SKIP_SYSTEMD=false
 DB_URL=""
@@ -107,6 +135,8 @@ Pass options through the pipe with: bash -s -- <options>
 
 Options:
   --version VERSION        Install a specific version (default: latest release)
+  --mirror HTTPS_URL       Prefix GitHub API and release downloads
+  --mirror-mode MODE       host-path (default) or full-url
   --mode MODE              Operating mode: all-in-one, server, agent
   --server-url URL         Control plane gRPC URL (agent mode)
   --server-ca-cert PATH    PEM file with the CA that signed the control plane's
@@ -127,6 +157,8 @@ Options:
 
 Environment Variables:
   WAFRED_VERSION       Same as --version
+  WAFRED_MIRROR        Same as --mirror
+  WAFRED_MIRROR_MODE   Same as --mirror-mode
   WAFRED_MODE          Same as --mode
   WAFRED_SERVER_URL    Same as --server-url
   WAFRED_SERVER_CA_CERT Same as --server-ca-cert
@@ -173,6 +205,8 @@ require_value() { # $1 option name, $2 next argument
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --version)        require_value "$1" "${2:-}"; VERSION="$2"; PARAMS_GIVEN=true; shift 2 ;;
+        --mirror)         require_value "$1" "${2:-}"; MIRROR="$2"; PARAMS_GIVEN=true; shift 2 ;;
+        --mirror-mode)    require_value "$1" "${2:-}"; MIRROR_MODE="$2"; PARAMS_GIVEN=true; shift 2 ;;
         --mode)           require_value "$1" "${2:-}"; MODE="$2"; PARAMS_GIVEN=true; shift 2 ;;
         --db-url)         require_value "$1" "${2:-}"; DB_URL="$2"; PARAMS_GIVEN=true; shift 2 ;;
         --server-url)     require_value "$1" "${2:-}"; SERVER_URL="$2"; PARAMS_GIVEN=true; shift 2 ;;
@@ -194,6 +228,9 @@ done
 # Environment variable fallbacks. The defaults are applied *after* the prompts,
 # so an unanswered question can fall back to them while an explicit flag wins.
 VERSION="${VERSION:-${WAFRED_VERSION:-}}"
+MIRROR="${MIRROR:-${WAFRED_MIRROR:-}}"
+MIRROR_MODE="${MIRROR_MODE:-${WAFRED_MIRROR_MODE:-host-path}}"
+normalize_mirror
 MODE="${MODE:-${WAFRED_MODE:-}}"
 DB_URL="${DB_URL:-${WAFRED_DB_URL:-}}"
 # Agent mode reads its settings from the command line or the environment, so
@@ -211,7 +248,7 @@ TLS_SANS="${TLS_SANS:-${WAFRED_TLS_SANS:-}}"
 # URL becomes .../download/vlatest/...
 if [[ "$VERSION" == "latest" ]]; then VERSION=""; fi
 
-if [[ -n "$VERSION$MODE$DB_URL$SERVER_URL$SERVER_CA_CERT$SERVER_TLS_NAME$API_KEY$ADMIN_EMAIL$ADMIN_PASSWORD$TLS_SANS" ]]; then
+if [[ -n "$VERSION$MIRROR$MODE$DB_URL$SERVER_URL$SERVER_CA_CERT$SERVER_TLS_NAME$API_KEY$ADMIN_EMAIL$ADMIN_PASSWORD$TLS_SANS" ]]; then
     PARAMS_GIVEN=true
 fi
 
@@ -390,6 +427,8 @@ print_plan_summary() {
     echo "${BOLD}Installation plan${NO_COLOR}"
     echo "  mode:        ${MODE:-all-in-one}"
     echo "  version:     ${VERSION:-latest release}"
+    echo "  mirror:      ${MIRROR:-none (official GitHub URLs)}"
+    if [[ -n "$MIRROR" ]]; then echo "  mirror mode: ${MIRROR_MODE}"; fi
     if [[ -n "${PLATFORM:-}" ]]; then
         echo "  platform:    ${PLATFORM}"
     fi
@@ -568,14 +607,17 @@ fi
 
 # ─── Version Resolution ───────────────────────────────────────────────────────
 get_latest_version() {
-    local url="https://api.github.com/repos/${REPO}/releases/latest"
+    local url response
+    url="$(mirror_url "https://api.github.com/repos/${REPO}/releases/latest")"
     if has curl; then
-        curl -fsSL "$url" | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/'
+        response="$(curl -fsSL "$url")" || fatal "Could not fetch the latest release via ${url}. Use --version to bypass the GitHub API."
     elif has wget; then
-        wget -qO- "$url" | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/'
+        response="$(wget -qO- "$url")" || fatal "Could not fetch the latest release via ${url}. Use --version to bypass the GitHub API."
     else
         fatal "Neither curl nor wget found. Please install one of them."
     fi
+    printf '%s\n' "$response" |
+        sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -n1
 }
 
 if [[ -z "$VERSION" ]]; then
@@ -602,7 +644,7 @@ fetch_asset() {
             continue
         fi
         ASSET_NAME="wafred-${OS}-${ARCH}.${ext}"
-        url="https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET_NAME}"
+        url="$(mirror_url "https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET_NAME}")"
         info "Downloading ${ASSET_NAME}..."
         info "URL: ${url}"
         if has curl; then

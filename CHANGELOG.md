@@ -5,6 +5,19 @@ Apache-2.0-licensed [PingWAF](https://github.com/shuaiZend/PingWAF) codebase.
 The original PingWAF release history is retained below for provenance; the
 older `pingap` history is retained as the proxy layer's inherited history.
 
+## [Unreleased]
+
+### Added
+
+- Both shell installers accept a configurable HTTPS GitHub mirror in host-path
+  or full-URL mode. The Compose installer also accepts a separate OCI image
+  mirror and persists the chosen WAFred image path in `.env` for later pulls.
+
+### Fixed
+
+- Re-running the Compose installer preserves existing credentials and settings;
+  choosing a new image mirror updates only `WAFRED_IMAGE`.
+
 ## [WAFred 1.0.0] - 2026-11-08
 
 The first independently maintained WAFred release. Functional changes from

@@ -213,6 +213,10 @@ cargo build --release --bin wafred --features full
 ./target/release/wafred all-in-one --db-url "postgres://wafred:wafred@localhost:5432/wafred"
 ```
 
+If GitHub or GHCR is slow from your location, both installers accept a custom
+download mirror; the Compose installer can also use a separate OCI image
+mirror. See [mirror setup and examples](./docs/deployment.md#github-and-ghcr-mirrors).
+
 Then open the dashboard at **https://localhost:9080** (HTTPS with a self-signed certificate generated on first boot) and sign in with `admin@wafred.local` / `wafred123` — **change the default password and `WAFRED_JWT_SECRET` before any production use**.
 
 👉 Full install wizard, the interactive installer and TLS / port options: **<https://waf.red/install/>** · step-by-step guide: **<https://waf.red/quickstart/>** · in-repo walkthrough (database setup, first site, distributed agents, systemd): **[docs/quick-start.md](./docs/quick-start.md)**.

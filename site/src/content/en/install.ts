@@ -130,7 +130,7 @@ const install = {
       installerUrl: "https://raw.githubusercontent.com/oyport/wafred/main/deploy/compose/install.sh",
       oneLiner: "curl -fsSL https://raw.githubusercontent.com/oyport/wafred/main/deploy/compose/install.sh | bash",
       oneLinerTitle: "One-line install",
-      oneLinerNote: "Run it in an empty directory: the installer downloads docker-compose.yml, writes a private .env, pulls the image and starts the stack. An existing .env is never overwritten — re-run the same command to upgrade.",
+      oneLinerNote: "Run it in an empty directory: the installer downloads docker-compose.yml, writes a private .env, pulls the image and starts the stack. Re-running keeps existing settings; a chosen image mirror updates only the image source.",
       customizeTitle: "Need to customise? Generate a command with flags",
       customizeHint: "Only change what you need; the command appends flags that differ from the defaults. The administrator password is never written into the command — the console forces a change at first sign-in.",
       title: "Deploy with Docker Compose",

@@ -130,7 +130,7 @@ const install = {
       installerUrl: "https://raw.githubusercontent.com/oyport/wafred/main/deploy/compose/install.sh",
       oneLiner: "curl -fsSL https://raw.githubusercontent.com/oyport/wafred/main/deploy/compose/install.sh | bash",
       oneLinerTitle: "ワンコマンドインストール",
-      oneLinerNote: "空のディレクトリで実行してください。インストーラは docker-compose.yml を取得し、本人のみ読み取り可能な .env を書き込み、イメージを取得して起動します。既存の .env は上書きしません（アップグレードは同じコマンドを再実行）。",
+      oneLinerNote: "空のディレクトリで実行してください。インストーラは docker-compose.yml を取得し、非公開の .env を書き込み、イメージを取得して起動します。再実行時は既存の設定を保持し、イメージプロキシ指定時はイメージの取得先だけ更新します。",
       customizeTitle: "カスタマイズする場合：オプション付きコマンドを生成",
       customizeHint: "変更が必要な項目だけ入力してください。既定値と異なるオプションだけが追加されます。管理者パスワードはコマンドに含めません。",
       title: "Docker Compose でデプロイ",

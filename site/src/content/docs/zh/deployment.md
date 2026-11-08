@@ -33,6 +33,18 @@ docker compose up -d
 
 compose 文件以 all-in-one 模式启动 `ghcr.io/oyport/wafred:latest`，并与 `postgres:16-alpine` 一起运行，发布 `80`、`443`、`9080` 与 `9090`。数据库端口默认只绑定 `127.0.0.1`。
 
+### GitHub / GHCR 下载加速
+
+安装脚本支持 `--mirror`（GitHub 文件前缀）和 `--image-mirror`（OCI 镜像前缀）。默认的 `--mirror-mode host-path` 适用于把 `raw.githubusercontent.com/...` 接在加速站后面的服务；若服务要求保留完整原始 URL，则使用 `--mirror-mode full-url`。例如 [GH-Proxy 的文件规则](https://gh-proxy.com/docs/github-accelerator)和[镜像规则](https://gh-proxy.com/docs/docker-mirror)分别使用完整 URL 和 `/docker/` 路径：
+
+```bash
+curl -fsSL https://gh-proxy.org/https://raw.githubusercontent.com/oyport/wafred/main/deploy/compose/install.sh \
+  | bash -s -- --mirror https://gh-proxy.org --mirror-mode full-url \
+      --image-mirror https://gh-proxy.org/docker
+```
+
+安装器会把镜像地址保存为 `.env` 中的 `WAFRED_IMAGE`，以后执行 `docker compose pull` 仍使用该地址。二进制安装器同样支持 `--mirror` / `--mirror-mode`；加 `--version` 可跳过不支持 GitHub API 的加速站。最初的 `curl` 也必须指向加速站。PostgreSQL 镜像仍从 Docker Hub 下载。详细说明见[仓库文档](https://github.com/oyport/wafred/blob/main/docs/zh/install-mirror.md)。
+
 > `hostname` 必须保持稳定。控制面按 hostname 与 API key 匹配重新注册，容器 ID 变化会留下「幽灵离线节点」。
 
 ## 源码构建

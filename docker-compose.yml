@@ -17,7 +17,7 @@ services:
   wafred:
     # Pin a released version for production (e.g. :0.23.0) — :latest tracks
     # the newest release; :main is the unstable amd64 snapshot of main.
-    image: ghcr.io/oyport/wafred:${WAFRED_TAG:-latest}
+    image: ${WAFRED_IMAGE:-ghcr.io/oyport/wafred}:${WAFRED_TAG:-latest}
     # To build from source instead of pulling the pre-built image, uncomment:
     # build:
     #   context: .
@@ -150,7 +150,7 @@ services:
   # WAFRED_MODE to "server" (control plane only).
   #
   # wafred-agent:
-  #   image: ghcr.io/oyport/wafred:${WAFRED_TAG:-latest}
+  #   image: ${WAFRED_IMAGE:-ghcr.io/oyport/wafred}:${WAFRED_TAG:-latest}
   #   # build:
   #   #   context: .
   #   #   dockerfile: Dockerfile

@@ -189,6 +189,9 @@ cargo build --release --bin wafred --features full
 ./target/release/wafred all-in-one --db-url "postgres://wafred:wafred@localhost:5432/wafred"
 ```
 
+若所在地区访问 GitHub 或 GHCR 较慢，两种安装脚本都支持自定义下载加速前缀；
+Compose 安装还可单独指定 OCI 镜像前缀。配置方法见[安装加速说明](./docs/zh/install-mirror.md)。
+
 随后打开控制台 **https://localhost:9080**（HTTPS，首次启动自动生成自签名证书），使用 `admin@wafred.local` / `wafred123` 登录——**生产环境务必修改默认密码与 `WAFRED_JWT_SECRET`**。
 
 👉 完整安装向导、交互式安装器、TLS/端口参数说明见**[官网安装页](https://waf.red/zh/install/)**；分步上手见**[官网快速上手页](https://waf.red/zh/quickstart/)**；仓库内完整流程（数据库准备、首个站点、分布式 Agent、systemd）见 **[docs/quick-start.md](./docs/quick-start.md)**。

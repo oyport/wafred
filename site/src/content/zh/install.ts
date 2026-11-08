@@ -129,7 +129,7 @@ const install = {
       installerUrl: "https://raw.githubusercontent.com/oyport/wafred/main/deploy/compose/install.sh",
       oneLiner: "curl -fsSL https://raw.githubusercontent.com/oyport/wafred/main/deploy/compose/install.sh | bash",
       oneLinerTitle: "一键安装命令",
-      oneLinerNote: "在空目录执行即可：安装器会下载 docker-compose.yml、写入仅本人可读的 .env、拉取镜像并启动。已有 .env 不会被覆盖——升级时重跑同一条命令即可。",
+      oneLinerNote: "在空目录执行即可：安装器会下载 docker-compose.yml、写入仅本人可读的 .env、拉取镜像并启动。重跑会保留已有设置；指定新的镜像加速站时只更新镜像来源。",
       customizeTitle: "需要自定义？生成带参数的命令",
       customizeHint: "只填写需要改动的项；命令只会追加与默认值不同的参数。管理员密码不会写入命令，首次登录时控制台会强制修改。",
       title: "使用 Docker Compose 部署",
