@@ -18,7 +18,7 @@ for setup and compatibility details.
   optional WAF expressions, priority, time schedules and per-node request
   thresholds. Rules can block without adding an IP to the blacklist, require
   existing Basic credentials, or require OIDC sign-in for selected paths.
-- Rainbow DNS Manager (彩虹合DNS) integration for ACME DNS-01 challenges, with
+- Rainbow DNS Manager (彩虹DNS) integration for ACME DNS-01 challenges, with
   automatic TXT record creation and cleanup.
 - Agent connection diagnostics for TLS/plaintext mismatches, untrusted CAs,
   certificate name mismatches and unreachable control planes.

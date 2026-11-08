@@ -86,7 +86,7 @@
 
 ### 🔐 TLS 与证书
 - **ACME / Let's Encrypt 自动签发与续期**，直接在边缘完成（HTTP-01 与 DNS-01）。
-- **多 DNS 提供商**支持 DNS-01（阿里云、Cloudflare、腾讯云 DNSPod、华为云、彩虹合DNS、手动）。
+- **多 DNS 提供商**支持 DNS-01（阿里云、Cloudflare、腾讯云 DNSPod、华为云、彩虹DNS、手动）。
 - **每站点证书状态**（`valid` / `即将过期` / `expired`）通过心跳上报控制面，并提供可检索的 ACME 事件日志。
 - **HSTS 与强制 HTTPS** 在边缘生效，`max-age` 默认半年（15552000 秒）。
 - **双向 TLS（mTLS）**——控制面内生成或导入 CA、签发客户端证书，吊销即时在边缘生效；证书被吊销或签发给其他站点时一律拒绝。
