@@ -45,6 +45,7 @@ mod tests {
             role: crate::models::role::ADMIN.to_string(),
             disabled: false,
             must_change_password: false,
+            is_demo: false,
             token_version: Set(token_version).unwrap(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

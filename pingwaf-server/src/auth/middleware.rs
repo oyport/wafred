@@ -4,6 +4,7 @@
 use axum::extract::{FromRef, FromRequestParts, OriginalUri, Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
+use axum::http::Method;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -31,6 +32,7 @@ pub struct AuthUser {
     pub role: String,
     /// The console forces a password (and name) change before any mutation.
     pub must_change_password: bool,
+    pub is_demo: bool,
 }
 
 impl AuthUser {
@@ -44,11 +46,18 @@ impl AuthUser {
             email: email.into(),
             role: role.into(),
             must_change_password: false,
+            is_demo: false,
         }
     }
 
     pub fn is_admin(&self) -> bool {
-        self.role == role::ADMIN
+        self.role == role::ADMIN && !self.is_demo
+    }
+
+    /// The showcase account can inspect all sites on its dedicated instance
+    /// while retaining the auditor role for every mutation check.
+    pub fn can_view_all_sites(&self) -> bool {
+        self.is_admin() || self.is_demo
     }
 
     /// Fails with `403` unless the caller is an administrator.
@@ -271,6 +280,35 @@ pub async fn require_password_change(
     )
 }
 
+fn demo_method_allowed(method: &Method) -> bool {
+    method == &Method::GET || method == &Method::HEAD || method == &Method::OPTIONS
+}
+
+/// Covers every API route, including self-service credential endpoints and
+/// future routes that may forget to enforce the auditor role themselves.
+pub async fn enforce_demo_read_only(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if demo_method_allowed(request.method()) {
+        return next.run(request).await;
+    }
+
+    let (mut parts, body) = request.into_parts();
+    if let Ok(user) = AuthUser::from_request_parts(&mut parts, &state).await {
+        if user.is_demo {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "this account is read-only",
+            );
+        }
+        parts.extensions.insert(user);
+    }
+    next.run(Request::from_parts(parts, body)).await
+}
+
 /// Pulls the raw bearer token out of the request headers.
 pub fn bearer_token(parts: &Parts) -> Result<String, AuthError> {
     let header = parts
@@ -327,12 +365,18 @@ pub async fn authenticate_user(
             account.role
         )));
     }
+    if account.is_demo && account.role != role::AUDITOR {
+        return Err(AuthError::Forbidden(
+            "this account has an invalid role".to_string(),
+        ));
+    }
 
     Ok(AuthUser {
         id,
         email: account.email,
         role: account.role,
         must_change_password: account.must_change_password,
+        is_demo: account.is_demo,
     })
 }
 
@@ -396,6 +440,63 @@ impl std::ops::Deref for AdminUser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn showcase_account_only_uses_safe_http_methods() {
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
+            assert!(demo_method_allowed(&method));
+        }
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            assert!(!demo_method_allowed(&method));
+        }
+    }
+
+    #[test]
+    fn showcase_account_sees_sites_without_becoming_an_administrator() {
+        let mut demo = AuthUser::new(Uuid::new_v4(), "demo@example.com", role::AUDITOR);
+        demo.is_demo = true;
+        assert!(demo.can_view_all_sites());
+        assert!(!demo.is_admin());
+        assert!(demo.require_admin().is_err());
+    }
+
+    #[tokio::test]
+    async fn showcase_middleware_blocks_self_service_writes() {
+        use axum::routing::{get, put};
+        use tower::ServiceExt;
+
+        let state = AppState::new(
+            sea_orm::DatabaseConnection::Disconnected,
+            crate::config::ServerConfig::default(),
+            crate::grpc::AgentRegistry::new(),
+        );
+        let app = axum::Router::new()
+            .route("/auth/password", put(|| async { StatusCode::NO_CONTENT }))
+            .route("/sites", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                enforce_demo_read_only,
+            ))
+            .with_state(state);
+        let mut demo = AuthUser::new(Uuid::new_v4(), "demo@example.com", role::AUDITOR);
+        demo.is_demo = true;
+
+        let write = Request::builder()
+            .method(Method::PUT)
+            .uri("/auth/password")
+            .extension(demo.clone())
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(app.clone().oneshot(write).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        let read = Request::builder()
+            .method(Method::GET)
+            .uri("/sites")
+            .extension(demo)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(read).await.unwrap().status(), StatusCode::OK);
+    }
 
     #[test]
     fn admin_check_rejects_viewers() {

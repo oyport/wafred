@@ -394,6 +394,11 @@ pub async fn authenticate_api_key(
                 "API key owner is disabled".to_string(),
             ));
         }
+        if owner.is_demo {
+            return Err(ApiError::Unauthorized(
+                "API key owner is unavailable".to_string(),
+            ));
+        }
         if !role::is_valid(&owner.role) {
             return Err(ApiError::Unauthorized(
                 "API key owner has an unknown role".to_string(),

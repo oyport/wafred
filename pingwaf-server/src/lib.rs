@@ -20,6 +20,7 @@ pub mod config_catalog;
 pub mod config_history;
 pub mod config_restore;
 pub mod defaults;
+mod demo;
 pub mod es;
 pub mod frontend;
 pub mod grpc;
@@ -142,6 +143,7 @@ pub async fn start_server(mut config: ServerConfig) -> anyhow::Result<()> {
 
     // ── 4. Seed default admin ────────────────────────────────────────────────
     seed_admin(&db, &config).await?;
+    demo::sync_account(&db).await?;
     // Best-effort like every seed: boot must not fail over the default group.
     if let Err(err) = defaults::seed_ip_group_defaults(&db).await {
         tracing::warn!(
@@ -580,6 +582,7 @@ async fn seed_admin(
         // The default password ships in the repository: force a change on
         // first login.
         must_change_password: sea_orm::Set(true),
+        is_demo: sea_orm::Set(false),
         token_version: sea_orm::Set(0),
         created_at: sea_orm::Set(now),
         updated_at: sea_orm::Set(now),
@@ -621,6 +624,7 @@ pub async fn bootstrap_and_seed_api_key(
         .map_err(|err| anyhow::anyhow!("bootstrap: migration failed: {err}"))?;
 
     seed_admin(&db, config).await?;
+    demo::sync_account(&db).await?;
     seed_bootstrap_api_key(&db).await
 }
 

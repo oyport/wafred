@@ -185,7 +185,7 @@ async fn list(
     let pagination = query.pagination.normalise();
 
     let mut condition = sea_orm::Condition::all();
-    if !current.is_admin() {
+    if !current.can_view_all_sites() {
         let user_site_ids = site::Entity::find()
             .filter(site::Column::UserId.eq(current.id))
             .select_only()

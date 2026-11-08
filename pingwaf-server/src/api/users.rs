@@ -185,6 +185,11 @@ async fn update(
         .one(&state.db)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("user {id} not found")))?;
+    if account.is_demo {
+        return Err(ApiError::Forbidden(
+            "this account is managed by the deployment".to_string(),
+        ));
+    }
 
     // Self-service profile changes go through `/auth/me`; role and status
     // changes on the caller's own account could lock the operator out.

@@ -100,6 +100,7 @@ mod m20240101_000092_rate_limit_exception;
 mod m20240101_000093_agent_display_name;
 pub mod m20240101_000094_site_path_restrictions;
 pub mod m20240101_000095_site_oidc_auth_scope;
+mod m20240101_000096_demo_account;
 
 use sea_orm_migration::prelude::*;
 
@@ -215,6 +216,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20240101_000093_agent_display_name::Migration),
             Box::new(m20240101_000094_site_path_restrictions::Migration),
             Box::new(m20240101_000095_site_oidc_auth_scope::Migration),
+            Box::new(m20240101_000096_demo_account::Migration),
         ]
     }
 }
@@ -226,7 +228,7 @@ mod tests {
     #[test]
     fn migrations_are_ordered_and_unique() {
         let migrations = Migrator::migrations();
-        assert_eq!(migrations.len(), 95);
+        assert_eq!(migrations.len(), 96);
         let names: Vec<String> =
             migrations.iter().map(|m| m.name().to_owned()).collect();
         let mut sorted = names.clone();

@@ -283,9 +283,9 @@ pub fn require_write(user: &AuthUser) -> Result<(), ApiError> {
 
 /// Loads a site and asserts that `user` may see (and optionally mutate) it.
 ///
-/// Administrators see every site; other roles only see sites they own. A site
-/// owned by somebody else is reported as `404` rather than `403` so that the API
-/// does not leak which domains exist.
+/// Administrators and the dedicated showcase account can inspect every site;
+/// other roles only see sites they own. A site owned by somebody else is
+/// reported as `404` rather than `403` so the API does not leak domains.
 pub async fn load_site(
     db: &DatabaseConnection,
     site_id: Uuid,
@@ -299,15 +299,15 @@ pub async fn load_site(
             ApiError::NotFound(format!("site {site_id} not found"))
         })?;
 
-    if !user.is_admin() {
+    if !user.can_view_all_sites() {
         if model.user_id != user.id {
             return Err(ApiError::NotFound(format!(
                 "site {site_id} not found"
             )));
         }
-        if write {
-            require_write(user)?;
-        }
+    }
+    if write {
+        require_write(user)?;
     }
     Ok(model)
 }
@@ -353,15 +353,15 @@ pub fn host_without_port(host: &str) -> &str {
 
 /// Restricts a site id filter to what `user` is allowed to query.
 ///
-/// Returns `None` when the caller asked for "all sites" *and* is an admin; in
-/// every other case handlers must filter by the returned id.
+/// Returns `None` when the caller may inspect all sites; in every other case
+/// handlers must filter by the returned id.
 pub fn scope_site(
     requested: Option<Uuid>,
     user: &AuthUser,
 ) -> Result<Option<Uuid>, ApiError> {
     match requested {
         Some(id) => Ok(Some(id)),
-        None if user.is_admin() => Ok(None),
+        None if user.can_view_all_sites() => Ok(None),
         None => Err(ApiError::BadRequest(
             "site_id is required for non-admin accounts".to_string(),
         )),

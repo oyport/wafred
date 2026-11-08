@@ -182,6 +182,10 @@ pub fn build_router(state: AppState) -> Router {
             api_state.clone(),
             crate::auth::middleware::require_password_change,
         ))
+        .layer(middleware::from_fn_with_state(
+            api_state.clone(),
+            crate::auth::middleware::enforce_demo_read_only,
+        ))
         // The limiter covers the whole API surface but only ever matches the
         // credential endpoints (see `bucket_for`), which is also what keeps
         // passkey logins — registered by a different module — covered.

@@ -142,7 +142,7 @@ async fn geo_global_stats(
            AND country_code IS NOT NULL AND country_code <> ''",
     );
     let mut values: Vec<sea_orm::Value> = vec![since.into()];
-    if !current.is_admin() {
+    if !current.can_view_all_sites() {
         let owned: Vec<site::Model> = site::Entity::find()
             .filter(site::Column::UserId.eq(current.id))
             .all(&state.db)

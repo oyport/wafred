@@ -156,6 +156,11 @@ fn key_principal(
 
 /// Builds the principal for a JWT caller from the freshly loaded account.
 fn jwt_principal(user: &AuthUser) -> Result<McpPrincipal, McpAuthError> {
+    if user.is_demo {
+        return Err(McpAuthError::forbidden(
+            "this account cannot use MCP",
+        ));
+    }
     if user.must_change_password {
         return Err(McpAuthError::forbidden(
             "replace the initial password before using MCP",
@@ -246,6 +251,7 @@ mod tests {
             role: role.to_string(),
             disabled: false,
             must_change_password: false,
+            is_demo: false,
             token_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -301,6 +307,14 @@ mod tests {
         let viewer = jwt_principal(&viewer).unwrap();
         assert!(viewer.can_read);
         assert!(!viewer.can_write);
+    }
+
+    #[test]
+    fn showcase_account_cannot_use_mcp() {
+        let mut demo =
+            AuthUser::new(Uuid::new_v4(), "demo@example.com", role::AUDITOR);
+        demo.is_demo = true;
+        assert_eq!(jwt_principal(&demo).unwrap_err().status, StatusCode::FORBIDDEN);
     }
 
     /// D06: the storage error used to be the 401 body, table names included.

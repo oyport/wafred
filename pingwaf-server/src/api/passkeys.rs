@@ -1193,6 +1193,7 @@ mod tests {
             role: role_name.into(),
             disabled,
             must_change_password: false,
+            is_demo: false,
             token_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),

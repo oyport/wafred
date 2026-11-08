@@ -350,7 +350,7 @@ async fn list_by_query(
         load_site_read(&state.db, id, &current).await?;
         condition = condition.add(cache_rules::Column::SiteId.eq(id));
     }
-    if !current.is_admin() && requested.is_none() {
+    if !current.can_view_all_sites() && requested.is_none() {
         // `scope_site` already rejected this, but a non-admin listing every
         // rule must never fall through to the unfiltered query.
         return Err(ApiError::BadRequest(
@@ -847,7 +847,7 @@ async fn status_all(
     current: AuthUser,
 ) -> Result<Json<Vec<CacheStatusView>>, ApiError> {
     let mut condition = Condition::all();
-    if !current.is_admin() {
+    if !current.can_view_all_sites() {
         condition = condition.add(site::Column::UserId.eq(current.id));
     }
     let sites = site::Entity::find()
