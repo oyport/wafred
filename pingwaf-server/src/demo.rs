@@ -19,6 +19,8 @@ use crate::models::{
 const ENABLED_ENV: &str = "WAFRED_DEMO_ENABLED";
 const EMAIL_ENV: &str = "WAFRED_DEMO_EMAIL";
 const PASSWORD_ENV: &str = "WAFRED_DEMO_PASSWORD";
+const DEFAULT_DEMO_EMAIL: &str = "demo@waf.red";
+const DEFAULT_DEMO_PASSWORD: &str = "demo@waf.red";
 const SAMPLE_DOMAIN: &str = "demo.example.com";
 const SAMPLE_AGENT: &str = "Mozilla/5.0 (WAFred Showcase Sample)";
 
@@ -30,6 +32,14 @@ struct Credentials {
 pub fn enabled() -> bool {
     parse_enabled(&std::env::var(ENABLED_ENV).unwrap_or_default())
         .unwrap_or(false)
+}
+
+/// Credentials shown on the unauthenticated login page when demo mode is on.
+/// Environment overrides are reflected exactly; defaults are for the public
+/// WAFred showcase deployment.
+pub fn login_hint() -> Option<(String, String)> {
+    let credentials = credentials_from_env().ok().flatten()?;
+    Some((credentials.email, credentials.password))
 }
 
 fn parse_enabled(value: &str) -> Result<bool> {
@@ -58,12 +68,10 @@ fn credentials_from_env() -> Result<Option<Credentials>> {
         return Ok(None);
     }
 
-    let email = std::env::var(EMAIL_ENV).with_context(|| {
-        format!("{EMAIL_ENV} is required when {ENABLED_ENV} is set")
-    })?;
-    let password = std::env::var(PASSWORD_ENV).with_context(|| {
-        format!("{PASSWORD_ENV} is required when {ENABLED_ENV} is set")
-    })?;
+    let email = std::env::var(EMAIL_ENV)
+        .unwrap_or_else(|_| DEFAULT_DEMO_EMAIL.to_string());
+    let password = std::env::var(PASSWORD_ENV)
+        .unwrap_or_else(|_| DEFAULT_DEMO_PASSWORD.to_string());
     Ok(Some(validate_credentials(&email, password)?))
 }
 

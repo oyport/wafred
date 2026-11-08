@@ -149,9 +149,7 @@ fn key_principal(
         key_id: Some(key.id),
         // A writer can always read; `write` keys are the broader grant.
         can_read: true,
-        can_write: has_write
-            && owner.role == role::ADMIN
-            && !owner.is_demo,
+        can_write: has_write && owner.role == role::ADMIN && !owner.is_demo,
         is_admin: owner.role == role::ADMIN,
     })
 }

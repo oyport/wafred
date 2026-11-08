@@ -580,9 +580,8 @@ async fn send_message(
                 .to_string(),
         ));
     }
-    let can_write = settings.allow_write_tools
-        && current.is_admin()
-        && !current.is_demo;
+    let can_write =
+        settings.allow_write_tools && current.is_admin() && !current.is_demo;
     // The stored key may be sealed; the provider needs plain text.
     let mut provider_settings = settings.clone();
     provider_settings.api_key =

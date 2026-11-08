@@ -73,6 +73,11 @@ export interface AuthStatus {
   registration_open: boolean
   /** Whether the login form should offer a passkey. */
   passkey_enabled: boolean
+  /** Present only when the private demo deployment is enabled. */
+  demo_credentials?: {
+    email: string
+    password: string
+  }
 }
 
 /** `api::passkeys::PasskeySummary` */

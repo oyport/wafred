@@ -63,6 +63,7 @@ export function LoginPage() {
     retry: false,
   })
 
+  const demoCredentials = status?.demo_credentials
   const needsSetup = status?.needs_setup ?? false
   const registrationOpen = status?.registration_open ?? false
   // With no accounts yet the only possible flow is registration, so pin the
@@ -209,6 +210,36 @@ export function LoginPage() {
               <WarningCircle weight="fill" className="mt-0.5 h-4 w-4 shrink-0 text-brand" />
               <span>{t('auth.setupNotice')}</span>
             </div>
+          )}
+
+          {!needsSetup && mode === 'login' && demoCredentials && (
+            <button
+              type="button"
+              onClick={() => {
+                setEmail(demoCredentials.email)
+                setPassword(demoCredentials.password)
+                setFormError(null)
+              }}
+              className="mt-5 w-full rounded-lg border border-brand/30 bg-brand-soft px-4 py-3 text-left transition-colors hover:border-brand/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand"
+            >
+              <span className="flex items-start gap-2.5">
+                <WarningCircle weight="fill" className="mt-0.5 h-4 w-4 shrink-0 text-brand" />
+                <span className="min-w-0 flex-1">
+                  <span className="block text-sm font-semibold text-fg-strong">
+                    {t('auth.demoLoginLabel')}
+                  </span>
+                  <span className="mt-1 block text-xs leading-relaxed text-fg-subtle">
+                    {t('auth.demoLoginHint')}
+                  </span>
+                  <span className="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
+                    <span className="text-fg-subtle">{t('auth.email')}</span>
+                    <span className="truncate font-mono text-fg">{demoCredentials.email}</span>
+                    <span className="text-fg-subtle">{t('auth.password')}</span>
+                    <span className="break-all font-mono text-fg">{demoCredentials.password}</span>
+                  </span>
+                </span>
+              </span>
+            </button>
           )}
 
           <form onSubmit={onSubmit} className="mt-8 flex flex-col gap-4" noValidate>

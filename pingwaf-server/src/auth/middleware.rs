@@ -460,10 +460,7 @@ mod tests {
         {
             assert!(!demo_request_allowed(&method, "/api/v1/settings/defense"));
         }
-        assert!(demo_request_allowed(
-            &Method::POST,
-            "/api/v1/auth/refresh"
-        ));
+        assert!(demo_request_allowed(&Method::POST, "/api/v1/auth/refresh"));
         assert!(!demo_request_allowed(&Method::POST, "/api/v1/sites"));
     }
 

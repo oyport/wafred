@@ -308,6 +308,8 @@
     "registerTitle": "创建账户",
     "setupSubtitle": "这是第一个账户，将拥有管理员权限。",
     "setupNotice": "尚无用户，创建管理员账户以开始使用。",
+    "demoLoginLabel": "演示账号，一键填入",
+    "demoLoginHint": "点击后自动填入演示账号和密码。演示账号无法保存修改。",
     "email": "邮箱",
     "password": "密码",
     "displayName": "显示名称",

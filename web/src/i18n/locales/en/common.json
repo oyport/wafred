@@ -308,6 +308,8 @@
     "registerTitle": "Create your account",
     "setupSubtitle": "This is the first account — it will have administrator privileges.",
     "setupNotice": "No users exist yet. Create the admin account to get started.",
+    "demoLoginLabel": "Demo account · Fill in",
+    "demoLoginHint": "Click to fill in the demo email and password. Demo accounts cannot save changes.",
     "email": "Email",
     "password": "Password",
     "displayName": "Display name",

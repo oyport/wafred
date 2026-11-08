@@ -187,6 +187,16 @@ pub struct AuthStatus {
     pub registration_open: bool,
     /// Whether the login form should offer a passkey.
     pub passkey_enabled: bool,
+    /// Public demo credentials, returned only by deployments with demo mode
+    /// enabled so the showcase login can fill them in with one click.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub demo_credentials: Option<DemoLoginCredentials>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DemoLoginCredentials {
+    pub email: String,
+    pub password: String,
 }
 
 /// Routes contributed to `/api/v1`.
@@ -217,6 +227,8 @@ async fn status(
             state.config.passkey_enabled,
         )
         .await?,
+        demo_credentials: crate::demo::login_hint()
+            .map(|(email, password)| DemoLoginCredentials { email, password }),
     }))
 }
 
