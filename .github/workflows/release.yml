@@ -106,7 +106,7 @@ jobs:
           cat /tmp/body.md
 
       - name: Create the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           body_path: /tmp/body.md
@@ -268,7 +268,7 @@ jobs:
       # used to carry `generate_release_notes: true` — two writers for one
       # body, which is how v0.29.3 got the same line twice and no notes.
       - name: Upload release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           files: |
