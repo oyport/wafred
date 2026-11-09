@@ -454,7 +454,7 @@ sha1 = "0.11.0"
 sha2 = { version = "0.11.0", default-features = false }
 strum = { version = "0.28.0", features = ["derive"] }
 substring = "1.4.5"
-sysinfo = { version = "0.39.6", features = [
+sysinfo = { version = "0.40.1", features = [
     "system",
     "disk",
 ], default-features = false }
