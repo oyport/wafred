@@ -37,6 +37,7 @@ RUN npm run build
 
 # ─── Stage 2: Rust Builder (release-perf profile) ────────────────────────────
 FROM mirror.gcr.io/library/rust:1.99.1-bookworm AS builder
+ARG TARGETARCH
 
 # SYNC: keep this list in lockstep with Dockerfile / ci.yml / release.yml
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -52,6 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock build.rs ./
+COPY .cargo/ .cargo/
 COPY pingwaf-proto/proto/ pingwaf-proto/proto/
 COPY vendor/ vendor/
 
@@ -105,7 +107,11 @@ RUN mkdir -p src && echo "fn main() {}" > src/main.rs \
 
 # Dependency warm-up under the same profile, so the release-perf artifacts
 # (target/release-perf/) are what the cached layers carry.
-RUN cargo build --locked --profile release-perf --features full || true; \
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      export CFLAGS="-march=x86-64 -mtune=generic -mno-avx -mno-avx2"; \
+      export CXXFLAGS="-march=x86-64 -mtune=generic -mno-avx -mno-avx2"; \
+    fi; \
+    cargo build --locked --profile release-perf --features full || true; \
     ls target/release-perf/deps/*.rlib >/dev/null 2>&1 \
       || { echo "ERROR: dependency warm-up produced no rlib — check build log above" >&2; exit 1; }
 
@@ -144,7 +150,11 @@ COPY pingwaf-challenge/ pingwaf-challenge/
 
 COPY --from=frontend-builder /app/web/dist/ web/dist/
 
-RUN find . -path ./target -prune -o -path ./vendor -prune -o -name '*.rs' -print0 | xargs -0 --no-run-if-empty touch \
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      export CFLAGS="-march=x86-64 -mtune=generic -mno-avx -mno-avx2"; \
+      export CXXFLAGS="-march=x86-64 -mtune=generic -mno-avx -mno-avx2"; \
+    fi; \
+    find . -path ./target -prune -o -path ./vendor -prune -o -name '*.rs' -print0 | xargs -0 --no-run-if-empty touch \
     && cargo build --locked --profile release-perf --bin wafred --features full
 
 # ─── Stage 3: Runtime ────────────────────────────────────────────────────────

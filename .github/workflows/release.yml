@@ -224,6 +224,10 @@ jobs:
       # (the cargo build) removes that failure mode.
       - name: Build and package WAFred
         shell: bash
+        env:
+          RUSTFLAGS: ${{ matrix.arch == 'amd64' && '-C target-cpu=x86-64' || '' }}
+          CFLAGS: ${{ matrix.arch == 'amd64' && '-march=x86-64 -mtune=generic -mno-avx -mno-avx2' || '' }}
+          CXXFLAGS: ${{ matrix.arch == 'amd64' && '-march=x86-64 -mtune=generic -mno-avx -mno-avx2' || '' }}
         run: |
           set -euo pipefail
           cargo build --locked --release --bin wafred ${{ matrix.features }} --target ${{ matrix.target }}

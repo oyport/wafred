@@ -51,6 +51,7 @@ RUN npm run build
 # ─── Stage 2: Rust Builder ───────────────────────────────────────────────────
 # 改进：版本从 1.98.0 升至 1.98.1，与 release.yml 的 dtolnay/rust-toolchain@1.98.1 对齐
 FROM mirror.gcr.io/library/rust:1.99.1-bookworm AS builder
+ARG TARGETARCH
 
 # SYNC: keep this list in lockstep with ci.yml / release.yml
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -70,6 +71,7 @@ WORKDIR /app
 #     - pingwaf-proto/proto/（pingwaf-proto/build.rs 需要 control_plane.proto 生成 gRPC stub）
 #     - 根 Cargo.toml/lock + 全部 25 个成员的 Cargo.toml
 COPY Cargo.toml Cargo.lock build.rs ./
+COPY .cargo/ .cargo/
 COPY pingwaf-proto/proto/ pingwaf-proto/proto/
 COPY vendor/ vendor/
 
@@ -127,7 +129,11 @@ RUN mkdir -p src && echo "fn main() {}" > src/main.rs \
 # 2d. 依赖预热构建（修复：build.rs 与 proto/ 已前置 COPY，预热现在真正生效）
 #     编译产物留在镜像层中，供 CI type=gha/type=registry 缓存后端正确导出和恢复
 #     保留 `|| true` 因 dummy 源可能触发个别 crate 的编译错误
-RUN cargo build --locked --release --features full || true; \
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      export CFLAGS="-march=x86-64 -mtune=generic -mno-avx -mno-avx2"; \
+      export CXXFLAGS="-march=x86-64 -mtune=generic -mno-avx -mno-avx2"; \
+    fi; \
+    cargo build --locked --release --features full || true; \
     ls target/release/deps/*.rlib >/dev/null 2>&1 \
       || { echo "ERROR: dependency warm-up produced no rlib — check build log above" >&2; exit 1; }
 
@@ -171,7 +177,11 @@ COPY --from=frontend-builder /app/web/dist/ web/dist/
 # 2g. 最终构建：touch 使 workspace crate 的 mtime 指纹失效（排除 target/ 避免污染生成代码），
 #     触发 25 个 workspace crate 重编，而第三方 .rlib 从预热层继承、不受影响
 #     （Docker 层叠加：target/ 存在于 2d 预热层的文件系统中，后续 COPY 源码层不会覆盖它）
-RUN find . -path ./target -prune -o -path ./vendor -prune -o -name '*.rs' -print0 | xargs -0 --no-run-if-empty touch \
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      export CFLAGS="-march=x86-64 -mtune=generic -mno-avx -mno-avx2"; \
+      export CXXFLAGS="-march=x86-64 -mtune=generic -mno-avx -mno-avx2"; \
+    fi; \
+    find . -path ./target -prune -o -path ./vendor -prune -o -name '*.rs' -print0 | xargs -0 --no-run-if-empty touch \
     && cargo build --locked --release --bin wafred --features full
 
 # ─── Stage 3: Runtime（行为契约保持不变）─────────────────────────────────────

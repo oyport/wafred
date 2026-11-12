@@ -94,7 +94,6 @@ id_rsa*
 wafred
 pingap
 
-# ─── Rust 工具链配置（Docker 内不需要）─────────────────────────────────────
-.cargo/
+# ─── Rust 格式化配置（Docker 构建不需要）───────────────────────────────────
 .rustfmt.toml
 LICENSE
