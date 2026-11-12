@@ -381,6 +381,10 @@ jobs:
           path: web/dist
 
       - name: Build (release, wafred, full)
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64
+          CFLAGS: -march=x86-64 -mtune=generic -mno-avx -mno-avx2
+          CXXFLAGS: -march=x86-64 -mtune=generic -mno-avx -mno-avx2
         run: cargo build --locked --release --bin wafred --features full
 
       - name: Upload release binary for :main image

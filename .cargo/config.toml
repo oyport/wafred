@@ -21,3 +21,14 @@
 # more often than it is stepped through.
 [build]
 incremental = false
+
+# Release binaries run on x86-64 CPUs without AVX (including common low-power
+# Intel parts). Pin both Rust and C/C++ code to the x86-64 baseline: the
+# mimalloc allocator is compiled from C, and compiler defaults can otherwise
+# emit VEX/AVX instructions even though the Rust target itself is portable.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64"]
+
+[env]
+CFLAGS_x86_64_unknown_linux_gnu = { value = "-march=x86-64 -mtune=generic -mno-avx -mno-avx2", force = false }
+CXXFLAGS_x86_64_unknown_linux_gnu = { value = "-march=x86-64 -mtune=generic -mno-avx -mno-avx2", force = false }
