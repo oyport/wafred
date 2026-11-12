@@ -5,6 +5,12 @@ Apache-2.0-licensed [PingWAF](https://github.com/shuaiZend/PingWAF) codebase.
 The original PingWAF release history is retained below for provenance; the
 older `pingap` history is retained as the proxy layer's inherited history.
 
+## [WAFred 1.0.1] - 2026-11-12
+
+### Fixed
+
+- Build x86-64 Linux binaries and Docker images for CPUs without AVX/AVX2.
+
 ## [WAFred 1.0.0] - 2026-11-08
 
 The first independently maintained WAFred release. Functional changes from

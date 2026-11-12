@@ -292,7 +292,7 @@ members = [
     "pingwaf-agent",
 ]
 [workspace.package]
-version = "1.0.0"
+version = "1.0.1"
 
 [workspace.dependencies]
 aes-gcm-siv = { version = "0.12.1", default-features = false, features = [
