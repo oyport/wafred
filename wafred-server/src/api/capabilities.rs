@@ -114,12 +114,9 @@ pub fn parse_semver(raw: &str) -> Option<(u64, u64, u64)> {
 pub fn version_supports(reported: &str, min: &str) -> bool {
     // Earlier WAFred 1.0.0 and 1.0.1 agents do not understand the path fields,
     // even though they compare greater than inherited upstream versions.
-    // Updated agents advertise the capability in their build metadata.
+    // WAFred 1.0.2 and later include the updated implementation.
     if matches!(min, MIN_AGENT_PATH_SCOPES | MIN_AGENT_CANONICAL_SCOPES)
         && matches!(parse_semver(reported), Some((1, 0, 0) | (1, 0, 1)))
-        && !reported.split_once('+').is_some_and(|(_, metadata)| {
-            metadata.split('.').any(|part| part == "wafredpath1")
-        })
     {
         return false;
     }
@@ -356,12 +353,8 @@ mod tests {
         assert!(!version_supports("1.0.1", MIN_AGENT_PATH_SCOPES));
         assert!(version_supports("1.0.2", MIN_AGENT_PATH_SCOPES));
         assert!(!version_supports("1.0.0", MIN_AGENT_CANONICAL_SCOPES));
-        assert!(version_supports("1.0.0+wafredpath1", MIN_AGENT_PATH_SCOPES));
-        assert!(version_supports(
-            "1.0.0+wafredpath1",
-            MIN_AGENT_CANONICAL_SCOPES
-        ));
-        assert!(version_supports("1.0.1", MIN_AGENT_PATH_SCOPES));
+        assert!(!version_supports("1.0.1", MIN_AGENT_CANONICAL_SCOPES));
+        assert!(version_supports("1.0.2", MIN_AGENT_CANONICAL_SCOPES));
     }
 
     #[test]

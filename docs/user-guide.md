@@ -372,9 +372,8 @@ by the edge agent, so the control plane refuses — with a `400` naming the
 offending agent and version — when the agents serving the site cannot execute
 what you are saving. This applies to **all five panels** that can carry a
 scope: path exceptions, IP rules, geo restrictions, basic auth and the OIDC
-configuration. The original WAFred 1.0.0 agent predates these updates; an
-updated 1.0.0 agent reports `1.0.0+wafredpath1`. Update and reconnect agents
-that still report plain `1.0.0` before saving these scoped settings. The
+configuration. WAFred 1.0.0 and 1.0.1 agents predate these updates; upgrade
+and reconnect them to version 1.0.2 or later before saving scoped settings. The
 version numbers below describe the upstream capability history. An older agent
 that reconnects after scoped settings exist generates a warning; update it
 before letting it serve traffic.

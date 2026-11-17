@@ -293,10 +293,7 @@ impl ControlPlaneClient {
             api_key: self.config.api_key.clone(),
             hostname,
             ip_address: get_local_ip(),
-            // WAFred 1.0.0 and 1.0.1 predate path-scope support. Build metadata
-            // lets the control plane distinguish updated agents without
-            // changing the product's published version number.
-            version: format!("{}+wafredpath1", env!("CARGO_PKG_VERSION")),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             os_info,
             cpu_cores,
             memory_bytes,

@@ -2403,9 +2403,8 @@ owned by the user its API key belongs to. A site with **no serving agent is
 not gated** (there is nothing to push to), and an agent whose reported version
 cannot be parsed counts as *not* supporting the capability (fail-closed).
 
-The WAFred 1.0.0 release predates these path-scope updates. Updated WAFred
-1.0.0 agents report `1.0.0+wafredpath1`; a plain `1.0.0` agent is treated as
-unsupported for these scoped changes until it is updated and reconnects.
+WAFred 1.0.0 and 1.0.1 agents predate these path-scope updates. Upgrade them
+to WAFred 1.0.2 or later and reconnect them before using scoped changes.
 The version numbers in the table record when the capabilities appeared in the
 upstream project. If an older agent reconnects after scoped settings already
 exist, the control plane logs a warning; update that agent before it serves
