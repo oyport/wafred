@@ -14,11 +14,11 @@ assert_contains() {
 }
 
 host_plan="$(bash "$ROOT/deploy/compose/install.sh" --mirror https://mirror.example.com/ --dry-run)"
-assert_contains "$host_plan" 'https://mirror.example.com/raw.githubusercontent.com/oyport/wafred/main/docker-compose.yml'
+assert_contains "$host_plan" 'https://mirror.example.com/raw.githubusercontent.com/oyport/wafred/<latest-release-tag>/docker-compose.yml'
 assert_contains "$host_plan" 'mirror.example.com/ghcr.io/oyport/wafred:latest'
 
 full_plan="$(bash "$ROOT/deploy/compose/install.sh" --mirror https://gh-proxy.org --mirror-mode full-url --image-mirror https://gh-proxy.org/docker/ --dry-run)"
-assert_contains "$full_plan" 'https://gh-proxy.org/https://raw.githubusercontent.com/oyport/wafred/main/docker-compose.yml'
+assert_contains "$full_plan" 'https://gh-proxy.org/https://raw.githubusercontent.com/oyport/wafred/<latest-release-tag>/docker-compose.yml'
 assert_contains "$full_plan" 'gh-proxy.org/docker/ghcr.io/oyport/wafred:latest'
 
 binary_plan="$(bash "$ROOT/install.sh" --mode agent --mirror https://gh-proxy.org --mirror-mode full-url --dry-run)"
@@ -104,7 +104,8 @@ unset MOCK_COMPOSE_MISSING
 bash "$ROOT/deploy/compose/install.sh" --dir "$TMP/compose" --admin-password custom-secret \
     --mirror https://gh-proxy.org --mirror-mode full-url \
     --image-mirror https://gh-proxy.org/docker >/dev/null
-grep -Fq 'curl https://gh-proxy.org/https://raw.githubusercontent.com/oyport/wafred/main/docker-compose.yml' "$MOCK_LOG"
+grep -Fq 'curl https://gh-proxy.org/https://api.github.com/repos/oyport/wafred/releases/latest' "$MOCK_LOG"
+grep -Fq 'curl https://gh-proxy.org/https://raw.githubusercontent.com/oyport/wafred/v1.0.0/docker-compose.yml' "$MOCK_LOG"
 grep -Fq 'WAFRED_IMAGE=gh-proxy.org/docker/ghcr.io/oyport/wafred' "$TMP/compose/.env"
 grep -Fq 'WAFRED_ADMIN_PASSWORD=custom-secret' "$TMP/compose/.env"
 grep -Fq 'docker compose up -d' "$MOCK_LOG"
