@@ -227,7 +227,8 @@ async fn status(
             state.config.passkey_enabled,
         )
         .await?,
-        demo_credentials: crate::demo::login_hint()
+        demo_credentials: crate::demo::login_hint(&state.db)
+            .await?
             .map(|(email, password)| DemoLoginCredentials { email, password }),
     }))
 }
@@ -590,6 +591,8 @@ async fn change_password(
     validate_password(&payload.new_password)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
 
+    let finished_setup =
+        account.role == role::ADMIN && account.must_change_password;
     let mut active: user::ActiveModel = account.into();
     let new_hash = hash_password_offloaded(payload.new_password.clone())
         .await
@@ -603,6 +606,14 @@ async fn change_password(
     active.updated_at = Set(Utc::now());
     active.update(&state.db).await?;
 
+    let setup_result = if finished_setup && crate::demo::enabled() {
+        crate::demo::sync_account(&state.db).await
+    } else {
+        Ok(())
+    };
+    if let Err(err) = setup_result {
+        tracing::warn!(error = %err, "showcase account setup failed");
+    }
     tracing::info!(user_id = %current.id, "password changed");
     Ok(StatusCode::NO_CONTENT.into_response())
 }

@@ -34,12 +34,22 @@ pub fn enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Credentials shown on the unauthenticated login page when demo mode is on.
-/// Environment overrides are reflected exactly; defaults are for the public
-/// WAFred showcase deployment.
-pub fn login_hint() -> Option<(String, String)> {
-    let credentials = credentials_from_env().ok().flatten()?;
-    Some((credentials.email, credentials.password))
+/// Show credentials only after the account has actually been provisioned.
+pub async fn login_hint(
+    db: &DatabaseConnection,
+) -> std::result::Result<Option<(String, String)>, sea_orm::DbErr> {
+    let Some(credentials) = credentials_from_env().ok().flatten() else {
+        return Ok(None);
+    };
+    let active = user::Entity::find()
+        .filter(user::Column::IsDemo.eq(true))
+        .filter(user::Column::Disabled.eq(false))
+        .filter(user::Column::Role.eq(role::AUDITOR))
+        .filter(user::Column::Email.eq(&credentials.email))
+        .one(db)
+        .await?
+        .is_some();
+    Ok(active.then_some((credentials.email, credentials.password)))
 }
 
 fn parse_enabled(value: &str) -> Result<bool> {
@@ -78,7 +88,7 @@ fn credentials_from_env() -> Result<Option<Credentials>> {
 /// Reconciles one marked account on each start. Disabling revokes outstanding
 /// access and refresh tokens through the existing disabled/token-version checks.
 pub async fn sync_account(db: &DatabaseConnection) -> Result<()> {
-    let credentials = credentials_from_env()?;
+    let mut credentials = credentials_from_env()?;
     if credentials.is_some() {
         let unfinished_admin = user::Entity::find()
             .filter(user::Column::Role.eq(role::ADMIN))
@@ -87,7 +97,10 @@ pub async fn sync_account(db: &DatabaseConnection) -> Result<()> {
             .one(db)
             .await?;
         if unfinished_admin.is_some() {
-            bail!("complete the initial administrator password change before enabling the showcase account");
+            // The console must be reachable for the administrator to finish
+            // setup. Keep the showcase unavailable until that succeeds.
+            tracing::info!("showcase account pending administrator setup");
+            credentials = None;
         }
     }
     let existing = user::Entity::find()
@@ -325,20 +338,7 @@ pub async fn run_sample_refresh(db: DatabaseConnection) {
     interval.tick().await;
     loop {
         interval.tick().await;
-        let result = async {
-            let account = user::Entity::find()
-                .filter(user::Column::IsDemo.eq(true))
-                .filter(user::Column::Disabled.eq(false))
-                .one(&db)
-                .await?;
-            if let Some(account) = account {
-                let site_id = sync_site(&db, account.id).await?;
-                refresh_sample_data(&db, site_id).await?;
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-        .await;
-        if let Err(err) = result {
+        if let Err(err) = sync_account(&db).await {
             tracing::warn!(error = %err, "showcase sample refresh failed");
         }
     }
