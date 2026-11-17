@@ -42,7 +42,7 @@ fn cgroup_v1_limit() -> Option<u64> {
 }
 
 fn host_total() -> Option<u64> {
-    let mut sys = sysinfo::System::new();
+    let mut sys = sysinfo::System::new().ok()?;
     sys.refresh_memory();
     let total = sys.total_memory();
     (total > 0).then_some(total)
@@ -73,7 +73,7 @@ fn cgroup_v1() -> Option<u64> {
 }
 
 fn sysinfo_available() -> Option<u64> {
-    let mut sys = sysinfo::System::new();
+    let mut sys = sysinfo::System::new().ok()?;
     sys.refresh_memory();
     Some(sys.available_memory())
 }

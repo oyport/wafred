@@ -34,12 +34,6 @@ updates:
       # than only majors, since 0.x minors would slip past update-types.
       # Lift this once pingora ships a newer sentry.
       - dependency-name: "sentry-core"
-      # tokio 1.54.0 added `assert!(capacity > 0)` to BufReader/BufStream
-      # `with_capacity`, which panicked with pingora 0.9.0's hardcoded (0, 0)
-      # buffers (cloudflare/pingora#1059). Pingora 0.9.1 fixed that, so the
-      # workspace pin "=1.53.3" is now only a deliberate staged upgrade; a
-      # dependabot PR can be taken once the data plane has been tested with
-      # tokio >= 1.54 (then drop this note).
 
   - package-ecosystem: npm
     directory: /web

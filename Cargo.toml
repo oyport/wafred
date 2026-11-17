@@ -300,7 +300,7 @@ aes-gcm-siv = { version = "0.12.1", default-features = false, features = [
     "alloc",
 ] }
 ahash = "0.8.12"
-arc-swap = "1.9.2"
+arc-swap = "1.9.5"
 async-trait = "0.1.92"
 base64 = "0.23.1"
 bytes = "1.12.1"
@@ -325,7 +325,7 @@ derive_more = { version = "2.1.1", default-features = false, features = [
 diff = "0.1.13"
 dirs = "7.0.0"
 etcd-client = "0.21.0"
-fancy-regex = "0.19.1"
+fancy-regex = "0.20.0"
 flate2 = "1.1.10"
 futures = "0.3.34"
 futures-util = "0.3.34"
@@ -454,22 +454,18 @@ sha1 = "0.11.0"
 sha2 = { version = "0.11.0", default-features = false }
 strum = { version = "0.28.0", features = ["derive"] }
 substring = "1.4.5"
-sysinfo = { version = "0.39.6", features = [
+sysinfo = { version = "0.40.1", features = [
     "system",
     "disk",
 ], default-features = false }
 tempfile = "3.27.0"
 tera = { version = "2", default-features = false }
 time = { version = "0.3.55", features = ["local-offset"] }
-TinyUFO = "0.9.0"
-# Pingora 0.9.1 fixed cloudflare/pingora#1059: tokio 1.54's
-# `assert!(capacity > 0)` no longer trips the L4 read buffers. The pin stays
-# for this release only so the tokio upgrade can be tested on its own; it can
-# be raised to `>= 1.54` in a dedicated change (and the matching note in
-# .github/dependabot.yml removed then).
-tokio = { version = "=1.53.3", default-features = false, features = ["fs"] }
+TinyUFO = "0.9.1"
+# Pingora 0.9.1 supports the Tokio 1.54 buffer-capacity checks.
+tokio = { version = "=1.54.1", default-features = false, features = ["fs"] }
 toml = "1.1.6"
-hcl-rs = "0.19"
+hcl-rs = "0.20"
 kdl = "6.7.1"
 tonic = "0.14.6"
 tonic-health = "0.14.6"

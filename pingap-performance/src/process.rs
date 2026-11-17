@@ -192,9 +192,15 @@ fn collect_process_system_info() -> ProcessSystemInfo {
         memory = ByteSize(value.physical_mem as u64).to_string();
     }
     let kind = MemoryRefreshKind::nothing().with_ram();
-    let mut sys =
-        System::new_with_specifics(RefreshKind::nothing().with_memory(kind));
-    sys.refresh_memory();
+    let (total_memory, used_memory) = match System::new_with_specifics(
+        RefreshKind::nothing().with_memory(kind),
+    ) {
+        Ok(mut sys) => {
+            sys.refresh_memory();
+            (sys.total_memory(), sys.used_memory())
+        },
+        Err(_) => (0, 0),
+    };
 
     let constant = constant_system_info();
     ProcessSystemInfo {
@@ -204,8 +210,8 @@ fn collect_process_system_info() -> ProcessSystemInfo {
         cpus: constant.cpus,
         physical_cpus: constant.physical_cpus,
         kernel: constant.kernel.clone(),
-        total_memory: ByteSize(sys.total_memory()).to_string(),
-        used_memory: ByteSize(sys.used_memory()).to_string(),
+        total_memory: ByteSize(total_memory).to_string(),
+        used_memory: ByteSize(used_memory).to_string(),
         pid,
         threads,
         fd_count,

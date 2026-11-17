@@ -38,7 +38,7 @@ hmac = { workspace = true }
 # AES-256-GCM at-rest sealing of notification channel secrets.
 ring = { workspace = true }
 # Password-based configuration backup encryption and compression.
-argon2 = "0.5.3"
+argon2 = "0.6.0"
 zstd = { workspace = true }
 thiserror = "2.0.17"
 urlencoding = "2.1.3"

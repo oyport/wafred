@@ -32,8 +32,8 @@ pub struct Sample {
 /// CPU usage is a delta between two refreshes, so the call takes a short
 /// pause between them; the monitor invokes it through `spawn_blocking` so the
 /// pause never occupies a Tokio runtime worker.
-pub fn sample() -> Sample {
-    let mut system = System::new();
+pub fn sample() -> Result<Sample, sysinfo::Error> {
+    let mut system = System::new()?;
     system.refresh_cpu_usage();
     system.refresh_memory();
     std::thread::sleep(std::time::Duration::from_millis(250));
@@ -48,17 +48,17 @@ pub fn sample() -> Sample {
     };
     let disk_percent = root_disk_percent();
 
-    Sample {
+    Ok(Sample {
         cpu_percent,
         memory_percent,
         disk_percent,
-    }
+    })
 }
 
 /// Usage percentage of the filesystem mounted at `/`.
 fn root_disk_percent() -> Option<f32> {
-    let disks = sysinfo::Disks::new_with_refreshed_list();
-    for disk in disks.list() {
+    let disks = sysinfo::Disks::new_with_refreshed_list().ok()?;
+    for disk in &disks {
         let mounted = disk.mount_point();
         let is_root = mounted == std::path::Path::new("/")
             || mounted
@@ -161,7 +161,11 @@ pub fn start(_state: AppState) -> tokio::task::JoinHandle<()> {
             // Run it on the blocking pool so that pause never parks a Tokio
             // worker that the control-plane listener needs.
             let current = match tokio::task::spawn_blocking(sample).await {
-                Ok(sample) => sample,
+                Ok(Ok(sample)) => sample,
+                Ok(Err(err)) => {
+                    tracing::warn!(error = %err, "control plane self-monitor sample failed");
+                    continue;
+                },
                 Err(err) => {
                     tracing::warn!(error = %err, "control plane self-monitor sample failed");
                     continue;
