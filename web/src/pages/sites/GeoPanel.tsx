@@ -561,7 +561,7 @@ function CountryPicker({
                   type="button"
                   aria-label={`${t('common.delete')} ${code}`}
                   onClick={() => toggle(code)}
-                  className="text-brand/70 hover:text-brand"
+                  className="text-fg-brand-strong/70 hover:text-fg-brand-strong"
                 >
                   <Trash weight="bold" className="h-3 w-3" />
                 </button>

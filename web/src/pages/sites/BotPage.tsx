@@ -350,7 +350,7 @@ export function BotPage() {
                       key={bot}
                       type="button"
                       onClick={() => addWhitelistEntry(bot)}
-                      className="rounded-full border border-dashed border-line px-2.5 py-0.5 text-xs text-fg-subtle transition-colors hover:border-brand hover:text-brand"
+                      className="rounded-full border border-dashed border-line px-2.5 py-0.5 text-xs text-fg-subtle transition-colors hover:border-brand hover:text-fg-brand-strong"
                     >
                       + {bot}
                     </button>

@@ -203,7 +203,7 @@ export function TagInput({
                 key={s}
                 type="button"
                 onClick={() => commit(s)}
-                className="rounded-full border border-dashed border-line px-2 py-0.5 text-xs text-fg-subtle transition-colors hover:border-brand hover:text-brand"
+                className="rounded-full border border-dashed border-line px-2 py-0.5 text-xs text-fg-subtle transition-colors hover:border-brand hover:text-fg-brand-strong"
               >
                 + {s}
               </button>

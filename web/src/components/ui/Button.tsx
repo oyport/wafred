@@ -25,14 +25,14 @@ export type ButtonProps = ButtonBaseProps &
 
 const variantClasses: Record<ButtonVariant, string> = {
   primary:
-    'bg-brand text-[#1d1d1d] border border-transparent hover:bg-brand-hover active:brightness-95 shadow-sm disabled:bg-brand/50',
+    'bg-brand text-on-brand border border-transparent hover:bg-brand-hover active:brightness-95 shadow-sm disabled:bg-disabled disabled:text-fg-disabled',
   secondary:
-    'bg-elevated text-fg border border-line hover:bg-recessed active:bg-recessed shadow-sm',
+    'bg-elevated text-fg border border-line hover:bg-recessed active:bg-recessed shadow-sm disabled:bg-disabled disabled:text-fg-disabled',
   danger:
-    'bg-danger text-[#1d1d1d] border border-transparent hover:brightness-110 active:brightness-95 shadow-sm disabled:bg-danger/50',
+    'bg-danger text-on-danger border border-transparent hover:bg-danger-hover active:brightness-95 shadow-sm disabled:bg-disabled disabled:text-fg-disabled',
   ghost:
-    'bg-transparent text-fg-subtle border border-transparent hover:bg-recessed hover:text-fg',
-  link: 'bg-transparent text-link border border-transparent hover:underline px-0',
+    'bg-transparent text-fg-subtle border border-transparent hover:bg-recessed hover:text-fg disabled:text-fg-disabled',
+  link: 'bg-transparent text-link border border-transparent hover:underline px-0 disabled:text-fg-disabled',
 }
 
 const sizeClasses: Record<ButtonSize, string> = {
@@ -65,7 +65,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
         disabled={disabled || loading}
         className={cn(
           'inline-flex items-center whitespace-nowrap font-medium transition-[background-color,color,border-color,box-shadow,transform] duration-150 select-none',
-          'disabled:cursor-not-allowed disabled:opacity-60 active:translate-y-px',
+          'disabled:cursor-not-allowed disabled:opacity-100 disabled:shadow-none enabled:active:translate-y-px',
           variantClasses[variant],
           sizeClasses[size],
           size === 'icon' && 'shrink-0',
