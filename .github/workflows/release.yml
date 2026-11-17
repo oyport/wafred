@@ -103,7 +103,7 @@ jobs:
             echo "the CHANGELOG section for ${VERSION} is empty" >&2
             exit 1
           fi
-          PREVIOUS_TAG="$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)"
+          PREVIOUS_TAG="$(git describe --first-parent --tags --match 'v[0-9]*' --abbrev=0 HEAD^ 2>/dev/null || true)"
           {
             cat /tmp/notes.md
             if [ -n "$PREVIOUS_TAG" ]; then
