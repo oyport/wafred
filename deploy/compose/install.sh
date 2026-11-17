@@ -98,11 +98,11 @@ latest_release_tag() {
     if command -v curl >/dev/null 2>&1; then
         tag="$(curl -fsSL --proto '=https' "$url" 2>/dev/null \
             | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-            | head -n1)"
+            | head -n1 || true)"
     elif command -v wget >/dev/null 2>&1; then
         tag="$(wget -qO- "$url" 2>/dev/null \
             | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-            | head -n1)"
+            | head -n1 || true)"
     fi
     printf '%s' "${tag#v}"
 }

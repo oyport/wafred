@@ -55,6 +55,7 @@ printf 'curl %s\n' "$url" >> "$MOCK_LOG"
 if [[ -n "$output" && "$url" == *docker-compose.yml ]]; then
     cp "$FIXTURE_COMPOSE" "$output"
 elif [[ "$url" == *api.github.com* ]]; then
+    [[ "${MOCK_FAIL_RELEASE_API:-}" != 1 ]] || exit 22
     # A compact API response may have later string fields on the same line.
     printf '{"tag_name":"v1.0.0","name":"not-the-version"}\n'
 else
@@ -100,6 +101,12 @@ bash "$ROOT/deploy/compose/install.sh" --dir "$TMP/auto-compose" >/dev/null
 grep -Fq 'apt-get update' "$MOCK_LOG"
 grep -Fq 'apt-get install -y --no-install-recommends docker-compose-plugin' "$MOCK_LOG"
 unset MOCK_COMPOSE_MISSING
+
+if failure="$(MOCK_FAIL_RELEASE_API=1 bash "$ROOT/deploy/compose/install.sh" \
+    --mirror https://gh-proxy.org --mirror-mode full-url 2>&1)"; then
+    echo 'accepted an unavailable latest release API' >&2; exit 1
+fi
+assert_contains "$failure" 'cannot resolve the latest release tag'
 
 bash "$ROOT/deploy/compose/install.sh" --dir "$TMP/compose" --admin-password custom-secret \
     --mirror https://gh-proxy.org --mirror-mode full-url \
