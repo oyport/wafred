@@ -2397,11 +2397,6 @@ mod tests {
             .any(|addr| extract_port(addr).parse::<u16>() == Ok(port))
     }
 
-    /// `ipv6_only` must be explicit (`false`, i.e. dual-stack) for a v6
-    /// listener and absent otherwise.
-    fn expected_ipv6_only(addr: &str) -> Option<bool> {
-        all_addrs_ipv6(addr).then_some(false)
-    }
     use pingwaf_agent::cache::{
         CacheRule as AgentCacheRule, CachedRules, GlobalCacheSettings,
         OidcAccessRule, OidcHeaderClaim, ProxyTrustConfig, ResponseReplaceRule,
