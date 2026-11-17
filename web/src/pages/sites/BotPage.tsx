@@ -15,7 +15,7 @@ import {
 } from '@phosphor-icons/react'
 import { PageHeader } from '@/components/PageHeader'
 import { Card, CardBody, CardHeader } from '@/components/ui/Card'
-import { useUnsavedGuard } from '@/hooks/useUnsavedGuard'
+import { useRegisterUnsaved } from '@/hooks/useUnsavedGuard'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
 import { Select } from '@/components/ui/Select'
@@ -111,7 +111,7 @@ export function BotPage() {
     },
   })
 
-  const unsavedDialog = useUnsavedGuard(dirty)
+  useRegisterUnsaved(dirty)
 
   const addWhitelistEntry = (pattern: string) => {
     const trimmed = pattern.trim()
@@ -150,7 +150,6 @@ export function BotPage() {
 
   return (
     <div className="animate-slide-up">
-      {unsavedDialog}
       <PageHeader
         title={t('pages.bot.title')}
         description={t('pages.bot.description')}
@@ -884,7 +883,7 @@ function MethodToggle({
   const { t } = useTranslation()
   return (
     <div className="flex items-start gap-3 rounded-lg border border-line bg-recessed/40 p-3">
-      <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-brand-soft text-brand">
+      <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-brand-soft text-fg-brand-strong">
         {icon}
       </span>
       {comingSoon ? (

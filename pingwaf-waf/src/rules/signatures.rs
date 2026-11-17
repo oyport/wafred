@@ -9,7 +9,9 @@
 //!    patterns that distinguish an attack from innocent text.
 
 use std::fmt;
+use std::sync::OnceLock;
 
+use ahash::AHashSet;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -2179,6 +2181,23 @@ impl SqlTok {
     }
 }
 
+/// `SQL_FUNCTIONS` / `SQL_KEYWORDS` as hash sets, built once per process.
+///
+/// `fingerprint_sql` classifies every word token; the previous shape did two
+/// linear slice scans per token (`contains` over 54 + 71 entries), which
+/// measured ~94ns/token on prose (112.5µs for an 8KB body). Membership is
+/// identical to the slice scan — only the lookup changes — so fingerprints
+/// stay byte-for-byte the same.
+fn sql_functions() -> &'static AHashSet<&'static str> {
+    static SET: OnceLock<AHashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| SQL_FUNCTIONS.iter().copied().collect())
+}
+
+fn sql_keywords() -> &'static AHashSet<&'static str> {
+    static SET: OnceLock<AHashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| SQL_KEYWORDS.iter().copied().collect())
+}
+
 /// Tokenize `lower` (assumed already lower-cased ASCII) into a SQL fingerprint
 /// string. The fingerprint mirrors libinjection's single-char-per-token form.
 fn fingerprint_sql(lower: &str) -> String {
@@ -2316,11 +2335,11 @@ fn fingerprint_sql(lower: &str) -> String {
                     i += 1;
                 }
                 let word = &lower[start..i];
-                let tok = if SQL_FUNCTIONS.contains(&word) {
+                let tok = if sql_functions().contains(word) {
                     SqlTok::Function
                 } else if matches!(word, "and" | "or" | "xor") {
                     SqlTok::Operator
-                } else if SQL_KEYWORDS.contains(&word) {
+                } else if sql_keywords().contains(word) {
                     SqlTok::Keyword
                 } else {
                     SqlTok::Ident
@@ -2475,7 +2494,14 @@ static SQLI_PREFILTER_NEEDLES: &[&str] = &[
     "pg_catalog",
     "sysobjects",
     "syscolumns",
-    "into",
+    // `into` alone was the needle for `INTO OUTFILE`/`INTO DUMPFILE`, and it
+    // is a substring of ordinary words ("Macintosh", "into"), so every UA
+    // string paid the full confirmation battery. The only strong check that
+    // needs it is `SQLI_INTO_FILE`, whose match always contains the file
+    // keyword itself; listing those instead keeps the prefilter a superset of
+    // every strong regex while letting "Macintosh" miss.
+    "outfile",
+    "dumpfile",
     "case",
     "to_char",
 ];
@@ -2487,10 +2513,42 @@ static SQLI_PREFILTER: Lazy<AhoCorasick> = Lazy::new(|| {
         .expect("aho-corasick build cannot fail with valid UTF-8 needles")
 });
 
-/// Strong (block-worthy) SQLi checks, run against lowercased text. Shared by
-/// the direct pass and the comment-stripped rescan (`OR/**/"1"="1"`).
+/// ASCII case-insensitive substring search, used only as a *necessary*
+/// condition gate in front of the expensive SQLi regexes.
+///
+/// The regexes use `(?i)`, whose Unicode case folding also matches the long s
+/// (`ſ`, U+017F) for `s`. A gate that is ASCII-only would therefore reject a
+/// value the regex can still match (`ſelect`), turning an optimisation into a
+/// false negative. Callers pair this with an explicit `contains('\u{17f}')`
+/// arm for keywords that contain `s`.
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    !needle.is_empty()
+        && haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+/// Strong (block-worthy) SQLi checks. Shared by the direct pass and the
+/// comment-stripped rescan (`OR/**/"1"="1"`). Every pattern is `(?i)`, so the
+/// caller may pass the original text; an ASCII-lowercased copy is not needed
+/// for matching.
+///
+/// Three checks dominate the battery on prose/Chinese values
+/// (`SQLI_BLIND_PROBE`, `SQLI_TAUTOLOGY`, `SQLI_BOOL_SUBQUERY` measured 70.5%
+/// of the regex time on an 8KB English body). Each is guarded by a cheap
+/// necessary condition: a gate miss proves the regex cannot match, so the
+/// gates only skip impossible work and never change which checks fire.
 fn sqli_strong_checks(lower: &str) -> Vec<&'static str> {
     let mut strong: Vec<&'static str> = Vec::with_capacity(4);
+    // `ſ` (U+017F) folds to `s` under `(?i)`; keep every keyword gate a
+    // superset of the regex it guards.
+    let long_s = lower.contains('\u{17f}');
+    let has_comparison =
+        lower.contains('=') || lower.contains('<') || lower.contains('>');
+    let has_case = long_s || contains_ci(lower, "case");
+    let has_select = long_s || contains_ci(lower, "select");
     if SQLI_UNION_SELECT.is_match(lower) {
         strong.push("union-select");
     }
@@ -2511,7 +2569,9 @@ fn sqli_strong_checks(lower: &str) -> Vec<&'static str> {
     if SQLI_WAITFOR.is_match(lower) {
         strong.push("waitfor-statement");
     }
-    if SQLI_TAUTOLOGY.is_match(lower) {
+    // Every `SQLI_TAUTOLOGY` alternative compares (`=`, `<>`, `>`); no case
+    // folding is involved in the gate itself.
+    if has_comparison && SQLI_TAUTOLOGY.is_match(lower) {
         strong.push("tautology");
     }
     if SQLI_TRUNCATED_TAUTOLOGY.is_match(lower) {
@@ -2525,10 +2585,15 @@ fn sqli_strong_checks(lower: &str) -> Vec<&'static str> {
     {
         strong.push("bare-select");
     }
-    if SQLI_BLIND_PROBE.is_match(lower) {
+    // Every `SQLI_BLIND_PROBE` alternative contains `case … when` or
+    // `to_char(`.
+    if (has_case || contains_ci(lower, "to_char"))
+        && SQLI_BLIND_PROBE.is_match(lower)
+    {
         strong.push("blind-probe");
     }
-    if SQLI_BOOL_SUBQUERY.is_match(lower) {
+    // Every `SQLI_BOOL_SUBQUERY` alternative contains `select`.
+    if has_select && SQLI_BOOL_SUBQUERY.is_match(lower) {
         strong.push("bool-subquery");
     }
     if SQLI_INFO_SCHEMA.is_match(lower) {
@@ -2549,8 +2614,9 @@ fn sqli_strong_checks(lower: &str) -> Vec<&'static str> {
 /// but never block a request on their own, which keeps prose like
 /// `"C# programming"` or `"well--done"` from tripping the detector.
 ///
-/// Inputs rejected by the keyword prefilter return an empty fingerprint;
-/// callers only inspect the fingerprint when `is_sqli` is true.
+/// Inputs rejected by the keyword prefilter, and inputs with no strong
+/// check, return an empty fingerprint: callers only inspect the fingerprint
+/// when `is_sqli` is true, and a weak-only fingerprint was never actionable.
 pub fn detect_sqli(input: &str) -> (bool, String) {
     if input.len() < 3 {
         return (false, String::new());
@@ -2561,23 +2627,40 @@ pub fn detect_sqli(input: &str) -> (bool, String) {
     if input.is_ascii() && !SQLI_PREFILTER.is_match(input) {
         return (false, String::new());
     }
-    let lower = input.to_ascii_lowercase();
-    let fp = fingerprint_sql(&lower);
 
-    let mut strong = sqli_strong_checks(&lower);
-    let mut weak: Vec<&'static str> = Vec::with_capacity(2);
+    // The strong checks run on the original input. Every one of the 14
+    // patterns is `(?i)`, so matching an ASCII-lowercased copy is
+    // match-equivalent (ASCII case folding is a subset of Unicode folding);
+    // the copy is only needed for the fingerprint and the weak-signal
+    // heuristics, which run after a strong check has already fired.
+    let mut strong = sqli_strong_checks(input);
 
     // Comment-split injection (`OR/**/"1"="1"`): when the raw text carries an
     // inline SQL comment and nothing fired, re-run the strong checks on the
     // comment-stripped text. The prefilter already guaranteed an interesting
     // keyword, so this only runs on inputs the first pass could not confirm.
-    if strong.is_empty() && lower.contains("/*") && lower.contains("*/") {
-        let stripped = SQLI_INLINE_COMMENT.replace_all(&lower, " ");
+    if strong.is_empty() && input.contains("/*") && input.contains("*/") {
+        let stripped = SQLI_INLINE_COMMENT.replace_all(input, " ");
         strong = sqli_strong_checks(&stripped);
         if !strong.is_empty() {
             strong.push("comment-stripped");
         }
     }
+
+    // `is_sqli` is exactly `!strong.is_empty()`, and every caller reads the
+    // fingerprint only inside `if is_sqli`. Running the tokenizer and the
+    // weak-signal heuristics for a value that cannot be reported is pure
+    // cost — on prose it was the single largest item of this path
+    // (112.5µs for an 8KB body). A weak-only fingerprint was never
+    // actionable; the public contract already said callers only inspect the
+    // fingerprint when `is_sqli` is true.
+    if strong.is_empty() {
+        return (false, String::new());
+    }
+
+    let lower = input.to_ascii_lowercase();
+    let fp = fingerprint_sql(&lower);
+    let mut weak: Vec<&'static str> = Vec::with_capacity(2);
 
     if SQLI_COMMENT_TERM.is_match(&lower) {
         weak.push("comment-terminator");
@@ -2599,15 +2682,9 @@ pub fn detect_sqli(input: &str) -> (bool, String) {
         weak.push("fn-call-shape");
     }
 
-    let is_sqli = !strong.is_empty();
-    let fingerprint = if strong.is_empty() && weak.is_empty() {
-        fp
-    } else {
-        let mut all = strong;
-        all.extend_from_slice(&weak);
-        format!("{}|{}", fp, all.join(","))
-    };
-    (is_sqli, fingerprint)
+    let mut all = strong;
+    all.extend_from_slice(&weak);
+    (true, format!("{}|{}", fp, all.join(",")))
 }
 
 // ---------------------------------------------------------------------------
@@ -2702,31 +2779,34 @@ pub fn detect_xss(input: &str) -> (bool, String) {
     if input.is_ascii() && !XSS_PREFILTER.is_match(input) {
         return (false, String::new());
     }
-    let lower = input.to_ascii_lowercase();
+    // Every pattern below carries `(?i)`, so matching the original input is
+    // equivalent to matching an ASCII-lowercased copy — the lowercase pass
+    // only allocated and copied the value for nothing. `(?i)` also folds
+    // Unicode (`ſ` for `s`), which an ASCII-lowercased copy never could.
     let mut hits: Vec<&'static str> = Vec::with_capacity(4);
 
-    if XSS_SCRIPT_TAG.is_match(&lower) {
+    if XSS_SCRIPT_TAG.is_match(input) {
         hits.push("script-tag");
     }
-    if XSS_EVENT_HANDLER.is_match(&lower) {
+    if XSS_EVENT_HANDLER.is_match(input) {
         hits.push("event-handler");
     }
-    if XSS_JS_URI.is_match(&lower) {
+    if XSS_JS_URI.is_match(input) {
         hits.push("js-uri");
     }
-    if XSS_DANGEROUS_TAG.is_match(&lower) {
+    if XSS_DANGEROUS_TAG.is_match(input) {
         hits.push("dangerous-tag");
     }
-    if XSS_DATA_URI.is_match(&lower) {
+    if XSS_DATA_URI.is_match(input) {
         hits.push("data-uri");
     }
-    if XSS_STYLE_EXPR.is_match(&lower) {
+    if XSS_STYLE_EXPR.is_match(input) {
         hits.push("style-expr");
     }
-    if XSS_HTML_COMMENT_BREAK.is_match(&lower) {
+    if XSS_HTML_COMMENT_BREAK.is_match(input) {
         hits.push("html-context-break");
     }
-    if XSS_DOM_CHAIN.is_match(&lower) {
+    if XSS_DOM_CHAIN.is_match(input) {
         hits.push("dom-chain");
     }
 
@@ -3681,6 +3761,70 @@ mod tests {
         let (hit, fp) = detect_sqli("1 union ſelect password");
         assert!(hit);
         assert!(fp.contains("union-select"));
+    }
+
+    #[test]
+    fn detect_sqli_gated_checks_keep_unicode_folding() {
+        // The necessary-condition gates in `sqli_strong_checks` must accept
+        // the long s (`ſ`, U+017F), which `(?i)` folds to `s`. A gate that
+        // missed it would turn a real detection into a bypass.
+        let (hit, fp) = detect_sqli("1 and 1=(ſelect 'secret')");
+        assert!(hit, "bool-subquery via long s should fire");
+        assert!(fp.contains("bool-subquery"));
+
+        let (hit, fp) = detect_sqli("1 and caſe when 1=1 then 1 end");
+        assert!(hit, "blind-probe via long s should fire");
+        assert!(fp.contains("blind-probe"));
+    }
+
+    #[test]
+    fn detect_sqli_gated_checks_still_fire_on_ascii() {
+        // The gates must only skip work, never a match: the ASCII shapes the
+        // three gated regexes exist for still fire.
+        let (hit, fp) =
+            detect_sqli("1' AND (SELECT 'a' FROM users LIMIT 1)='a");
+        assert!(hit);
+        assert!(fp.contains("bool-subquery"));
+
+        let (hit, fp) = detect_sqli("1 and case when 1=1 then 1 end");
+        assert!(hit);
+        assert!(fp.contains("blind-probe"));
+    }
+
+    #[test]
+    fn detect_sqli_into_file_survives_prefilter_needle_change() {
+        // The prefilter no longer lists bare `into` (it matched "Macintosh"
+        // and every other word containing it); the file keyword itself keeps
+        // the `INTO OUTFILE`/`INTO DUMPFILE` checks reachable.
+        let (hit, fp) = detect_sqli("1 into outfile '/tmp/x'");
+        assert!(hit);
+        assert!(fp.contains("into-file"));
+
+        let (hit, fp) = detect_sqli("1 INTO DUMPFILE '/tmp/x'");
+        assert!(hit);
+        assert!(fp.contains("into-file"));
+    }
+
+    #[test]
+    fn detect_sqli_user_agent_into_substring_stays_clean() {
+        // `Macintosh` used to hit the `into` prefilter needle and drag the
+        // whole confirmation battery along; the value is not SQLi either way.
+        let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+                  AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0";
+        let (hit, fp) = detect_sqli(ua);
+        assert!(!hit);
+        assert!(fp.is_empty());
+    }
+
+    #[test]
+    fn detect_sqli_weak_only_value_has_empty_fingerprint() {
+        // `is_sqli == !strong.is_empty()`, and every caller reads the
+        // fingerprint only when `is_sqli` is true. A value with no strong
+        // check therefore returns an empty fingerprint instead of paying for
+        // the tokenizer (the single largest cost of this path on prose).
+        let (hit, fp) = detect_sqli("color and comment");
+        assert!(!hit);
+        assert!(fp.is_empty(), "weak-only fingerprint should be empty: {fp}");
     }
 
     #[test]

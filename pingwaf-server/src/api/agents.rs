@@ -88,6 +88,14 @@ pub struct AgentResponse {
     pub public_ip: Option<String>,
     /// First LAN address that is not loopback or a container/bridge interface.
     pub private_ip: Option<String>,
+    /// Address the control plane accepted the agent's heartbeat stream from.
+    ///
+    /// Different from `public_ip`: that one is the agent's own guess at its
+    /// egress address, while this is the TCP peer the control plane actually
+    /// saw, so it survives NAT and a lying/broken probe.
+    pub peer_ip: Option<String>,
+    /// When `peer_ip` was last observed on a live stream.
+    pub peer_ip_seen_at: Option<DateTime<Utc>>,
     pub version: Option<String>,
     pub os_info: Option<String>,
     pub cpu_cores: Option<i32>,
@@ -244,6 +252,20 @@ pub fn routes() -> Router<AppState> {
         .route("/agents/flush-logs", post(flush_logs))
 }
 
+/// Permissions of the key an enrollment mints.
+///
+/// Only `agent`, deliberately: the token is pasted into the install command,
+/// copied to the edge host and kept in its config, so it is the credential most
+/// likely to leak. `agent` covers registration, heartbeats and log shipping;
+/// anything more would hand the edge a control-plane credential. In particular
+/// `read` must not be added: `/mcp` accepts a `read` key as a console read
+/// grant, and the enrollment owner is always an administrator (see
+/// [`crate::mcp::auth`] for the scope narrowing that is the second line of
+/// defence).
+fn enroll_key_permissions() -> Vec<String> {
+    vec![permission::AGENT.to_string()]
+}
+
 /// `POST /api/v1/agents/enroll` — mints an agent key and returns the command
 /// line that installs and starts a node with it.
 ///
@@ -266,14 +288,9 @@ async fn enroll(
         ));
     }
 
-    let (model, token) = mint_key(
-        &state,
-        current.id,
-        name,
-        vec![permission::AGENT.to_string(), permission::READ.to_string()],
-        None,
-    )
-    .await?;
+    let (model, token) =
+        mint_key(&state, current.id, name, enroll_key_permissions(), None)
+            .await?;
 
     let server_url = agent_server_url(&state, &headers);
     let install_command = format!(
@@ -738,6 +755,8 @@ async fn enrich(
             ip_address: row.ip_address,
             public_ip: row.public_ip,
             private_ip: row.private_ip,
+            peer_ip: row.peer_ip,
+            peer_ip_seen_at: row.peer_ip_seen_at,
             version: row.version,
             os_info: row.os_info,
             cpu_cores: row.cpu_cores,
@@ -966,6 +985,21 @@ mod tests {
             reason: None,
             graceful: true,
         }
+    }
+
+    /// The enrollment key is handed to the edge node (install command, agent
+    /// config, shell history, `ps`), so it must carry `agent` and nothing else.
+    /// A `read` bit here used to turn the data-plane credential into a console
+    /// read grant through `/mcp` (see `mcp::auth::key_principal`).
+    #[test]
+    fn enroll_key_has_only_agent_permission() {
+        assert_eq!(
+            vec![permission::AGENT.to_string()],
+            enroll_key_permissions()
+        );
+        // Not empty either: `key_allows_agent` treats an empty permission set
+        // as an agent key, but an explicit `agent` is what the mint writes.
+        assert!(!enroll_key_permissions().is_empty());
     }
 
     #[test]

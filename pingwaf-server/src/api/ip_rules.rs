@@ -13,6 +13,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::api::capabilities;
 use crate::api::common::{
     load_site_read, load_site_write, non_empty, parse_uuid, Page, Pagination,
 };
@@ -85,6 +86,11 @@ pub struct CreateRequest {
     pub note: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Empty = the whole site; otherwise only matching request paths.
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub match_type: Option<String>,
     #[serde(default)]
     pub priority: i32,
 }
@@ -105,6 +111,11 @@ pub struct UpdateRequest {
     pub note: Option<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// `Some("")` clears the scope (whole site).
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub match_type: Option<String>,
     #[serde(default)]
     pub priority: Option<i32>,
 }
@@ -315,9 +326,19 @@ async fn create(
     let id = parse_uuid(&site_id, "site id")?;
     load_site_write(&state.db, id, &current).await?;
     validate(&payload.name, &payload.action)?;
+    let (path, match_type) =
+        crate::api::path_exceptions::validate_optional_path(
+            &payload.path,
+            payload.match_type.as_deref(),
+        )?;
     let (group_id, ip_ranges) =
         resolve_create_mode(&state, &payload.group_id, &payload.ip_ranges)
             .await?;
+
+    // Capability gate: any non-empty scope needs an agent that understands
+    // one, and a regex scope needs the matcher on top (see `capabilities`).
+    capabilities::ensure_ip_rule_supported(&state.db, id, &path, &match_type)
+        .await?;
 
     let timestamp = chrono::Utc::now();
     let model = ip_access_rules::ActiveModel {
@@ -328,6 +349,8 @@ async fn create(
         action: Set(payload.action),
         note: Set(non_empty(&payload.note)),
         enabled: Set(payload.enabled),
+        path: Set(path),
+        match_type: Set(match_type),
         priority: Set(payload.priority),
         group_id: Set(group_id),
         created_at: Set(timestamp),
@@ -356,6 +379,8 @@ async fn update(
     load_site_write(&state.db, id, &current).await?;
 
     let row = find(&state, id, target).await?;
+    let stored_path = row.path.clone();
+    let stored_match_type = row.match_type.clone();
     let mut active: ip_access_rules::ActiveModel = row.into();
 
     if let Some(name) = non_empty(&payload.name) {
@@ -404,6 +429,33 @@ async fn update(
     }
     if let Some(enabled) = payload.enabled {
         active.enabled = Set(enabled);
+    }
+    if payload.path.is_some() || payload.match_type.is_some() {
+        let (path, match_type) =
+            crate::api::path_exceptions::validate_optional_path(
+                payload.path.as_deref().unwrap_or(&stored_path),
+                // A partial update that only rewrites `path` must keep the
+                // stored scope type: falling back to `None` here let
+                // `validate_optional_path` default the pair to `prefix`, which
+                // silently downgraded a regex scope (and skipped the
+                // capability gate, which then saw `prefix`).
+                Some(
+                    payload
+                        .match_type
+                        .as_deref()
+                        .unwrap_or(stored_match_type.as_str()),
+                ),
+            )?;
+        active.path = Set(path.clone());
+        active.match_type = Set(match_type.clone());
+        // Partial-update semantics: gate the effective scope of this write.
+        capabilities::ensure_ip_rule_supported(
+            &state.db,
+            id,
+            &path,
+            &match_type,
+        )
+        .await?;
     }
     if let Some(priority) = payload.priority {
         active.priority = Set(priority);
@@ -468,6 +520,8 @@ async fn bulk_import(
         action: Set(payload.action),
         note: Set(non_empty(&payload.note)),
         enabled: Set(payload.enabled),
+        path: Set(String::new()),
+        match_type: Set("prefix".to_string()),
         priority: Set(0),
         group_id: Set(None),
         created_at: Set(timestamp),

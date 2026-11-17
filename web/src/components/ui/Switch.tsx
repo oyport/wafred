@@ -1,7 +1,7 @@
 import { forwardRef, useId, useState, type ReactNode } from 'react'
 import { cn } from '@/lib/utils'
 
-export interface SwitchProps {
+interface SwitchBaseProps {
   checked?: boolean
   defaultChecked?: boolean
   onCheckedChange?: (checked: boolean) => void
@@ -11,11 +11,38 @@ export interface SwitchProps {
   size?: 'sm' | 'md'
   className?: string
   id?: string
+  /**
+   * Accessible name for a standalone switch (table rows, toolbars) where a
+   * visible `label` would break the layout. Required when `label` is absent.
+   */
+  ariaLabel?: string
+  /**
+   * DOM spelling of {@link SwitchBaseProps.ariaLabel}, accepted so existing
+   * call sites (which used to pass a prop the component silently dropped) keep
+   * working. Prefer `ariaLabel` in new code.
+   */
+  'aria-label'?: string
 }
+
+/**
+ * A switch always needs an accessible name: either the visible `label`
+ * (rendered as `<label htmlFor>` so clicking the text toggles it), or
+ * `ariaLabel` for standalone switches. Omitting both is a type error, which is
+ * what keeps axe `button-name` / `aria-toggle-field-name` at zero.
+ */
+export type SwitchProps = SwitchBaseProps &
+  (
+    | { label: ReactNode }
+    | { label?: undefined; ariaLabel: string }
+    | { label?: undefined; 'aria-label': string }
+  )
 
 export const Switch = forwardRef<HTMLButtonElement, SwitchProps>(
   (
-    {
+    props,
+    ref,
+  ) => {
+    const {
       checked,
       defaultChecked = false,
       onCheckedChange,
@@ -25,11 +52,13 @@ export const Switch = forwardRef<HTMLButtonElement, SwitchProps>(
       size = 'md',
       className,
       id,
-    },
-    ref,
-  ) => {
+      ariaLabel,
+      'aria-label': ariaLabelProp,
+    } = props as SwitchBaseProps
     const generatedId = useId()
     const switchId = id ?? generatedId
+    const descriptionId = `${switchId}-description`
+    const accessibleName = ariaLabel ?? ariaLabelProp
     const isControlled = checked !== undefined
     const [internal, setInternal] = useState(defaultChecked)
     const isOn = isControlled ? checked : internal
@@ -53,6 +82,8 @@ export const Switch = forwardRef<HTMLButtonElement, SwitchProps>(
         type="button"
         role="switch"
         aria-checked={isOn}
+        aria-label={accessibleName}
+        aria-describedby={description ? descriptionId : undefined}
         disabled={disabled}
         onClick={toggle}
         className={cn(
@@ -85,7 +116,9 @@ export const Switch = forwardRef<HTMLButtonElement, SwitchProps>(
         >
           {label && <span className="text-sm font-medium text-fg">{label}</span>}
           {description && (
-            <span className="mt-0.5 text-xs text-fg-subtle">{description}</span>
+            <span id={descriptionId} className="mt-0.5 text-xs text-fg-subtle">
+              {description}
+            </span>
           )}
         </label>
       </div>

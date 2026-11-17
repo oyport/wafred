@@ -19,6 +19,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::api::capabilities;
 use crate::api::common::{load_site_read, load_site_write, parse_uuid};
 use crate::api::error::ApiError;
 use crate::api::sites::touch_site;
@@ -107,7 +108,9 @@ impl From<path_exceptions::Model> for PathExceptionView {
 }
 
 /// Validates and normalises the match type (`prefix` is the default).
-fn validate_match_type(raw: Option<&str>) -> Result<String, ApiError> {
+pub(crate) fn validate_match_type(
+    raw: Option<&str>,
+) -> Result<String, ApiError> {
     let value = raw
         .map(str::trim)
         .filter(|v| !v.is_empty())
@@ -124,7 +127,7 @@ fn validate_match_type(raw: Option<&str>) -> Result<String, ApiError> {
 /// engine uses (`pingwaf-waf/src/rules/expression.rs`), so a pathological
 /// pattern is refused at save time instead of being dropped — or pinning
 /// memory — on the data plane.
-fn validate_regex(pattern: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_regex(pattern: &str) -> Result<(), ApiError> {
     const MAX_REGEX_SIZE: usize = 4 * 1024 * 1024;
     regex::RegexBuilder::new(pattern)
         .size_limit(MAX_REGEX_SIZE)
@@ -142,7 +145,10 @@ fn validate_regex(pattern: &str) -> Result<(), ApiError> {
 /// `regex` is the exception: `^/api` does not start with `/` and `*`/`?` are
 /// operators there, so only the shared limits (length, no whitespace/control
 /// characters) apply in addition to a compile check.
-fn validate_path(raw: &str, match_type: &str) -> Result<String, ApiError> {
+pub(crate) fn validate_path(
+    raw: &str,
+    match_type: &str,
+) -> Result<String, ApiError> {
     let path = raw.trim();
     if path.is_empty() {
         return Err(ApiError::BadRequest("path must not be empty".to_string()));
@@ -196,8 +202,27 @@ fn validate_path(raw: &str, match_type: &str) -> Result<String, ApiError> {
     Ok(path.to_string())
 }
 
+/// Validates an optional access-restriction path scope.
+///
+/// An empty path means "the whole site" and normalises `match_type` to the
+/// `prefix` default. A non-empty path reuses the path-exception rules
+/// verbatim, including the regex budget.
+pub(crate) fn validate_optional_path(
+    path: &str,
+    match_type: Option<&str>,
+) -> Result<(String, String), ApiError> {
+    let match_type = validate_match_type(match_type)?;
+    let path = path.trim();
+    if path.is_empty() {
+        return Ok((String::new(), "prefix".to_string()));
+    }
+    Ok((validate_path(path, &match_type)?, match_type))
+}
+
 /// `*` collapses the list; unknown tokens are rejected rather than ignored.
-fn validate_skip_layers(raw: &[String]) -> Result<Vec<String>, ApiError> {
+pub(crate) fn validate_skip_layers(
+    raw: &[String],
+) -> Result<Vec<String>, ApiError> {
     if raw.is_empty() {
         return Err(ApiError::BadRequest(
             "skip_layers must not be empty; use [\"*\"] to skip every layer"
@@ -229,6 +254,25 @@ fn validate_skip_layers(raw: &[String]) -> Result<Vec<String>, ApiError> {
         ));
     }
     Ok(layers)
+}
+
+/// Whether this update makes the stored scope live again, even though the
+/// payload carries no scope field. Re-enabling an exception that needs a
+/// capability the fleet lacks must be rejected, not silently pushed.
+///
+/// Semantics:
+/// - `touches_scope` → always check (the payload rewrites the scope).
+/// - `enabling && !stored_enabled` → check (re-enabling makes the stored
+///   scope live on agents that may not support it).
+/// - otherwise → no check: `enabled: true` on an already-enabled row is an
+///   idempotent no-op, and a disabling or note-only edit never changes
+///   detection behaviour on the edge.
+fn update_requires_capability_check(
+    touches_scope: bool,
+    enabling: bool,
+    stored_enabled: bool,
+) -> bool {
+    touches_scope || (enabling && !stored_enabled)
 }
 
 fn validate_note(raw: Option<&str>) -> Result<Option<String>, ApiError> {
@@ -291,10 +335,30 @@ async fn create_exception(
         })?,
         &match_type,
     )?;
+    // Never infer "skip everything" from a missing field: a script that
+    // forgets `skip_layers` must not create a total bypass. The console
+    // always sends an explicit list, and `*` remains available on request.
     let skip_layers = validate_skip_layers(
-        payload.skip_layers.as_deref().unwrap_or(&["*".to_string()]),
+        payload.skip_layers.as_deref().ok_or_else(|| {
+            ApiError::BadRequest(
+                "skip_layers is required; use [\"*\"] to skip every layer"
+                    .to_string(),
+            )
+        })?,
     )?;
     let note = validate_note(payload.note.as_deref())?;
+
+    // Capability gate: `skip_layers` is validated non-empty above, so every
+    // created exception changes detection behaviour on the edge. A regex
+    // match type additionally needs a data plane that implements regex
+    // scopes at all (see `capabilities` for the evidence trail).
+    capabilities::ensure_path_exception_supported(
+        &state.db,
+        site_id,
+        &match_type,
+        &skip_layers,
+    )
+    .await?;
 
     let count = path_exceptions::Entity::find()
         .filter(path_exceptions::Column::SiteId.eq(site_id))
@@ -356,6 +420,8 @@ async fn update_exception(
     load_site_write(&state.db, site_id, &current).await?;
 
     let row = find_exception(&state, site_id, id).await?;
+    let stored_skip_layers = row.skip_layers.clone();
+    let stored_enabled = row.enabled;
     let mut match_type = row.match_type.clone();
     if payload.match_type.is_some() {
         match_type = validate_match_type(payload.match_type.as_deref())?;
@@ -382,7 +448,7 @@ async fn update_exception(
         let stored_path = active.path.clone().unwrap();
         let checked = validate_path(&stored_path, &match_type)?;
         active.path = Set(checked);
-        active.match_type = Set(match_type);
+        active.match_type = Set(match_type.clone());
     }
     if let Some(layers) = payload.skip_layers.as_deref() {
         active.skip_layers = Set(validate_skip_layers(layers)?);
@@ -397,6 +463,30 @@ async fn update_exception(
         active.enabled = Set(enabled);
     }
     active.updated_at = Set(Utc::now());
+
+    // Capability gate on the *effective* scope after this partial update:
+    // the payload touching the scope, or re-enabling a disabled exception
+    // (which makes the stored scope live again), both run the gate, so a
+    // regex/skip_layers exception cannot be silently re-armed on an old
+    // agent. A note-only edit on an already-enabled row is never blocked.
+    let touches_scope = payload.path.is_some()
+        || payload.match_type.is_some()
+        || payload.skip_layers.is_some();
+    if update_requires_capability_check(
+        touches_scope,
+        payload.enabled == Some(true),
+        stored_enabled,
+    ) {
+        let effective_layers =
+            payload.skip_layers.clone().unwrap_or(stored_skip_layers);
+        capabilities::ensure_path_exception_supported(
+            &state.db,
+            site_id,
+            &match_type,
+            &effective_layers,
+        )
+        .await?;
+    }
 
     let model = active.update(&state.db).await?;
     tracing::info!(
@@ -466,6 +556,33 @@ mod tests {
     }
 
     #[test]
+    fn optional_path_empty_means_the_whole_site() {
+        assert_eq!(
+            validate_optional_path("", Some("regex")).unwrap(),
+            (String::new(), "prefix".to_string())
+        );
+        assert_eq!(
+            validate_optional_path("   ", None).unwrap(),
+            (String::new(), "prefix".to_string())
+        );
+    }
+
+    #[test]
+    fn optional_path_reuses_the_exception_rules() {
+        assert_eq!(
+            validate_optional_path("/admin", None).unwrap(),
+            ("/admin".to_string(), "prefix".to_string())
+        );
+        assert_eq!(
+            validate_optional_path("^/api/(v1|v2)/", Some("regex")).unwrap(),
+            ("^/api/(v1|v2)/".to_string(), "regex".to_string())
+        );
+        assert!(validate_optional_path("admin", None).is_err());
+        assert!(validate_optional_path("^/broken(", Some("regex")).is_err());
+        assert!(validate_optional_path("/api", Some("glob")).is_err());
+    }
+
+    #[test]
     fn wildcard_requires_a_single_trailing_star() {
         assert_eq!(
             validate_path("/api/*", "wildcard").unwrap(),
@@ -510,6 +627,35 @@ mod tests {
         assert_eq!(validate_match_type(None).unwrap(), "prefix");
         assert_eq!(validate_match_type(Some("regex")).unwrap(), "regex");
         assert!(validate_match_type(Some("glob")).is_err());
+    }
+
+    #[test]
+    fn note_only_edits_never_trigger_the_capability_check() {
+        // Note-only edit on an enabled row: not a scope change.
+        assert!(!update_requires_capability_check(false, false, true));
+        // Note-only edit on a disabled row: still does not arm the scope.
+        assert!(!update_requires_capability_check(false, false, false));
+    }
+
+    #[test]
+    fn re_enabling_a_disabled_exception_requires_the_check() {
+        // `{"enabled": true}` on a disabled row re-arms the stored scope.
+        assert!(update_requires_capability_check(false, true, false));
+    }
+
+    #[test]
+    fn enabling_an_already_enabled_row_is_an_idempotent_noop() {
+        // `enabled: true` on an already-enabled row changes nothing on the
+        // edge, so a historical legacy scope is not re-gated here.
+        assert!(!update_requires_capability_check(false, true, true));
+    }
+
+    #[test]
+    fn scope_touching_edits_always_require_the_check() {
+        assert!(update_requires_capability_check(true, false, true));
+        assert!(update_requires_capability_check(true, false, false));
+        assert!(update_requires_capability_check(true, true, false));
+        assert!(update_requires_capability_check(true, true, true));
     }
 
     #[test]

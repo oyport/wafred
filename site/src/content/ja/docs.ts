@@ -52,6 +52,14 @@ const docs = {
       minutes: 7,
       topics: ["REST", "gRPC", "認証", "自動化"],
     },
+    {
+      slug: "security",
+      icon: "lock",
+      title: "セキュリティ",
+      lead: "脆弱性の非公開報告、サポートバージョン、公開前の hardening 手順。",
+      minutes: 8,
+      topics: ["脆弱性報告", "サポートバージョン", "hardening", "シークレット"],
+    },
   ],
   sidebarLabel: "ドキュメント",
   screenshot: {

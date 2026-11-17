@@ -167,6 +167,7 @@ Notes on a few of these:
   ```text
   {{version}}     the pingap version
   {{error_type}}  the pingora error type, also sent as X-Pingap-EType
+  {{status}}      the HTTP status code (e.g. 404)
   {{content}}     the error message
   ```
 

@@ -31,23 +31,34 @@ interface ErrorEnvelope {
   message?: string
 }
 
+/** Response header the control plane stamps every `/api/v1` reply with. */
+export const REQUEST_ID_HEADER = 'x-request-id'
+
 export class ApiError extends Error {
   status: number
   code: ApiErrorCode | string
   /** True when the request never reached the server (DNS/TLS/offline). */
   networkError: boolean
+  /**
+   * Correlation id the server returned for this request (`x-request-id`).
+   * Error cards quote it so a bug report can be matched to the control plane's
+   * log line; `null` when the request never produced a response.
+   */
+  requestId: string | null
 
   constructor(
     message: string,
     status: number,
     code: ApiErrorCode | string = 'internal_error',
     networkError = false,
+    requestId: string | null = null,
   ) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.code = code
     this.networkError = networkError
+    this.requestId = requestId
   }
 }
 
@@ -189,7 +200,31 @@ async function readError(response: Response): Promise<ApiError> {
       : response.status === 501 ? 'not_implemented'
       : 'bad_request'
   }
-  return new ApiError(message, response.status, code)
+  // T03: keep the server's correlation id on the error so the UI can show the
+  // exact request a support ticket refers to.
+  const requestId = response.headers.get(REQUEST_ID_HEADER)?.trim() || null
+  return new ApiError(message, response.status, code, false, requestId)
+}
+
+/**
+ * Ends a session the server has rejected (UX-06).
+ *
+ * Besides clearing the stored credentials, the browser is sent to the login
+ * page with `?next=<current location>` so signing back in returns the operator
+ * to the page they were on. This is a full navigation rather than a router
+ * push on purpose: it drops the in-memory TanStack Query cache, so data
+ * fetched under the expired identity can never be rendered again (the audit
+ * found the old site list still visible after the token was invalidated).
+ */
+function endExpiredSession(): void {
+  useAuthStore.getState().logout()
+  if (typeof window === 'undefined' || !window.location) return
+  const { pathname, search, hash } = window.location
+  // Already on the login page: `logout()` re-renders the form, no navigation
+  // needed (and a redirect here would loop).
+  if (pathname === '/login') return
+  const next = encodeURIComponent(`${pathname}${search}${hash}`)
+  window.location.replace(`/login?next=${next}`)
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
@@ -227,8 +262,9 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   if (!response.ok) {
     const apiError = await readError(response)
     if (apiError.status === 401 && !skipAuth) {
-      // Session is truly over — drop credentials so the router redirects.
-      useAuthStore.getState().logout()
+      // Session is truly over — drop credentials and return to the login page
+      // with the current location so the operator can resume where they were.
+      endExpiredSession()
     }
     throw apiError
   }

@@ -45,6 +45,9 @@ pub struct LogEntry {
     pub response_body_truncated: bool,
     pub upstream_addr: String,
     pub upstream_latency_ms: u64,
+    /// Status returned by the origin; repeats `response_status` when the data
+    /// plane answered itself (block, challenge, cache hit, edge error).
+    pub upstream_status: u32,
     pub waf_score: u32,
     pub waf_action: String,
     pub waf_rule_id: String,
@@ -75,6 +78,9 @@ pub struct LogEntry {
 type PurgeCacheFn = Box<dyn Fn(&str, &[String], &[String]) + Send + Sync>;
 
 /// How often expired dynamic IP blocks are swept from the rule cache.
+/// Consecutive batch failures before the log shipper falls back to sending
+/// entries one at a time (see `flush_or_isolate`).
+const LOG_SHIP_ISOLATION_THRESHOLD: u32 = 3;
 const BLOCK_SWEEP_INTERVAL_SECS: u64 = 60;
 
 /// How often the debounced blocked-IP disk flush runs (see
@@ -137,6 +143,15 @@ pub struct ControlPlaneClient {
 }
 
 impl ControlPlaneClient {
+    /// The agent token minted at registration, once it succeeded.
+    ///
+    /// The self-upgrade loop authenticates against the REST API with the same
+    /// credential the gRPC stream carries, so it needs the value this client
+    /// already holds rather than a second registration.
+    pub fn current_agent_token(&self) -> Option<String> {
+        self.agent_token.load_full().map(|token| (*token).clone())
+    }
+
     /// Create a new control plane client.
     ///
     /// The client does not connect immediately — call `connect()` or `start()` to begin.
@@ -375,9 +390,11 @@ impl ControlPlaneClient {
             loop {
                 interval.tick().await;
                 if shutdown.load(Ordering::Relaxed) {
+                    rule_cache.flush_rule_cache_if_dirty();
                     break;
                 }
                 rule_cache.flush_blocked_ips();
+                rule_cache.flush_rule_cache_if_dirty();
             }
         });
         handles.push(handle);
@@ -910,6 +927,7 @@ impl ControlPlaneClient {
         let mut receiver = self.log_receiver.lock().await;
         let mut batch: Vec<proto::LogEntry> =
             Vec::with_capacity(self.config.log_batch_size);
+        let mut consecutive_failures: u32 = 0;
 
         let flush_interval =
             Duration::from_secs(self.config.log_flush_interval_secs.max(1));
@@ -921,11 +939,12 @@ impl ControlPlaneClient {
             if self.shutdown_signal.load(Ordering::Relaxed) {
                 // Flush remaining logs before shutdown
                 if !batch.is_empty() {
-                    Self::flush_logs(
+                    Self::flush_or_isolate(
                         &mut client,
                         &mut batch,
                         &agent_token,
                         self.config.log_batch_size,
+                        &mut consecutive_failures,
                     )
                     .await;
                 }
@@ -937,16 +956,17 @@ impl ControlPlaneClient {
                     match entry {
                         Some(log_entry) => {
                             let proto_entry =
-                                Self::convert_log_entry(agent_id, &log_entry);
+                                Self::convert_log_entry(agent_id, log_entry);
                             batch.push(proto_entry);
 
                             // Flush when batch is full
                             if batch.len() >= self.config.log_batch_size {
-                                Self::flush_logs(
+                                Self::flush_or_isolate(
                                     &mut client,
                                     &mut batch,
                                     &agent_token,
                                     self.config.log_batch_size,
+                                    &mut consecutive_failures,
                                 )
                                 .await;
                             }
@@ -961,11 +981,12 @@ impl ControlPlaneClient {
                 _ = interval.tick() => {
                     // Periodic flush
                     if !batch.is_empty() {
-                        Self::flush_logs(
+                        Self::flush_or_isolate(
                             &mut client,
                             &mut batch,
                             &agent_token,
                             self.config.log_batch_size,
+                            &mut consecutive_failures,
                         )
                         .await;
                     }
@@ -976,11 +997,12 @@ impl ControlPlaneClient {
                     // flight — up to one batch, so a flood cannot turn a
                     // single command into an unbounded send loop.
                     if !batch.is_empty() {
-                        Self::flush_logs(
+                        Self::flush_or_isolate(
                             &mut client,
                             &mut batch,
                             &agent_token,
                             self.config.log_batch_size,
+                            &mut consecutive_failures,
                         )
                         .await;
                     }
@@ -990,7 +1012,7 @@ impl ControlPlaneClient {
                             Ok(entry) => {
                                 batch.push(Self::convert_log_entry(
                                     agent_id,
-                                    &entry,
+                                    entry,
                                 ));
                                 drained += 1;
                             },
@@ -1002,11 +1024,12 @@ impl ControlPlaneClient {
                         }
                     }
                     if !batch.is_empty() {
-                        Self::flush_logs(
+                        Self::flush_or_isolate(
                             &mut client,
                             &mut batch,
                             &agent_token,
                             self.config.log_batch_size,
+                            &mut consecutive_failures,
                         )
                         .await;
                     }
@@ -1016,11 +1039,12 @@ impl ControlPlaneClient {
                 }
                 _ = self.wait_for_shutdown() => {
                     if !batch.is_empty() {
-                        Self::flush_logs(
+                        Self::flush_or_isolate(
                             &mut client,
                             &mut batch,
                             &agent_token,
                             self.config.log_batch_size,
+                            &mut consecutive_failures,
                         )
                         .await;
                     }
@@ -1032,15 +1056,16 @@ impl ControlPlaneClient {
         Ok(())
     }
 
-    /// Flush a batch of log entries to the server.
+    /// Flush a batch of log entries to the server. `true` when the batch was
+    /// accepted (or was empty); `false` when it must be retried.
     async fn flush_logs(
         client: &mut ProtoClient<Channel>,
         batch: &mut Vec<proto::LogEntry>,
         agent_token: &Option<Arc<String>>,
         batch_cap: usize,
-    ) {
+    ) -> bool {
         if batch.is_empty() {
-            return;
+            return true;
         }
 
         let entries = std::mem::take(batch);
@@ -1063,18 +1088,92 @@ impl ControlPlaneClient {
                         received = ack.received_count,
                         "Flushed logs to server"
                     );
+                    true
                 } else {
                     warn!(
                         error = %ack.error_message,
                         "Server rejected log batch"
                     );
+                    false
                 }
             },
             Err(e) => {
                 error!(error = %e, count, "Failed to ship logs");
                 restore_failed_batch(batch, entries, batch_cap);
+                false
             },
         }
+    }
+
+    /// Ship one entry per RPC.
+    ///
+    /// Used after a batch keeps failing: a single entry the server cannot
+    /// persist (before the server-side NUL sanitiser shipped, a binary body
+    /// did exactly this) must not block every log line behind it. Entries the
+    /// server still rejects are dropped and counted, never retried forever.
+    async fn flush_logs_individually(
+        client: &mut ProtoClient<Channel>,
+        entries: Vec<proto::LogEntry>,
+        agent_token: &Option<Arc<String>>,
+    ) -> usize {
+        let mut dropped = 0usize;
+        for entry in entries {
+            let mut request =
+                tonic::Request::new(tokio_stream::iter(vec![entry]));
+            attach_agent_token(&mut request, agent_token);
+            match client.ship_logs(request).await {
+                Ok(response) => {
+                    let ack = response.into_inner();
+                    if !ack.success {
+                        dropped += 1;
+                        warn!(
+                            error = %ack.error_message,
+                            "dropping a log entry the server rejected"
+                        );
+                    }
+                },
+                Err(e) => {
+                    dropped += 1;
+                    warn!(error = %e, "dropping an unshippable log entry");
+                },
+            }
+        }
+        dropped
+    }
+
+    /// Flush the batch; after a few consecutive failures, isolate entries.
+    ///
+    /// The batch-retry path is intentionally unbounded for transport errors
+    /// (a control plane restart must not lose logs), but one entry that can
+    /// never be persisted would otherwise head-of-line block the shipper
+    /// forever. After [`LOG_SHIP_ISOLATION_THRESHOLD`] failures the batch is
+    /// sent one entry at a time, so only the poison entry is dropped.
+    async fn flush_or_isolate(
+        client: &mut ProtoClient<Channel>,
+        batch: &mut Vec<proto::LogEntry>,
+        agent_token: &Option<Arc<String>>,
+        batch_cap: usize,
+        consecutive_failures: &mut u32,
+    ) {
+        if batch.is_empty() {
+            return;
+        }
+        if Self::flush_logs(client, batch, agent_token, batch_cap).await {
+            *consecutive_failures = 0;
+            return;
+        }
+        *consecutive_failures += 1;
+        if *consecutive_failures < LOG_SHIP_ISOLATION_THRESHOLD {
+            return;
+        }
+        let entries = std::mem::take(batch);
+        let dropped =
+            Self::flush_logs_individually(client, entries, agent_token).await;
+        error!(
+            dropped,
+            "log batch failed repeatedly; shipped entries individually"
+        );
+        *consecutive_failures = 0;
     }
 
     /// Run the certificate-event shipping loop.
@@ -1195,51 +1294,52 @@ impl ControlPlaneClient {
     }
 
     /// Convert a local LogEntry to the proto LogEntry type.
-    fn convert_log_entry(agent_id: &str, entry: &LogEntry) -> proto::LogEntry {
+    fn convert_log_entry(agent_id: &str, entry: LogEntry) -> proto::LogEntry {
         proto::LogEntry {
             agent_id: agent_id.to_string(),
-            site_id: entry.site_id.clone(),
-            request_id: entry.request_id.clone(),
+            site_id: entry.site_id,
+            request_id: entry.request_id,
             timestamp: Some(prost_types::Timestamp {
                 seconds: chrono::Utc::now().timestamp(),
                 nanos: 0,
             }),
-            client_ip: entry.client_ip.clone(),
-            method: entry.method.clone(),
-            scheme: entry.scheme.clone(),
-            host: entry.host.clone(),
-            path: entry.path.clone(),
-            query_string: entry.query_string.clone(),
-            protocol: entry.protocol.clone(),
-            request_headers: entry.request_headers.clone(),
-            request_body: entry.request_body.clone().unwrap_or_default(),
+            client_ip: entry.client_ip,
+            method: entry.method,
+            scheme: entry.scheme,
+            host: entry.host,
+            path: entry.path,
+            query_string: entry.query_string,
+            protocol: entry.protocol,
+            request_headers: entry.request_headers,
+            request_body: entry.request_body.unwrap_or_default(),
             request_body_size: entry.request_body_size,
             request_body_truncated: entry.request_body_truncated,
             response_status: entry.response_status,
-            response_headers: entry.response_headers.clone(),
-            response_body: entry.response_body.clone().unwrap_or_default(),
+            response_headers: entry.response_headers,
+            response_body: entry.response_body.unwrap_or_default(),
             response_body_size: entry.response_body_size,
             response_body_truncated: entry.response_body_truncated,
-            upstream_addr: entry.upstream_addr.clone(),
+            upstream_addr: entry.upstream_addr,
             upstream_latency_ms: entry.upstream_latency_ms,
+            upstream_status: entry.upstream_status,
             waf_score: entry.waf_score,
-            waf_action: entry.waf_action.clone(),
-            waf_rule_id: entry.waf_rule_id.clone(),
-            waf_enforced_rule_id: entry.waf_enforced_rule_id.clone(),
-            waf_rule_name: entry.waf_rule_name.clone(),
-            waf_event_type: entry.waf_event_type.clone(),
-            waf_details: entry.waf_details.clone(),
-            waf_matched_tags: entry.waf_matched_tags.clone(),
-            user_identity: entry.user_identity.clone(),
+            waf_action: entry.waf_action,
+            waf_rule_id: entry.waf_rule_id,
+            waf_enforced_rule_id: entry.waf_enforced_rule_id,
+            waf_rule_name: entry.waf_rule_name,
+            waf_event_type: entry.waf_event_type,
+            waf_details: entry.waf_details,
+            waf_matched_tags: entry.waf_matched_tags,
+            user_identity: entry.user_identity,
             total_latency_ms: entry.total_latency_ms,
-            cache_status: entry.cache_status.clone(),
-            tls_version: entry.tls_version.clone(),
-            ja3_hash: entry.ja3_hash.clone(),
-            country_code: entry.country_code.clone(),
-            city: entry.city.clone(),
+            cache_status: entry.cache_status,
+            tls_version: entry.tls_version,
+            ja3_hash: entry.ja3_hash,
+            country_code: entry.country_code,
+            city: entry.city,
             asn: entry.asn,
-            user_agent: entry.user_agent.clone(),
-            referer: entry.referer.clone(),
+            user_agent: entry.user_agent,
+            referer: entry.referer,
         }
     }
 
@@ -1258,6 +1358,8 @@ impl ControlPlaneClient {
     pub fn shutdown(&self) {
         info!("Initiating agent shutdown");
         self.shutdown_signal.store(true, Ordering::Relaxed);
+        // A debounced rule update may still be waiting for the flush loop.
+        self.rule_cache.flush_rule_cache_if_dirty();
     }
 
     /// Get the current system metrics snapshot.
@@ -1874,14 +1976,12 @@ fn get_hostname() -> String {
 }
 
 fn get_local_ip() -> String {
-    // Attempt to determine local IP by connecting to a public address
-    std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|socket| {
-            socket.connect("8.8.8.8:80")?;
-            socket.local_addr()
-        })
-        .map(|addr| addr.ip().to_string())
-        .unwrap_or_else(|_| "127.0.0.1".to_string())
+    // Same egress probe the metrics sampler uses: it tries an IPv4 then an
+    // IPv6 destination, so an IPv6-only node reports its real address instead
+    // of the loopback fallback the hard-coded `0.0.0.0` socket produced.
+    crate::probe::egress_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string())
 }
 
 fn get_system_info() -> (u32, u64, String) {

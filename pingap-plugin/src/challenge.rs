@@ -55,7 +55,7 @@ use pingwaf_challenge::{
 use std::borrow::Cow;
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
@@ -113,6 +113,12 @@ pub(crate) static FALLBACK_COOKIE_SECRET: LazyLock<String> =
         );
         uuid::Uuid::new_v4().simple().to_string()
     });
+
+/// Last-resort secret for a cache directory that exists but cannot be
+/// written. It must stay stable for the process: callers on both sides of the
+/// clearance contract (WAF verification and challenge signing) resolve it
+/// independently, and a fresh UUID per call would make every cookie invalid.
+static UNPERSISTED_COOKIE_SECRET: OnceLock<String> = OnceLock::new();
 
 #[inline]
 fn now_secs() -> i64 {
@@ -691,8 +697,11 @@ pub(crate) fn resolve_cookie_secret(configured: &str) -> String {
         secret
     } else {
         // Keep the clearance system working even on a read-only cache dir;
-        // cookies merely do not survive a restart.
-        uuid::Uuid::new_v4().simple().to_string()
+        // cookies merely do not survive a restart. The value is process-wide
+        // so the WAF and the challenge plugin agree on it.
+        UNPERSISTED_COOKIE_SECRET
+            .get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+            .clone()
     }
 }
 
@@ -1103,11 +1112,10 @@ impl Plugin for ChallengePlugin {
         }
 
         // A path exception that skips the challenge layer exempts this
-        // request from the standalone challenge gate too. The WAF plugin
-        // (which runs first) resolved the exception against the site's
-        // rules and stamped the verdict on the pending-access entry; this
-        // plugin has no site-rule context of its own. No entry (or a
-        // request the WAF skipped) reads as false: fail-closed.
+        // request from the standalone challenge gate too. The fast path is
+        // the pending-access entry the WAF stamps when it runs; a missing
+        // entry (WAF not in the chain, table full) falls through to the
+        // direct site-rule lookup below.
         if let Some(request_id) = ctx.state.request_id.as_deref()
             && (super::waf::pending_path_bypasses_challenge(request_id)
                 || super::waf::pending_path_bypasses_rate_limit(request_id))
@@ -1118,6 +1126,13 @@ impl Plugin for ChallengePlugin {
         let host = get_host(session.req_header())
             .unwrap_or_default()
             .to_string();
+        // Resolve the site's exceptions directly instead of relying only on
+        // the WAF's pending-access handshake: the WAF may be absent from the
+        // chain or its pending table may be full, yet `skip_layers = ["*"]`
+        // must still suppress this gate.
+        if super::waf::path_exception_skips_challenge(&host, &path) {
+            return Ok(RequestPluginResult::Continue);
+        }
         // Sites behind a CDN/proxy derive the client IP from the trusted
         // forwarded header so challenge rate limiting keys on the real
         // visitor address.
@@ -1270,6 +1285,45 @@ mod tests {
         assert!(pending.bytes > 0);
         if let Some((_, removed)) = PENDING_CHALLENGES.remove(&request_id) {
             account_pending_removed(&removed);
+        }
+    }
+
+    /// The footer brand on every shared page links to the official site, and
+    /// the new tab cannot reach back through `window.opener`.
+    #[test]
+    fn brand_pages_link_to_the_official_site() {
+        let pages: Vec<(&str, String)> = vec![
+            (
+                "block",
+                String::from_utf8_lossy(&block_page("r", "x").body).to_string(),
+            ),
+            (
+                "paused",
+                String::from_utf8_lossy(&paused_page("r").body).to_string(),
+            ),
+            (
+                "rate-limit",
+                String::from_utf8_lossy(&rate_limit_page("r", "x", 30).body)
+                    .to_string(),
+            ),
+            (
+                "basic-auth",
+                String::from_utf8_lossy(&basic_auth_page("r", "x", "y").body)
+                    .to_string(),
+            ),
+            (
+                "fail-closed",
+                String::from_utf8_lossy(&fail_closed_page("r").body)
+                    .to_string(),
+            ),
+        ];
+        for (label, body) in pages {
+            assert!(
+                body.contains(r#"href="https://www.pingwaf.com""#),
+                "{label}: {body}"
+            );
+            assert!(body.contains(r#"rel="noopener""#), "{label}: {body}");
+            assert!(body.contains("Protected by"), "{label}: {body}");
         }
     }
 
@@ -1561,6 +1615,17 @@ cookie_secret = "test-secret"
         Arc<WafredAgent>,
         tempfile::TempDir,
     ) {
+        install_challenge_agent_with_exceptions(challenge, Vec::new()).await
+    }
+
+    async fn install_challenge_agent_with_exceptions(
+        challenge: Option<proto::ChallengeConfig>,
+        path_exceptions: Vec<proto::PathException>,
+    ) -> (
+        tokio::sync::MutexGuard<'static, ()>,
+        Arc<PingWafAgent>,
+        tempfile::TempDir,
+    ) {
         let lock = lock_agent().await;
         let dir = tempfile::tempdir().unwrap();
         let config = AgentConfig {
@@ -1600,6 +1665,7 @@ cookie_secret = "test-secret"
                             site_id: "site-1".to_string(),
                             config_hash: "hash-1".to_string(),
                             challenge: challenge.clone(),
+                            path_exceptions,
                             ..Default::default()
                         }),
                         trust_proxy_headers: false,
@@ -1661,6 +1727,54 @@ cookie_secret = "test-secret"
             )
             .await
             .unwrap()
+    }
+
+    /// A path exception that skips the rate/challenge layer must suppress
+    /// this plugin's own gate even when the WAF registered no pending entry
+    /// (the standalone/old-agent case). `rate_limit` is included because
+    /// this plugin shares its CC rate window with that layer.
+    #[tokio::test]
+    async fn test_path_exception_skips_the_challenge_gate() {
+        let (_guard, _agent, _dir) = install_challenge_agent_with_exceptions(
+            Some(proto::ChallengeConfig {
+                enabled: true,
+                under_attack_mode: true,
+                default_level: proto::ChallengeLevel::ChallengeNonInteractive
+                    as i32,
+                clearance_duration_seconds: 1800,
+                exempt_paths: Vec::new(),
+                request_threshold: 0,
+                browser_integrity_check: true,
+                tls_fingerprint_check: false,
+            }),
+            vec![proto::PathException {
+                id: "rate-api".to_string(),
+                path: "/api".to_string(),
+                match_type: proto::PathMatchType::PathMatchPrefix as i32,
+                skip_layers: vec!["rate_limit".to_string()],
+                enabled: true,
+                log_hits: false,
+                note: String::new(),
+            }],
+        )
+        .await;
+        let plugin = ChallengePlugin::new(
+            &toml::from_str::<PluginConf>(
+                r###"cookie_secret = "test-secret""###,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            run_challenge_request(&plugin, "example.com", "/api/x").await
+                == RequestPluginResult::Continue,
+            "the exception must suppress this plugin's gate"
+        );
+        assert!(matches!(
+            run_challenge_request(&plugin, "example.com", "/other").await,
+            RequestPluginResult::Respond(_)
+        ));
     }
 
     /// Under attack mode is enforced per site: the configured site gets the

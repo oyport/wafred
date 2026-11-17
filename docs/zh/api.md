@@ -447,3 +447,38 @@ curl -k -H "Authorization: Bearer $TOKEN" \
 - 多值编码（如 `gzip, br`）仍按不支持透传，不做替换。
 
 详见：[Response body replacement (`response_replace`)](../api.md#response-body-replacement-response_replace)。
+
+## MCP server（MCP 服务）
+
+> 完整英文原文见 [`docs/api.md` → MCP server](../api.md#mcp-server)；本节为关键契约的中文镜像。
+
+控制面在**根路径** `/mcp`（不在 `/api/v1` 下）提供 MCP 端点，使用 **Streamable HTTP**：
+客户端 `POST` JSON-RPC 2.0 消息并获得 JSON 响应；`GET`/`DELETE` 返回 `405`。端点无状态，
+不签发 `Mcp-Session-Id`。
+
+### 认证与权限边界
+
+- 复用控制台凭据：`Authorization: Bearer` + `pwk_…` API key 或用户 JWT。
+- key 需带 `read` 或 `write` 权限才会被接受；写工具额外要求 key 自身带 `write`。
+- **只有同时满足「key 带 `write`」且「key 属主是管理员」时才是 fleet-wide**（可见全部站点，
+  并可调用 admin-only 工具：控制面审计日志、防御设置、站点暂停）。
+- **`read` key（包括历史上 agent enroll key 曾携带的 `read`）只能看到其属主自己拥有的站点**。
+- 被撤销/禁用的 key 一律拒绝；JWT 会话与 REST API 使用同一套账号校验（禁用账号、过期 token、
+  强制改密账号均拒绝）。
+- 端点不在 REST 凭据限流器内，另有约束：单批 JSON-RPC 最多 16 条，请求体上限 256 KiB。
+
+### 数据边界
+
+- `write` key 等同管理员凭据，**不要交给不受控的 AI 客户端**；
+- 内置 AI 助手调用同一批工具，会把用户消息与工具结果（站点元数据、访问日志、WAF 事件，
+  管理员还包括控制面审计条目）发送给 **Settings → AI assistant** 配置的 OpenAI 兼容
+  provider。仅在该数据允许离开部署时启用，并审阅 provider 的保留与数据处理条款；
+  `allow_write_tools` 默认关闭，非必要不要打开（提示注入可能改变线上配置）。
+
+### 方法与资源
+
+支持 `initialize`、`ping`、`tools/list`、`tools/call`、`resources/list`、`resources/read`、
+`resources/templates/list`、`prompts/list`、`prompts/get`、`logging/setLevel`（接受但无操作）
+以及 JSON-RPC 批量调用；通知返回 `202 Accepted`。
+
+`/mcp` 挂在根路由上，因此 9080 的自保护栈（访问日志、IP 白名单、WAF）同样作用于它。

@@ -52,6 +52,14 @@ const docs = {
       minutes: 7,
       topics: ["REST", "gRPC", "auth", "automatización"],
     },
+    {
+      slug: "security",
+      icon: "lock",
+      title: "Seguridad",
+      lead: "Cómo reportar vulnerabilidades en privado, qué versiones reciben correcciones y cómo endurecer la instancia antes de exponerla.",
+      minutes: 8,
+      topics: ["divulgación", "versiones", "endurecimiento", "secretos"],
+    },
   ],
   sidebarLabel: "Documentación",
   screenshot: {

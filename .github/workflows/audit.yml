@@ -33,5 +33,42 @@ jobs:
         with:
           tool: cargo-audit
 
+      # `cargo tree` is only needed by the guard below; pin the toolchain the
+      # same way ci.yml does instead of relying on the runner image.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      # `.cargo/audit.toml` accepts RUSTSEC-2026-0459 (libsqlite3-sys) because
+      # that crate is only a record of sqlx's optional `sqlite` feature and never
+      # reaches a build. That reasoning dies the moment a manifest enables a
+      # sqlite backend, so assert it here rather than trust a comment.
+      - name: Assert libsqlite3-sys stays out of the build graph
+        env:
+          # Keep the tree on one line per package: coloured output wraps the
+          # name in escapes, which breaks a plain substring match.
+          CARGO_TERM_COLOR: never
+        run: |
+          # Only stdout is the graph. stderr carries download progress (which
+          # includes a literal "Downloaded libsqlite3-sys v0.30.1" line) and the
+          # "nothing to print" notice — mixing the two once made this guard fail
+          # on a tree that had no such edge at all.
+          cargo tree --locked --all-features -i libsqlite3-sys > graph.out 2> graph.err || true
+          echo "--- cargo tree (stderr) ---"
+          cat graph.err
+          echo "--- cargo tree (stdout) ---"
+          cat graph.out
+          if grep -q "libsqlite3-sys v" graph.out; then
+            echo "::error::libsqlite3-sys entered the build graph (a sqlite backend was enabled). Revisit the RUSTSEC-2026-0459 ignore in .cargo/audit.toml."
+            exit 1
+          fi
+          # Belt and braces: no manifest may reference a sqlite feature, so the
+          # crate cannot be compiled even if the tree check above is ever wrong.
+          if grep -rn --include=Cargo.toml -E 'sqlx-sqlite|sqlite' .; then
+            echo "::error::a Cargo.toml references sqlite; revisit RUSTSEC-2026-0459."
+            exit 1
+          fi
+
       - name: Run cargo audit
         run: cargo audit

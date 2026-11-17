@@ -72,7 +72,7 @@ export function PillMultiSelect({
                 'inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-[13px] font-medium',
                 'transition-all duration-150 disabled:cursor-not-allowed disabled:opacity-50',
                 selected
-                  ? 'border-brand bg-brand-soft text-brand'
+                  ? 'border-brand bg-brand-soft text-fg-brand-strong'
                   : 'border-line bg-elevated text-fg-subtle hover:border-fill hover:text-fg',
               )}
             >

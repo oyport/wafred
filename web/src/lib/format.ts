@@ -7,27 +7,86 @@
  * what "3 minutes ago" looks like.
  */
 
-const numberFormatter = new Intl.NumberFormat('en-US')
+/**
+ * BCP-47 tag the number and date formatters use.
+ *
+ * Defaults to the browser locale, but the i18n layer calls
+ * {@link setDisplayLocale} so a console switched to 中文 or 日本語 renders its
+ * numbers and timestamps in that language instead of whatever the machine
+ * happens to run.
+ */
+let displayLocale: string | undefined = undefined
 
-/** `1234567` → `1,234,567`. */
-export function formatNumber(value: number | null | undefined): string {
-  if (value === null || value === undefined || !Number.isFinite(value)) return '—'
-  return numberFormatter.format(value)
+/** Point the formatters at a language; called by the i18n layer. */
+export function setDisplayLocale(locale: string): void {
+  displayLocale = locale
 }
 
-/** `1234567` → `1.2M`. */
+interface NumberFormatters {
+  number: Intl.NumberFormat
+  compact: Intl.NumberFormat
+  percent: Map<number, Intl.NumberFormat>
+}
+
+const numberFormatterCache = new Map<string, NumberFormatters>()
+
+function numberFormatters(): NumberFormatters {
+  const key = displayLocale ?? 'default'
+  const cached = numberFormatterCache.get(key)
+  if (cached) return cached
+  const locale = displayLocale
+  const set: NumberFormatters = {
+    number: new Intl.NumberFormat(locale),
+    compact: new Intl.NumberFormat(locale, {
+      notation: 'compact',
+      maximumFractionDigits: 1,
+    }),
+    percent: new Map(),
+  }
+  numberFormatterCache.set(key, set)
+  return set
+}
+
+function percentFormatter(digits: number): Intl.NumberFormat {
+  const set = numberFormatters()
+  const cached = set.percent.get(digits)
+  if (cached) return cached
+  const formatter = new Intl.NumberFormat(displayLocale, {
+    style: 'percent',
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  })
+  set.percent.set(digits, formatter)
+  return formatter
+}
+
+/** `1234567` → `1,234,567` (grouping follows the console language). */
+export function formatNumber(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—'
+  return numberFormatters().number.format(value)
+}
+
+/**
+ * `1234567` → `1.2M` (中文/日本語 → `123.5万`). The compact form is the default
+ * for KPI cards; tables use {@link formatNumber} so a row stays exact. Callers
+ * that show a compact value should put the exact figure in a `title` (see
+ * {@link formatRawValue}) so the two never disagree for a reader.
+ */
 export function formatCompactNumber(value: number | null | undefined): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return '—'
-  return new Intl.NumberFormat('en-US', {
-    notation: 'compact',
-    maximumFractionDigits: 1,
-  }).format(value)
+  return numberFormatters().compact.format(value)
+}
+
+/** The exact, locale-grouped figure behind a compact KPI — for `title`/tooltip. */
+export function formatRawValue(value: number | null | undefined): string | null {
+  if (value === null || value === undefined || !Number.isFinite(value)) return null
+  return numberFormatters().number.format(value)
 }
 
 /** `0.4231` → `42.3%`. */
 export function formatPercent(ratio: number | null | undefined, digits = 1): string {
   if (ratio === null || ratio === undefined || !Number.isFinite(ratio)) return '—'
-  return `${(ratio * 100).toFixed(digits)}%`
+  return percentFormatter(digits).format(ratio)
 }
 
 /** `820` → `820 µs`; above 1 ms delegates to {@link formatLatency}. */
@@ -58,20 +117,6 @@ export function formatLatency(ms: number | null | undefined): string {
     return `${h}h ${String(Math.round((ms % 3_600_000) / 60_000)).padStart(2, '0')}m`
   }
   return `${Math.floor(ms / 86_400_000)}d ${Math.round((ms % 86_400_000) / 3_600_000)}h`
-}
-
-/**
- * BCP-47 tag the date formatters use.
- *
- * Defaults to the browser locale, but the i18n layer calls
- * {@link setDisplayLocale} so a console switched to 中文 or 日本語 renders its
- * timestamps in that language instead of whatever the machine happens to run.
- */
-let displayLocale: string | undefined = undefined
-
-/** Point the date formatters at a language; called by the i18n layer. */
-export function setDisplayLocale(locale: string): void {
-  displayLocale = locale
 }
 
 interface DateFormatters {
@@ -254,4 +299,47 @@ export function statusTone(code: number | null | undefined): 'success' | 'neutra
   if (code >= 400) return 'warning'
   if (code >= 300) return 'neutral'
   return 'success'
+}
+
+/** Time zone the browser/console renders timestamps in (IANA name). */
+export function displayTimeZone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+  } catch {
+    return 'UTC'
+  }
+}
+
+/**
+ * Full timestamp plus its zone, for `title` attributes: hovering a table cell
+ * tells the operator both the exact instant and the zone it is shown in, which
+ * is what "no time zone annotation" was missing.
+ */
+export function formatDateTimeWithZone(
+  value: string | number | Date | null | undefined,
+): string {
+  const date = toDate(value)
+  if (!date) return '—'
+  return `${formatters().absolute.format(date)} (${displayTimeZone()})`
+}
+
+/** Time of day plus its zone — the compact variant of {@link formatDateTimeWithZone}. */
+export function formatTimeWithZone(
+  value: string | number | Date | null | undefined,
+): string {
+  const date = toDate(value)
+  if (!date) return '—'
+  return `${formatters().shortTime.format(date)} (${displayTimeZone()})`
+}
+
+/**
+ * Duration in seconds rendered with the same unit ladder as
+ * {@link formatLatency}, so a value stored in seconds (certificate lifetimes,
+ * cache TTLs) never grows a second spelling such as `1.4 s` vs `1.4s`.
+ */
+export function formatSeconds(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined || !Number.isFinite(seconds)) {
+    return '—'
+  }
+  return formatLatency(seconds * 1000)
 }

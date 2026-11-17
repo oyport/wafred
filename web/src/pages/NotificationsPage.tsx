@@ -184,6 +184,7 @@ export function NotificationsPage() {
               size="sm"
               variant="ghost"
               onClick={() => testMutation.mutate(row.id)}
+              aria-label={t('pages.notifications.test')}
               title={t('pages.notifications.test')}
             >
               <PaperPlaneTilt className="h-4 w-4" />
@@ -194,6 +195,7 @@ export function NotificationsPage() {
                   size="sm"
                   variant="ghost"
                   onClick={() => setEditing(row)}
+                  aria-label={t('common.edit')}
                   title={t('common.edit')}
                 >
                   <Pencil className="h-4 w-4" />
@@ -202,6 +204,7 @@ export function NotificationsPage() {
                   size="sm"
                   variant="ghost"
                   onClick={() => setPendingDelete(row)}
+                  aria-label={t('common.delete')}
                   title={t('common.delete')}
                 >
                   <Trash className="h-4 w-4 text-danger" />
@@ -279,6 +282,7 @@ export function NotificationsPage() {
               </h3>
               <Select
                 className="w-56"
+                aria-label={t('a11y.filterByEventType')}
                 value={eventTypeFilter}
                 onChange={(e) => {
                   setEventTypeFilter(e.target.value)
@@ -306,6 +310,7 @@ export function NotificationsPage() {
                   <div className="flex items-center gap-1">
                     <Select
                       className="w-32"
+                      aria-label={t('a11y.retentionWindow')}
                       value={String(purgeDays)}
                       onChange={(e) => setPurgeDays(Number(e.target.value))}
                       options={[7, 30, 90].map((d) => ({
@@ -532,7 +537,7 @@ function SettingsCard({
           <h3 className="text-base font-semibold text-fg">
             {t('pages.notifications.settingsTitle')}
           </h3>
-          <label className="flex items-center gap-2 text-sm" title={t('pages.notifications.masterEnabledHint')}>
+          <label className="flex items-center gap-2 text-sm pw-touch-check" title={t('pages.notifications.masterEnabledHint')}>
             <input
               type="checkbox"
               checked={enabled}
@@ -590,7 +595,7 @@ function SettingsCard({
             {eventToggleRows.map((type) => {
               const key = EVENT_TOGGLE_KEY[type]
               return (
-                <label key={type} className="flex items-center gap-2 text-sm">
+                <label key={type} className="flex items-center gap-2 text-sm pw-touch-check">
                   <input
                     type="checkbox"
                     checked={Boolean(toggles[key])}
@@ -698,7 +703,7 @@ function LoginSecurityCard({ canWrite }: { canWrite: boolean }) {
               {t('pages.notifications.loginSecurityHint')}
             </p>
           </div>
-          <label className="flex items-center gap-2 text-sm">
+          <label className="flex items-center gap-2 text-sm pw-touch-check">
             <input
               type="checkbox"
               checked={current?.anomaly_enabled ?? false}
@@ -731,7 +736,7 @@ function LoginSecurityCard({ canWrite }: { canWrite: boolean }) {
             placeholder="http://ip-api.com/json/{ip}?…"
           />
         </div>
-        <label className="mt-2 flex items-center gap-2 text-sm">
+        <label className="mt-2 flex items-center gap-2 text-sm pw-touch-check">
           <input
             type="checkbox"
             checked={current?.trust_last_hop ?? false}
@@ -1011,7 +1016,7 @@ function ChannelDialog({ initial, onClose, onSaved }: ChannelDialogProps) {
           </p>
           <div className="grid max-h-40 grid-cols-2 gap-1 overflow-y-auto rounded-md border border-border p-2">
             {NOTIFICATION_EVENT_TYPES.map((type) => (
-              <label key={type} className="flex items-center gap-2 text-sm">
+              <label key={type} className="flex items-center gap-2 text-sm pw-touch-check">
                 <input
                   type="checkbox"
                   checked={events.has(type)}
@@ -1024,7 +1029,7 @@ function ChannelDialog({ initial, onClose, onSaved }: ChannelDialogProps) {
           </div>
         </div>
 
-        <label className="flex items-center gap-2 text-sm">
+        <label className="flex items-center gap-2 text-sm pw-touch-check">
           <input
             type="checkbox"
             checked={enabled}

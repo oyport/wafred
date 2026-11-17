@@ -1,5 +1,6 @@
 import { Fragment, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
+import { useTranslation } from 'react-i18next'
 import { CaretRight } from '@phosphor-icons/react'
 import { cn } from '@/lib/utils'
 
@@ -14,8 +15,9 @@ export interface BreadcrumbProps {
 }
 
 export function Breadcrumb({ items, className }: BreadcrumbProps) {
+  const { t } = useTranslation()
   return (
-    <nav aria-label="Breadcrumb" className={cn('flex items-center', className)}>
+    <nav aria-label={t('a11y.breadcrumb')} className={cn('flex items-center', className)}>
       <ol className="flex items-center gap-1 text-[13px]">
         {items.map((item, i) => {
           const isLast = i === items.length - 1

@@ -11,6 +11,7 @@ import { useToast } from '@/components/ui/Toast'
 import { sitesApi, siteKeys } from '@/api/sites'
 import { errorMessage } from '@/api/errors'
 import { useCanWrite } from '@/hooks'
+import { useRegisterUnsaved } from '@/hooks/useUnsavedGuard'
 import type { IpGroupResponse, Site } from '@/api/types'
 import { parseTrustedRanges, TRUSTED_HEADER_OPTIONS } from './types'
 
@@ -65,6 +66,8 @@ export function ProxyTrustCard({
     lastHop !== site.trust_last_hop ||
     ranges !== site.trusted_proxy_ranges.join('\n') ||
     !sameIds(groupIds, savedGroupIds)
+  // Aggregated by `SiteDetailPage`, which owns the single leave-guard dialog.
+  useRegisterUnsaved(dirty)
 
   const save = useMutation({
     mutationFn: (parsedRanges: string[]) =>

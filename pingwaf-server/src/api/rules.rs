@@ -69,7 +69,11 @@ pub struct UpdateGroupRequest {
     pub enabled: Option<bool>,
 }
 
+/// Rejecting unknown keys keeps a read-modify-write client honest: echoing a
+/// server-owned field back (for example `managed_rule_id`) or a typo used to be
+/// dropped silently, which looked like a successful edit that changed nothing.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateRuleRequest {
     pub name: String,
     #[serde(default)]
@@ -109,6 +113,7 @@ fn default_mode() -> String {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateRuleRequest {
     #[serde(default)]
     pub name: Option<String>,
@@ -189,7 +194,7 @@ async fn seed_defaults(
 /// value that enforces is `block`. A bare "unknown mode 'enforce'" left them
 /// guessing, so the rejection lists `off` | `monitor` | `block` and spells the
 /// confusion out when it recognises the near-miss.
-fn validate_mode(rule_mode: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_mode(rule_mode: &str) -> Result<(), ApiError> {
     if mode::is_valid(rule_mode) {
         return Ok(());
     }
@@ -249,22 +254,32 @@ fn validate_group(name: &str, phase: &str) -> Result<(), ApiError> {
 /// Rejects action/mode pairs whose runtime meaning contradicts the label the
 /// operator sees. `allow` short-circuits before every block rule, so pairing it
 /// with `mode=block` promises enforcement that can never happen.
-fn validate_action_mode(
+pub(crate) fn validate_action_mode(
     rule_action: &str,
     rule_mode: &str,
 ) -> Result<(), ApiError> {
-    if rule_action == action::ALLOW && rule_mode == mode::BLOCK {
-        return Err(ApiError::BadRequest(
+    if rule_action != action::ALLOW {
+        return Ok(());
+    }
+    match rule_mode {
+        mode::MONITOR => Ok(()),
+        mode::BLOCK => Err(ApiError::BadRequest(
             "action 'allow' cannot use mode 'block': an allow rule always \
              passes the request, so the block mode would never apply; use \
-             'monitor' or 'off'"
+             'monitor'"
                 .to_string(),
-        ));
+        )),
+        mode::OFF => Err(ApiError::BadRequest(
+            "action 'allow' cannot use mode 'off': off disables the rule and \
+             its whitelist exemption, so later block rules run again; use \
+             'monitor' to keep the allow rule active"
+                .to_string(),
+        )),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
-fn validate_rule(
+pub(crate) fn validate_rule(
     name: &str,
     expression: &str,
     rule_action: &str,
@@ -482,6 +497,10 @@ async fn create_rule(
     let model = rule::ActiveModel {
         id: Set(Uuid::new_v4()),
         group_id: Set(group_id),
+        // `managed_rule_id` is control-plane-internal: the API never accepts
+        // it from a client, so a custom rule can never claim to mirror a
+        // managed rule (which would stop it being pushed as a custom rule).
+        managed_rule_id: Set(None),
         site_id: Set(id),
         name: Set(payload.name.trim().to_string()),
         description: Set(non_empty(&payload.description)),
@@ -529,6 +548,25 @@ async fn update_rule(
     load_site_write(&state.db, id, &current).await?;
 
     let row = find_rule(&state, id, target).await?;
+    // A managed-linked seed row is now an override, not a custom rule: only
+    // its enabled/mode switch is delivered. Reject silent no-op edits instead
+    // of returning 200 while the expression/action never reach the edge.
+    if row.managed_rule_id.is_some()
+        && (payload.name.is_some()
+            || payload.description.is_some()
+            || payload.expression.is_some()
+            || payload.action.is_some()
+            || payload.severity.is_some()
+            || payload.tags.is_some()
+            || payload.priority.is_some()
+            || payload.group_id.is_some()
+            || payload.clear_group.is_some())
+    {
+        return Err(ApiError::BadRequest(
+            "this rule controls a built-in managed rule; only enabled and mode can be changed"
+                .to_string(),
+        ));
+    }
     // Effective values for the combination check: a PATCH that changes only one
     // side must still be validated against the stored other side.
     let mut effective_action = row.action.clone();
@@ -700,6 +738,36 @@ mod tests {
         assert!(message.contains("off|monitor|block"), "{message}");
         assert!(message.contains("use 'block'"), "{message}");
         assert!(validate_rule("r", OK_EXPR, "block", "block", 9).is_err());
+
+        // An allow rule is the exemption itself: off would remove it and let
+        // later block rules run, so only monitor is accepted.
+        assert!(validate_rule("r", OK_EXPR, "allow", "off", 3).is_err());
+        assert!(validate_rule("r", OK_EXPR, "allow", "monitor", 3).is_ok());
+        assert!(validate_rule("r", OK_EXPR, "allow", "block", 3).is_err());
+    }
+
+    #[test]
+    fn rule_payloads_reject_unknown_fields() {
+        // A client that echoes a server-owned field back (or typos one) used to
+        // have it silently dropped, which looked like a successful edit.
+        assert!(serde_json::from_str::<CreateRuleRequest>(
+            r#"{"name":"r","expression":"http.request.method eq \"GET\""}"#
+        )
+        .is_ok());
+        assert!(
+            serde_json::from_str::<CreateRuleRequest>(
+                r#"{"name":"r","expression":"http.request.method eq \"GET\"","managed_rule_id":"PINGWAF-1002"}"#
+            )
+            .is_err()
+        );
+        assert!(serde_json::from_str::<UpdateRuleRequest>(
+            r#"{"enabled":false}"#
+        )
+        .is_ok());
+        assert!(serde_json::from_str::<UpdateRuleRequest>(
+            r#"{"enabled":false,"managed_rule_id":"PINGWAF-1002"}"#
+        )
+        .is_err());
     }
 
     #[test]

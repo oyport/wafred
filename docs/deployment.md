@@ -87,10 +87,11 @@ file manually:
 git clone https://github.com/oyport/wafred.git
 cd wafred
 
-# Set secrets (recommended)
+# Set secrets (required — there is no built-in default password any more)
 export JWT_SECRET=$(openssl rand -hex 32)
 export ADMIN_PASSWORD=$(openssl rand -hex 16)
 export POSTGRES_PASSWORD=$(openssl rand -hex 16)
+export PINGWAF_SECRET_KEY=$(openssl rand -hex 32)
 
 docker compose up -d
 
@@ -114,6 +115,18 @@ unprivileged `wafred` user. Binding a port below 1024 therefore needs
 thread 'Pingora HTTP Proxy Service' panicked at …/pingora-core-0.9.x/src/services/listening.rs:293:14:
 Failed to build listeners: … PermissionDenied … bind() failed on 0.0.0.0:443
 ```
+
+Both listeners bind the IPv6 wildcard `[::]` by default with
+`IPV6_V6ONLY=false`, so one socket serves IPv4 and IPv6: an IPv4 client simply
+arrives as `::ffff:a.b.c.d` and the data plane canonicalises it back to
+`a.b.c.d` before IP access rules, rate-limit keys, auto-ban and logs see it. Two
+consequences worth knowing:
+
+- A host with IPv6 disabled at the kernel level cannot bind `[::]`, so the
+  default falls back to `0.0.0.0` automatically instead of failing to start.
+- To pin one family, set `PINGWAF_LISTEN_HTTP_ADDR` / `PINGWAF_LISTEN_HTTPS_ADDR`
+  (e.g. `0.0.0.0:80`), which is also what the `bind() failed on [::]:443`
+  message above is telling you to look at.
 
 Images built from this repository grant that capability to the binary at build
 time (`setcap cap_net_bind_service=+ep /usr/local/bin/wafred`, asserted with
@@ -187,6 +200,11 @@ The systemd path solves the same problem a different way — the unit grants
 | `HEARTBEAT_INTERVAL` | `15` | Agent heartbeat interval (seconds) |
 | `RUST_LOG` | `info,sqlx=warn` | Log level filter |
 
+> `.env` holds the DSN, `PINGWAF_SECRET_KEY`, the JWT secret and the admin
+> password. Keep it `chmod 600`, out of version control, and prefer a secret
+> manager (systemd credentials, Kubernetes Secret, Docker secret) over a plain
+> file.
+
 ## Manual Installation (Binary + systemd)
 
 ### 1. Install the Binary
@@ -197,11 +215,10 @@ The installer runs in two modes:
   no arguments it asks, in order: deployment mode (all-in-one / server /
   agent), then for agent mode the control-plane gRPC URL and enrollment API
   key, or for server/all-in-one the administrator e-mail, the administrator
-  password twice (leaving it empty keeps the default, which the dashboard
-  forces to change at first login), the PostgreSQL URL, the certificate SAN
-  list of the dashboard, and the version to install. It then prints an
-  **Installation plan** summary and asks `Continue? [Y/n]` before touching
-  anything.
+  password twice (leaving it empty generates a random password, printed once at
+  the end), the PostgreSQL URL, the certificate SAN list of the dashboard, and
+  the version to install. It then prints an **Installation plan** summary and
+  asks `Continue? [Y/n]` before touching anything.
 - **One-line unattended install** — any argument switches the script to
   fully non-interactive: it installs with the given values and defaults and
   never prompts. Because `curl | bash` has no terminal on stdin, piping the
@@ -243,6 +260,25 @@ over as environment variables (`WAFRED_ADMIN_EMAIL` /
 `WAFRED_ADMIN_PASSWORD` / `WAFRED_TLS_SANS`) or as flags — not typed into a
 prompt that will never appear. Run with `--dry-run` first to check the plan
 the script resolved from your options.
+
+**What the installer verifies and generates** (fail-closed where noted):
+
+- **Release checksum** — every release asset ships a `.sha256` sidecar. The
+  installer downloads it and **aborts** when the sidecar is missing, malformed
+  or does not match the archive; a tampered or truncated download is never
+  installed.
+- **Administrator password** — when `--admin-password` /
+  `PINGWAF_ADMIN_PASSWORD` is empty, a random password is generated and printed
+  **once** at the end of the run. There is no built-in default password.
+- **`PINGWAF_SECRET_KEY`** — generated when unset and written to
+  `/etc/pingwaf/pingwaf.env` (mode `0600`, owned by `pingwaf`); the shipped
+  systemd unit reads it through `EnvironmentFile=-/etc/pingwaf/pingwaf.env`.
+  An existing key is kept on upgrade: rotating it silently would make every
+  sealed notification/AI/backup credential unreadable.
+- **Listen addresses** — `127.0.0.1:9080` (console) and `127.0.0.1:9090`
+  (gRPC) by default. `--listen-public` (or `PINGWAF_LISTEN_PUBLIC=1`) publishes
+  them on `0.0.0.0` and prints a reminder to change the administrator password
+  first; prefer a TLS reverse proxy over exposing the console directly.
 
 > Prebuilt release assets are published for **Linux** (amd64/arm64) only; on
 > macOS, [build from source](./quick-start.md#path-2-build-from-source).
@@ -364,6 +400,13 @@ and therefore no file key:
 | `WAFRED_PASSKEY_TRUST_FORWARDED_PROTO` | `false` | Believe `X-Forwarded-Proto` when deriving the origin |
 | `WAFRED_MALLOC_PURGE_DELAY_MS` | derived from memory ceiling | Allocator purge delay in **milliseconds** (mimalloc `mi_option_purge_delay`). Overrides the automatic bucketing (<1 GB → 0, 1-4 GB → 250, 4-16 GB → 500, >16 GB → 1000); `-1` disables purging. The standard `MIMALLOC_PURGE_DELAY` is honoured as a fallback |
 
+> **Passkeys need a secure context.** WebAuthn only works over HTTPS under a
+> hostname (or `localhost`), never plain `http://` or a bare IP. Behind a
+> TLS-terminating proxy set `PINGWAF_PASSKEY_ORIGIN` to the public origin, and
+> `PINGWAF_PASSKEY_TRUST_FORWARDED_PROTO=true` only when that proxy is the one
+> terminating TLS. Ceremony state lives in the database, so several replicas can
+> serve one ceremony without sticky sessions.
+
 The refresh-token lifetime (30 days), the minimum pool size (`1`) and the
 server-side log batch size (`500`) are compiled-in constants with no override.
 
@@ -382,6 +425,8 @@ server-side log batch size (`500`) are compiled-in constants with no override.
 | `log_flush_interval_secs` | int | `5` | Max time between flushes |
 | `max_body_log_size` | int | `8192` | Max request body bytes to log |
 | `metrics_ship_interval_secs` | int | `30` | Edge-metrics ship interval; `0` disables shipping |
+| `auto_upgrade` | bool | `false` | Install the control plane's build automatically when the versions differ. Replaces the binary and restarts the process — see [Agent Self-Upgrade](#agent-self-upgrade) |
+| `upgrade_url` | string | — | Control plane REST base (`https://cp.example.com:9080`) used only by the upgrade endpoints. Auto-upgrade stays disabled while this is unset |
 
 Environment variables: `WAFRED_SERVER_URL`, `WAFRED_SERVER_CA_CERT`,
 `WAFRED_SERVER_TLS_NAME`, `WAFRED_API_KEY`,
@@ -936,6 +981,15 @@ A hardening pass before exposing the control plane beyond localhost:
   password is active, and the dashboard forces a password change on first
   login, but do not leave the seed in place. `wafred user add-admin` can
   create administrators before boot instead.
+- **Set `PINGWAF_SECRET_KEY`.** 32 random bytes (`openssl rand -hex 32`); it
+  seals notification-channel secrets, the AI provider key and backup-target
+  credentials. Without it those fields are stored in clear text. Back it up
+  separately and read the rotation note in
+  [`SECURITY.md`](../SECURITY.md#credentials-and-secrets) before changing it —
+  there is no online rotation.
+- **Protect the secrets file.** `.env` (DSN, `PINGWAF_SECRET_KEY`, JWT secret,
+  admin password) must be `chmod 600` and out of version control; prefer a
+  secret manager (systemd credentials, Kubernetes Secret, Docker secret).
 - **Give the control plane a real JWT secret.** A placeholder secret (the
   `change-me-…` default or the compose value) makes the server generate and
   persist a random one on first boot, which is safe but rotates whenever the
@@ -1066,11 +1120,24 @@ change has to reach the fleet immediately.
 
 ## Upgrade Procedure
 
+Take a backup before every upgrade, and pin the exact version you deploy —
+`:latest` makes an upgrade an unauditable drift and leaves you without a known
+rollback target.
+
 ### Docker
 
 ```bash
-docker compose pull
-docker compose up -d
+cd /path/to/compose            # the directory holding docker-compose.yml and .env
+# 1) Snapshot: database, environment (secrets) and the compose file.
+docker compose exec -T postgres pg_dump -U pingwaf -d pingwaf -Fc > pre-upgrade.dump
+cp .env pre-upgrade.env && chmod 600 pre-upgrade.env
+cp docker-compose.yml pre-upgrade-compose.yml
+# 2) Pin the new version (edit PINGWAF_TAG in .env) and recreate only the app.
+docker compose pull pingwaf
+docker compose up -d pingwaf
+# 3) Verify.
+docker compose ps
+curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:9080/healthz   # expect 200
 ```
 
 ### Binary
@@ -1084,6 +1151,81 @@ sudo systemctl restart wafred
 ```
 
 Database migrations run automatically on startup.
+
+### Rollback
+
+A failed upgrade is recovered by going back to the previous version, not by
+forward-fixing in place:
+
+```bash
+# Docker: put the previous tag back in .env, then recreate the app.
+#   PINGWAF_TAG=<previous-version>
+docker compose up -d pingwaf
+# Binary: reinstall the previous version and restart.
+./install.sh --version PREVIOUS_VERSION && sudo systemctl restart pingwaf
+```
+
+Migrations are **forward-only**: the previous binary may refuse to start against
+a database a newer release has already migrated. If that happens, restore the
+`pre-upgrade.dump` taken above (and the matching `.env`) before starting the old
+version. Keep the dump until the new version has served traffic for a full day.
+
+> **Installer upgrades keep your secrets and volumes.** The compose installer
+> reuses the administrator password and `PINGWAF_SECRET_KEY` from the existing
+> `.env` on `--force`, and never deletes `postgres-data` / `pingwaf-data` /
+> `pingwaf-certs`; the binary installer keeps `/etc/pingwaf/pingwaf.env` (the
+> instance key). If you need to reclaim host disk, the only volume-pruning path
+> is `scripts/sweep-host-storage.sh --prune-volumes`, which removes unused
+> **non-PingWAF** volumes only — names starting `waf_` are never touched.
+>
+> A compose file downloaded from an **older release tag** does not carry the
+> install hardening (loopback binds, `PINGWAF_SECRET_KEY` pass-through, no
+> default admin password). The installer warns about it; upgrade to a release
+> whose compose file includes those changes rather than assuming the
+> guarantees apply.
+
+> The control plane and its embedded agent are one process in `all-in-one` mode,
+> so an upgrade briefly interrupts the data plane (seconds). Distributed
+> deployments upgrade the control plane first, then let agents pick up the new
+> bundle; see [Agent Self-Upgrade](#agent-self-upgrade).
+
+### Agent Self-Upgrade
+
+A distributed deployment has two moving parts, and the console's fleet view now
+shows both. To let the edges follow the control plane by themselves:
+
+```toml
+[agent]
+auto_upgrade = true
+upgrade_url = "https://cp.example.com:9080"   # the REST API, not the gRPC port
+```
+
+or `PINGWAF_AUTO_UPGRADE=true PINGWAF_UPGRADE_URL=https://cp.example.com:9080`.
+
+What happens: every 5 minutes (first check after 1 minute) the agent asks
+`/api/v1/agent-upgrade/manifest` what this control plane is running. If the
+version differs it downloads **the control plane's own binary** — PingWAF is one
+binary whose role comes from `PINGWAF_MODE`, so that is the artifact to install
+— verifies `size` and `sha256` against the manifest, keeps the current binary as
+`<exe>.prev`, then re-execs itself. In-flight connections drop at that moment;
+that is the cost of an in-place restart, and the reason this is opt-in.
+
+Properties worth knowing before turning it on:
+
+- It only trusts the control plane that authenticated the agent: the artifact is
+  served over the same API, with the same token, and there is no release feed.
+- A digest or size mismatch aborts before anything is replaced, and a failed
+  download leaves the running build untouched.
+- Rollback is manual and local: stop the service, `mv <exe>.prev <exe>`, start.
+- The certificate must cover the host in `upgrade_url` — the agent verifies it
+  with the same CA (`server_ca_cert` / the injected all-in-one PEM) the gRPC
+  channel uses. Point `upgrade_url` at a name in the certificate, not at the raw
+  IP of a self-signed control plane.
+- **Containers and all-in-one are out of scope.** A container's binary lives in
+  an image layer, so the replacement is lost on the next `docker compose up`;
+  update containers by pulling a new tag. In all-in-one the embedded agent
+  shares the control plane's process, so upgrading would restart the control
+  plane and the flag is ignored there by construction.
 
 > ⚠️ **Do not upgrade with `--no-systemd` on an older unit.** Older versions of
 > this document suggested `./install.sh --version NEW_VERSION --no-systemd` to

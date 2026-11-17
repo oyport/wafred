@@ -64,6 +64,17 @@ pub enum ApiError {
     /// Unexpected failure; the message is logged in full and a generic text is
     /// returned to the client.
     Internal(String),
+    /// Wraps another error with a more specific machine-readable code.
+    ///
+    /// The HTTP status and the human-readable message are inherited from
+    /// `inner`; only the envelope's `code` changes. Built with
+    /// [`ApiError::with_code`] so a handler can name the exact failure (for
+    /// example `auth.invalid_credentials`) without changing the status or the
+    /// text the client sees today.
+    Coded {
+        inner: Box<ApiError>,
+        code: &'static str,
+    },
 }
 
 impl ApiError {
@@ -81,6 +92,7 @@ impl ApiError {
             ApiError::BadGateway(_) => "bad_gateway",
             ApiError::ServiceUnavailable(_) => "service_unavailable",
             ApiError::Internal(_) => "internal_error",
+            ApiError::Coded { code, .. } => code,
         }
     }
 
@@ -98,6 +110,24 @@ impl ApiError {
             ApiError::BadGateway(_) => StatusCode::BAD_GATEWAY,
             ApiError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::Coded { inner, .. } => inner.status(),
+        }
+    }
+
+    /// Attaches a specific machine-readable code to this error.
+    ///
+    /// Status and message are untouched — only the envelope's `code` becomes
+    /// `code` — so a handler can name the exact failure (e.g.
+    /// `auth.invalid_credentials`) for the console's localised hints while the
+    /// HTTP contract stays byte-identical. Re-wrapping a coded error replaces
+    /// the code instead of nesting another layer.
+    pub fn with_code(self, code: &'static str) -> Self {
+        match self {
+            ApiError::Coded { inner, .. } => ApiError::Coded { inner, code },
+            other => ApiError::Coded {
+                inner: Box::new(other),
+                code,
+            },
         }
     }
 
@@ -141,6 +171,9 @@ impl std::fmt::Display for ApiError {
             | ApiError::BadGateway(msg)
             | ApiError::ServiceUnavailable(msg)
             | ApiError::Internal(msg) => f.write_str(msg),
+            ApiError::Coded { inner, .. } => {
+                std::fmt::Display::fmt(inner.as_ref(), f)
+            },
         }
     }
 }
@@ -219,6 +252,9 @@ mod tests {
         (status, serde_json::from_slice(&body).unwrap())
     }
 
+    /// The message the login handler uses for both failure shapes.
+    const INVALID: &str = "invalid e-mail or password";
+
     /// D11: `DbErr::RecordNotFound` carries the lookup text, which on a
     /// generated query names the table — a 404 must not echo it back.
     #[tokio::test]
@@ -251,6 +287,91 @@ mod tests {
         let (status, body) = envelope(err).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body["error"]["code"], "internal_error");
+        assert_eq!(body["error"]["message"], INTERNAL_MESSAGE);
+    }
+
+    /// `with_code` changes only the envelope's `code`: the HTTP status and the
+    /// human-readable message keep coming from the wrapped error, so adding a
+    /// specific code cannot change the contract a client already depends on.
+    #[tokio::test]
+    async fn with_code_changes_only_the_code() {
+        let err = ApiError::Unauthorized(INVALID.to_string())
+            .with_code("auth.invalid_credentials");
+        assert_eq!(err.code(), "auth.invalid_credentials");
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(err.to_string(), INVALID);
+
+        let (status, body) = envelope(err).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "auth.invalid_credentials");
+        assert_eq!(body["error"]["message"], INVALID);
+    }
+
+    /// Wrapping an already-coded error replaces the code instead of nesting
+    /// another layer, so the last (most specific) call wins.
+    #[test]
+    fn with_code_replaces_an_existing_code() {
+        let err = ApiError::BadRequest("domain conflict".to_string())
+            .with_code("site.domain_conflict")
+            .with_code("site.domain_conflict");
+        assert_eq!(err.code(), "site.domain_conflict");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.to_string(), "domain conflict");
+
+        let err = ApiError::Conflict("x".to_string())
+            .with_code("a.first")
+            .with_code("a.second");
+        assert_eq!(err.code(), "a.second");
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+    }
+
+    /// Every default code and status is untouched by the new variant: a coded
+    /// wrapper is opt-in per call site.
+    #[test]
+    fn default_codes_and_statuses_are_unchanged() {
+        let cases = [
+            (ApiError::BadRequest(String::new()), "bad_request"),
+            (ApiError::Unauthorized(String::new()), "unauthorized"),
+            (ApiError::Forbidden(String::new()), "forbidden"),
+            (ApiError::NotFound(String::new()), "not_found"),
+            (ApiError::Conflict(String::new()), "conflict"),
+            (
+                ApiError::TooManyRequests(String::new()),
+                "too_many_requests",
+            ),
+            (
+                ApiError::Unprocessable(String::new()),
+                "unprocessable_entity",
+            ),
+            (ApiError::NotImplemented(String::new()), "not_implemented"),
+            (ApiError::BadGateway(String::new()), "bad_gateway"),
+            (
+                ApiError::ServiceUnavailable(String::new()),
+                "service_unavailable",
+            ),
+            (ApiError::Internal(String::new()), "internal_error"),
+        ];
+        for (err, code) in cases {
+            assert_eq!(err.code(), code);
+            let status = err.status();
+            // A coded wrapper never changes the status either.
+            assert_eq!(
+                err.with_code("some.specific_code").status(),
+                status,
+                "{code} status must survive with_code"
+            );
+        }
+    }
+
+    /// A coded `Internal` keeps the 500 status and the generic body text: the
+    /// specific code must not leak the cause either.
+    #[tokio::test]
+    async fn coded_internal_keeps_the_generic_body() {
+        let err = ApiError::Internal("connection refused".to_string())
+            .with_code("storage.unavailable");
+        let (status, body) = envelope(err).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["code"], "storage.unavailable");
         assert_eq!(body["error"]["message"], INTERNAL_MESSAGE);
     }
 }

@@ -474,11 +474,15 @@ impl Server {
         let tcp_socket_options = if conf.tcp_fastopen.is_some()
             || conf.tcp_keepalive.is_some()
             || conf.reuse_port.is_some()
+            || conf.ipv6_only.is_some()
         {
             let mut opts = TcpSocketOptions::default();
             opts.tcp_fastopen = conf.tcp_fastopen;
             opts.tcp_keepalive.clone_from(&conf.tcp_keepalive);
             opts.so_reuseport = conf.reuse_port;
+            // Only meaningful for an AF_INET6 socket; `validate_with_locations`
+            // rejects the combination with an IPv4 address before this runs.
+            opts.ipv6_only = conf.ipv6_only;
             Some(opts)
         } else {
             None
@@ -1088,14 +1092,8 @@ impl Server {
                 Some(original_uri);
         }
 
-        if self
-            .handle_request_plugin(PluginStep::Request, session, ctx)
-            .await?
-        {
-            return Ok(true);
-        }
-
-        Ok(false)
+        self.handle_request_plugin(PluginStep::Request, session, ctx)
+            .await
     }
 }
 
@@ -1977,10 +1975,7 @@ impl ProxyHttp for Server {
             .handle_request_plugin(PluginStep::ProxyUpstream, session, ctx)
             .await?;
 
-        if done {
-            return Ok(false);
-        }
-        Ok(true)
+        Ok(!done)
     }
 
     /// Selects and configures the upstream peer to proxy to.
@@ -2456,10 +2451,21 @@ impl ProxyHttp for Server {
         // support request with the x-request-id is attributable in seconds.
         let _ = upstream_response.insert_header("server", "wafred");
 
-        // add server-timing response header
+        // add server-timing response header. Plugins (the WAF) may have
+        // stamped their own timings already: append instead of replacing, so
+        // enabling this switch cannot erase `waf;dur` / `cache;desc`.
         if self.enable_server_timing {
-            let _ = upstream_response
-                .insert_header("server-timing", ctx.generate_server_timing());
+            let generated = ctx.generate_server_timing();
+            let merged = match upstream_response
+                .headers
+                .get("server-timing")
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.is_empty())
+            {
+                Some(existing) => format!("{generated}, {existing}"),
+                None => generated,
+            };
+            let _ = upstream_response.insert_header("server-timing", merged);
         }
         Ok(())
     }
@@ -2657,11 +2663,15 @@ impl ProxyHttp for Server {
         // The full error (with request_id) is already logged once above in
         // the single "fail to proxy" line (R-05); only the fixed,
         // error-type-specific page renders here.
+        // The shared error page is used for 4xx and 5xx alike (404, 408, 413,
+        // 429, 5xx), so it renders the status code it is answering with.
+        let status = code.to_string();
         let content = self.error_template.render(
             pingap_util::get_pkg_version(),
             public_error_message(error_type),
             error_type,
             ctx.state.request_id.as_deref().unwrap_or(""),
+            &status,
         );
         let buf = Bytes::from(content);
         let content_type = if self.error_template.is_json() {

@@ -52,6 +52,14 @@ const docs = {
       minutes: 7,
       topics: ["REST", "gRPC", "认证", "自动化"],
     },
+    {
+      slug: "security",
+      icon: "lock",
+      title: "安全",
+      lead: "私密报告漏洞、支持版本与上线前的加固清单。",
+      minutes: 8,
+      topics: ["漏洞披露", "支持版本", "加固", "密钥"],
+    },
   ],
   sidebarLabel: "文档",
   screenshot: {

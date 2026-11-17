@@ -128,6 +128,9 @@ describe('site OIDC API contract', () => {
       // before access rules existed.
       access_mode: 'allow_all',
       access_rules: [],
+      // Empty path = every path; the server stores `prefix` for it.
+      path: '',
+      match_type: 'prefix',
     })
     expect(created_at).toMatch(/^\d{4}-\d{2}-\d{2}T/)
     expect(updated_at).toMatch(/^\d{4}-\d{2}-\d{2}T/)
@@ -168,9 +171,12 @@ describe('OidcPanel contract', () => {
     expect(src).not.toContain('pages.oidc.clientSecret')
   })
 
-  it('guards with blockedReason and useUnsavedGuard', () => {
+  it('guards with blockedReason and registers its dirty state', () => {
     expect(src).toContain('blockedReason')
-    expect(src).toContain('useUnsavedGuard(dirty)')
+    // UX-07: the panel registers into the shared page-level registry; the
+    // single leave-guard dialog is owned by `SiteDetailPage`.
+    expect(src).toContain('useRegisterUnsaved(dirty)')
+    expect(src).not.toContain('useUnsavedGuard(dirty)')
   })
 
   it('requires a provider while the gate is on', () => {

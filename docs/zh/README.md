@@ -15,6 +15,7 @@
 | [cli.md](./cli.md) | 管理员二进制 CLI——运行模式、运维子命令（`user`/`mode`/`security`/`config`）、故障处置手册 |
 | [user-guide.md](./user-guide.md) | 控制台使用：站点、规则、策略、IP 访问控制、限流（关键章节中文镜像） |
 | [http-lifecycle.md](./http-lifecycle.md) | 请求生命周期中各功能的作用阶段——WAF 检查顺序、缓存、错误页，以及如何据此排查问题 |
+| [architecture.md](./architecture.md) | 架构与信任边界（中文摘要；英文全文见 [modules.md](../modules.md)） |
 | [api.md](./api.md) | REST API 参考（基址 `https://<host>:9080/api/v1`；关键章节中文镜像） |
 | [ai-crawl.md](./ai-crawl.md) | AI 爬虫控制——爬虫家族、站点级策略、生成的 robots.txt / llms.txt |
 | [profiling.md](./profiling.md) | 系统观测与归因：`/system/metrics` CPU/内存快照、`/system/profile` 模块/方法归因 |

@@ -32,6 +32,7 @@ import { cachingApi, cacheKeys } from '@/api/caching'
 import { useCanWrite } from '@/hooks'
 import { cn } from '@/lib/utils'
 import { formatDateTime, formatNumber, formatPercent, formatSize } from '@/lib/format'
+import { localizedErrorMessage } from '@/lib/errorMessages'
 import { mergeCacheRows, presetToExpression, type CacheRow } from '@/lib/cachePolicy'
 import type {
   CacheRule,
@@ -156,7 +157,9 @@ function formFromRule(rule: CacheRule): FormState {
 }
 
 function errorText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e)
+  // Backend codes with a translated hint (UX-05) win over the English server
+  // message; everything else keeps the specific server text.
+  return localizedErrorMessage(e)
 }
 
 type Translate = ReturnType<typeof useTranslation>['t']
@@ -467,6 +470,9 @@ export function CachingPage() {
       invalidate()
     },
     onError: (e) => setError(errorText(e)),
+    // The dialog renders the localized message inline; a second English toast
+    // from the global mutation cache would contradict it (UX-05).
+    meta: { silentToast: true },
   })
 
   /**
@@ -975,7 +981,7 @@ export function CachingPage() {
                   <span
                     className={cn(
                       'flex h-10 w-10 shrink-0 items-center justify-center rounded-lg',
-                      cacheEnabled ? 'bg-brand-soft text-brand' : 'bg-recessed text-fg-subtle',
+                      cacheEnabled ? 'bg-brand-soft text-fg-brand-strong' : 'bg-recessed text-fg-subtle',
                     )}
                   >
                     <Lightning weight="duotone" className="h-5 w-5" />

@@ -52,7 +52,7 @@ impl ValueSource {
 pub struct DecodedValue<'a> {
     pub source: ValueSource,
     /// Parameter / header / cookie name (empty for the path itself).
-    pub name: String,
+    pub name: Cow<'a, str>,
     /// Value after URL-decoding, entity decoding and (optionally) escape
     /// decoding. Borrowed when the wire form needed no transformation, which
     /// is the common case and avoids one String per field.
@@ -73,10 +73,9 @@ pub struct NormalizedRequest<'a> {
     /// Uppercased method — borrowed when the wire form was already uppercase
     /// (the common case), owned otherwise.
     pub method: Cow<'a, str>,
-    pub path: String,
+    pub path: Cow<'a, str>,
     /// Path plus `?query`, with the path portion normalized.
     pub full_uri: String,
-    pub query_params: Vec<(String, Cow<'a, str>)>,
     /// The request's own header list, borrowed verbatim. Header lookups are
     /// ASCII case-insensitive.
     pub headers: &'a [(String, String)],
@@ -89,9 +88,68 @@ pub struct NormalizedRequest<'a> {
     /// copies this into the verdict so a truncated/undecoded body can never
     /// look like a clean pass.
     pub body_inspection: BodyInspection,
-    pub cookies: Vec<(String, String)>,
+    pub cookies: Vec<(Cow<'a, str>, Cow<'a, str>)>,
     /// Flat list of every decoded value the detectors should scan.
     pub decoded_values: Vec<DecodedValue<'a>>,
+    /// Scan-surface truncations that happened while normalizing. Kept apart
+    /// from `body_inspection` because a query or a form can be truncated
+    /// without any body-encoding issue.
+    pub truncation: Truncation,
+}
+
+/// Scan-surface truncations that happened while normalizing.
+///
+/// A request that fell out of the scan surface must never look like a clean
+/// pass: the engine copies this into the verdict, the data plane turns it
+/// into an event, and `body_stage_policy = strict` rejects it. The previous
+/// shape dropped the bytes silently, which made "pad the payload past an
+/// internal cap" a stable bypass (2026-11-13 audit, P1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Truncation {
+    pub query_params: bool,
+    pub form_params: bool,
+    pub multipart_parts: bool,
+    pub decoded_values: bool,
+    pub value_len: bool,
+    pub body_scan_cap: bool,
+}
+
+impl Truncation {
+    pub fn is_empty(self) -> bool {
+        !(self.query_params
+            || self.form_params
+            || self.multipart_parts
+            || self.decoded_values
+            || self.value_len
+            || self.body_scan_cap)
+    }
+
+    /// A stable, log-friendly marker, or `None` when nothing was truncated.
+    pub fn detail(self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut reasons: Vec<&str> = Vec::new();
+        if self.query_params {
+            reasons.push("query-params");
+        }
+        if self.form_params {
+            reasons.push("form-params");
+        }
+        if self.multipart_parts {
+            reasons.push("multipart-parts");
+        }
+        if self.decoded_values {
+            reasons.push("decoded-values");
+        }
+        if self.value_len {
+            reasons.push("value-len");
+        }
+        if self.body_scan_cap {
+            reasons.push("body-scan-cap");
+        }
+        Some(format!("request=truncated({})", reasons.join(",")))
+    }
 }
 
 impl NormalizedRequest<'_> {
@@ -134,6 +192,19 @@ const SKIP_HEADERS: &[&str] = &[
     "transfer-encoding",
 ];
 
+/// ASCII case-insensitive substring test for content-type sniffing. The
+/// content type is a header value the detectors never scan, so a lowercased
+/// copy per request was pure cost; `eq_ignore_ascii_case` on a sliding window
+/// is allocation-free and byte-equivalent to `to_ascii_lowercase().contains()`.
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    !needle.is_empty()
+        && haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 /// Decode and normalize an entire request.
 ///
 /// `max_decode_layers` caps how many URL-decoding passes are applied to defend
@@ -151,47 +222,42 @@ pub fn normalize_request<'a>(
     decode_escapes: bool,
 ) -> NormalizedRequest<'a> {
     let decoded_path_raw = multi_decode(raw_path, max_decode_layers);
-    let normalized_path = normalize_path(&decoded_path_raw);
+    // Path normalization is a no-op for the overwhelming majority of paths
+    // (no `%`, no `//`, no dot segments, no fragment); keep the decoded form
+    // borrowed instead of materializing a fresh String for it.
+    let normalized_path: Cow<'a, str> = match &decoded_path_raw {
+        Cow::Borrowed(raw) => match normalize_path(raw) {
+            Cow::Borrowed(_) => Cow::Borrowed(*raw),
+            Cow::Owned(owned) => Cow::Owned(owned),
+        },
+        Cow::Owned(decoded) => Cow::Owned(normalize_path(decoded).into_owned()),
+    };
 
     let mut decoded_values = Vec::with_capacity(8);
+    let mut truncation = Truncation::default();
     decoded_values.push(DecodedValue {
         source: ValueSource::Path,
-        name: String::new(),
-        // `normalize_path` has already borrowed the decoded form; hand the
-        // owned String to the scan list instead of cloning it once more.
+        name: Cow::Borrowed(""),
         decoded: decoded_path_raw,
         field: true,
     });
 
-    // NOTE: the raw query is split on `&` *before* decoding so that an
-    // encoded `%26` inside a value is not mistaken for a separator. Each
-    // key/value is then multi-decoded individually inside `parse_query`.
-    let query_params = parse_query(
+    // Build the decoded URI in one allocation; `parse_query` appends the
+    // `?k=v&…` suffix while it parses, so no intermediate Vec of pairs and no
+    // second join pass exist. NOTE: the raw query is split on `&` *before*
+    // decoding so that an encoded `%26` inside a value is not mistaken for a
+    // separator. Each key/value is then multi-decoded inside `parse_query`.
+    let mut full_uri =
+        String::with_capacity(normalized_path.len() + raw_query.len() + 1);
+    full_uri.push_str(&normalized_path);
+    parse_query(
         raw_query,
         max_decode_layers,
         decode_escapes,
         &mut decoded_values,
+        &mut truncation,
+        &mut full_uri,
     );
-    // Build the decoded URI in one allocation. The old shape allocated one
-    // String per parameter, a Vec of them, and the final joined String; a
-    // 100-parameter request paid 202 allocations for a value the detectors
-    // usually only read once.
-    let mut full_uri =
-        String::with_capacity(normalized_path.len() + raw_query.len() + 1);
-    full_uri.push_str(&normalized_path);
-    if !query_params.is_empty() {
-        full_uri.push('?');
-        for (index, (key, value)) in query_params.iter().enumerate() {
-            if index > 0 {
-                full_uri.push('&');
-            }
-            full_uri.push_str(key);
-            // Preserve the old `format!("{key}={value}")` shape, including
-            // `flag=` for a bare flag; rules may match on the `=`.
-            full_uri.push('=');
-            full_uri.push_str(value);
-        }
-    }
 
     // The method only needs re-allocating when the wire form was not already
     // uppercase; proxy stacks hand us uppercase methods ~always.
@@ -219,7 +285,7 @@ pub fn normalize_request<'a>(
         let decoded = decode_value(v, max_decode_layers, decode_escapes);
         decoded_values.push(DecodedValue {
             source: ValueSource::Header,
-            name: k.clone(),
+            name: Cow::Borrowed(k.as_str()),
             decoded,
             field: true,
         });
@@ -238,6 +304,21 @@ pub fn normalize_request<'a>(
     let body_values_start = decoded_values.len();
 
     if let Some(text) = body_text.as_deref() {
+        // Bound the parse/scan surface independently of the decompression
+        // cap: parsing a 1 MiB form into values costs far more than the
+        // request's wire size, and the excess would only be dropped by the
+        // per-value cap afterwards. The prefix is still scanned; the engine
+        // marks the request truncated so the data plane can reject it.
+        let text = if text.len() > MAX_SCAN_BODY_BYTES {
+            let mut end = MAX_SCAN_BODY_BYTES;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            truncation.body_scan_cap = true;
+            &text[..end]
+        } else {
+            text
+        };
         // Form-encoded bodies are split into parameters so each value is
         // inspected separately; anything else is scanned as a single blob.
         let content_type = headers
@@ -245,15 +326,15 @@ pub fn normalize_request<'a>(
             .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
             .map(|(_, v)| v.as_str())
             .unwrap_or_default();
-        let ctype = content_type.to_ascii_lowercase();
-        if ctype.contains("multipart/form-data") {
+        if contains_ci(content_type, "multipart/form-data") {
             // Boundaries are case-sensitive, so the parser takes the original
             // header value rather than the lower-cased copy. Textual parts
             // become typed fields; without that the whole body stayed one
             // `field: false` blob and a single SQLi/XSS hit only scored 2.
             if let Some(boundary) = multipart_boundary(content_type) {
                 let delimiter = format!("--{boundary}");
-                for part in text.split(&delimiter).take(MAX_MULTIPART_PARTS) {
+                let mut parts = text.split(&delimiter);
+                for part in parts.by_ref().take(MAX_MULTIPART_PARTS) {
                     let part = part.strip_prefix("\r\n").unwrap_or(part);
                     if part.is_empty() || part.starts_with("--") {
                         continue;
@@ -295,7 +376,7 @@ pub fn normalize_request<'a>(
                     };
                     decoded_values.push(DecodedValue {
                         source: ValueSource::Body,
-                        name: multipart_part_name(head),
+                        name: Cow::Owned(multipart_part_name(head)),
                         // Owned: the part slices borrow the temporarily
                         // decompressed body, which is moved into the result
                         // further down.
@@ -310,24 +391,39 @@ pub fn normalize_request<'a>(
                         field: true,
                     });
                 }
+                if parts.next().is_some() {
+                    truncation.multipart_parts = true;
+                }
             }
             // Keep the raw body as a blob too: file parts are not form
             // fields, and the blob scan still covers them.
             let decoded = decode_value(text, max_decode_layers, decode_escapes);
             decoded_values.push(DecodedValue {
                 source: ValueSource::Body,
-                name: String::new(),
+                name: Cow::Borrowed(""),
                 decoded: Cow::Owned(decoded.into_owned()),
                 field: false,
             });
-        } else if ctype.contains("application/x-www-form-urlencoded") {
+        } else if contains_ci(content_type, "application/x-www-form-urlencoded")
+        {
             parse_form_body(
                 text,
                 max_decode_layers,
                 decode_escapes,
                 &mut decoded_values,
+                &mut truncation,
             );
-        } else if ctype.contains("json") || looks_like_json(text) {
+            // Keep the raw body as a blob too, matching multipart/JSON: a
+            // payload that a per-value cap cut off is still covered by the
+            // linear blob scan.
+            let decoded = decode_value(text, max_decode_layers, decode_escapes);
+            decoded_values.push(DecodedValue {
+                source: ValueSource::Body,
+                name: Cow::Borrowed(""),
+                decoded: Cow::Owned(decoded.into_owned()),
+                field: false,
+            });
+        } else if contains_ci(content_type, "json") || looks_like_json(text) {
             // Structured bodies: keep the raw blob (bulk content can be
             // benign), then add every string member as a *field* so the
             // detectors see typed inputs — with JSON escape handling
@@ -335,7 +431,7 @@ pub fn normalize_request<'a>(
             let decoded = decode_value(text, max_decode_layers, decode_escapes);
             decoded_values.push(DecodedValue {
                 source: ValueSource::Body,
-                name: String::new(),
+                name: Cow::Borrowed(""),
                 decoded: Cow::Owned(decoded.into_owned()),
                 field: false,
             });
@@ -349,7 +445,7 @@ pub fn normalize_request<'a>(
             let decoded = decode_value(text, max_decode_layers, decode_escapes);
             decoded_values.push(DecodedValue {
                 source: ValueSource::Body,
-                name: String::new(),
+                name: Cow::Borrowed(""),
                 decoded: Cow::Owned(decoded.into_owned()),
                 field: false,
             });
@@ -376,14 +472,35 @@ pub fn normalize_request<'a>(
     // Bound the total scan surface, not just individual parser inputs. A
     // 64 KiB query or a base64-expanded form can otherwise create thousands of
     // values (and thousands of AC/regex passes) from one small request.
-    decoded_values.truncate(MAX_DECODED_VALUES);
+    if decoded_values.len() > MAX_DECODED_VALUES {
+        truncation.decoded_values = true;
+        decoded_values.truncate(MAX_DECODED_VALUES);
+    }
     for value in &mut decoded_values {
         if value.decoded.len() > MAX_DECODED_VALUE_LEN {
+            truncation.value_len = true;
             let mut end = MAX_DECODED_VALUE_LEN;
             while end > 0 && !value.decoded.is_char_boundary(end) {
                 end -= 1;
             }
-            value.decoded = Cow::Owned(value.decoded[..end].to_string());
+            // Truncate an owned buffer in place (the large body blobs are
+            // owned) and re-slice a borrowed one; the old shape always
+            // allocated a second copy while the original was still alive.
+            let truncated: Option<&'a str> = match &value.decoded {
+                Cow::Borrowed(borrowed) => {
+                    let borrowed: &'a str = borrowed;
+                    Some(&borrowed[..end])
+                },
+                Cow::Owned(_) => None,
+            };
+            match truncated {
+                Some(borrowed) => value.decoded = Cow::Borrowed(borrowed),
+                None => {
+                    if let Cow::Owned(owned) = &mut value.decoded {
+                        owned.truncate(end);
+                    }
+                },
+            }
         }
     }
 
@@ -391,14 +508,42 @@ pub fn normalize_request<'a>(
         method,
         path: normalized_path,
         full_uri,
-        query_params,
         headers,
         body,
         body_text,
         body_inspection,
         cookies,
         decoded_values,
+        truncation,
     }
+}
+
+/// Canonical path used for scope and exemption matching.
+///
+/// Decoding and dot-segment resolution only run when the raw path could hide
+/// a different path (`%`, `..`, `//`, `/.`), so the common case stays an
+/// allocation-free borrow. `None` means the path cannot be scoped safely (a
+/// fragment or matrix-parameter smuggling) and callers must not match it
+/// against a scope. This is the one implementation shared by path exceptions,
+/// the WAF scope filter and the challenge exemption list; the raw-path prefix
+/// comparison they used to have let `/api/../admin` match `/api/*` while the
+/// origin resolved it to `/admin` (2026-11-13 audit, P1).
+pub fn canonical_scope_path(path: &str) -> Option<Cow<'_, str>> {
+    if path.contains('#') || path.contains("..;") {
+        return None;
+    }
+    if !(path.contains('%')
+        || path.contains("..")
+        || path.contains("//")
+        || path.contains("/."))
+    {
+        return Some(Cow::Borrowed(path));
+    }
+    // Keep this in lock-step with the engine's default decode depth. A site
+    // configured for more layers may see a more-decoded path in the engine;
+    // the conservative safe reading is to scope what three layers expose.
+    let decoded = url::multi_decode(path, 3);
+    Some(Cow::Owned(path::normalize(&decoded).into_owned()))
 }
 
 /// Run URL multi-decoding plus HTML entity decoding, returning a stable form
@@ -410,12 +555,22 @@ pub fn decode_value<'a>(
     decode_escapes: bool,
 ) -> Cow<'a, str> {
     let url_decoded = multi_decode(input, max_decode_layers);
-    let out = if url_decoded.contains('&') {
+    // `decode_entities` copies whenever the value contains `&`; only do that
+    // when an entity actually decodes (URLs in Referer headers, form-encoded
+    // bodies and JSON strings all contain bare `&`).
+    let out = if url_decoded.contains('&')
+        && html::has_decodable_entity(&url_decoded)
+    {
         Cow::Owned(decode_entities(&url_decoded))
     } else {
         url_decoded
     };
-    let out = if decode_escapes {
+    // Escape resolution is only meaningful when a marker is present. The
+    // previous shape wrapped `decode_escapes_owned` in `Cow::Owned`
+    // unconditionally, which allocated and copied the whole value for every
+    // Strict-level request even when nothing changed — the very fast path
+    // `decode_escapes` exists for was thrown away one layer up.
+    let out = if decode_escapes && has_escape_marker(&out) {
         Cow::Owned(decode_escapes_owned(&out))
     } else {
         out
@@ -423,7 +578,7 @@ pub fn decode_value<'a>(
     // Escape resolution can expose a fresh percent layer (`\u0025\u0032\u0035`
     // → `%25`) that the pre-escape multi_decode never saw; re-run the bounded
     // percent pass so the innermost form is readable to the detectors.
-    if out.contains('%') {
+    if out.contains('%') && url::has_percent_escape(&out) {
         Cow::Owned(multi_decode(&out, max_decode_layers).into_owned())
     } else {
         out
@@ -455,15 +610,21 @@ fn decode_value_form<'a>(
     decode_value(input, max_decode_layers, decode_escapes)
 }
 
+/// `true` when `input` carries a `\xHH` / `\uHHHH` escape marker. Shared by
+/// [`decode_escapes`] (its fast path) and [`decode_value`] (so the Strict
+/// level can skip the owned copy when no marker is present).
+fn has_escape_marker(input: &str) -> bool {
+    input.contains("\\x")
+        || input.contains("\\X")
+        || input.contains("\\u")
+        || input.contains("\\U")
+}
+
 /// Resolve `\xHH` and `\uHHHH` escape sequences. Returns the input untouched
 /// (borrowed) when it contains no escape marker, so the Normal-level path
 /// never allocates for this.
 pub fn decode_escapes(input: &str) -> Cow<'_, str> {
-    let has_marker = input.contains("\\x")
-        || input.contains("\\X")
-        || input.contains("\\u")
-        || input.contains("\\U");
-    if !has_marker {
+    if !has_escape_marker(input) {
         return Cow::Borrowed(input);
     }
     let bytes = input.as_bytes();
@@ -509,22 +670,31 @@ fn decode_escapes_owned(input: &str) -> String {
 }
 
 /// Split a query string on `&` and decode each key/value pair, pushing
-/// every value into `decoded_values` for downstream scanning.
+/// every value into `decoded_values` for downstream scanning and appending
+/// the decoded `?k=v&…` suffix to `full_uri` as it goes.
 fn parse_query<'a>(
     query: &'a str,
     max_decode_layers: usize,
     decode_escapes: bool,
     decoded_values: &mut Vec<DecodedValue<'a>>,
-) -> Vec<(String, Cow<'a, str>)> {
+    truncation: &mut Truncation,
+    full_uri: &mut String,
+) {
     if query.is_empty() {
-        return Vec::new();
+        return;
     }
-    let mut out = Vec::with_capacity(4);
+    let mut first = true;
     // Split on `&` only. `;` is *not* treated as a separator: doing so would
     // cut classic command-injection payloads (`cmd=;cat /etc/passwd`) into an
     // empty value plus a name-only fragment, hiding the attack from the
     // detectors.
-    for pair in query.split('&').take(MAX_QUERY_PARAMS) {
+    // `splitn(cap + 1)` keeps the unparsed remainder as the last slice, so
+    // the tail can be scanned without collecting (or re-joining) it.
+    let mut pairs = query.splitn(MAX_QUERY_PARAMS + 1, '&');
+    for _ in 0..MAX_QUERY_PARAMS {
+        let Some(pair) = pairs.next() else {
+            break;
+        };
         if pair.is_empty() {
             continue;
         }
@@ -539,6 +709,13 @@ fn parse_query<'a>(
             decode_value_form(k, max_decode_layers, decode_escapes);
         let val_decoded =
             decode_value_form(v, max_decode_layers, decode_escapes);
+        // Preserve the old `format!("{key}={value}")` shape, including
+        // `flag=` for a bare flag; rules may match on the `=`.
+        full_uri.push(if first { '?' } else { '&' });
+        first = false;
+        full_uri.push_str(&key_decoded);
+        full_uri.push('=');
+        full_uri.push_str(&val_decoded);
         // A query value that is itself serialized JSON (`?id={"id":"…"}`) is
         // unpacked in place, same as form fields — the container shape hides
         // the member payloads from every detector otherwise.
@@ -552,12 +729,8 @@ fn parse_query<'a>(
                 decoded_values,
             )
         {
-            // Nothing below uses the key on this branch (the JSON unpack
-            // already recorded its members), so move it into `out`.
-            out.push((key_decoded.to_string(), val_decoded));
             continue;
         }
-        out.push((key_decoded.to_string(), val_decoded.clone()));
         // The key itself is request input too: `?redirect:%24%7B%23a%3D%23…`
         // carries the whole OGNL payload in an *encoded* key with an empty
         // value, invisible to the detectors unless the key joins the scan
@@ -567,19 +740,34 @@ fn parse_query<'a>(
         if !key_decoded.is_empty() && key_decoded.len() <= 1024 {
             decoded_values.push(DecodedValue {
                 source: ValueSource::QueryParam,
-                name: String::new(),
-                decoded: Cow::Owned(key_decoded.to_string()),
+                name: Cow::Borrowed(""),
+                decoded: key_decoded.clone(),
                 field: true,
             });
         }
         decoded_values.push(DecodedValue {
             source: ValueSource::QueryParam,
-            name: key_decoded.into_owned(),
+            name: key_decoded,
             decoded: val_decoded,
             field: true,
         });
     }
-    out
+    if let Some(tail) = pairs.next() {
+        // The tail past the parameter cap is still request input: scan it as
+        // one blob instead of dropping it. Decode it like any other value —
+        // the raw form would hide a percent-encoded payload from the
+        // detectors (2026-11-13 audit follow-up).
+        truncation.query_params = true;
+        decoded_values.push(DecodedValue {
+            source: ValueSource::QueryParam,
+            name: Cow::Borrowed(""),
+            decoded: Cow::Owned(
+                decode_value_form(tail, max_decode_layers, decode_escapes)
+                    .into_owned(),
+            ),
+            field: false,
+        });
+    }
 }
 
 /// The `boundary` parameter of a `multipart/form-data` content type.
@@ -617,12 +805,19 @@ fn parse_form_body(
     max_decode_layers: usize,
     decode_escapes: bool,
     decoded_values: &mut Vec<DecodedValue<'_>>,
+    truncation: &mut Truncation,
 ) {
     if body.is_empty() {
         return;
     }
-    // See `parse_query` — `;` must stay part of the value.
-    for pair in body.split('&') {
+    // See `parse_query` — `;` must stay part of the value. Parsing stops at
+    // the parameter cap so a compressed form cannot expand into hundreds of
+    // thousands of allocations; the unparsed tail is scanned as one blob.
+    let mut pairs = body.splitn(MAX_FORM_PARAMS + 1, '&');
+    for _ in 0..MAX_FORM_PARAMS {
+        let Some(pair) = pairs.next() else {
+            break;
+        };
         if pair.is_empty() {
             continue;
         }
@@ -658,16 +853,28 @@ fn parse_form_body(
         if !key_decoded.is_empty() && key_decoded.len() <= 1024 {
             decoded_values.push(DecodedValue {
                 source: ValueSource::Body,
-                name: String::new(),
+                name: Cow::Borrowed(""),
                 decoded: Cow::Owned(key_decoded.to_string()),
                 field: true,
             });
         }
         decoded_values.push(DecodedValue {
             source: ValueSource::Body,
-            name: key_decoded.into_owned(),
+            name: Cow::Owned(key_decoded.into_owned()),
             decoded: Cow::Owned(val_decoded.into_owned()),
             field: true,
+        });
+    }
+    if let Some(tail) = pairs.next() {
+        truncation.form_params = true;
+        decoded_values.push(DecodedValue {
+            source: ValueSource::Body,
+            name: Cow::Borrowed(""),
+            decoded: Cow::Owned(
+                decode_value_form(tail, max_decode_layers, decode_escapes)
+                    .into_owned(),
+            ),
+            field: false,
         });
     }
 }
@@ -686,9 +893,17 @@ const JSON_MAX_VALUES: usize = 64;
 /// independent of the wire body cap: one 64 KiB query can otherwise expand
 /// into thousands of independently scanned values.
 const MAX_QUERY_PARAMS: usize = 256;
+/// Form parameters parsed per request. Parsing stops here instead of parsing
+/// a 1 MiB body into hundreds of thousands of values and truncating after
+/// the fact (2026-11-13 audit, P1: 1.5 KiB of gzip expanded to ~80 MB).
+const MAX_FORM_PARAMS: usize = 512;
 const MAX_DECODED_VALUES: usize = 2048;
 const MAX_DECODED_VALUE_LEN: usize = 8 * 1024;
 const MAX_MULTIPART_PARTS: usize = 64;
+/// Parse/scan surface for one body. Staging caps the wire bytes at 64 KiB by
+/// default; this bounds the decompressed form so parsing work stays
+/// proportional to a request a normal client sends.
+const MAX_SCAN_BODY_BYTES: usize = 256 * 1024;
 
 /// A JSON-looking body: JSON content type or an object/array opening brace
 /// after leading whitespace. The sniff only *enables* the parse — a parse
@@ -809,14 +1024,12 @@ fn expand_base64<'a>(
     let mut layer_end = decoded_values.len();
     let mut depth = 0usize;
     while layer_start < layer_end && depth < B64_MAX_DEPTH {
-        // Snapshot the layer: expanding pushes into the same vector.
-        let layer: Vec<(ValueSource, String, Cow<'_, str>)> = decoded_values
-            [layer_start..layer_end]
-            .iter()
-            // Do not clone every field just to discover that it is not
-            // base64. The cheap alphabet/length prefilter keeps the common
-            // request (no encoded payloads) allocation-free here.
-            .filter(|v| {
+        // Snapshot only the indices: expanding pushes into the same vector,
+        // and cloning `name`/`decoded` here copied every owned body value
+        // (up to 16KB each) just to read it once.
+        let layer: Vec<usize> = (layer_start..layer_end)
+            .filter(|&index| {
+                let v = &decoded_values[index];
                 v.field
                     && v.decoded.len() >= 10
                     && v.decoded.len() <= B64_MAX_VALUE_LEN
@@ -827,18 +1040,18 @@ fn expand_base64<'a>(
                             || b == b'='
                     })
             })
-            .map(|v| (v.source, v.name.clone(), v.decoded.clone()))
             .collect();
-        for (source, name, value) in layer {
+        for index in layer {
             // 10B floor: `MSBhbmQgMT0y` (`1 and 1=2`, 12B) rides inside JSON
             // members and falls between the old 16B gate and the 12B core
             // gate inside `b64_decode_value`. The charset + printability
             // gates there remain the real quality filter; this length check
             // only bounds work.
+            let value = &decoded_values[index].decoded;
             if value.len() < 10 || value.len() > B64_MAX_VALUE_LEN {
                 continue;
             }
-            let Some(mut decoded) = b64_decode_value(&value) else {
+            let Some(mut decoded) = b64_decode_value(value) else {
                 continue;
             };
             // Transport-wrapped payloads often carry a second obfuscation
@@ -880,11 +1093,12 @@ fn expand_base64<'a>(
                     })
                     .collect();
             }
-            let name = if name.is_empty() {
+            let source = decoded_values[index].source;
+            let name = Cow::Owned(if decoded_values[index].name.is_empty() {
                 "b64".to_string()
             } else {
-                format!("{name}.b64")
-            };
+                format!("{}.b64", decoded_values[index].name)
+            });
             if looks_like_json(&decoded)
                 && unpack_string_json(
                     &decoded,
@@ -951,62 +1165,74 @@ fn expand_b64_substrings<'a>(
     if !strict {
         return;
     }
-    let layer: Vec<(ValueSource, String, Cow<'_, str>)> = decoded_values
-        .iter()
-        .filter(|v| {
+    let layer: Vec<usize> = (0..decoded_values.len())
+        .filter(|&index| {
+            let v = &decoded_values[index];
             v.field
                 && !v.name.contains(".b64")
                 && v.decoded.len() >= 16
                 && (v.decoded.contains('"') || v.decoded.contains('\''))
         })
-        .map(|v| (v.source, v.name.clone(), v.decoded.clone()))
         .collect();
-    for (source, name, value) in layer {
-        let bytes = value.as_bytes();
-        let mut pushed = 0usize;
-        let mut i = 0usize;
-        while i + 1 < bytes.len() && pushed < 4 {
-            // Run must open right behind a string quote. Single quotes count
-            // too: SQL/Python string literals carry payloads the same way
-            // (`{'id': 'MCcgfHwg…='}` unwraps to a UNION/tautology chain),
-            // and the white corpus's only single-quoted runs are camelCase
-            // API names that the printability gate inside
-            // [`b64_decode_value`] rejects after decoding.
-            if bytes[i] != b'"' && bytes[i] != b'\'' {
-                i += 1;
-                continue;
-            }
-            let quote = bytes[i];
-            let start = i + 1;
-            let mut end = start;
-            while end < bytes.len()
-                && (bytes[end].is_ascii_alphanumeric()
-                    || bytes[end] == b'+'
-                    || bytes[end] == b'/'
-                    || bytes[end] == b'=')
-            {
-                end += 1;
-            }
-            let run_len = end - start;
-            // Close straight into the matching quote; padding may precede it.
-            if run_len >= 16 && end < bytes.len() && bytes[end] == quote {
-                if let Some(decoded) = b64_decode_value(&value[start..end]) {
-                    decoded_values.push(DecodedValue {
-                        source,
-                        name: if name.is_empty() {
-                            "b64q".to_string()
-                        } else {
-                            format!("{name}.b64q")
-                        },
-                        decoded: Cow::Owned(decoded),
-                        field: true,
-                    });
-                    pushed += 1;
+    for index in layer {
+        // Collect the decoded runs first: `decoded_values` cannot be pushed
+        // to while `value` is borrowed, and the old snapshot copied every
+        // candidate value just to work around that.
+        let mut runs: Vec<String> = Vec::new();
+        {
+            let value = &decoded_values[index].decoded;
+            let bytes = value.as_bytes();
+            let mut i = 0usize;
+            while i + 1 < bytes.len() && runs.len() < 4 {
+                // Run must open right behind a string quote. Single quotes
+                // count too: SQL/Python string literals carry payloads the
+                // same way (`{'id': 'MCcgfHwg…='}` unwraps to a
+                // UNION/tautology chain), and the white corpus's only
+                // single-quoted runs are camelCase API names that the
+                // printability gate inside [`b64_decode_value`] rejects
+                // after decoding.
+                if bytes[i] != b'"' && bytes[i] != b'\'' {
+                    i += 1;
+                    continue;
                 }
-                i = end + 1;
-            } else {
-                i = end.max(start + 1);
+                let quote = bytes[i];
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric()
+                        || bytes[end] == b'+'
+                        || bytes[end] == b'/'
+                        || bytes[end] == b'=')
+                {
+                    end += 1;
+                }
+                let run_len = end - start;
+                // Close straight into the matching quote; padding may
+                // precede it.
+                if run_len >= 16 && end < bytes.len() && bytes[end] == quote {
+                    if let Some(decoded) = b64_decode_value(&value[start..end])
+                    {
+                        runs.push(decoded);
+                    }
+                    i = end + 1;
+                } else {
+                    i = end.max(start + 1);
+                }
             }
+        }
+        let source = decoded_values[index].source;
+        for decoded in runs {
+            let name = Cow::Owned(if decoded_values[index].name.is_empty() {
+                "b64q".to_string()
+            } else {
+                format!("{}.b64q", decoded_values[index].name)
+            });
+            decoded_values.push(DecodedValue {
+                source,
+                name,
+                decoded: Cow::Owned(decoded),
+                field: true,
+            });
         }
     }
 }
@@ -1099,7 +1325,7 @@ fn walk_json<'a>(
             let decoded = decode_value(s, max_decode_layers, decode_escapes);
             decoded_values.push(DecodedValue {
                 source: ValueSource::Body,
-                name: path,
+                name: Cow::Owned(path),
                 decoded: Cow::Owned(decoded.into_owned()),
                 field: true,
             });
@@ -1152,7 +1378,7 @@ fn walk_json<'a>(
             }
             decoded_values.push(DecodedValue {
                 source: ValueSource::Body,
-                name: path,
+                name: Cow::Owned(path),
                 decoded: Cow::Owned(n.to_string()),
                 field: true,
             });
@@ -1164,7 +1390,7 @@ fn walk_json<'a>(
             }
             decoded_values.push(DecodedValue {
                 source: ValueSource::Body,
-                name: path,
+                name: Cow::Owned(path),
                 decoded: Cow::Owned(b.to_string()),
                 field: true,
             });
@@ -1179,7 +1405,7 @@ fn parse_cookies<'a>(
     header: &'a str,
     max_decode_layers: usize,
     decode_escapes: bool,
-    cookies: &mut Vec<(String, String)>,
+    cookies: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     decoded_values: &mut Vec<DecodedValue<'a>>,
 ) {
     for pair in header.split(';') {
@@ -1193,10 +1419,10 @@ fn parse_cookies<'a>(
         };
         let key_decoded = multi_decode(k, max_decode_layers);
         let val_decoded = decode_value(v, max_decode_layers, decode_escapes);
-        cookies.push((key_decoded.to_string(), val_decoded.to_string()));
+        cookies.push((key_decoded.clone(), val_decoded.clone()));
         decoded_values.push(DecodedValue {
             source: ValueSource::Cookie,
-            name: key_decoded.into_owned(),
+            name: key_decoded,
             decoded: val_decoded,
             field: true,
         });
@@ -1206,6 +1432,19 @@ fn parse_cookies<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_value_without_escape_marker_borrows() {
+        // Strict-level `decode_value` used to wrap `decode_escapes_owned` in
+        // `Cow::Owned` unconditionally, allocating and copying every value
+        // even when no `\x`/`\u` marker was present.
+        let decoded = decode_value("plain-value", 3, true);
+        assert!(matches!(decoded, Cow::Borrowed(_)));
+        assert_eq!(decoded, "plain-value");
+
+        // A real marker is still resolved.
+        assert_eq!(decode_value(r"a\x41", 3, true), "aA");
+    }
 
     #[test]
     fn key_only_b64_and_escape_onions_join_scan_surface() {
@@ -1262,14 +1501,13 @@ mod tests {
         );
         assert_eq!(req.method, "GET");
         assert_eq!(req.path, "/foo/bar");
-        assert_eq!(req.query_params.len(), 2);
-        assert_eq!(
-            req.cookies,
-            vec![
-                ("a".to_string(), "1".to_string()),
-                ("b".to_string(), "hello world".to_string()),
-            ]
-        );
+        assert_eq!(req.full_uri, "/foo/bar?x=1&y=hello world");
+        let cookies: Vec<(&str, &str)> = req
+            .cookies
+            .iter()
+            .map(|(k, v)| (k.as_ref(), v.as_ref()))
+            .collect();
+        assert_eq!(cookies, vec![("a", "1"), ("b", "hello world")]);
         // path + 2 query keys + 2 query values + UA + 2 cookies
         assert_eq!(req.decoded_values.len(), 8);
     }
@@ -1538,6 +1776,88 @@ mod tests {
         assert!(fields > 0);
     }
 
+    /// Regression (2026-11-13 audit, P1): the parameter past the cap must
+    /// still reach the scan surface as a blob, and the truncation must be
+    /// reported instead of silently dropped.
+    #[test]
+    fn query_tail_past_the_cap_is_scanned_and_reported() {
+        let mut query = (0..MAX_QUERY_PARAMS)
+            .map(|i| format!("k{i}=v"))
+            .collect::<Vec<_>>()
+            .join("&");
+        // Percent-encoded on purpose: the tail blob must be decoded, or an
+        // attacker who pads past the cap hides the payload from the engine.
+        query.push_str("&q=%27+OR+1%3D1--");
+        let req = normalize_request("GET", "/", &query, &[], None, 3, false);
+        assert!(req.truncation.query_params);
+        assert!(req
+            .decoded_values
+            .iter()
+            .any(|value| value.decoded.contains("OR 1=1--")));
+        assert!(req
+            .truncation
+            .detail()
+            .is_some_and(|detail| detail.contains("query-params")));
+    }
+
+    #[test]
+    fn form_tail_past_the_cap_is_scanned_and_reported() {
+        let mut body = (0..MAX_FORM_PARAMS)
+            .map(|i| format!("k{i}=v"))
+            .collect::<Vec<_>>()
+            .join("&");
+        body.push_str("&q=1' OR 1=1--");
+        let headers = vec![(
+            "content-type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let req = normalize_request(
+            "POST",
+            "/login",
+            "",
+            &headers,
+            Some(body.as_bytes()),
+            3,
+            false,
+        );
+        assert!(req.truncation.form_params);
+        assert!(req
+            .decoded_values
+            .iter()
+            .any(|value| value.decoded.contains("OR 1=1--")));
+    }
+
+    /// Regression (2026-11-13 audit, P1): `FF FE` on a urlencoded body is
+    /// two bytes to the origin, not a UTF-16 BOM. The form payload must stay
+    /// in the scan surface.
+    #[test]
+    fn bom_prefixed_form_body_stays_scannable() {
+        let headers = vec![(
+            "content-type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let body = b"\xFF\xFE&q=%27+OR+1%3D1--";
+        let req = normalize_request(
+            "POST",
+            "/login",
+            "",
+            &headers,
+            Some(body),
+            3,
+            false,
+        );
+        assert!(
+            req.decoded_values
+                .iter()
+                .any(|value| value.decoded.contains("' OR 1=1--")),
+            "payload missing from scan surface: {:?}",
+            req.decoded_values
+                .iter()
+                .map(|value| value.decoded.as_ref())
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn decoded_values_and_lengths_are_bounded() {
         // A huge query must not explode into unbounded scan values; every
@@ -1713,6 +2033,5 @@ mod tests {
             false,
         );
         assert_eq!(req.full_uri, "/a/b?x=1&flag=&y=/");
-        assert_eq!(req.query_params.len(), 3);
     }
 }

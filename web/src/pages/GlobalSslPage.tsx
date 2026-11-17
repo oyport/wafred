@@ -1243,7 +1243,7 @@ export function GlobalSslPage() {
                   className="flex flex-col gap-1 rounded-md border border-line bg-elevated px-3 py-2"
                 >
                   <div className="flex items-center justify-between gap-2">
-                    <label className="flex min-w-0 items-center gap-2">
+                    <label className="flex min-w-0 items-center gap-2 pw-touch-check">
                       <input
                         type="checkbox"
                         className="h-4 w-4 accent-[var(--color-brand)]"

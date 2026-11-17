@@ -28,7 +28,7 @@ import { Tabs } from '@/components/ui/Tabs'
 import { Textarea } from '@/components/ui/Textarea'
 import { Table, type Column } from '@/components/ui/Table'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
-import { useUnsavedGuard } from '@/hooks/useUnsavedGuard'
+import { useRegisterUnsaved } from '@/hooks/useUnsavedGuard'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { SkeletonRows, SkeletonStat } from '@/components/ui/Skeleton'
 import { useToast } from '@/components/ui/Toast'
@@ -169,7 +169,7 @@ function OriginVerifyCard({ siteId, canWrite }: { siteId: string; canWrite: bool
     site !== null &&
     draft !== verifyCertMode(site.origin_verify_cert ?? null)
 
-  const unsavedDialog = useUnsavedGuard(dirty)
+  useRegisterUnsaved(dirty)
 
   return (
     <Card className="mb-6">
@@ -191,7 +191,6 @@ function OriginVerifyCard({ siteId, canWrite }: { siteId: string; canWrite: bool
         }
       />
       <CardBody className="flex flex-col gap-4">
-        {unsavedDialog}
         {siteQuery.isPending && !draft ? (
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <SkeletonStat />
@@ -535,7 +534,7 @@ export function SslPage() {
           <span
             className={cn(
               'flex h-8 w-8 shrink-0 items-center justify-center rounded-md',
-              isCurrent(c) ? 'bg-brand text-white' : 'bg-brand-soft text-brand',
+              isCurrent(c) ? 'bg-brand text-white' : 'bg-brand-soft text-fg-brand-strong',
             )}
           >
             <Lock weight="duotone" className="h-4 w-4" />

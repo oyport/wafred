@@ -6,13 +6,16 @@ import {
   ArrowClockwise,
   ArrowRight,
   Gauge,
+  ShieldCheck,
+  Warning,
 } from '@phosphor-icons/react'
 import { Card, CardBody, CardHeader } from '@/components/ui/Card'
-import { useUnsavedGuard } from '@/hooks/useUnsavedGuard'
+import { useRegisterUnsaved } from '@/hooks/useUnsavedGuard'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
 import { Select } from '@/components/ui/Select'
 import { Switch } from '@/components/ui/Switch'
+import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { TagInput } from '@/components/ui/MultiSelect'
 import { SkeletonCard } from '@/components/ui/Skeleton'
 import { useToast } from '@/components/ui/Toast'
@@ -20,6 +23,7 @@ import { ErrorState } from '@/components/ErrorState'
 import { challengeApi, challengeKeys, defaultChallengeConfig } from '@/api/challenge'
 import { rateLimitApi, rateLimitKeys } from '@/api/rateLimiting'
 import { useCanWrite } from '@/hooks'
+import { cn } from '@/lib/utils'
 import { CHALLENGE_LEVELS, type ChallengeConfig } from '@/api/types'
 
 const MIN_CLEARANCE_SECS = 60
@@ -52,16 +56,141 @@ function validateExemptPaths(paths: string[]): string | null {
 }
 
 /**
- * The mitigation module of the protection page: an entry card into the
- * dedicated rate-limiting page plus the site's challenge configuration.
+ * The mitigation module of the protection page ("Rate limiting & challenge"):
+ * an entry card into the dedicated rate-limiting page, the site's emergency
+ * under-attack switch, and the challenge configuration.
+ *
+ * Under-attack mode used to live in the page-level detection section; it is a
+ * challenge control, so it belongs on this tab. It stays a separate card
+ * rather than a field of the challenge form so the two controls cannot fight
+ * each other (the server forces the gate on while under-attack is on).
  */
 export function MitigationPanel() {
   const { siteId = '' } = useParams<{ siteId: string }>()
   return (
     <div className="flex flex-col gap-4">
       <RateLimitingEntryCard siteId={siteId} />
+      <UnderAttackCard siteId={siteId} />
       <ChallengeConfigCard siteId={siteId} />
     </div>
+  )
+}
+
+/**
+ * Under Attack Mode: challenge every visitor while an attack is in progress.
+ *
+ * Enabling is a deliberate emergency action (every visitor is challenged), so
+ * it goes through a confirmation; disabling is immediate. Turning it on also
+ * forces the challenge gate on — the server applies the same pairing.
+ */
+function UnderAttackCard({ siteId }: { siteId: string }) {
+  const { t } = useTranslation()
+  const toast = useToast()
+  const queryClient = useQueryClient()
+  const canWrite = useCanWrite()
+  const [confirmEnable, setConfirmEnable] = useState(false)
+
+  const configQuery = useQuery({
+    queryKey: challengeKeys.config(siteId),
+    queryFn: () => challengeApi.get(siteId),
+    enabled: Boolean(siteId),
+  })
+  const active = configQuery.data?.under_attack_mode ?? false
+
+  const setUnderAttack = useMutation({
+    mutationFn: (enabled: boolean) =>
+      challengeApi.update(siteId, {
+        // The challenge gate must be on for the banner to mean anything; the
+        // server forces the same pairing.
+        under_attack_mode: enabled,
+        ...(enabled ? { enabled: true } : {}),
+      }),
+    onSuccess: (saved) => {
+      queryClient.setQueryData(challengeKeys.config(siteId), saved)
+      toast.success(
+        saved.under_attack_mode
+          ? t('pages.protection.underAttackOn')
+          : t('pages.protection.underAttackOff'),
+      )
+      void queryClient.invalidateQueries({ queryKey: challengeKeys.all(siteId) })
+    },
+    onError: (error) => {
+      toast.error(
+        t('pages.protection.updateFailed'),
+        error instanceof Error ? error.message : undefined,
+      )
+    },
+  })
+
+  if (configQuery.isPending) return <SkeletonCard className="h-20" />
+
+  return (
+    <Card>
+      <CardBody
+        className={cn(
+          'flex flex-wrap items-center justify-between gap-4',
+          active && 'rounded-lg bg-danger/10',
+        )}
+      >
+        <span className="flex min-w-0 items-center gap-3">
+          <span
+            className={cn(
+              'flex h-10 w-10 shrink-0 items-center justify-center rounded-lg',
+              active
+                ? 'bg-danger/15 text-fg-danger'
+                : 'bg-recessed text-fg-subtle',
+            )}
+          >
+            {active ? (
+              <Warning weight="fill" className="h-5 w-5" />
+            ) : (
+              <ShieldCheck weight="duotone" className="h-5 w-5" />
+            )}
+          </span>
+          <span className="min-w-0">
+            <span className="block text-sm font-semibold text-fg-strong">
+              {active
+                ? t('pages.protection.underAttackActive')
+                : t('pages.protection.underAttackTitle')}
+            </span>
+            <span className="mt-0.5 block text-[13px] text-fg-subtle">
+              {active
+                ? t('pages.protection.underAttackActiveHint')
+                : t('pages.protection.underAttackHint')}
+            </span>
+          </span>
+        </span>
+        {canWrite && (
+          <Switch
+            size="md"
+            checked={active}
+            disabled={setUnderAttack.isPending}
+            aria-label={t('pages.protection.underAttackTitle')}
+            onCheckedChange={(enabled) => {
+              if (enabled) {
+                setConfirmEnable(true)
+              } else {
+                setUnderAttack.mutate(false)
+              }
+            }}
+          />
+        )}
+      </CardBody>
+
+      <ConfirmDialog
+        open={confirmEnable}
+        onClose={() => setConfirmEnable(false)}
+        onConfirm={() => {
+          setConfirmEnable(false)
+          setUnderAttack.mutate(true)
+        }}
+        tone="danger"
+        title={t('pages.protection.underAttackConfirmTitle')}
+        description={t('pages.protection.underAttackConfirmDescription')}
+        confirmLabel={t('pages.protection.underAttackCta')}
+        loading={setUnderAttack.isPending}
+      />
+    </Card>
   )
 }
 
@@ -120,6 +249,10 @@ function ChallengeConfigCard({ siteId }: { siteId: string }) {
 
   const [config, setConfig] = useState<ChallengeConfig | null>(null)
   const [dirty, setDirty] = useState(false)
+  // UX-04: the challenge gate is the site's CC protection; turning it off is a
+  // protection downgrade, so it needs an explicit acknowledgement.
+  const [confirmDisable, setConfirmDisable] = useState(false)
+  const [disableAck, setDisableAck] = useState(false)
 
   const configQuery = useQuery({
     queryKey: challengeKeys.config(siteId),
@@ -172,7 +305,7 @@ function ChallengeConfigCard({ siteId }: { siteId: string }) {
     },
   })
 
-  const unsavedDialog = useUnsavedGuard(dirty)
+  useRegisterUnsaved(dirty)
 
   if (configQuery.isPending) {
     return <SkeletonCard className="h-64" />
@@ -191,11 +324,10 @@ function ChallengeConfigCard({ siteId }: { siteId: string }) {
 
   return (
     <div>
-      {unsavedDialog}
       {config ? (
         <div className="flex flex-col gap-4">
-          {/* Under-attack mode is managed from the page-level banner; keep it
-              out of this form so the two controls cannot fight each other. */}
+          {/* Under-attack mode is a sibling card on this tab, not a field of
+              this form, so the two controls cannot fight each other. */}
           <Card>
             <CardHeader
               title={t('pages.cc.general')}
@@ -228,7 +360,14 @@ function ChallengeConfigCard({ siteId }: { siteId: string }) {
               <Switch
                 checked={config.enabled}
                 disabled={!canWrite}
-                onCheckedChange={(enabled) => patch({ enabled })}
+                onCheckedChange={(enabled) => {
+                  if (enabled) {
+                    patch({ enabled: true })
+                    return
+                  }
+                  setDisableAck(false)
+                  setConfirmDisable(true)
+                }}
                 label={t('pages.cc.enable')}
                 description={t('pages.cc.enableHint')}
               />
@@ -323,6 +462,34 @@ function ChallengeConfigCard({ siteId }: { siteId: string }) {
           </Card>
         </div>
       ) : null}
+
+      <ConfirmDialog
+        open={confirmDisable}
+        onClose={() => {
+          setConfirmDisable(false)
+          setDisableAck(false)
+        }}
+        onConfirm={() => {
+          setConfirmDisable(false)
+          setDisableAck(false)
+          patch({ enabled: false })
+        }}
+        tone="danger"
+        title={t('pages.cc.disableConfirmTitle')}
+        description={t('pages.cc.disableConfirmDescription')}
+        confirmLabel={t('pages.cc.disableConfirmTitle')}
+        disabled={!disableAck}
+      >
+        <label className="flex items-start gap-2.5 text-[13px] pw-touch-check">
+          <input
+            type="checkbox"
+            className="mt-0.5 rounded border-border accent-brand"
+            checked={disableAck}
+            onChange={(e) => setDisableAck(e.target.checked)}
+          />
+          <span>{t('pages.cc.disableAck')}</span>
+        </label>
+      </ConfirmDialog>
     </div>
   )
 }

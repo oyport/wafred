@@ -74,7 +74,11 @@ export function AssistantWidget() {
       <aside
         role="complementary"
         aria-label={t('pages.assistant.title')}
-        aria-hidden={!open}
+        // `inert` (not `aria-hidden`) while closed: the panel stays mounted so
+        // an in-flight stream survives, but its buttons/inputs must leave the
+        // tab order and the accessibility tree — `aria-hidden` alone leaves
+        // focusable content inside a hidden region (axe `aria-hidden-focus`).
+        inert={!open}
         className={cn(
           'fixed bottom-0 right-0 top-14 z-40 flex w-full flex-col border-l border-line bg-elevated shadow-xl',
           'transition-transform duration-200 ease-out sm:w-[420px]',

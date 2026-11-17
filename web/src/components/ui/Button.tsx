@@ -4,7 +4,7 @@ import { cn } from '@/lib/utils'
 export type ButtonVariant = 'primary' | 'secondary' | 'danger' | 'ghost' | 'link'
 export type ButtonSize = 'sm' | 'md' | 'lg' | 'icon'
 
-export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+export interface ButtonBaseProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: ButtonVariant
   size?: ButtonSize
   loading?: boolean
@@ -12,13 +12,24 @@ export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   fullWidth?: boolean
 }
 
+/**
+ * Icon-only buttons render no text, so they must carry an `aria-label`
+ * (axe `button-name`). The union makes omitting it a type error whenever
+ * `size="icon"` is used, instead of relying on review to catch it.
+ */
+export type ButtonProps = ButtonBaseProps &
+  (
+    | { size: 'icon'; 'aria-label': string }
+    | { size?: Exclude<ButtonSize, 'icon'> }
+  )
+
 const variantClasses: Record<ButtonVariant, string> = {
   primary:
-    'bg-brand text-white border border-transparent hover:bg-brand-hover active:brightness-95 shadow-sm disabled:bg-brand/50',
+    'bg-brand text-[#1d1d1d] border border-transparent hover:bg-brand-hover active:brightness-95 shadow-sm disabled:bg-brand/50',
   secondary:
     'bg-elevated text-fg border border-line hover:bg-recessed active:bg-recessed shadow-sm',
   danger:
-    'bg-danger text-white border border-transparent hover:brightness-110 active:brightness-95 shadow-sm disabled:bg-danger/50',
+    'bg-danger text-[#1d1d1d] border border-transparent hover:brightness-110 active:brightness-95 shadow-sm disabled:bg-danger/50',
   ghost:
     'bg-transparent text-fg-subtle border border-transparent hover:bg-recessed hover:text-fg',
   link: 'bg-transparent text-link border border-transparent hover:underline px-0',
@@ -32,8 +43,10 @@ const sizeClasses: Record<ButtonSize, string> = {
 }
 
 export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
-  (
-    {
+  (props, ref) => {
+    // The public type is a union that enforces `aria-label` for icon buttons;
+    // the implementation works on the flat shape.
+    const {
       className,
       variant = 'secondary',
       size = 'md',
@@ -43,10 +56,8 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
       children,
       disabled,
       type = 'button',
-      ...props
-    },
-    ref,
-  ) => {
+      ...rest
+    } = props as ButtonBaseProps
     return (
       <button
         ref={ref}
@@ -61,7 +72,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
           fullWidth && 'w-full',
           className,
         )}
-        {...props}
+        {...rest}
       >
         {loading ? (
           <span

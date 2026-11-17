@@ -16,7 +16,7 @@ export const ROUTES = {
   docs: "/docs/",
 } as const;
 
-export const DOC_SLUGS = ["architecture", "deployment", "waf-engine", "waf-test-report", "api"] as const;
+export const DOC_SLUGS = ["architecture", "deployment", "waf-engine", "waf-test-report", "api", "security"] as const;
 export type DocSlug = (typeof DOC_SLUGS)[number];
 
 export function docPath(slug: DocSlug): string {

@@ -1,4 +1,11 @@
-import { useMemo, useState, type ReactNode } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react'
 import { CaretUp, CaretDown, CaretLeft, CaretRight } from '@phosphor-icons/react'
 import { useTranslation } from 'react-i18next'
 import { cn } from '@/lib/utils'
@@ -31,6 +38,12 @@ export interface TableProps<T> {
   pageSize?: number
   className?: string
   dense?: boolean
+  /**
+   * Accessible name of the horizontally scrollable region. Callers should
+   * pass a page-specific one (e.g. "Security events table"); the default is
+   * a generic "scrollable table" label (UX-08).
+   */
+  scrollLabel?: string
 }
 
 type SortDir = 'asc' | 'desc'
@@ -60,10 +73,32 @@ export function Table<T>({
   pageSize = 0,
   className,
   dense = false,
+  scrollLabel,
 }: TableProps<T>) {
   const { t } = useTranslation()
   const [sort, setSort] = useState<{ key: string; dir: SortDir } | null>(null)
   const [page, setPage] = useState(0)
+
+  // Mobile horizontal-scroll hint (UX-08): a table that overflows shows a
+  // right-edge fade until the last column is reached, so a narrow viewport
+  // does not look like a table that simply ends at the fold.
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const [overflowRight, setOverflowRight] = useState(false)
+  const updateOverflow = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    setOverflowRight(el.scrollWidth - el.clientWidth - el.scrollLeft > 2)
+  }, [])
+
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    updateOverflow()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(updateOverflow)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [updateOverflow, data.length, columns.length])
 
   const sorted = useMemo(() => {
     if (!sort) return data
@@ -226,7 +261,14 @@ export function Table<T>({
               ))
             )}
           </tbody>
-        </table>
+          </table>
+        </div>
+        {overflowRight && (
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-y-0 right-0 w-8 rounded-r-lg bg-gradient-to-l from-elevated/95 to-transparent"
+          />
+        )}
       </div>
 
       {pageSize > 0 && sorted.length > 0 && (
@@ -243,6 +285,7 @@ export function Table<T>({
               size="icon"
               variant="ghost"
               aria-label={t('pagination.previous')}
+              className="pw-touch-target"
               disabled={safePage === 0}
               onClick={() => setPage((p) => Math.max(0, p - 1))}
               icon={<CaretLeft weight="bold" className="h-4 w-4" />}
@@ -254,6 +297,7 @@ export function Table<T>({
               size="icon"
               variant="ghost"
               aria-label={t('pagination.next')}
+              className="pw-touch-target"
               disabled={safePage >= pageCount - 1}
               onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
               icon={<CaretRight weight="bold" className="h-4 w-4" />}

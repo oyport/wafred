@@ -35,6 +35,7 @@ use crate::challenge::{
     resolve_cookie_secret,
 };
 use crate::host_cache::{HostCacheSweep, touch};
+use crate::path_filter::{MatchType, PathFilter};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use chrono::{Datelike, Timelike};
@@ -61,6 +62,7 @@ use pingwaf_agent::cache::{
     RateLimitRule as CacheRateLimitRule, SiteRules as CacheSiteRules,
     SslConfig as CacheSslConfig, WafAction as CacheWafAction,
     WafConfig as CacheWafConfig, WafMode as CacheWafMode,
+    WafRule as CacheWafRule,
 };
 use pingwaf_agent::{AccessLogEntry, SecurityEvent, WafredAgent};
 use pingwaf_challenge::{
@@ -74,9 +76,8 @@ use pingwaf_waf::{
     StackSet, WafAction, WafEngine, WafEngineConfig, WafLevel, WafMode,
     WafVerdict,
 };
-use regex::{Regex, RegexBuilder};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -174,6 +175,8 @@ struct BasicAuthGate {
     credentials: Vec<Vec<u8>>,
     delay: Option<std::time::Duration>,
     hide_credentials: bool,
+    /// Empty scope = the gate applies to the whole site.
+    path: Option<PathFilter>,
 }
 
 /// Realm advertised when the site did not name one.
@@ -234,6 +237,18 @@ impl BasicAuthGate {
                 std::time::Duration::from_secs(u64::from(cfg.delay_seconds))
             }),
             hide_credentials: cfg.hide_credentials,
+            path: match PathFilter::compile(&cfg.path, &cfg.match_type) {
+                Ok(filter) => filter,
+                Err(err) => {
+                    // A broken scope keeps the gate site-wide (fail-closed).
+                    warn!(
+                        path = %cfg.path,
+                        error = %err,
+                        "basic auth path failed to compile; requiring auth site-wide"
+                    );
+                    None
+                },
+            },
         })
     }
 
@@ -301,8 +316,10 @@ fn access_rules_require_basic_auth(site_rules: &CacheSiteRules) -> bool {
     ip_rule || geo_rule
 }
 
-/// The protection layers an operator-curated path exception skips. An empty
-/// `skip_layers` list (or one containing `*`) collapses to "every layer".
+/// The protection layers an operator-curated path exception skips. `*`
+/// expands to the detection/dispatch layers only; authentication layers
+/// (`mtls`, `basic_auth`) must be named explicitly, so one click cannot
+/// silently disable client certificates or the login gate.
 #[derive(Debug, Clone, PartialEq)]
 struct BypassLayers {
     all: bool,
@@ -313,9 +330,10 @@ impl BypassLayers {
     /// Compiles the wire list. Unknown layer names are kept (the control
     /// plane defines the vocabulary) but can never match a check below.
     fn build(raw: &[String]) -> Self {
-        // `*` is the explicit "skip every layer" spelling. An empty list is a
-        // malformed rule (the control plane rejects it), and compiling it to
-        // "skip everything" would turn a corrupt row into a total bypass.
+        // `*` is the explicit "skip every detection layer" spelling. An empty
+        // list is a malformed rule (the control plane rejects it), and
+        // compiling it to "skip everything" would turn a corrupt row into a
+        // total bypass.
         if raw.iter().any(|layer| layer == "*") {
             return Self {
                 all: true,
@@ -329,8 +347,23 @@ impl BypassLayers {
     }
 
     /// Whether the named protection layer is skipped for this request.
+    ///
+    /// `*` deliberately excludes `mtls` and `basic_auth`: an exception that
+    /// bypasses detection must not also remove authentication unless the
+    /// operator named that layer explicitly.
     fn skips(&self, layer: &str) -> bool {
-        self.all || self.named.iter().any(|name| name == layer)
+        if self.all {
+            return matches!(
+                layer,
+                "waf"
+                    | "bot"
+                    | "access"
+                    | "ai_bot"
+                    | "rate_limit"
+                    | "challenge"
+            );
+        }
+        self.named.iter().any(|name| name == layer)
     }
 
     /// Whether every challenge flavour is skipped, including the standalone
@@ -360,42 +393,161 @@ struct PathBypass {
 }
 
 /// The site's enabled path exceptions, precompiled per config fingerprint
-/// into the three match groups. Only honoured while the site observes —
-/// a block-mode site (or one not in observation mode) ignores them
-/// entirely, so an exception can never weaken active enforcement.
+/// into the three match groups. Honoured in every WAF mode: an operator
+/// exception is explicit configuration, not something block mode overrides.
 #[derive(Debug, Default)]
 struct PathExceptions {
-    exact: Vec<(String, PathBypass)>,
+    exact: Vec<(PathFilter, PathBypass)>,
     /// `path` itself or anything below it (`/api` matches `/api/x` but
     /// never `/apix`).
-    prefix: Vec<(String, PathBypass)>,
+    prefix: Vec<(PathFilter, PathBypass)>,
     /// Single trailing `*`: a segment prefix of the pattern with the `*`
     /// removed (`/api/*` matches `/api/x`, not `/api`).
-    wildcard: Vec<(String, PathBypass)>,
+    wildcard: Vec<(PathFilter, PathBypass)>,
     /// Operator-written `regex`, unanchored and case-sensitive. Consulted
     /// last so the older match types keep their precedence.
-    regex: Vec<(Regex, PathBypass)>,
+    regex: Vec<(PathFilter, PathBypass)>,
 }
 
-/// Compiles an operator pattern with the same automaton budget the WAF
-/// expression engine uses, so one pathological pattern cannot pin tens of
-/// megabytes on the data plane.
-fn compile_path_regex(pattern: &str) -> Result<Regex, regex::Error> {
-    const MAX_REGEX_SIZE: usize = 4 * 1024 * 1024;
-    RegexBuilder::new(pattern)
-        .size_limit(MAX_REGEX_SIZE)
-        .dfa_size_limit(MAX_REGEX_SIZE)
-        .build()
+/// Builds a Cloudflare-style `Server-Timing` value for a response the WAF
+/// handled: `waf`, `upstream` (when the origin was contacted), `cache` (when
+/// caching is enabled) and `total`.
+fn server_timing_value(
+    waf_ms: u64,
+    upstream_ms: Option<u64>,
+    cache_status: &str,
+    total_ms: u64,
+) -> String {
+    let mut parts = vec![format!("waf;dur={waf_ms}")];
+    if let Some(upstream_ms) = upstream_ms {
+        parts.push(format!("upstream;dur={upstream_ms}"));
+    }
+    if !cache_status.is_empty() {
+        parts.push(format!("cache;desc=\"{cache_status}\""));
+    }
+    parts.push(format!("total;dur={total_ms}"));
+    parts.join(", ")
+}
+
+/// Appends our timings to an existing `Server-Timing` header instead of
+/// overwriting one the origin set.
+fn merge_server_timing(existing: Option<&str>, value: &str) -> String {
+    match existing.filter(|existing| !existing.is_empty()) {
+        Some(existing) => format!("{value}, {existing}"),
+        None => value.to_string(),
+    }
+}
+
+/// Cache phase worth exposing in `Server-Timing`.
+///
+/// Early request phases (`uninitialized`, `key`) are omitted: a block page
+/// served before any cache decision must not claim a cache state, and the
+/// documented value set stays limited to the four final phases.
+fn cache_timing_desc(session: &Session) -> &'static str {
+    if !session.cache.enabled() {
+        return "";
+    }
+    match session.cache.phase().as_str() {
+        "hit" => "hit",
+        "miss" => "miss",
+        "bypass" => "bypass",
+        "expired" => "expired",
+        _ => "",
+    }
+}
+
+/// Request-phase time the WAF plugin spent on this request, as recorded by the
+/// proxy's plugin runner (`pingwaf:waf`).
+fn waf_processing_ms(ctx: &Ctx) -> u64 {
+    ctx.features
+        .as_ref()
+        .and_then(|features| features.plugin_processing_times.as_ref())
+        .map(|times| {
+            times
+                .iter()
+                .filter(|(name, _)| {
+                    name.as_ref() == "waf" || name.ends_with(":waf")
+                })
+                .map(|(_, time)| u64::from(*time))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// Stamps a WAF-generated response (block, challenge, rate limit, auth page)
+/// with the same timing header a proxied response carries.
+fn with_server_timing(
+    mut response: HttpResponse,
+    ctx: &Ctx,
+    session: &Session,
+    started: Instant,
+) -> HttpResponse {
+    // The body phase starts its clock late; fall back to the plugin time the
+    // proxy recorded during the request phase.
+    let waf_ms =
+        (started.elapsed().as_millis() as u64).max(waf_processing_ms(ctx));
+    let value = server_timing_value(
+        waf_ms,
+        None,
+        cache_timing_desc(session),
+        ctx.timing.created_at.elapsed().as_millis() as u64,
+    );
+    insert_server_timing(&mut response, &value);
+    response
+}
+
+/// Merges a timing value into an `HttpResponse`, which keeps a header vector
+/// rather than a `HeaderMap`.
+fn insert_server_timing(response: &mut HttpResponse, value: &str) {
+    let headers = response.headers.get_or_insert_with(Vec::new);
+    match headers
+        .iter_mut()
+        .find(|(name, _)| name.as_str() == "server-timing")
+    {
+        Some((_, existing)) => {
+            let merged = merge_server_timing(existing.to_str().ok(), value);
+            if let Ok(parsed) = http::HeaderValue::from_str(&merged) {
+                *existing = parsed;
+            }
+        },
+        None => {
+            if let Ok(parsed) = http::HeaderValue::from_str(value) {
+                headers.push((
+                    http::header::HeaderName::from_static("server-timing"),
+                    parsed,
+                ));
+            }
+        },
+    }
 }
 
 impl PathExceptions {
     /// Compiles the site's exception list; `None` when nothing is enabled.
     fn build(rules: &[CachePathException]) -> Option<Self> {
         let mut compiled = Self::default();
-        for rule in rules {
-            if !rule.enabled || rule.path.is_empty() {
-                continue;
-            }
+        // Longest pattern first: `/api/admin` must beat `/api` for an
+        // operator who wrote both. The control plane only de-duplicates
+        // identical paths, so overlapping prefixes are a normal case.
+        let mut ordered: Vec<&CachePathException> =
+            rules.iter().filter(|rule| rule.enabled).collect();
+        ordered.sort_by_key(|rule| std::cmp::Reverse(rule.path.len()));
+        for rule in ordered {
+            let filter = match PathFilter::compile(&rule.path, &rule.match_type)
+            {
+                Ok(Some(filter)) => filter,
+                Ok(None) => continue,
+                Err(err) => {
+                    // The control plane refuses these on save; this is the
+                    // defence for a bundle written by another version. The
+                    // exception simply stops applying, never widens.
+                    warn!(
+                        path = %rule.path,
+                        error = %err,
+                        "path exception regex failed to compile; rule ignored"
+                    );
+                    continue;
+                },
+            };
             let bypass = PathBypass {
                 id: rule.id.clone(),
                 name: if rule.note.is_empty() {
@@ -407,30 +559,13 @@ impl PathExceptions {
                 log_hits: rule.log_hits,
             };
             // Query strings are ignored by construction (only `path` is
-            // matched) and no further normalisation is applied.
-            match rule.match_type.as_str() {
-                "exact" => compiled.exact.push((rule.path.clone(), bypass)),
-                "wildcard" => compiled.wildcard.push((
-                    rule.path.trim_end_matches('*').to_string(),
-                    bypass,
-                )),
-                "regex" => match compile_path_regex(&rule.path) {
-                    Ok(re) => compiled.regex.push((re, bypass)),
-                    Err(err) => {
-                        // The control plane refuses these on save; this is the
-                        // defence for a bundle written by another version. The
-                        // exception simply stops applying, never widens.
-                        warn!(
-                            path = %rule.path,
-                            error = %err,
-                            "path exception regex failed to compile; rule ignored"
-                        );
-                    },
-                },
-                // `prefix` and any unknown match type: the proto default is
-                // PATH_MATCH_PREFIX, so unknown degrades to the same
-                // semantics rather than to something broader.
-                _ => compiled.prefix.push((rule.path.clone(), bypass)),
+            // matched); `PathFilter::matches` canonicalises the path before
+            // comparing, so traversal forms cannot satisfy a broader scope.
+            match filter.match_type() {
+                MatchType::Exact => compiled.exact.push((filter, bypass)),
+                MatchType::Wildcard => compiled.wildcard.push((filter, bypass)),
+                MatchType::Regex => compiled.regex.push((filter, bypass)),
+                MatchType::Prefix => compiled.prefix.push((filter, bypass)),
             }
         }
         if compiled.exact.is_empty()
@@ -449,29 +584,24 @@ impl PathExceptions {
     fn match_path(&self, path: &str) -> Option<&PathBypass> {
         self.exact
             .iter()
-            .find(|(pattern, _)| pattern == path)
+            .find(|(filter, _)| filter.matches(path))
             .map(|(_, bypass)| bypass)
             .or_else(|| {
                 self.prefix
                     .iter()
-                    .find(|(pattern, _)| {
-                        path == pattern
-                            || path
-                                .strip_prefix(pattern.as_str())
-                                .is_some_and(|rest| rest.starts_with('/'))
-                    })
+                    .find(|(filter, _)| filter.matches(path))
                     .map(|(_, bypass)| bypass)
             })
             .or_else(|| {
                 self.wildcard
                     .iter()
-                    .find(|(pattern, _)| path.starts_with(pattern.as_str()))
+                    .find(|(filter, _)| filter.matches(path))
                     .map(|(_, bypass)| bypass)
             })
             .or_else(|| {
                 self.regex
                     .iter()
-                    .find(|(pattern, _)| pattern.is_match(path))
+                    .find(|(filter, _)| filter.matches(path))
                     .map(|(_, bypass)| bypass)
             })
     }
@@ -848,8 +978,6 @@ struct SiteContext {
     /// Site-wide basic auth gate; `None` when the site has none, it is
     /// disabled, or it stores no usable credential.
     basic_auth: Option<BasicAuthGate>,
-    /// Custom rule id → name.
-    rule_names: HashMap<String, String>,
     /// Site paused from the dashboard: every request gets the maintenance page.
     paused: bool,
     /// Observation mode: every protection keeps detecting but only records —
@@ -873,7 +1001,7 @@ struct SiteContext {
     /// key on the resolved address.
     proxy_trust: ProxyTrust,
     /// Operator-curated path exceptions, compiled; `None` when the site has
-    /// none enabled. Only consulted while `observation_mode` is on.
+    /// none enabled. Honoured in every WAF mode, including block mode.
     path_exceptions: Option<Arc<PathExceptions>>,
     /// Explicit route restrictions; evaluated before exception bypasses.
     path_restrictions: Option<Arc<PathRestrictions>>,
@@ -915,14 +1043,6 @@ impl SiteContext {
             rate_limits: (!rate_limits.rules.is_empty()).then_some(rate_limits),
             mtls: MtlsPolicy::build(site_rules.ssl_config.as_ref()),
             basic_auth,
-            rule_names: waf_cfg
-                .map(|cfg| {
-                    cfg.custom_rules
-                        .iter()
-                        .map(|r| (r.id.clone(), r.name.clone()))
-                        .collect()
-                })
-                .unwrap_or_default(),
             paused: site_rules.is_paused(),
             observation_mode: site_rules.observation_mode,
             waf_mode: waf_cfg.map(|cfg| cfg.mode),
@@ -969,6 +1089,18 @@ impl SiteContext {
                 })
                 .unwrap_or_default(),
         }
+    }
+
+    /// Configured name of the rule with `id`, for the security event.
+    ///
+    /// Looks through the site engine's rule set instead of keeping a per-site
+    /// `id -> name` map: the map duplicated every custom rule's id and name
+    /// for every site, while the engine already holds the compiled rules.
+    fn rule_name(&self, id: &str) -> Option<String> {
+        self.engine
+            .as_ref()
+            .and_then(|engine| engine.rule_name(id))
+            .map(str::to_string)
     }
 
     /// Resolves the engine choice for the rules this context was built from.
@@ -1059,6 +1191,8 @@ struct IpRule {
     name: String,
     action: IpRuleAction,
     ranges: IpRules,
+    /// Empty scope = the whole site.
+    path: Option<PathFilter>,
 }
 
 /// Geo restrictions with the country and ASN lists normalised once.
@@ -1071,6 +1205,8 @@ struct GeoRule {
     challenge: bool,
     /// The policy answers with a basic auth prompt instead of a block page.
     basic_auth: bool,
+    /// Empty scope = the whole site.
+    path: Option<PathFilter>,
 }
 
 /// Why a request was denied, and by which rule.
@@ -1123,10 +1259,8 @@ impl AccessPolicy {
             .ip_access_rules
             .iter()
             .filter(|rule| rule.enabled && !rule.ip_ranges.is_empty())
-            .map(|rule| IpRule {
-                id: rule.id.clone(),
-                name: rule.name.clone(),
-                action: match rule.action {
+            .filter_map(|rule| {
+                let action = match rule.action {
                     CacheIpAccessAction::Allow => IpRuleAction::Allow,
                     CacheIpAccessAction::Challenge
                     | CacheIpAccessAction::JsChallenge => {
@@ -1134,8 +1268,32 @@ impl AccessPolicy {
                     },
                     CacheIpAccessAction::Block => IpRuleAction::Block,
                     CacheIpAccessAction::BasicAuth => IpRuleAction::BasicAuth,
-                },
-                ranges: IpRules::new(&rule.ip_ranges),
+                };
+                let path = match PathFilter::compile(&rule.path, &rule.match_type)
+                {
+                    Ok(filter) => filter,
+                    Err(err) => {
+                        // A broken scope must not widen an allow rule; a denial
+                        // keeps enforcing site-wide (fail-closed).
+                        warn!(
+                            rule = %rule.name,
+                            path = %rule.path,
+                            error = %err,
+                            "ip access rule path failed to compile; using a safe default"
+                        );
+                        if action == IpRuleAction::Allow {
+                            return None;
+                        }
+                        None
+                    },
+                };
+                Some(IpRule {
+                    id: rule.id.clone(),
+                    name: rule.name.clone(),
+                    action,
+                    ranges: IpRules::new(&rule.ip_ranges),
+                    path,
+                })
             })
             .collect();
         Self {
@@ -1152,9 +1310,13 @@ impl AccessPolicy {
         ip: &str,
         addr: Option<IpAddr>,
         country: Option<&str>,
+        path: &str,
     ) -> PolicyOutcome {
         if let Some(addr) = addr {
             for rule in &self.ip_rules {
+                if !rule.path.as_ref().is_none_or(|scope| scope.matches(path)) {
+                    continue;
+                }
                 if !rule.ranges.is_match_addr(&addr) {
                     continue;
                 }
@@ -1200,6 +1362,10 @@ impl AccessPolicy {
         let Some(geo) = self.geo.as_ref().filter(|geo| geo.enabled) else {
             return PolicyOutcome::NoMatch;
         };
+        // A path scope limits the whole geo policy, not individual countries.
+        if !geo.path.as_ref().is_none_or(|scope| scope.matches(path)) {
+            return PolicyOutcome::NoMatch;
+        }
         let asn_denied = !geo.blocked_asns.is_empty()
             && addr.is_some_and(|addr| {
                 lookup_asn_addr(addr)
@@ -1261,6 +1427,18 @@ impl GeoRule {
                 CacheWafAction::Challenge | CacheWafAction::JsChallenge
             ),
             basic_auth: matches!(cfg.action, CacheWafAction::BasicAuth),
+            path: match PathFilter::compile(&cfg.path, &cfg.match_type) {
+                Ok(filter) => filter,
+                Err(err) => {
+                    // Geo denials stay site-wide on a broken scope.
+                    warn!(
+                        path = %cfg.path,
+                        error = %err,
+                        "geo restriction path failed to compile; enforcing site-wide"
+                    );
+                    None
+                },
+            },
         }
     }
 }
@@ -2009,7 +2187,7 @@ impl RateLimitPolicy {
 /// [`EvalContext`] borrows from this state plus the request data.
 struct ExpressionState {
     full_uri: std::cell::OnceCell<String>,
-    cookies: std::cell::OnceCell<Vec<(String, String)>>,
+    cookies: std::cell::OnceCell<Vec<(Cow<'static, str>, Cow<'static, str>)>>,
 }
 
 impl ExpressionState {
@@ -2064,7 +2242,9 @@ impl ExpressionState {
 }
 
 /// Parses the `Cookie` header into name/value pairs.
-fn parse_cookies(headers: &[(String, String)]) -> Vec<(String, String)> {
+fn parse_cookies(
+    headers: &[(String, String)],
+) -> Vec<(Cow<'static, str>, Cow<'static, str>)> {
     let Some(raw) = headers
         .iter()
         .find(|(k, _)| k == "cookie")
@@ -2075,7 +2255,10 @@ fn parse_cookies(headers: &[(String, String)]) -> Vec<(String, String)> {
     raw.split(';')
         .filter_map(|pair| {
             let (name, value) = pair.trim().split_once('=')?;
-            Some((name.trim().to_string(), value.trim().to_string()))
+            Some((
+                Cow::Owned(name.trim().to_string()),
+                Cow::Owned(value.trim().to_string()),
+            ))
         })
         .collect()
 }
@@ -2108,7 +2291,7 @@ static CLEARANCE_MANAGER: RwLock<Option<(PathBuf, CookieManager)>> =
 /// match so a clearance earned on one site cannot be replayed against
 /// another. Standalone (no agent) has no shared secret to verify against
 /// and stays exempt-free.
-fn clearance_valid(value: Option<String>, site_id: &str) -> bool {
+fn clearance_valid(value: Option<String>, site_key: &str) -> bool {
     let Some(value) = value else {
         return false;
     };
@@ -2120,21 +2303,23 @@ fn clearance_valid(value: Option<String>, site_id: &str) -> bool {
     {
         let cached =
             CLEARANCE_MANAGER.read().unwrap_or_else(|e| e.into_inner());
-        if let Some((path, manager)) = cached.as_ref()
-            && *path == secret_path
+        if let Some((cached_path, manager)) = cached.as_ref()
+            && cached_path == path
         {
             return manager
                 .validate_clearance(&value)
-                .is_ok_and(|payload| payload.site_id == site_id);
+                .is_ok_and(|payload| payload.site_id == site_key);
         }
     }
     let secret = resolve_cookie_secret("");
     let manager = CookieManager::new(secret.as_bytes(), 3600);
     let valid = manager
         .validate_clearance(&value)
-        .is_ok_and(|payload| payload.site_id == site_id);
-    *CLEARANCE_MANAGER.write().unwrap_or_else(|e| e.into_inner()) =
-        Some((secret_path, manager));
+        .is_ok_and(|payload| payload.site_id == site_key);
+    if let Some(path) = secret_path {
+        *CLEARANCE_MANAGER.write().unwrap_or_else(|e| e.into_inner()) =
+            Some((path, manager));
+    }
     valid
 }
 
@@ -2192,6 +2377,9 @@ struct PendingAccess {
 /// Response facts gathered before the access entry is emitted.
 struct ResponseFacts {
     status_code: u32,
+    /// Status the origin returned. Equals `status_code` when the edge answered
+    /// itself (block/challenge/rate limit), per the access-log contract.
+    upstream_status: u32,
     upstream_addr: String,
     upstream_latency_ms: u64,
     headers: Vec<(String, String)>,
@@ -2221,6 +2409,7 @@ impl ResponseFacts {
     fn generated(status_code: u32) -> Self {
         Self {
             status_code,
+            upstream_status: status_code,
             upstream_addr: String::new(),
             upstream_latency_ms: 0,
             headers: Vec::new(),
@@ -2303,6 +2492,73 @@ fn cap_headers<'a>(
         out.push((name, value.to_string()));
     }
     out
+}
+
+/// Cap a header vector in place to the access-log limits.
+///
+/// Same selection as [`cap_headers`] (first `MAX_LOG_HEADERS` entries while
+/// the running size stays within `MAX_LOG_HEADERS_BYTES`) but without
+/// allocating a second vector: the request's header vector is moved into the
+/// pending entry, so the cap is applied to that buffer directly.
+fn cap_headers_in_place(
+    mut headers: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    headers.truncate(MAX_LOG_HEADERS);
+    let mut total = 0usize;
+    let mut keep = 0usize;
+    for (name, value) in &headers {
+        total += name.len() + value.len();
+        if total > MAX_LOG_HEADERS_BYTES {
+            break;
+        }
+        keep += 1;
+    }
+    headers.truncate(keep);
+    headers
+}
+
+/// Copy the request facts into the pending entry.
+///
+/// Used by the cold paths that answer before the body stage: they still hold
+/// the `RequestData` (and return right after), so the facts are copied rather
+/// than moved. The hot path uses [`backfill_pending_facts_owned`] instead.
+fn backfill_pending_facts(request_id: &str, request: &RequestData) {
+    let Some(mut pending) = PENDING_ACCESS.get_mut(request_id) else {
+        return;
+    };
+    pending.client_ip = request.client_ip.clone();
+    pending.method = request.method.clone();
+    pending.scheme = request.scheme.clone();
+    pending.protocol = request.protocol.clone();
+    pending.path = request.path.clone();
+    pending.query = request.query.clone();
+    pending.country_code = request.country_code.clone().unwrap_or_default();
+    pending.request_headers = cap_headers(
+        request
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_str())),
+    );
+}
+
+/// Move the request facts into the pending entry.
+///
+/// The request is not handed to the body stage, so the access log can own the
+/// strings: the copy made at registration (needed only when the body stage
+/// keeps a second `RequestData`) is skipped entirely, and the header vector is
+/// capped in place instead of cloned.
+fn backfill_pending_facts_owned(request_id: &str, request: RequestData) {
+    let Some(mut pending) = PENDING_ACCESS.get_mut(request_id) else {
+        return;
+    };
+    pending.client_ip = request.client_ip;
+    pending.method = request.method;
+    pending.scheme = request.scheme;
+    pending.protocol = request.protocol;
+    pending.path = request.path;
+    pending.query = request.query;
+    pending.country_code = request.country_code.unwrap_or_default();
+    pending.request_headers = cap_headers_in_place(request.headers);
 }
 
 /// Accumulates the request-body prefix kept for logging: at most `limit`
@@ -2527,6 +2783,10 @@ enum VerdictOutcome {
     /// The request passed (or the verdict was only recorded); proxying
     /// continues.
     Continue,
+    /// The header phase found a Block/Challenge, but a body-based allow rule
+    /// may still flip it. The request continues; the deferred body phase must
+    /// deliver the final verdict or fall back to this decision on timeout.
+    Deferred,
     /// The plugin answers the request itself (block or challenge page).
     Respond(HttpResponse),
 }
@@ -2540,6 +2800,10 @@ struct DeferredVerdict {
     /// A path exception skipped the challenge layer for this request, so a
     /// Challenge verdict from the body phase must not serve a challenge page.
     skip_challenge: bool,
+    /// The header phase already decided Block/Challenge, but the body-based
+    /// allow rule may flip it. Used as a fail-closed fallback if the body
+    /// stage times out or never reaches the final verdict.
+    header_block: bool,
     site_id: String,
     host: String,
     request_data: RequestData,
@@ -2842,6 +3106,7 @@ fn emit_access(
         response_size,
         upstream_addr: response.upstream_addr,
         upstream_latency_ms: response.upstream_latency_ms,
+        upstream_status: response.upstream_status,
         total_latency_ms,
         cache_status: response.cache_status.clone(),
         user_agent: pending.user_agent,
@@ -3174,6 +3439,11 @@ pub struct WafPlugin {
     /// (default) scans the encoded bytes and marks the body uninspected;
     /// `reject` answers 415.
     encoded_body_policy: EncodedBodyPolicy,
+    /// What to do when the scan surface was truncated (query/form/value/body
+    /// cap or the inspection deadline). `monitor` (default) forwards and
+    /// emits an event; `reject` answers 413. `body_stage_policy = strict`
+    /// keeps its old "reject a truncated body" behaviour either way.
+    truncated_body_policy: TruncatedBodyPolicy,
     hash_value: String,
     /// Per-domain engines built from agent rules, keyed by host.
     site_contexts: DashMap<String, CachedSite>,
@@ -3226,6 +3496,29 @@ impl EncodedBodyPolicy {
         match value.trim().to_ascii_lowercase().as_str() {
             "reject" | "fail_closed" | "fail-closed" => Self::Reject,
             _ => Self::InspectWire,
+        }
+    }
+}
+
+/// How a request whose scan surface was truncated is handled.
+///
+/// Truncation happens when a query/form/value/body cap (or the inspection
+/// deadline) stopped the scan early. The bytes past the cap were not
+/// inspected, so forwarding the request is exactly the "pad the payload past
+/// the inspection surface" bypass; `reject` closes it with a `413`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TruncatedBodyPolicy {
+    /// Forward it and emit `body_scan_truncated` / `body_scan_deadline`.
+    Monitor,
+    /// Reject with `413` instead of forwarding a partly-scanned request.
+    Reject,
+}
+
+impl TruncatedBodyPolicy {
+    fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "reject" | "fail_closed" | "fail-closed" => Self::Reject,
+            _ => Self::Monitor,
         }
     }
 }
@@ -3319,20 +3612,34 @@ fn build_site_engine(cfg: &CacheWafConfig) -> WafEngine {
     //   never carries its action (downgraded, no enforcement).
     // - `block`: the rule is evaluated and enforced.
     // The site-level engine mode stays the master switch on top of this.
+    // A legacy `allow + off` row is kept as an allow rule: `off` used to make
+    // the whitelist disappear and later block rules match again. The API now
+    // rejects the pair and migration 000096 backfills it, but old agent
+    // snapshots and restored backups can still contain it.
+    let effective_mode = |r: &CacheWafRule| {
+        if r.action == CacheWafAction::Allow && r.mode == CacheWafMode::Off {
+            CacheWafMode::Monitor
+        } else {
+            r.mode
+        }
+    };
     let monitor_custom_rules: std::collections::HashSet<String> = cfg
         .custom_rules
         .iter()
-        // Only `monitor` rules participate in the event/score stream.
-        .filter(|r| r.enabled && r.mode == CacheWafMode::Monitor)
-        .map(|r| r.id.clone())
+        // Only monitor rules participate in the event/score stream.
+        .filter(|r| r.enabled && effective_mode(r) == CacheWafMode::Monitor)
+        .map(|r| r.id.to_string())
         .collect();
     // Active rules: enabled and not off. Off rules must not be compiled or
     // evaluated (R-01); `enabled = false` rules are likewise skipped.
     let rules: Vec<CompiledRule> = cfg
         .custom_rules
         .iter()
-        .filter(|r| r.enabled && r.mode != CacheWafMode::Off)
+        .filter(|r| r.enabled)
         .filter_map(|r| {
+            if effective_mode(r) == CacheWafMode::Off {
+                return None;
+            }
             let action = match r.action {
                 CacheWafAction::Block => RuleAction::Block,
                 CacheWafAction::Log => RuleAction::Log,
@@ -3350,8 +3657,8 @@ fn build_site_engine(cfg: &CacheWafConfig) -> WafEngine {
                 },
             };
             match CompiledRule::compile(
-                r.id.clone(),
-                r.name.clone(),
+                Arc::clone(&r.id),
+                Arc::clone(&r.name),
                 &r.expression,
                 action,
                 r.severity as u8,
@@ -3407,6 +3714,7 @@ fn build_site_engine(cfg: &CacheWafConfig) -> WafEngine {
         rules,
         enable_managed_rules: true,
         fast_path_block_on_critical: true,
+        inspection_deadline: WafEngineConfig::default().inspection_deadline,
     };
     WafEngine::new(&engine_config)
 }
@@ -3570,6 +3878,13 @@ impl WafPlugin {
     fn body_inspection_event(verdict: &WafVerdict) -> Option<&'static str> {
         if verdict.details.contains("body=uninspected") {
             Some("body_encoded_uninspected")
+        } else if verdict.details.contains("request=truncated") {
+            // Query/form/value/body caps: the request fell out of the scan
+            // surface. Never let that read as a clean pass.
+            Some("body_scan_truncated")
+        } else if verdict.details.contains("request=deadline") {
+            // The soft inspection deadline stopped deep detection early.
+            Some("body_scan_deadline")
         } else if verdict.details.contains("body=prefix") {
             Some("body_expanded_cap")
         } else {
@@ -3881,14 +4196,17 @@ impl WafPlugin {
             // A client holding a valid clearance for this site already
             // solved its challenge: re-issuing it would loop forever, so
             // let it pass.
-            if clearance_valid(clearance_cookie(&request_data.headers), site_id)
-            {
+            // Bind the clearance to the host the challenge plugin also uses
+            // as its subject. The two plugins share one cookie name, so a
+            // UUID-vs-host mismatch makes each reject the other's cookie and
+            // re-challenge forever.
+            if clearance_valid(clearance_cookie(&request_data.headers), host) {
                 return RequestPluginResult::Continue;
             }
             build_challenge_response(
                 request_id,
                 original_url,
-                site_id,
+                host,
                 pow_difficulty,
                 ChallengeKind::Js,
             )
@@ -3904,6 +4222,15 @@ impl WafPlugin {
     /// verdict onto proxy behaviour. Shared by the request phase (headers
     /// only — the body has not arrived yet) and the request-body filter
     /// (complete body, or the staged prefix of an over-cap body).
+    ///
+    /// `defer_events`: the body phase will re-run this verdict on the
+    /// complete body and ship the final security event and request count
+    /// there, so the request-phase pass must not log or count — otherwise
+    /// one request produces two events and two counts (P0-8).
+    /// `defer_block`: the site has an `allow` rule that reads the request
+    /// body, so a header-phase Block verdict is not final — the body may
+    /// still flip the request to Pass. The request continues and the staged
+    /// body decides (P0-9).
     #[allow(clippy::too_many_arguments)]
     fn enforce_verdict(
         &self,
@@ -3916,16 +4243,22 @@ impl WafPlugin {
         context: Option<&Arc<SiteContext>>,
         observe: bool,
         skip_challenge: bool,
+        defer_events: bool,
+        defer_block: bool,
     ) -> VerdictOutcome {
         match choice {
             EngineChoice::Disabled => {
-                if let Some(agent) = agent {
+                if let Some(agent) = agent
+                    && !defer_events
+                {
                     agent.record_request(false);
                 }
                 return VerdictOutcome::Continue;
             },
             EngineChoice::Base if self.mode == WafMode::Off => {
-                if let Some(agent) = agent {
+                if let Some(agent) = agent
+                    && !defer_events
+                {
                     agent.record_request(false);
                 }
                 return VerdictOutcome::Skipped;
@@ -3949,11 +4282,51 @@ impl WafPlugin {
         if self.encoded_body_policy == EncodedBodyPolicy::Reject
             && verdict.details.contains("body=uninspected")
         {
+            // 415 is terminal: the body stage will not run to do the deferred
+            // count, so count here even when the caller deferred events.
             if let Some(agent) = agent {
                 agent.record_request(false);
             }
             return VerdictOutcome::Respond(
                 HttpResponse::builder(http::StatusCode::UNSUPPORTED_MEDIA_TYPE)
+                    .no_store()
+                    .finish(),
+            );
+        }
+
+        // `body_stage_policy = strict` promises an uninspected tail is
+        // rejected instead of forwarded. The normalization caps are the same
+        // shape: a request whose query/form/value was cut short is exactly
+        // "padded past the inspection surface", which the 2026-11-13 audit
+        // turned into a stable bypass. Strict sites reject it instead of
+        // passing it silently.
+        let scan_incomplete = verdict.details.contains("request=truncated")
+            || verdict.details.contains("request=deadline");
+        if verdict.action == WafAction::Pass
+            && scan_incomplete
+            && (self.truncated_body_policy == TruncatedBodyPolicy::Reject
+                || self.body_stage_policy == BodyStagePolicy::Strict)
+        {
+            // A truncated-but-clean request is the bypass shape: reject it
+            // and keep the reason visible in the event stream. Block/Monitor
+            // verdicts keep their own path below (the block page and its
+            // event matter more than the 413).
+            if !defer_events {
+                Self::log_event(
+                    site_id,
+                    request_id,
+                    host,
+                    request_data,
+                    &verdict,
+                    "body_inspection",
+                    "body_scan_truncated",
+                );
+            }
+            if let Some(agent) = agent {
+                agent.record_request(false);
+            }
+            return VerdictOutcome::Respond(
+                HttpResponse::builder(http::StatusCode::PAYLOAD_TOO_LARGE)
                     .no_store()
                     .finish(),
             );
@@ -3974,25 +4347,27 @@ impl WafPlugin {
                 return String::new();
             };
             context
-                .and_then(|context| context.rule_names.get(id))
-                .cloned()
+                .and_then(|context| context.rule_name(id))
                 .unwrap_or_default()
         };
 
         if verdict.action == WafAction::Pass {
-            if let Some(event_type) = Self::body_inspection_event(&verdict) {
-                Self::log_event(
-                    site_id,
-                    request_id,
-                    host,
-                    request_data,
-                    &verdict,
-                    "body_inspection",
-                    event_type,
-                );
-            }
-            if let Some(agent) = agent {
-                agent.record_request(false);
+            if !defer_events {
+                if let Some(event_type) = Self::body_inspection_event(&verdict)
+                {
+                    Self::log_event(
+                        site_id,
+                        request_id,
+                        host,
+                        request_data,
+                        &verdict,
+                        "body_inspection",
+                        event_type,
+                    );
+                }
+                if let Some(agent) = agent {
+                    agent.record_request(false);
+                }
             }
             return VerdictOutcome::Continue;
         }
@@ -4000,15 +4375,17 @@ impl WafPlugin {
         // Monitor: log the event but let the request through.
         if verdict.action == WafAction::Monitor {
             let rule_name = rule_name_of(&verdict);
-            Self::log_event(
-                site_id,
-                request_id,
-                host,
-                request_data,
-                &verdict,
-                &rule_name,
-                Self::engine_event_type(&verdict),
-            );
+            if !defer_events {
+                Self::log_event(
+                    site_id,
+                    request_id,
+                    host,
+                    request_data,
+                    &verdict,
+                    &rule_name,
+                    Self::engine_event_type(&verdict),
+                );
+            }
             return VerdictOutcome::Continue;
         }
 
@@ -4030,21 +4407,33 @@ impl WafPlugin {
                 enforced_rule_id: None,
                 ..verdict.clone()
             };
-            Self::log_event(
-                site_id,
-                request_id,
-                host,
-                request_data,
-                &observed,
-                &rule_name,
-                Self::engine_event_type(&observed),
-            );
+            if !defer_events {
+                Self::log_event(
+                    site_id,
+                    request_id,
+                    host,
+                    request_data,
+                    &observed,
+                    &rule_name,
+                    Self::engine_event_type(&observed),
+                );
+            }
             return VerdictOutcome::Continue;
         }
 
         // Block / Challenge: log the security event, then emit the access
         // entry with the real status — a Respond result never reaches
         // handle_response, so this is the only chance to log it.
+        //
+        // A body-based `allow` rule is the one exception (P0-9): its
+        // whitelist exemption reads `http.request.body`, which the request
+        // phase has not seen. Blocking here would answer with a 403 before
+        // the body phase could re-run the verdict and flip it to Pass, so
+        // the block is deferred: the request continues, the body is staged,
+        // and the body phase delivers the final verdict.
+        if defer_block {
+            return VerdictOutcome::Deferred;
+        }
         let rule_name = rule_name_of(&verdict);
         Self::log_event(
             site_id,
@@ -4082,8 +4471,7 @@ impl WafPlugin {
             // clearance for this site solved its challenge before: issuing
             // the same challenge again would loop forever, so let it
             // through.
-            if clearance_valid(clearance_cookie(&request_data.headers), site_id)
-            {
+            if clearance_valid(clearance_cookie(&request_data.headers), host) {
                 if let Some(agent) = agent {
                     agent.record_request(false);
                 }
@@ -4098,7 +4486,7 @@ impl WafPlugin {
             build_challenge_response(
                 request_id,
                 &original_url,
-                site_id,
+                host,
                 self.pow_difficulty,
                 ChallengeKind::Js,
             )
@@ -4107,6 +4495,9 @@ impl WafPlugin {
         // marker is what makes the origin of the response unambiguous.
         let response =
             stamp_mitigated(response, verdict.action == WafAction::Challenge);
+        // The access entry is emitted here, before `handle_request` gets the
+        // Respond outcome: fill the request facts first.
+        backfill_pending_facts(request_id, request_data);
         emit_generated_access(agent, request_id, &response);
         VerdictOutcome::Respond(response)
     }
@@ -4174,6 +4565,10 @@ impl TryFrom<&PluginConf> for WafPlugin {
             value,
             "encoded_body_policy",
         ));
+        let truncated_body_policy = TruncatedBodyPolicy::parse(&get_str_conf(
+            value,
+            "truncated_body_policy",
+        ));
         let body_stage_timeout =
             stage_deadline_timeout(Some(Duration::from_secs(
                 get_int_conf_or_default(
@@ -4216,6 +4611,7 @@ impl TryFrom<&PluginConf> for WafPlugin {
             rules: Vec::new(),
             enable_managed_rules: true,
             fast_path_block_on_critical: true,
+            inspection_deadline: WafEngineConfig::default().inspection_deadline,
         };
 
         Ok(Self {
@@ -4233,6 +4629,7 @@ impl TryFrom<&PluginConf> for WafPlugin {
             body_stage_timeout,
             body_stage_policy,
             encoded_body_policy,
+            truncated_body_policy,
             hash_value,
             site_contexts: DashMap::new(),
             site_contexts_by_id: DashMap::new(),
@@ -4259,6 +4656,9 @@ impl Plugin for WafPlugin {
         if step != self.plugin_step {
             return Ok(RequestPluginResult::Skipped);
         }
+        // Request-phase start, used to stamp `Server-Timing` on responses this
+        // plugin generates itself (there is no upstream to time).
+        let started = Instant::now();
         // ACME http-01 validation requests are answered by the proxy before
         // the plugin chain runs; skip them here too, as a second line of
         // defense: no rule evaluation, no challenge, no block page — a CA
@@ -4266,6 +4666,16 @@ impl Plugin for WafPlugin {
         // a real token shape: a bare prefix would also release
         // `/.well-known/acme-challenge/../../admin` from every rule.
         if is_acme_challenge_path(session.req_header().uri.path()) {
+            return Ok(RequestPluginResult::Skipped);
+        }
+        // The clearance endpoint is served by the challenge plugin. A rule
+        // that matches every path (or `/_pingwaf/...`) must not challenge the
+        // verification POST itself — that turns the challenge page into a
+        // loop with no way to obtain a cookie. Exact path and method only, so
+        // `/_pingwaf/challenge/verify/../admin` is not exempted.
+        if session.req_header().method == http::Method::POST
+            && session.req_header().uri.path() == VERIFY_ENDPOINT
+        {
             return Ok(RequestPluginResult::Skipped);
         }
         // The visitor-auth endpoints are the site's own front door, and they run
@@ -4463,28 +4873,28 @@ impl Plugin for WafPlugin {
                 &request_id,
                 PendingAccess {
                     site_id: site_id.clone(),
-                    client_ip: client_ip.clone(),
-                    method: method.clone(),
-                    scheme: scheme.clone(),
-                    protocol: protocol.clone(),
+                    client_ip: String::new(),
+                    method: String::new(),
+                    scheme: String::new(),
+                    protocol: String::new(),
                     host: host.clone(),
-                    path: path.clone(),
-                    query: query.clone(),
+                    path: String::new(),
+                    query: String::new(),
                     user_agent: user_agent.clone(),
-                    referer,
+                    referer: referer.clone(),
                     tls_version: ctx
                         .conn
                         .tls_version
                         .clone()
                         .unwrap_or_default()
                         .to_string(),
-                    country_code: country.clone().unwrap_or_default(),
+                    country_code: String::new(),
                     // Backfilled by the OIDC plugin
                     // (`amend_pending_access_identity`) once it has validated
                     // a session: this entry is built during the request phase,
                     // which runs before that plugin.
                     user_identity: String::new(),
-                    request_headers: log_headers,
+                    request_headers: Vec::new(),
                     // The body prefix is backfilled by the request-body
                     // filter (`amend_pending_access_body`) once the bytes
                     // have streamed through it.
@@ -4522,8 +4932,11 @@ impl Plugin for WafPlugin {
         // the certificate keeps serving and the traffic remains visible. ──
         if context.as_ref().is_some_and(|site| site.paused) {
             let response = paused_page(&request_id);
+            backfill_pending_facts(&request_id, &request_data);
             emit_generated_access(agent.as_ref(), &request_id, &response);
-            return Ok(RequestPluginResult::Respond(response));
+            return Ok(RequestPluginResult::Respond(with_server_timing(
+                response, ctx, session, started,
+            )));
         }
 
         // ── Fail-closed edges: an agent configured with `fail_open = false`
@@ -4533,6 +4946,7 @@ impl Plugin for WafPlugin {
         // is reported as a `fail_closed` security event. ──
         if matches!(choice, EngineChoice::FailClosed) {
             let response = fail_closed_page(&request_id);
+            backfill_pending_facts(&request_id, &request_data);
             emit_generated_access(agent.as_ref(), &request_id, &response);
             if let Some(agent) = &agent {
                 Self::log_fail_closed(
@@ -4543,7 +4957,9 @@ impl Plugin for WafPlugin {
                     &request_data,
                 );
             }
-            return Ok(RequestPluginResult::Respond(response));
+            return Ok(RequestPluginResult::Respond(with_server_timing(
+                response, ctx, session, started,
+            )));
         }
 
         // ── Dynamic IP blocks: an IP the edge already refused (an auto-block
@@ -4586,8 +5002,11 @@ impl Plugin for WafPlugin {
                     &request_id,
                     "IP temporarily blocked by WAF defense",
                 );
+                backfill_pending_facts(&request_id, &request_data);
                 emit_generated_access(Some(agent), &request_id, &response);
-                return Ok(RequestPluginResult::Respond(response));
+                return Ok(RequestPluginResult::Respond(with_server_timing(
+                    response, ctx, session, started,
+                )));
             }
         }
 
@@ -4679,12 +5098,15 @@ impl Plugin for WafPlugin {
         // ── Path exceptions: an operator-curated path skips the protection
         // layers it names. Evaluated only after the three branches above —
         // a paused site, a fail-closed agent and an active IP ban are
-        // enforced decisions no exception may bypass. The exception itself
-        // is honoured only while the site observes (`resolve_path_bypass`
-        // already gates on observation mode), so it can never weaken a
-        // block-mode site. The access-log entry has been registered above,
+        // enforced decisions no exception may bypass. The exception is
+        // honoured in every WAF mode, including block mode; only those hard
+        // gates run first. The access-log entry has been registered above,
         // so bypassed requests remain visible. ──
         if let Some(bypass) = &path_bypass {
+            // The exception itself is an auditable decision: keep the access
+            // entry even when `log_hits=false` (the static-asset filter would
+            // otherwise drop `/static/...` exceptions without a trace).
+            mark_waf_triggered(&request_id);
             if bypass.log_hits
                 && let Some(agent) = &agent
             {
@@ -4720,8 +5142,11 @@ impl Plugin for WafPlugin {
             && let Some(reason) = mtls.denial(ctx)
         {
             let response = block_page(&request_id, reason);
+            backfill_pending_facts(&request_id, &request_data);
             emit_generated_access(agent.as_ref(), &request_id, &response);
-            return Ok(RequestPluginResult::Respond(response));
+            return Ok(RequestPluginResult::Respond(with_server_timing(
+                response, ctx, session, started,
+            )));
         }
 
         // ── Access restrictions: IP rules and geo stop a request before the
@@ -4736,6 +5161,7 @@ impl Plugin for WafPlugin {
                 &request_data.client_ip,
                 client_addr,
                 request_data.country_code.as_deref(),
+                &path,
             );
             if let Some(denial) =
                 access.denial().filter(|denial| !denial.basic_auth)
@@ -4762,6 +5188,7 @@ impl Plugin for WafPlugin {
                     } else {
                         format!("{path}?{query}")
                     };
+                    backfill_pending_facts(&request_id, &request_data);
                     return Ok(Self::deny_request(
                         agent.as_ref(),
                         &site_id,
@@ -4785,10 +5212,19 @@ impl Plugin for WafPlugin {
         // later verdict can skip it. An `allow` rule is the one exemption:
         // it means the client is trusted outright ──
         let gate = context.as_ref().and_then(|site| site.basic_auth.as_ref());
+        let gate_in_scope = gate.is_some_and(|gate| {
+            gate.path.as_ref().is_none_or(|scope| scope.matches(&path))
+        });
         let gate_required = match &access {
             PolicyOutcome::Allowed => false,
+            // A `basic_auth` rule already matched the client through its own
+            // path scope. The gate's scope only governs the *site-wide*
+            // switch; it must not turn a matched rule into a silent bypass.
+            // With no usable gate the request is still refused below.
             PolicyOutcome::Denied(denial) => denial.basic_auth,
-            PolicyOutcome::NoMatch => gate.is_some_and(|gate| gate.site_wide),
+            PolicyOutcome::NoMatch => {
+                gate.is_some_and(|gate| gate.site_wide) && gate_in_scope
+            },
         };
         let gate_required =
             (gate_required && !bypasses("basic_auth")) || path_basic_auth;
@@ -4826,8 +5262,11 @@ impl Plugin for WafPlugin {
                         })
                 };
                 let response = basic_auth_page(&request_id, realm, &reason);
+                backfill_pending_facts(&request_id, &request_data);
                 emit_generated_access(agent.as_ref(), &request_id, &response);
-                return Ok(RequestPluginResult::Respond(response));
+                return Ok(RequestPluginResult::Respond(with_server_timing(
+                    response, ctx, session, started,
+                )));
             }
             if let Some(gate) = gate
                 && gate.hide_credentials
@@ -4885,6 +5324,7 @@ impl Plugin for WafPlugin {
                         } else {
                             format!("{path}?{query}")
                         };
+                        backfill_pending_facts(&request_id, &request_data);
                         return Ok(Self::deny_request(
                             agent.as_ref(),
                             &site_id,
@@ -4930,6 +5370,7 @@ impl Plugin for WafPlugin {
                         } else {
                             format!("{path}?{query}")
                         };
+                        backfill_pending_facts(&request_id, &request_data);
                         return Ok(Self::deny_request(
                             agent.as_ref(),
                             &site_id,
@@ -4977,7 +5418,7 @@ impl Plugin for WafPlugin {
                 rate.rules.iter().any(|r| r.action == RateAction::Challenge)
                     && clearance_valid(
                         clearance_cookie(&request_data.headers),
-                        &site_id,
+                        &host,
                     );
             let outcome = rate.evaluate(
                 &self.rate_counters,
@@ -5055,6 +5496,7 @@ impl Plugin for WafPlugin {
                         if let Some(agent) = &agent {
                             agent.record_request(false);
                         }
+                        backfill_pending_facts(&request_id, &request_data);
                         return Ok(RequestPluginResult::Continue);
                     }
                     // Defense in depth: refuse the client at the edge for the
@@ -5074,7 +5516,7 @@ impl Plugin for WafPlugin {
                         build_challenge_response(
                             &request_id,
                             &original_url,
-                            &site_id,
+                            &host,
                             self.pow_difficulty,
                             ChallengeKind::Js,
                         )
@@ -5085,12 +5527,15 @@ impl Plugin for WafPlugin {
                             tripped.retry_after,
                         )
                     };
+                    backfill_pending_facts(&request_id, &request_data);
                     emit_generated_access(
                         agent.as_ref(),
                         &request_id,
                         &response,
                     );
-                    return Ok(RequestPluginResult::Respond(response));
+                    return Ok(RequestPluginResult::Respond(
+                        with_server_timing(response, ctx, session, started),
+                    ));
                 }
             }
         }
@@ -5103,6 +5548,7 @@ impl Plugin for WafPlugin {
             if let Some(agent) = &agent {
                 agent.record_request(false);
             }
+            backfill_pending_facts(&request_id, &request_data);
             return Ok(RequestPluginResult::Skipped);
         }
 
@@ -5113,6 +5559,29 @@ impl Plugin for WafPlugin {
         // A `waf` bypass keeps the request-phase accounting (every other
         // path through here records via the verdict pipeline) but skips the
         // engine verdict entirely.
+        //
+        // When the engine will re-run on the complete body (a staged body
+        // the request-body filter inspects), the request-phase pass must not
+        // log events or count the request: the body phase is the final
+        // verdict and ships both exactly once (P0-8). The exception to the
+        // exception: a Block verdict is still final here — the response goes
+        // out and the body never arrives — unless the site has a body-based
+        // `allow` rule that could still flip it (P0-9).
+        let engine_runs = match &choice {
+            EngineChoice::Site(_) => true,
+            EngineChoice::Base => self.mode != WafMode::Off,
+            EngineChoice::Disabled | EngineChoice::FailClosed => false,
+        };
+        let body_inspected = wants_body
+            && has_body
+            && !bypasses("waf")
+            && should_inspect
+            && engine_runs;
+        let defer_events = body_inspected;
+        let defer_block = body_inspected
+            && context
+                .as_ref()
+                .is_some_and(|site| site.allow_rules_need_body);
         let outcome = if bypasses("waf") {
             if let Some(agent) = &agent {
                 agent.record_request(false);
@@ -5129,28 +5598,48 @@ impl Plugin for WafPlugin {
                 context.as_ref(),
                 observe,
                 bypasses("challenge"),
+                defer_events,
+                defer_block,
             );
             if let VerdictOutcome::Respond(response) = outcome {
-                return Ok(RequestPluginResult::Respond(response));
+                backfill_pending_facts(&request_id, &request_data);
+                return Ok(RequestPluginResult::Respond(with_server_timing(
+                    response, ctx, session, started,
+                )));
             }
             outcome
+        };
+        // From here on the request may be moved into the body stage, so the
+        // data lives in an Option: whichever exit is taken, the pending entry
+        // is backfilled exactly once (by move on the non-staged tail).
+        let mut request_data = Some(request_data);
+        let verify_endpoint = {
+            let request = request_data
+                .as_ref()
+                .expect("request data is present until the body stage");
+            request.method == "POST" && request.path == VERIFY_ENDPOINT
+        };
+        // The header phase found a Block/Challenge but a body-based allow
+        // rule may still flip it. Record the fallback decision and let the
+        // request reach the body stage; that stage (or the timeout handler)
+        // owns the final answer.
+        let deferred_header_block = matches!(outcome, VerdictOutcome::Deferred);
+        let outcome = match outcome {
+            VerdictOutcome::Deferred => VerdictOutcome::Continue,
+            other => other,
         };
 
         // The request is on its way to the upstream: register the body
         // stage so the request-body filter can withhold and inspect the
         // incoming chunks. A request the plugin answered above never
         // reaches the filter and creates no entry.
-        if wants_body
-            && has_body
-            && !(request_data.method == "POST"
-                && request_data.path == VERIFY_ENDPOINT)
-        {
+        if wants_body && has_body && !bypasses("waf") && !verify_endpoint {
             let engine_runs = match &choice {
                 EngineChoice::Site(_) => true,
                 EngineChoice::Base => self.mode != WafMode::Off,
                 EngineChoice::Disabled | EngineChoice::FailClosed => false,
             };
-            let inspect = should_inspect && engine_runs;
+            let inspect = should_inspect && engine_runs && !bypasses("waf");
             let max_entries = deferred_body_max_entries(self.max_body_size);
             // One site must not be able to exhaust the process-wide pool and
             // turn every other site into a 503. The per-site scan is only
@@ -5186,13 +5675,22 @@ impl Plugin for WafPlugin {
                     site_id = %site_id,
                     "body stage pool exhausted; rejecting request"
                 );
-                return Ok(RequestPluginResult::Respond(
+                backfill_pending_facts(
+                    &request_id,
+                    request_data
+                        .as_ref()
+                        .expect("request data is present until the body stage"),
+                );
+                return Ok(RequestPluginResult::Respond(with_server_timing(
                     HttpResponse::builder(
                         http::StatusCode::SERVICE_UNAVAILABLE,
                     )
                     .no_store()
                     .finish(),
-                ));
+                    ctx,
+                    session,
+                    started,
+                )));
             }
             DEFERRED_BODY.insert(
                 request_id.clone(),
@@ -5201,14 +5699,25 @@ impl Plugin for WafPlugin {
                     passthrough: !inspect,
                     inspect,
                     log_prefix: LogBodyPrefix::new(body_limit),
-                    deferred: inspect.then(|| DeferredVerdict {
-                        choice: choice.clone(),
-                        context: context.clone(),
-                        observe,
-                        skip_challenge: bypasses("challenge"),
-                        site_id: site_id.clone(),
-                        host: host.clone(),
-                        request_data: request_data.clone(),
+                    deferred: inspect.then(|| {
+                        backfill_pending_facts(
+                            &request_id,
+                            request_data.as_ref().expect(
+                                "request data is present until the body stage",
+                            ),
+                        );
+                        DeferredVerdict {
+                            choice: choice.clone(),
+                            context: context.clone(),
+                            observe,
+                            skip_challenge: bypasses("challenge"),
+                            header_block: deferred_header_block,
+                            site_id: site_id.clone(),
+                            host: host.clone(),
+                            request_data: request_data.take().expect(
+                                "request data is present until the body stage",
+                            ),
+                        }
                     }),
                     created_at: Instant::now(),
                     // Per-site stage timeout, snapshotted from the request's
@@ -5220,10 +5729,7 @@ impl Plugin for WafPlugin {
                         ) as u64),
                 },
             );
-        } else if wants_body
-            && !(request_data.method == "POST"
-                && request_data.path == VERIFY_ENDPOINT)
-        {
+        } else if wants_body && !verify_endpoint {
             // GET/HEAD without CL/TE: h2/h3 may still carry a body. Park the
             // verdict and let the first chunk decide whether to stage it.
             let engine_runs = match &choice {
@@ -5237,28 +5743,48 @@ impl Plugin for WafPlugin {
                         request_id = %request_id,
                         "lazy body stage table full; h2/h3 body cannot be staged"
                     );
+                    backfill_pending_facts(
+                        &request_id,
+                        request_data.as_ref().expect(
+                            "request data is present until the body stage",
+                        ),
+                    );
                     return Ok(RequestPluginResult::Continue);
                 }
                 LAZY_WAF_STAGE.insert(
                     request_id.clone(),
-                    (
-                        Instant::now(),
+                    (Instant::now(), {
+                        backfill_pending_facts(
+                            &request_id,
+                            request_data.as_ref().expect(
+                                "request data is present until the body stage",
+                            ),
+                        );
                         DeferredVerdict {
                             choice: choice.clone(),
                             context: context.clone(),
                             observe,
                             skip_challenge: bypasses("challenge"),
+                            header_block: false,
                             site_id: site_id.clone(),
                             host: host.clone(),
-                            request_data: request_data.clone(),
-                        },
-                    ),
+                            request_data: request_data.take().expect(
+                                "request data is present until the body stage",
+                            ),
+                        }
+                    }),
                 );
             }
         }
 
+        if let Some(request) = request_data.take() {
+            backfill_pending_facts_owned(&request_id, request);
+        }
+
         Ok(match outcome {
-            VerdictOutcome::Continue => RequestPluginResult::Continue,
+            VerdictOutcome::Continue | VerdictOutcome::Deferred => {
+                RequestPluginResult::Continue
+            },
             VerdictOutcome::Skipped => RequestPluginResult::Skipped,
             VerdictOutcome::Respond(_) => {
                 unreachable!("handled above")
@@ -5268,7 +5794,7 @@ impl Plugin for WafPlugin {
 
     fn handle_request_body(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         ctx: &mut Ctx,
         body: &mut Option<bytes::Bytes>,
         end_of_stream: bool,
@@ -5409,6 +5935,11 @@ impl Plugin for WafPlugin {
                     user_identity: String::new(),
                 });
             }
+            if !fallback_counted && let Some(agent) = PingWafAgent::instance() {
+                // The request phase deferred its count to the body phase;
+                // this timeout is the body phase's final word.
+                agent.record_request(false);
+            }
             let (log_body, log_body_size, log_truncated) =
                 entry.log_prefix.finish();
             amend_pending_access_body(
@@ -5503,9 +6034,18 @@ impl Plugin for WafPlugin {
                                 dv.context.as_ref(),
                                 dv.observe,
                                 dv.skip_challenge,
+                                // The body phase is the final verdict: it
+                                // logs and counts here, exactly once.
+                                false,
+                                false,
                             );
                             if let VerdictOutcome::Respond(response) = outcome {
-                                return Ok(Some(response));
+                                return Ok(Some(with_server_timing(
+                                    response,
+                                    ctx,
+                                    session,
+                                    Instant::now(),
+                                )));
                             }
                             // The verdict passed: hand the staged bytes
                             // over and stop withholding. The entry is done
@@ -5562,12 +6102,21 @@ impl Plugin for WafPlugin {
                     dv.context.as_ref(),
                     dv.observe,
                     dv.skip_challenge,
+                    // The body phase is the final verdict: it logs and
+                    // counts here, exactly once.
+                    false,
+                    false,
                 );
                 // The block page goes back through the proxy; the
                 // staged body is dropped with the aborted upstream
                 // exchange — the source never saw a byte of it.
                 if let VerdictOutcome::Respond(response) = outcome {
-                    return Ok(Some(response));
+                    return Ok(Some(with_server_timing(
+                        response,
+                        ctx,
+                        session,
+                        Instant::now(),
+                    )));
                 }
             }
             // Passed: hand the complete body upstream in one write, which
@@ -5586,6 +6135,34 @@ impl Plugin for WafPlugin {
         ctx: &mut Ctx,
         upstream_response: &mut ResponseHeader,
     ) -> pingora::Result<ResponsePluginResult> {
+        // Runs after `handle_cache_headers`, which stamped the same phase
+        // into `x-cache-status`: the phase is final here, and this is the
+        // only stage where the cache state is reachable (the body stage has
+        // no cache accessor).
+        let cache_status = if session.cache.enabled() {
+            session.cache.phase().as_str().to_string()
+        } else {
+            String::new()
+        };
+        // Every response that passed through the WAF carries the timings,
+        // including ones the plugin answers itself (block/challenge).
+        let timing = server_timing_value(
+            waf_processing_ms(ctx),
+            ctx.timing
+                .upstream_processing
+                .map(|value| value.max(0) as u64),
+            cache_timing_desc(session),
+            ctx.timing.created_at.elapsed().as_millis() as u64,
+        );
+        let merged = merge_server_timing(
+            upstream_response
+                .headers
+                .get("server-timing")
+                .and_then(|value| value.to_str().ok()),
+            &timing,
+        );
+        let _ = upstream_response.insert_header("server-timing", merged);
+
         let Some(request_id) = ctx.state.request_id.clone() else {
             return Ok(ResponsePluginResult::Unchanged);
         };
@@ -5596,15 +6173,6 @@ impl Plugin for WafPlugin {
         let status = upstream_response.status.as_u16();
         let upstream_latency_ms =
             ctx.timing.upstream_processing.unwrap_or(0).max(0) as u64;
-        // Runs after `handle_cache_headers`, which stamped the same phase
-        // into `x-cache-status`: the phase is final here, and this is the
-        // only stage where the cache state is reachable (the body stage has
-        // no cache accessor).
-        let cache_status = if session.cache.enabled() {
-            session.cache.phase().as_str().to_string()
-        } else {
-            String::new()
-        };
         let headers = cap_headers(upstream_response.headers.iter().filter_map(
             |(name, value)| {
                 value
@@ -5640,6 +6208,7 @@ impl Plugin for WafPlugin {
             if body_less {
                 HeaderOutcome::Immediate(ResponseFacts {
                     status_code: status as u32,
+                    upstream_status: status as u32,
                     upstream_addr: ctx.upstream.address.clone(),
                     upstream_latency_ms,
                     headers,
@@ -5664,6 +6233,7 @@ impl Plugin for WafPlugin {
                 );
                 entry.response = Some(ResponseFacts {
                     status_code: status as u32,
+                    upstream_status: status as u32,
                     upstream_addr: ctx.upstream.address.clone(),
                     upstream_latency_ms,
                     headers,
@@ -6025,6 +6595,23 @@ ml_threshold = 0.75
         }
     }
 
+    /// Old agents or restored backups can still carry `allow + off`; dropping
+    /// it would silently turn the whitelist back into a block.
+    #[test]
+    fn legacy_allow_off_still_whitelists() {
+        let mut cfg = cache_waf_config(false, Vec::new(), Vec::new());
+        let mut allow =
+            custom_rule("legacy-allow", CacheWafMode::Off, "allowmark");
+        allow.action = CacheWafAction::Allow;
+        cfg.custom_rules = vec![
+            allow,
+            custom_rule("block-same", CacheWafMode::Block, "allowmark"),
+        ];
+        let engine = build_site_engine(&cfg);
+        let verdict = engine.inspect(&probe("?q=allowmark"));
+        assert_eq!(verdict.action, WafAction::Pass);
+    }
+
     #[test]
     fn off_rules_are_not_compiled_or_evaluated() {
         let mut cfg = cache_waf_config(false, Vec::new(), Vec::new());
@@ -6096,6 +6683,36 @@ ml_threshold = 0.75
                 "body=prefix(checked=1048576, reason=DecompressedCap)"
             )),
             Some("body_expanded_cap")
+        );
+        assert_eq!(
+            WafPlugin::body_inspection_event(&pass(
+                "request=truncated(query-params,value-len)"
+            )),
+            Some("body_scan_truncated")
+        );
+        assert_eq!(
+            WafPlugin::body_inspection_event(&pass("request=deadline")),
+            Some("body_scan_deadline")
+        );
+    }
+
+    #[test]
+    fn truncated_body_policy_parses() {
+        assert_eq!(
+            TruncatedBodyPolicy::parse(""),
+            TruncatedBodyPolicy::Monitor
+        );
+        assert_eq!(
+            TruncatedBodyPolicy::parse("monitor"),
+            TruncatedBodyPolicy::Monitor
+        );
+        assert_eq!(
+            TruncatedBodyPolicy::parse("reject"),
+            TruncatedBodyPolicy::Reject
+        );
+        assert_eq!(
+            TruncatedBodyPolicy::parse("FAIL-CLOSED"),
+            TruncatedBodyPolicy::Reject
         );
     }
 
@@ -6225,6 +6842,17 @@ advanced_mode = true
             panic!("expected a block response");
         };
         assert_eq!(http::StatusCode::FORBIDDEN, resp.status);
+        // The block page carries the same timing header as a proxied response.
+        let timing = resp
+            .headers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|(name, _)| name.as_str() == "server-timing")
+            .map(|(_, value)| value.to_str().unwrap().to_string())
+            .expect("server-timing on a block page");
+        assert!(timing.contains("waf;dur="), "{timing}");
+        assert!(timing.contains("total;dur="), "{timing}");
     }
 
     /// Reads one header off a generated response.
@@ -7004,7 +7632,7 @@ inspect_body = true"###,
 
         // Without a clearance the challenge page answers.
         let RequestPluginResult::Respond(resp) =
-            run_path_request(&plugin, "/admin", None).await
+            run_path_request_from(&plugin, "/admin", "10.1.1.1").await
         else {
             panic!("expected the challenge page");
         };
@@ -7015,7 +7643,7 @@ inspect_body = true"###,
         let manager = CookieManager::new(secret.as_bytes(), 3600);
         let cookie = manager.issue_clearance(
             ClearanceLevel::NonInteractive,
-            "site-1",
+            "example.com",
             "fingerprint",
         );
         assert!(
@@ -7032,7 +7660,7 @@ inspect_body = true"###,
         // cookie's site id is checked against the request's site.
         let other = manager.issue_clearance(
             ClearanceLevel::NonInteractive,
-            "site-9",
+            "other.example",
             "fingerprint",
         );
         let RequestPluginResult::Respond(resp) = run_path_request(
@@ -7136,6 +7764,9 @@ inspect_body = true"###,
                                     as i32,
                                 note: String::new(),
                                 enabled: true,
+                                path: "/admin".to_string(),
+                                match_type: proto::PathMatchType::PathMatchPrefix
+                                    as i32,
                             },
                             proto::IpAccessRule {
                                 id: "block-all".to_string(),
@@ -7145,6 +7776,9 @@ inspect_body = true"###,
                                     as i32,
                                 note: String::new(),
                                 enabled: true,
+                                path: String::new(),
+                                match_type: proto::PathMatchType::PathMatchPrefix
+                                    as i32,
                             },
                         ],
                         ..Default::default()
@@ -7190,6 +7824,9 @@ inspect_body = true"###,
                             action: proto::IpAccessAction::IpAccessBlock as i32,
                             note: String::new(),
                             enabled: true,
+                            path: String::new(),
+                            match_type: proto::PathMatchType::PathMatchPrefix
+                                as i32,
                         }],
                         ..Default::default()
                     }),
@@ -7204,6 +7841,130 @@ inspect_body = true"###,
             })
             .unwrap();
         installed
+    }
+
+    /// The access-log fact backfill: the hot path moves the request facts
+    /// into the pending entry and caps the header vector in place; the cold
+    /// path copies them. Both must produce the same log fields.
+    #[tokio::test]
+    async fn test_access_log_facts_backfill_helpers() {
+        fn pending() -> PendingAccess {
+            PendingAccess {
+                site_id: "site-1".to_string(),
+                client_ip: String::new(),
+                method: String::new(),
+                scheme: String::new(),
+                protocol: String::new(),
+                host: "example.com".to_string(),
+                path: String::new(),
+                query: String::new(),
+                user_agent: "ua".to_string(),
+                referer: "ref".to_string(),
+                tls_version: String::new(),
+                country_code: String::new(),
+                user_identity: String::new(),
+                request_headers: Vec::new(),
+                request_body: None,
+                request_body_size: 0,
+                request_body_truncated: false,
+                body_limit: 0,
+                response: None,
+                waf_triggered: false,
+                path_bypasses_challenge: false,
+                path_bypasses_rate_limit: false,
+                start: Instant::now(),
+            }
+        }
+        let headers: Vec<(String, String)> = (0..100)
+            .map(|i| (format!("x-h-{i:03}"), format!("v-{i}")))
+            .collect();
+        let expected_headers =
+            cap_headers(headers.iter().map(|(n, v)| (n.clone(), v.as_str())));
+        let request = RequestData {
+            method: "GET".to_string(),
+            path: "/waf-facts".to_string(),
+            query: "probe=1".to_string(),
+            headers: headers.clone(),
+            body: None,
+            client_ip: "203.0.113.9".to_string(),
+            country_code: Some("US".to_string()),
+            scheme: "https".to_string(),
+            protocol: "HTTP/2.0".to_string(),
+        };
+
+        register_pending_access("facts-move", pending());
+        backfill_pending_facts_owned("facts-move", request.clone());
+        {
+            let entry = PENDING_ACCESS.get("facts-move").unwrap();
+            assert_eq!("GET", entry.method);
+            assert_eq!("/waf-facts", entry.path);
+            assert_eq!("probe=1", entry.query);
+            assert_eq!("203.0.113.9", entry.client_ip);
+            assert_eq!("US", entry.country_code);
+            assert_eq!("https", entry.scheme);
+            assert_eq!("HTTP/2.0", entry.protocol);
+            assert_eq!(expected_headers, entry.request_headers);
+        }
+        PENDING_ACCESS.remove("facts-move");
+
+        register_pending_access("facts-copy", pending());
+        backfill_pending_facts("facts-copy", &request);
+        {
+            let entry = PENDING_ACCESS.get("facts-copy").unwrap();
+            assert_eq!("GET", entry.method);
+            assert_eq!("/waf-facts", entry.path);
+            assert_eq!(expected_headers, entry.request_headers);
+        }
+        PENDING_ACCESS.remove("facts-copy");
+    }
+
+    /// Early-answer paths (paused site, fail-closed edge) emit the access row
+    /// before `handle_request` returns; the request facts must still be on it.
+    #[tokio::test]
+    async fn test_access_log_request_facts_survive_early_paths() {
+        let raw = "GET /waf-facts?probe=1 HTTP/1.1\r\nHost: example.com\r\n\
+                   User-Agent: e2e-agent/1.0\r\n\
+                   Referer: https://ref.example/page\r\n\
+                   X-Facts: yes\r\n\r\n";
+
+        {
+            let (_guard, agent, _dir) = install_paused_agent().await;
+            let plugin = WafPlugin::new(
+                &toml::from_str::<PluginConf>(r###"mode = "block""###).unwrap(),
+            )
+            .unwrap();
+            let RequestPluginResult::Respond(resp) =
+                run_request_raw(&plugin, raw, "203.0.113.11").await
+            else {
+                panic!("expected the paused site to answer");
+            };
+            assert_eq!(http::StatusCode::SERVICE_UNAVAILABLE, resp.status);
+            let entry = agent.client.pop_log().await.unwrap();
+            assert_access_request_facts(&entry, "203.0.113.11");
+        }
+
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let config = AgentConfig {
+                cache_dir: dir.path().to_string_lossy().to_string(),
+                fail_open: false,
+                ..Default::default()
+            };
+            let (_guard, agent, _dir) =
+                install_test_agent_with(config, dir).await;
+            let plugin = WafPlugin::new(
+                &toml::from_str::<PluginConf>(r###"mode = "block""###).unwrap(),
+            )
+            .unwrap();
+            let RequestPluginResult::Respond(resp) =
+                run_request_raw(&plugin, raw, "203.0.113.12").await
+            else {
+                panic!("expected the fail-closed edge to refuse");
+            };
+            assert_eq!(http::StatusCode::SERVICE_UNAVAILABLE, resp.status);
+            let entry = agent.client.pop_log().await.unwrap();
+            assert_access_request_facts(&entry, "203.0.113.12");
+        }
     }
 
     /// A paused site answers with a 503 maintenance page (and a Retry-After
@@ -7671,6 +8432,44 @@ inspect_body = true"###,
 
     /// Builds one request carrying the client certificate facts the TLS layer
     /// would have put on the connection.
+    /// Run one request with a custom raw request (line + headers) and client
+    /// IP, returning the plugin result. Used by the access-log fact tests.
+    async fn run_request_raw(
+        plugin: &WafPlugin,
+        input_header: &str,
+        client_ip: &str,
+    ) -> RequestPluginResult {
+        let mock_io = Builder::new().read(input_header.as_bytes()).build();
+        let mut session = Session::new_h1(Box::new(mock_io));
+        session.read_request().await.unwrap();
+        let mut ctx = Ctx::default();
+        ctx.conn.client_ip = Some(client_ip.to_string());
+        plugin
+            .handle_request(PluginStep::EarlyRequest, &mut session, &mut ctx)
+            .await
+            .unwrap()
+    }
+
+    /// The access-log request facts an early-answer path must still carry.
+    fn assert_access_request_facts(
+        entry: &pingwaf_agent::client::LogEntry,
+        client_ip: &str,
+    ) {
+        assert_eq!("GET", entry.method);
+        assert_eq!("/waf-facts", entry.path);
+        assert_eq!("probe=1", entry.query_string);
+        assert_eq!(client_ip, entry.client_ip);
+        assert_eq!("example.com", entry.host);
+        assert_eq!("http", entry.scheme);
+        assert_eq!("HTTP/1.1", entry.protocol);
+        assert_eq!("e2e-agent/1.0", entry.user_agent);
+        assert_eq!("https://ref.example/page", entry.referer);
+        assert_eq!(
+            Some("yes"),
+            entry.request_headers.get("x-facts").map(String::as_str)
+        );
+    }
+
     async fn run_request_with_cert(
         plugin: &WafPlugin,
         digest: Option<&str>,
@@ -7769,6 +8568,8 @@ inspect_body = true"###,
         /// (3 = allow, 4 = basic auth).
         rule: Option<(&'static str, i32)>,
         hide_credentials: bool,
+        /// Scope of the gate itself; empty = the whole site.
+        gate_path: &'static str,
     }
 
     /// Installs an agent whose only site carries `credentials` and the given
@@ -7792,6 +8593,8 @@ inspect_body = true"###,
                 action: *action,
                 note: String::new(),
                 enabled: true,
+                path: String::new(),
+                match_type: proto::PathMatchType::PathMatchPrefix as i32,
             })
             .collect();
         let config_hash = format!(
@@ -7828,6 +8631,9 @@ inspect_body = true"###,
                                 .collect(),
                             delay_seconds: 0,
                             hide_credentials: posture.hide_credentials,
+                            path: posture.gate_path.to_string(),
+                            match_type: proto::PathMatchType::PathMatchPrefix
+                                as i32,
                         }),
                         ..Default::default()
                     }),
@@ -7875,6 +8681,27 @@ inspect_body = true"###,
     /// The site-wide gate answers 401 with a challenge until the client
     /// presents a stored credential, and the attempt lands in the access log
     /// as a response the plugin generated itself.
+    #[test]
+    fn basic_auth_gate_scopes_to_its_path() {
+        let gate = BasicAuthGate::build(&CacheBasicAuthConfig {
+            enabled: true,
+            realm: "Restricted".to_string(),
+            credentials: vec![pingwaf_agent::cache::BasicAuthCredential {
+                username: "alice".to_string(),
+                authorization: base64_encode("alice:pw"),
+            }],
+            delay_seconds: 0,
+            hide_credentials: false,
+            path: "/admin".to_string(),
+            match_type: "prefix".to_string(),
+        })
+        .expect("gate with one credential");
+        let scope = gate.path.as_ref().expect("path scope");
+        assert!(scope.matches("/admin"));
+        assert!(scope.matches("/admin/users"));
+        assert!(!scope.matches("/public"));
+    }
+
     #[tokio::test]
     async fn test_basic_auth_gate_challenges_until_credentials_match() {
         let (_guard, agent, _dir) = install_basic_auth_agent(
@@ -7882,6 +8709,7 @@ inspect_body = true"###,
             BasicAuthPosture {
                 site_wide: true,
                 rule: None,
+                gate_path: "",
                 hide_credentials: false,
             },
         )
@@ -7934,6 +8762,7 @@ inspect_body = true"###,
             BasicAuthPosture {
                 site_wide: true,
                 rule: None,
+                gate_path: "",
                 hide_credentials: true,
             },
         )
@@ -7960,6 +8789,7 @@ inspect_body = true"###,
             BasicAuthPosture {
                 site_wide: false,
                 rule: Some(("10.1.1.0/24", 4)),
+                gate_path: "",
                 hide_credentials: false,
             },
         )
@@ -7987,6 +8817,33 @@ inspect_body = true"###,
         assert!(result == RequestPluginResult::Continue);
     }
 
+    /// A matched `basic_auth` rule is never downgraded to a bypass just
+    /// because the gate's own path scope names another path.
+    #[tokio::test]
+    async fn a_basic_auth_rule_is_not_bypassed_by_the_gate_scope() {
+        let (_guard, _agent, _dir) = install_basic_auth_agent(
+            &[("alice", "hunter2")],
+            BasicAuthPosture {
+                site_wide: false,
+                rule: Some(("10.1.1.0/24", 4)),
+                hide_credentials: false,
+                gate_path: "/admin",
+            },
+        )
+        .await;
+        let plugin = WafPlugin::new(
+            &toml::from_str::<PluginConf>(r###"mode = "block""###).unwrap(),
+        )
+        .unwrap();
+
+        let (result, _) =
+            run_request_with_auth(&plugin, "10.1.1.1", None).await;
+        let RequestPluginResult::Respond(resp) = result else {
+            panic!("a matched basic_auth rule must require credentials");
+        };
+        assert_eq!(http::StatusCode::UNAUTHORIZED, resp.status);
+    }
+
     /// A rule that requires authentication while the site stores no
     /// credential refuses the matched client outright.
     #[tokio::test]
@@ -7996,6 +8853,7 @@ inspect_body = true"###,
             BasicAuthPosture {
                 site_wide: false,
                 rule: Some(("10.1.1.0/24", 4)),
+                gate_path: "",
                 hide_credentials: false,
             },
         )
@@ -8023,6 +8881,7 @@ inspect_body = true"###,
                 site_wide: true,
                 rule: Some(("10.1.1.0/24", 3)),
                 hide_credentials: false,
+                gate_path: "",
             },
         )
         .await;
@@ -8041,6 +8900,25 @@ inspect_body = true"###,
             panic!("expected the gate to challenge an unlisted client");
         };
         assert_eq!(http::StatusCode::UNAUTHORIZED, resp.status);
+    }
+
+    /// A request on `path` from a specific client, for path-scope tests.
+    async fn run_path_request_from(
+        plugin: &WafPlugin,
+        path: &str,
+        client_ip: &str,
+    ) -> RequestPluginResult {
+        let input_header =
+            format!("GET {path} HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        let mock_io = Builder::new().read(input_header.as_bytes()).build();
+        let mut session = Session::new_h1(Box::new(mock_io));
+        session.read_request().await.unwrap();
+        let mut ctx = Ctx::default();
+        ctx.conn.client_ip = Some(client_ip.to_string());
+        plugin
+            .handle_request(PluginStep::EarlyRequest, &mut session, &mut ctx)
+            .await
+            .unwrap()
     }
 
     /// Builds one request against the plugin from `client_ip`.
@@ -8070,10 +8948,20 @@ inspect_body = true"###,
         )
         .unwrap();
 
+        // The allow rule is scoped to /admin: the whitelisted client passes
+        // there ...
         assert!(
-            run_request(&plugin, "10.1.1.1").await
+            run_path_request_from(&plugin, "/admin", "10.1.1.1").await
                 == RequestPluginResult::Continue
         );
+        // ... but the same client falls through to the catch-all block rule
+        // outside that path.
+        let RequestPluginResult::Respond(resp) =
+            run_path_request_from(&plugin, "/", "10.1.1.1").await
+        else {
+            panic!("expected the catch-all rule to answer outside /admin");
+        };
+        assert_eq!(http::StatusCode::FORBIDDEN, resp.status);
 
         let RequestPluginResult::Respond(resp) =
             run_request(&plugin, "203.0.113.7").await
@@ -8112,6 +9000,9 @@ inspect_body = true"###,
                                 as i32,
                             note: String::new(),
                             enabled: true,
+                            path: String::new(),
+                            match_type: proto::PathMatchType::PathMatchPrefix
+                                as i32,
                         }],
                         ..Default::default()
                     }),
@@ -8574,6 +9465,308 @@ inspect_body = true"###,
                 .find(|(name, _)| *name == "content-type")
                 .map(|(_, value)| value.as_str())
         );
+    }
+
+    /// Installs an agent whose site runs the WAF engine with the given
+    /// custom rules. `advanced_mode` body inspection is on, so POST bodies
+    /// are staged and inspected in the request-body filter.
+    async fn install_waf_agent(
+        mode: proto::WafMode,
+        rules: Vec<proto::WafRule>,
+    ) -> (
+        tokio::sync::MutexGuard<'static, ()>,
+        Arc<PingWafAgent>,
+        tempfile::TempDir,
+    ) {
+        let installed = install_test_agent().await;
+        installed
+            .1
+            .rule_cache
+            .update_from_site_config(&proto::SiteConfig {
+                sites: vec![proto::Site {
+                    id: "site-1".to_string(),
+                    name: "example".to_string(),
+                    domain: "example.com".to_string(),
+                    alternate_domains: Vec::new(),
+                    status: 0,
+                    rules: Some(proto::RuleBundle {
+                        site_id: "site-1".to_string(),
+                        config_hash: "hash-1".to_string(),
+                        waf: Some(proto::WafConfig {
+                            enabled: true,
+                            mode: mode as i32,
+                            advanced_mode: true,
+                            // Tests that exercise the fail-open timeout need a
+                            // short window; immediate-body tests are unaffected.
+                            body_stage_timeout_secs: 1,
+                            custom_rules: rules,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    trust_proxy_headers: false,
+                    trusted_header: String::new(),
+                    trust_last_hop: false,
+                    trusted_proxy_ranges: Vec::new(),
+                    downstream_timeout_secs: 60,
+                }],
+                config_hash: "hash-1".to_string(),
+                updated_at: None,
+            })
+            .unwrap();
+        installed
+    }
+
+    /// Drives one POST through the request phase and, when it was not
+    /// answered there, the full body through the request-body filter. The
+    /// second element is the response the body phase answered with, if any.
+    async fn run_post_with_body(
+        plugin: &WafPlugin,
+        target: &str,
+        user_agent: &str,
+        body: &str,
+    ) -> (RequestPluginResult, Option<HttpResponse>, Session, Ctx) {
+        let input = format!(
+            "POST {target} HTTP/1.1\r\nHost: example.com\r\n\
+             User-Agent: {user_agent}\r\n\
+             Content-Type: text/plain\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mock_io = Builder::new().read(input.as_bytes()).build();
+        let mut session = Session::new_h1(Box::new(mock_io));
+        session.read_request().await.unwrap();
+        let mut ctx = Ctx::default();
+        let result = plugin
+            .handle_request(PluginStep::EarlyRequest, &mut session, &mut ctx)
+            .await
+            .unwrap();
+        let mut answered = None;
+        if result == RequestPluginResult::Continue {
+            answered = plugin
+                .handle_request_body(
+                    &mut session,
+                    &mut ctx,
+                    &mut Some(bytes::Bytes::from(body.to_string())),
+                    true,
+                )
+                .unwrap();
+        }
+        (result, answered, session, ctx)
+    }
+
+    /// P0-8 regression: a request inspected in both phases ships exactly one
+    /// security event and one request count — the request-phase pass defers
+    /// to the body phase, which runs the final verdict on the complete body.
+    #[tokio::test]
+    async fn test_body_inspection_produces_one_event_and_one_count() {
+        let (_guard, agent, _dir) =
+            install_waf_agent(proto::WafMode::Monitor, Vec::new()).await;
+        let plugin = WafPlugin::new(
+            &toml::from_str::<PluginConf>(r###"mode = "monitor""###).unwrap(),
+        )
+        .unwrap();
+
+        let (result, answered, _session, _ctx) = run_post_with_body(
+            &plugin,
+            "/api?id=1'%20OR%201=1%20--",
+            "check",
+            "payload",
+        )
+        .await;
+        assert!(result == RequestPluginResult::Continue);
+        assert!(answered.is_none(), "monitor mode answers nothing");
+
+        assert_eq!(
+            1,
+            agent.metrics.requests_total(),
+            "the request is counted once, not once per phase"
+        );
+        assert_eq!(
+            0,
+            agent.metrics.blocked_requests_total(),
+            "monitor mode never blocks"
+        );
+        let event = agent.client.pop_log().await.unwrap();
+        assert_eq!("waf", event.waf_event_type);
+        assert!(agent.client.pop_log().await.is_none());
+    }
+
+    /// Without a body-based `allow` rule a header-phase Block verdict stays
+    /// final: the request is answered in the request phase and the body is
+    /// never exposed to inspection (behaviour preserved by P0-8/P0-9).
+    #[tokio::test]
+    async fn test_request_phase_block_still_answers_before_body() {
+        let (_guard, agent, _dir) =
+            install_waf_agent(proto::WafMode::Block, Vec::new()).await;
+        let plugin = WafPlugin::new(
+            &toml::from_str::<PluginConf>(r###"mode = "block""###).unwrap(),
+        )
+        .unwrap();
+
+        let (result, answered, _session, _ctx) = run_post_with_body(
+            &plugin,
+            "/api?id=1'%20OR%201=1%20--",
+            "check",
+            "payload",
+        )
+        .await;
+        let RequestPluginResult::Respond(resp) = result else {
+            panic!("expected the header-phase block to answer");
+        };
+        assert_eq!(http::StatusCode::FORBIDDEN, resp.status);
+        assert!(answered.is_none(), "the body was never staged");
+        assert_eq!(1, agent.metrics.requests_total());
+        assert_eq!(1, agent.metrics.blocked_requests_total());
+        let event = agent.client.pop_log().await.unwrap();
+        assert_eq!("block", event.waf_action);
+        // The block answered the request: one event and one access row, and
+        // no second verdict from a body that was never staged.
+        let access = agent.client.pop_log().await.unwrap();
+        assert_eq!(403, access.response_status);
+        assert!(agent.client.pop_log().await.is_none());
+    }
+
+    /// A deferred header block must not be lost when the body stage times
+    /// out: the timeout path re-applies the header verdict instead of
+    /// forwarding a known-bad request upstream.
+    #[tokio::test]
+    async fn deferred_block_is_enforced_on_body_timeout() {
+        let rules = vec![
+            proto::WafRule {
+                id: "allow-safe".to_string(),
+                name: "allow safe payload".to_string(),
+                description: String::new(),
+                expression: r#"http.request.body contains "safe""#.to_string(),
+                action: proto::WafAction::Allow as i32,
+                severity: 3,
+                tags: Vec::new(),
+                enabled: true,
+                mode: proto::WafMode::Monitor as i32,
+                priority: 1,
+            },
+            proto::WafRule {
+                id: "block-evil".to_string(),
+                name: "block evil client".to_string(),
+                description: String::new(),
+                expression:
+                    r#"http.request.headers["user-agent"] contains "evilbot""#
+                        .to_string(),
+                action: proto::WafAction::Block as i32,
+                severity: 5,
+                tags: Vec::new(),
+                enabled: true,
+                mode: proto::WafMode::Block as i32,
+                priority: 2,
+            },
+        ];
+        let (_guard, _agent, _dir) =
+            install_waf_agent(proto::WafMode::Block, rules).await;
+        let plugin = WafPlugin::new(
+            &toml::from_str::<PluginConf>(r###"mode = "block""###).unwrap(),
+        )
+        .unwrap();
+
+        let input = "POST /upload HTTP/1.1\r\nHost: example.com\r\n\
+                     User-Agent: evilbot/1.0\r\n\
+                     Content-Length: 1024\r\n\r\n";
+        let mock_io = Builder::new().read(input.as_bytes()).build();
+        let mut session = Session::new_h1(Box::new(mock_io));
+        session.read_request().await.unwrap();
+        let mut ctx = Ctx::default();
+        let result = plugin
+            .handle_request(PluginStep::EarlyRequest, &mut session, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(result, RequestPluginResult::Continue);
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let answered = plugin
+            .handle_request_body(&mut session, &mut ctx, &mut None, true)
+            .unwrap()
+            .expect("the deferred block must be enforced on timeout");
+        assert_eq!(http::StatusCode::FORBIDDEN, answered.status);
+    }
+
+    /// P0-9 regression: a site whose `allow` rule reads `http.request.body`
+    /// must not be blocked on headers alone — the header-phase block is
+    /// deferred and the body phase flips the verdict to Pass.
+    #[tokio::test]
+    async fn test_body_allow_rule_defeats_header_block() {
+        let rules = vec![
+            proto::WafRule {
+                id: "allow-safe".to_string(),
+                name: "allow safe payload".to_string(),
+                description: String::new(),
+                expression: r#"http.request.body contains "safe""#.to_string(),
+                action: proto::WafAction::Allow as i32,
+                severity: 3,
+                tags: Vec::new(),
+                enabled: true,
+                mode: proto::WafMode::Monitor as i32,
+                priority: 1,
+            },
+            proto::WafRule {
+                id: "block-evil".to_string(),
+                name: "block evil client".to_string(),
+                description: String::new(),
+                expression:
+                    r#"http.request.headers["user-agent"] contains "evilbot""#
+                        .to_string(),
+                action: proto::WafAction::Block as i32,
+                severity: 5,
+                tags: Vec::new(),
+                enabled: true,
+                mode: proto::WafMode::Block as i32,
+                priority: 2,
+            },
+        ];
+        let (_guard, agent, _dir) =
+            install_waf_agent(proto::WafMode::Block, rules).await;
+        let plugin = WafPlugin::new(
+            &toml::from_str::<PluginConf>(r###"mode = "block""###).unwrap(),
+        )
+        .unwrap();
+
+        // The header block matches, but the body satisfies the allow rule:
+        // the request must pass, once counted, without a block event.
+        let (result, answered, _session, _ctx) = run_post_with_body(
+            &plugin,
+            "/upload",
+            "evilbot/1.0",
+            "safe payload",
+        )
+        .await;
+        assert!(
+            result == RequestPluginResult::Continue,
+            "the body-based allow must win over the header block"
+        );
+        assert!(answered.is_none(), "the passed body flows upstream");
+        assert_eq!(1, agent.metrics.requests_total());
+        assert_eq!(0, agent.metrics.blocked_requests_total());
+        assert!(
+            agent.client.pop_log().await.is_none(),
+            "a passed request ships no security event"
+        );
+
+        // Same headers, body without the allow marker: the deferred verdict
+        // confirms the block in the body phase.
+        let (result, answered, _session, _ctx) = run_post_with_body(
+            &plugin,
+            "/upload",
+            "evilbot/1.0",
+            "hostile payload",
+        )
+        .await;
+        assert!(result == RequestPluginResult::Continue);
+        let resp =
+            answered.expect("expected the body phase to confirm the block");
+        assert_eq!(http::StatusCode::FORBIDDEN, resp.status);
+        assert_eq!(2, agent.metrics.requests_total());
+        assert_eq!(1, agent.metrics.blocked_requests_total());
+        let event = agent.client.pop_log().await.unwrap();
+        assert_eq!("block", event.waf_action);
+        assert_eq!("block-evil", event.waf_rule_id);
     }
 
     /// Builds one request with an explicit user agent header.
@@ -9622,7 +10815,7 @@ inspect_body = true"###,
         let manager = CookieManager::new(secret.as_bytes(), 3600);
         let cookie = manager.issue_clearance(
             ClearanceLevel::NonInteractive,
-            "site-1",
+            "example.com",
             "fingerprint",
         );
         assert!(
@@ -9964,6 +11157,144 @@ inspect_body = true"###,
     }
 
     #[test]
+    fn server_timing_lists_every_phase() {
+        assert_eq!(
+            server_timing_value(3, Some(8), "hit", 12),
+            "waf;dur=3, upstream;dur=8, cache;desc=\"hit\", total;dur=12"
+        );
+        // A generated answer has no upstream; cache is omitted when disabled.
+        assert_eq!(
+            server_timing_value(0, None, "", 1),
+            "waf;dur=0, total;dur=1"
+        );
+    }
+
+    #[test]
+    fn server_timing_is_appended_to_an_origin_header() {
+        assert_eq!(
+            merge_server_timing(Some("origin;dur=5"), "waf;dur=1, total;dur=2"),
+            "waf;dur=1, total;dur=2, origin;dur=5"
+        );
+        assert_eq!(merge_server_timing(None, "total;dur=1"), "total;dur=1");
+        assert_eq!(merge_server_timing(Some(""), "total;dur=1"), "total;dur=1");
+    }
+
+    #[test]
+    fn generated_response_merges_server_timing_headers() {
+        let mut response = block_page("req-1", "blocked");
+        insert_server_timing(&mut response, "waf;dur=1, total;dur=2");
+        insert_server_timing(&mut response, "waf;dur=3, total;dur=4");
+
+        let value = response
+            .headers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|(name, _)| name.as_str() == "server-timing")
+            .map(|(_, value)| value.to_str().unwrap().to_string())
+            .unwrap();
+        assert_eq!(value, "waf;dur=3, total;dur=4, waf;dur=1, total;dur=2");
+    }
+
+    /// Standalone deployments have no agent, but the challenge plugin still
+    /// signs with the process-wide fallback: clearance validation must use the
+    /// same key instead of rejecting every cookie.
+    #[tokio::test]
+    async fn clearance_is_valid_without_an_agent() {
+        let _guard = lock_agent().await;
+        PingWafAgent::set_agent_instance(None);
+
+        let secret = resolve_cookie_secret("");
+        let manager = CookieManager::new(secret.as_bytes(), 3600);
+        let cookie = manager.issue_clearance(
+            ClearanceLevel::NonInteractive,
+            "example.com",
+            "fingerprint",
+        );
+        assert!(clearance_valid(Some(cookie), "example.com"));
+    }
+
+    /// A broad rule must not challenge the endpoint that issues the clearance
+    /// cookie; otherwise the page can never finish.
+    #[tokio::test]
+    async fn verify_endpoint_is_not_evaluated_by_rules() {
+        let plugin = WafPlugin::new(
+            &toml::from_str::<PluginConf>(r###"mode = "block""###).unwrap(),
+        )
+        .unwrap();
+        let input = "POST /_pingwaf/challenge/verify HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
+        let mock_io = Builder::new().read(input.as_bytes()).build();
+        let mut session = Session::new_h1(Box::new(mock_io));
+        session.read_request().await.unwrap();
+
+        let result = plugin
+            .handle_request(
+                PluginStep::EarlyRequest,
+                &mut session,
+                &mut Ctx::default(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, RequestPluginResult::Skipped));
+    }
+
+    /// The standalone challenge plugin resolves the same site exceptions
+    /// itself, so an "all layers" row must suppress its gate even without a
+    /// WAF pending-access entry (standalone / pre-0.32.17 agents).
+    #[tokio::test]
+    async fn path_exception_all_layers_is_visible_to_the_challenge_gate() {
+        let (_guard, agent, _dir) = install_test_agent().await;
+        agent
+            .rule_cache
+            .update_from_site_config(&proto::SiteConfig {
+                sites: vec![proto::Site {
+                    id: "site-1".to_string(),
+                    name: "example".to_string(),
+                    domain: "example.com".to_string(),
+                    alternate_domains: Vec::new(),
+                    status: 0,
+                    rules: Some(proto::RuleBundle {
+                        site_id: "site-1".to_string(),
+                        config_hash: "hash-1".to_string(),
+                        path_exceptions: vec![proto::PathException {
+                            id: "all-api".to_string(),
+                            path: "/api".to_string(),
+                            match_type: proto::PathMatchType::PathMatchPrefix
+                                as i32,
+                            skip_layers: vec!["*".to_string()],
+                            enabled: true,
+                            log_hits: false,
+                            note: String::new(),
+                        }],
+                        ..Default::default()
+                    }),
+                    trust_proxy_headers: false,
+                    trusted_header: String::new(),
+                    trust_last_hop: false,
+                    trusted_proxy_ranges: Vec::new(),
+                    downstream_timeout_secs: 60,
+                }],
+                config_hash: "hash-1".to_string(),
+                updated_at: None,
+            })
+            .unwrap();
+
+        assert!(path_exception_skips_challenge("example.com", "/api/x"));
+        assert!(!path_exception_skips_challenge("example.com", "/other"));
+        assert!(!path_exception_skips_challenge("unknown.example", "/api"));
+    }
+
+    #[test]
+    fn path_exception_prefers_the_most_specific_prefix() {
+        let compiled = PathExceptions::build(&[
+            path_exception("wide", "/api", "prefix", &["waf"]),
+            path_exception("deep", "/api/admin", "prefix", &["challenge"]),
+        ])
+        .unwrap();
+        assert_eq!(compiled.match_path("/api/admin/x").unwrap().id, "deep");
+    }
+
+    #[test]
     fn path_exception_skip_layers_are_selective() {
         // A subset skips only the named layers.
         let compiled = PathExceptions::build(&[path_exception(
@@ -9993,9 +11324,13 @@ inspect_body = true"###,
         )])
         .unwrap();
         let bypass = compiled.match_path("/api").unwrap();
-        for layer in ["mtls", "access", "basic_auth", "bot", "waf"] {
+        for layer in ["access", "bot", "waf", "rate_limit"] {
             assert!(bypass.layers.skips(layer));
         }
+        // Authentication layers require an explicit name; `*` is detection
+        // only, so one click cannot remove client certificates or the gate.
+        assert!(!bypass.layers.skips("mtls"));
+        assert!(!bypass.layers.skips("basic_auth"));
         assert!(bypass.layers.skips_challenge());
 
         // An empty list is malformed (the API rejects it). Compiling it must

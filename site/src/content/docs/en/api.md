@@ -122,7 +122,7 @@ curl -s -X POST https://localhost:9080/api/v1/keys \
 
 ## MCP
 
-The control plane exposes a Streamable HTTP MCP endpoint at `POST /mcp` (root path, deliberately outside `/api/v1`). It accepts either a `pwk_…` API key or a JWT; write tools additionally require the key owner to be an administrator. `GET` and `DELETE` return `405`, and request bodies are capped at 256 KiB. This is the intended way to let an assistant inspect sites, rules and logs without handing it dashboard credentials.
+The control plane exposes a Streamable HTTP MCP endpoint at `POST /mcp` (root path, deliberately outside `/api/v1`). It accepts either a `pwk_…` API key or a JWT. A key needs `read` or `write` to be accepted; write tools additionally require `write` on the key. A key is fleet-wide — all sites, including the admin-only tools such as the control-plane audit log and defense settings — only when it carries `write` **and** its owner is an administrator. A read-only key is scoped to the sites its owner owns, so an agent enrolment key (which used to carry `read`) can never read another tenant's data through MCP. `GET` and `DELETE` return `405`, and request bodies are capped at 256 KiB. This is the intended way to let an assistant inspect sites, rules and logs without handing it dashboard credentials; the built-in AI assistant calls the same tools and sends the results to the provider configured under Settings → AI assistant, so enable it only where that data may leave the deployment.
 
 ## Notifications
 

@@ -8,6 +8,7 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::api::capabilities;
 use crate::api::common::{
     load_site_read, load_site_write, parse_uuid, query_all,
 };
@@ -42,6 +43,11 @@ pub struct UpdateGeoRequest {
     pub block_unknown: Option<bool>,
     #[serde(default)]
     pub action: Option<String>,
+    /// Empty = the whole site.
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub match_type: Option<String>,
 }
 
 /// How far back the country statistics look.
@@ -203,6 +209,8 @@ async fn update_geo(
     load_site_write(&state.db, id, &current).await?;
 
     let row = find_or_create(&state, id).await?;
+    let stored_path = row.path.clone();
+    let stored_match_type = row.match_type.clone();
     let mut active: geo_rules::ActiveModel = row.into();
 
     if let Some(enabled) = payload.enabled {
@@ -245,6 +253,35 @@ async fn update_geo(
         }
         active.action = Set(action_str);
     }
+    if payload.path.is_some() || payload.match_type.is_some() {
+        let (path, match_type) =
+            crate::api::path_exceptions::validate_optional_path(
+                payload.path.as_deref().unwrap_or(&stored_path),
+                // A partial update that only rewrites `path` must keep the
+                // stored scope type: falling back to `None` here let
+                // `validate_optional_path` default the pair to `prefix`, which
+                // silently downgraded a regex scope (and skipped the
+                // capability gate, which then saw `prefix`).
+                Some(
+                    payload
+                        .match_type
+                        .as_deref()
+                        .unwrap_or(stored_match_type.as_str()),
+                ),
+            )?;
+        // The gate sees the effective scope (after merging onto the stored
+        // row), not the raw payload — a partial update that only sends `path`
+        // inherits the stored `match_type`.
+        capabilities::ensure_attached_scope_supported(
+            &state.db,
+            id,
+            Some(&path),
+            &match_type,
+        )
+        .await?;
+        active.path = Set(path);
+        active.match_type = Set(match_type);
+    }
     active.updated_at = Set(chrono::Utc::now());
 
     let updated = active.update(&state.db).await?;
@@ -278,6 +315,8 @@ async fn find_or_create(
         blocked_asns: Set(Vec::new()),
         block_unknown: Set(false),
         action: Set(action::BLOCK.to_string()),
+        path: Set(String::new()),
+        match_type: Set("prefix".to_string()),
         updated_at: Set(now),
     }
     .insert(&state.db)

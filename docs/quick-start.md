@@ -144,6 +144,13 @@ postgres://wafred:wafred@localhost:5432/wafred
 > curl -fsSL https://raw.githubusercontent.com/oyport/wafred/main/deploy/compose/install.sh | bash
 > ```
 >
+> The installer generates a random administrator password (printed **once**, at
+> the end) and a `PINGWAF_SECRET_KEY` in `.env` (mode `0600`), keeps the data
+> volumes on `--force`, and publishes the console (9080) / gRPC (9090) on
+> **`127.0.0.1` only** — set `PINGWAF_ADMIN_BIND` / `PINGWAF_GRPC_BIND` to
+> `0.0.0.0` only behind a reverse proxy or for remote agents, after changing the
+> administrator password.
+>
 > Use the steps below when you want to inspect or edit the compose file first.
 > The command generator on the [install page](https://waf.red/install/) writes the same flags.
 
@@ -167,7 +174,8 @@ a reachable instance with the built-in defaults.
 
 ```bash
 export POSTGRES_PASSWORD="$(openssl rand -hex 16)"
-export JWT_SECRET="$(openssl rand -hex 32)"      # must be >= 16 characters
+export JWT_SECRET="$(openssl rand -hex 32)"      # 32 random bytes (server floor: 16 chars)
+export PINGWAF_SECRET_KEY="$(openssl rand -hex 32)"  # seals channel/AI/backup secrets
 export ADMIN_PASSWORD="$(openssl rand -hex 16)"
 ```
 
@@ -182,10 +190,19 @@ ADMIN_PASSWORD=$(openssl rand -hex 16)
 ALLOW_REGISTRATION=false
 RUST_LOG=info,sqlx=warn
 EOF
+chmod 600 .env
 ```
 
-> `.env` holds secrets and is **not** covered by the repository `.gitignore`.
-> Keep it out of version control.
+> `.env` holds secrets (the DSN, `PINGWAF_SECRET_KEY`, the JWT secret and the
+> admin password) and is **not** covered by the repository `.gitignore`. Keep it
+> out of version control, `chmod 600` it, and prefer a secret manager (systemd
+> credentials, Kubernetes Secret, Docker secret) over a plain file.
+>
+> **Back up `PINGWAF_SECRET_KEY` separately from the database.** It encrypts
+> notification-channel secrets, the AI provider key and backup-target
+> credentials; without it those fields are stored in clear text. There is no
+> online rotation — read the rotation note in
+> [`SECURITY.md`](../SECURITY.md#credentials-and-secrets) before changing it.
 
 Compose variables you can set:
 
@@ -490,14 +507,24 @@ also ships a hardened unit file, [`wafred.service`](../wafred.service).
 >
 > - **Interactive** — download the script and run `bash install.sh` on a
 >   terminal: it asks for the deployment mode, the admin credentials (e-mail
->   and password twice; empty keeps the default, forced to change at first
->   login), the PostgreSQL URL, the dashboard certificate SANs and the
->   version, shows an installation plan, and asks for confirmation.
+>   and password twice; leaving the password empty generates a random one,
+>   printed once at the end), the PostgreSQL URL, the dashboard certificate
+>   SANs and the version, shows an installation plan, and asks for
+>   confirmation.
 > - **One line, unattended** —
 >   `curl -fsSL https://raw.githubusercontent.com/oyport/wafred/main/install.sh | sudo bash -s -- --mode all-in-one`
 >   installs with the given values and defaults and never prompts (piping
 >   means there is no terminal to prompt on; flags go after `-s --`).
 >   `--dry-run` prints the resolved plan without changing anything.
+>
+> The installer is fail-closed: it **verifies the release `.sha256`** and aborts
+> on a missing/mismatched checksum; it **generates `PINGWAF_SECRET_KEY`** and
+> writes it to `/etc/pingwaf/pingwaf.env` (mode `0600`, read by the systemd
+> unit), keeping an existing key on upgrade. The dashboard (9080) and gRPC
+> (9090) bind to **`127.0.0.1`** by default; `--listen-public` (or
+> `PINGWAF_LISTEN_PUBLIC=1`) publishes them on `0.0.0.0` — use that only behind
+> a reverse proxy or for remote agents, and change the administrator password
+> first.
 >
 > On macOS there are no release binaries — build via
 > [Path 2](#path-2-build-from-source), then follow the steps below.

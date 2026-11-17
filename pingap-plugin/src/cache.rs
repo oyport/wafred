@@ -889,6 +889,12 @@ impl Plugin for Cache {
                 .path_and_query()
                 .map(|value| value.as_str())
                 .unwrap_or_else(|| req_header.uri.path());
+            let cookie_pairs: Vec<(Cow<'_, str>, Cow<'_, str>)> = cookies
+                .iter()
+                .map(|(key, value)| {
+                    (Cow::Borrowed(key.as_str()), Cow::Borrowed(value.as_str()))
+                })
+                .collect();
             let eval_ctx = EvalContext {
                 method: req_header.method.as_str(),
                 path: req_header.uri.path(),
@@ -901,7 +907,7 @@ impl Plugin for Cache {
                     .unwrap_or_default(),
                 body: None,
                 headers: &headers,
-                cookies: &cookies,
+                cookies: &cookie_pairs,
                 client_ip: &client_ip,
                 parsed_ip: IpAddr::from_str(&client_ip).ok(),
                 country_code: None,
@@ -1648,7 +1654,7 @@ purge_ip_list = ["192.168.1.1"]
     fn eval_ctx<'a>(
         path: &'a str,
         headers: &'a [(String, String)],
-        cookies: &'a [(String, String)],
+        cookies: &'a [(Cow<'a, str>, Cow<'a, str>)],
     ) -> EvalContext<'a> {
         EvalContext {
             method: "GET",
@@ -1829,22 +1835,24 @@ purge_ip_list = ["192.168.1.1"]
             cache_rule(r#"http.request.headers["x-branch"] eq "main""#, true),
         ]));
         let headers = vec![("x-branch".to_string(), "main".to_string())];
-        let empty: Vec<(String, String)> = Vec::new();
+        let empty_headers: Vec<(String, String)> = Vec::new();
+        let empty_cookies: Vec<(Cow<'static, str>, Cow<'static, str>)> =
+            Vec::new();
         assert!(evaluate(
             &site.rules[0].expression,
-            &eval_ctx("/static/app.css", &empty, &empty)
+            &eval_ctx("/static/app.css", &empty_headers, &empty_cookies)
         ));
         assert!(!evaluate(
             &site.rules[0].expression,
-            &eval_ctx("/api/data", &empty, &empty)
+            &eval_ctx("/api/data", &empty_headers, &empty_cookies)
         ));
         assert!(evaluate(
             &site.rules[1].expression,
-            &eval_ctx("/api/data", &headers, &empty)
+            &eval_ctx("/api/data", &headers, &empty_cookies)
         ));
         assert!(!evaluate(
             &site.rules[1].expression,
-            &eval_ctx("/api/data", &empty, &empty)
+            &eval_ctx("/api/data", &empty_headers, &empty_cookies)
         ));
     }
 

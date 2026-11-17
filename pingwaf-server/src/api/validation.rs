@@ -10,6 +10,11 @@
 //! `update_certificate` and the TLS posture all accepted what create rejected).
 
 use crate::api::error::ApiError;
+use crate::api::path_exceptions::{
+    validate_match_type, validate_path, validate_skip_layers,
+};
+use crate::api::rules::validate_rule;
+use crate::models::{action, mode};
 
 /// Upper bound on a rule expression (bytes).
 ///
@@ -17,6 +22,15 @@ use crate::api::error::ApiError;
 /// recursive descent, so an unbounded input is both a parse-time cost and a
 /// memory lever. 8 KiB is far above anything a hand-written rule needs.
 pub(crate) const MAX_EXPRESSION_LEN: usize = 8 * 1024;
+
+/// Specific machine-readable code for an expression the data plane cannot
+/// compile (empty, oversized or unparsable).
+///
+/// The console keys its localised hint on it; every other validation failure
+/// keeps the default `bad_request` code. Shared with the callers that surface
+/// the error unchanged (`rules`, `rate_limiting`, `cache`).
+pub(crate) const EXPRESSION_INVALID_CODE: &str =
+    "validation.expression_invalid";
 
 /// Upper bound on a PEM bundle handed to the API (bytes, 1 MiB).
 ///
@@ -31,18 +45,27 @@ pub(crate) const MAX_PEM_LEN: usize = 1024 * 1024;
 /// expression fails to parse, so without this check a rule looks enabled in
 /// the console while enforcing nothing.
 pub(crate) fn validate_expression(expression: &str) -> Result<(), ApiError> {
+    // Every rejection below is the same client-facing failure — this
+    // expression cannot be compiled — so they all carry the specific code the
+    // console renders its localised hint from. Status (`400`) and message are
+    // unchanged.
     if expression.trim().is_empty() {
         return Err(ApiError::BadRequest(
             "expression must not be empty".to_string(),
-        ));
+        )
+        .with_code(EXPRESSION_INVALID_CODE));
     }
     if expression.len() > MAX_EXPRESSION_LEN {
         return Err(ApiError::BadRequest(format!(
             "expression must be at most {MAX_EXPRESSION_LEN} bytes"
-        )));
+        ))
+        .with_code(EXPRESSION_INVALID_CODE));
     }
     pingwaf_waf::rules::expression::parse_expression(expression).map_err(
-        |err| ApiError::BadRequest(format!("expression is not valid: {err}")),
+        |err| {
+            ApiError::BadRequest(format!("expression is not valid: {err}"))
+                .with_code(EXPRESSION_INVALID_CODE)
+        },
     )?;
     Ok(())
 }
@@ -60,6 +83,62 @@ pub(crate) fn validate_optional_expression(
         return Ok(());
     }
     validate_expression(expression)
+}
+
+/// The outcome of validating one restored or cloned rule row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuleRowFix {
+    /// The row is valid exactly as stored.
+    Keep,
+    /// `action=allow` paired with `mode=off`: the mode must be rewritten to
+    /// `monitor`. The same normalisation is applied by migration 000096 and
+    /// the restore transaction, so a snapshot or source site carrying the
+    /// pre-fix combination is repaired instead of silently dropping a rule
+    /// the operator configured.
+    AllowOffMonitor,
+}
+
+/// Validates one rule row against the same checks the create/update API
+/// applies, shared by the restore planner and the site clone so neither can
+/// persist what the API rejects.
+///
+/// `Err` carries the reason the row must be skipped (never silently kept);
+/// `Ok` may carry the `allow`+`off` normalisation. The allow+off pair is
+/// repaired here rather than rejected because it is a known historical state,
+/// not operator garbage.
+pub(crate) fn check_rule_fields(
+    name: &str,
+    expression: &str,
+    rule_action: &str,
+    rule_mode: &str,
+    severity: i32,
+) -> Result<RuleRowFix, String> {
+    let allow_off = rule_action == action::ALLOW && rule_mode == mode::OFF;
+    let effective_mode = if allow_off { mode::MONITOR } else { rule_mode };
+    validate_rule(name, expression, rule_action, effective_mode, severity)
+        .map_err(|err| err.to_string())?;
+    Ok(if allow_off {
+        RuleRowFix::AllowOffMonitor
+    } else {
+        RuleRowFix::Keep
+    })
+}
+
+/// Validates one restored or cloned path-exception row against the same
+/// checks the create/update API applies. `Err` = skip the row, `Ok` returns
+/// the normalised `(path, match_type, skip_layers)`.
+pub(crate) fn check_path_exception_fields(
+    path: &str,
+    match_type: Option<&str>,
+    skip_layers: &[String],
+) -> Result<(String, String, Vec<String>), String> {
+    let match_type =
+        validate_match_type(match_type).map_err(|err| err.to_string())?;
+    let path =
+        validate_path(path, &match_type).map_err(|err| err.to_string())?;
+    let layers =
+        validate_skip_layers(skip_layers).map_err(|err| err.to_string())?;
+    Ok((path, match_type, layers))
 }
 
 /// Validates one PEM bundle (a leaf/chain or a CA anchor).
@@ -239,6 +318,25 @@ mod tests {
         assert!(validate_expression("(http.host eq \"x\"").is_err());
     }
 
+    /// The console maps this specific code to its localised hint; status and
+    /// message stay what they were (`400`, the parser/limit text).
+    #[test]
+    fn invalid_expressions_carry_their_specific_code() {
+        for bad in ["", "   ", "ip.src == 1.2.3.4"] {
+            let err = validate_expression(bad).expect_err("must be rejected");
+            assert_eq!(err.code(), EXPRESSION_INVALID_CODE, "{bad:?}");
+            assert_eq!(
+                err.status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "{bad:?}"
+            );
+            assert!(!err.to_string().is_empty(), "{bad:?}");
+        }
+        // A blank *optional* expression stays legal (rate limits treat it as
+        // "every request") and never carries the code.
+        assert!(validate_optional_expression("").is_ok());
+    }
+
     #[test]
     fn expressions_are_capped_at_eight_kibibytes() {
         let base = r#"http.host eq "a""#;
@@ -270,6 +368,56 @@ mod tests {
             &"x".repeat(MAX_EXPRESSION_LEN + 1)
         )
         .is_err());
+    }
+
+    /// The shared rule-row check: valid rows keep, the historical allow+off
+    /// pair is repaired to monitor, everything the write API rejects is a
+    /// skip. Restore and clone both route through this, so neither can
+    /// persist what `create_rule` would refuse.
+    #[test]
+    fn rule_row_checks_mirror_the_write_api() {
+        let expr = r#"http.request.method eq "POST""#;
+        assert_eq!(
+            Ok(RuleRowFix::Keep),
+            check_rule_fields("block posts", expr, "block", "block", 3)
+        );
+        assert_eq!(
+            Ok(RuleRowFix::AllowOffMonitor),
+            check_rule_fields("whitelist", expr, "allow", "off", 3)
+        );
+        // allow cannot pair with block.
+        assert!(check_rule_fields("allow", expr, "allow", "block", 3).is_err());
+        // Unknown mode and action.
+        assert!(check_rule_fields("r", expr, "block", "enforce", 3).is_err());
+        assert!(check_rule_fields("r", expr, "quarantine", "block", 3).is_err());
+        // Expression the data plane would drop.
+        assert!(check_rule_fields("r", "and and", "block", "block", 3).is_err());
+        // Severity outside 1..=5.
+        assert!(check_rule_fields("r", expr, "block", "block", 9).is_err());
+    }
+
+    /// The shared path-exception-row check used by restore and clone.
+    #[test]
+    fn path_exception_row_checks_mirror_the_write_api() {
+        let layers = vec!["waf".to_string()];
+        let (path, match_type, _) =
+            check_path_exception_fields("/health", None, &layers)
+                .expect("a valid row");
+        assert_eq!(("/health", "prefix"), (path.as_str(), match_type.as_str()));
+        // Empty skip_layers is rejected — it would restore a bypass-shaped
+        // row that skips nothing.
+        assert!(check_path_exception_fields("/health", None, &[]).is_err());
+        // Unknown layer names.
+        assert!(check_path_exception_fields(
+            "/health",
+            None,
+            &["everything".to_string()]
+        )
+        .is_err());
+        // A regex that does not compile.
+        assert!(
+            check_path_exception_fields("(", Some("regex"), &layers).is_err()
+        );
     }
 
     #[test]

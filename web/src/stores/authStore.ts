@@ -1,13 +1,15 @@
 import { create } from 'zustand'
 import type { User } from '@/api/types'
+import { webStorage } from '@/lib/storage'
 
 const TOKEN_KEY = 'wafred.token'
 const REFRESH_KEY = 'wafred.refreshToken'
 const USER_KEY = 'wafred.user'
 
 function read<T>(key: string, parse: (raw: string) => T): T | null {
-  if (typeof localStorage === 'undefined') return null
-  const raw = localStorage.getItem(key)
+  const storage = webStorage()
+  if (!storage) return null
+  const raw = storage.getItem(key)
   if (!raw) return null
   try {
     return parse(raw)

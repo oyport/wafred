@@ -123,6 +123,7 @@ modules = ["grpc-web"]
   ```text
   {{version}}     pingap 版本
   {{error_type}}  pingora 的错误类型，同时作为 X-Pingap-EType 响应头发送
+  {{status}}      HTTP 状态码（如 404）
   {{content}}     错误信息
   ```
 

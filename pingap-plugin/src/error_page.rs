@@ -140,15 +140,23 @@ h1{font-size:24px;margin:0 0 10px;letter-spacing:-.015em;font-weight:650}
   word-break:break-all;text-align:right;
 }
 .brand{margin-top:26px;font-size:12px;color:var(--muted);letter-spacing:.02em}
+.brand a{text-decoration:none}
+.brand a:hover{text-decoration:underline}
 .brand b{color:var(--accent);font-weight:700}
 </style>"##;
 
-// NOTE: there are deliberately no built-in 403/429 pages. An origin-returned
-// 403 used to be replaced with a WAF-style "Access Denied" page, which made
-// every visitor (and every site owner) believe the WAF had blocked them.
-// Following Cloudflare's model, origin responses are passed through untouched;
-// only gateway-class failures — which the edge itself produces when the
-// upstream is unreachable — get a branded page. Administrators can still
+// NOTE: there are deliberately no built-in 403/404/408/413/429 pages. An
+// origin-returned 403 used to be replaced with a WAF-style "Access Denied"
+// page, which made every visitor (and every site owner) believe the WAF had
+// blocked them. Following Cloudflare's model, origin responses are passed
+// through untouched; only gateway-class failures — which the edge itself
+// produces when the upstream is unreachable — get a branded page.
+//
+// The non-5xx codes above still have a default page, just not one from this
+// plugin: the proxy's own `error.html` renders 404/408/413/429 (and 5xx that
+// never reached a site) with the status code, request id and a retry hint.
+// This plugin only brands 502/503/504, so enabling it must not change how an
+// origin's 404 or a client's 429 is presented. Administrators can still
 // configure custom pages for any status via the control plane.
 
 /// 5xx — origin/gateway failure page (shared by 502/503/504). The copy must

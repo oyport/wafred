@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::api::capabilities;
 use crate::api::common::{
     ensure_acme_wildcard_supported, ensure_domains_available, load_site_read,
     load_site_write, map_domain_conflict, non_empty, normalise_domain,
@@ -25,7 +26,10 @@ use crate::api::common::{
 };
 use crate::api::error::ApiError;
 use crate::api::state::AppState;
-use crate::api::validation::validate_pem_bundle;
+use crate::api::validation::{
+    check_path_exception_fields, check_rule_fields, validate_pem_bundle,
+    RuleRowFix,
+};
 use crate::auth::AuthUser;
 use crate::grpc::notify_config_changed;
 use crate::models::{
@@ -38,6 +42,36 @@ use crate::models::{
     trusted_header, visitor_site_grant, waf_settings, ResponseReplaceConfig,
     ResponseReplaceRule,
 };
+
+/// Specific machine-readable code for a hostname another site already serves.
+///
+/// The console keys its localised hint on it; the HTTP status (`400`) and the
+/// human-readable message are unchanged. Only the hostname-conflict paths carry
+/// it — every other validation failure keeps the default `bad_request` code.
+const DOMAIN_CONFLICT_CODE: &str = "site.domain_conflict";
+
+/// Tags a hostname conflict with [`DOMAIN_CONFLICT_CODE`].
+///
+/// `ensure_domains_available` reports hostname conflicts (an exact duplicate, a
+/// wildcard overlap, or a hostname under another site's wildcard) as its *only*
+/// `BadRequest`; every other error it can return comes from the database and is
+/// mapped by `From<DbErr>` to `NotFound`/`Conflict`/`Internal`. Matching the
+/// variant therefore tags exactly the conflicts, without string-sniffing.
+fn site_domain_conflict(err: ApiError) -> ApiError {
+    match err {
+        ApiError::BadRequest(_) => err.with_code(DOMAIN_CONFLICT_CODE),
+        other => other,
+    }
+}
+
+/// [`map_domain_conflict`] for the database-side hostname backstops
+/// (`uq_sites_domain` and the conflict trigger), with the specific code.
+///
+/// A non-conflict database error keeps its default code: `map_domain_conflict`
+/// passes it through `From<DbErr>`, which never produces a `BadRequest`.
+fn map_site_domain_conflict(err: DbErr) -> ApiError {
+    site_domain_conflict(map_domain_conflict(err))
+}
 
 /// Longest accepted route `rewrite_path`, in **bytes**, mirroring
 /// `pingap_config::MAX_REWRITE_PATH_LEN` — the data plane drops anything longer,
@@ -1278,7 +1312,7 @@ pub(crate) async fn create_site_for_user(
     // The pre-check above is not atomic: a racing create can slip through it.
     // The unique index and the conflicts trigger on `sites` are the backstop.
     .await
-    .map_err(map_domain_conflict)?;
+    .map_err(map_site_domain_conflict)?;
 
     // Every site starts with a default origin pool; the first origin node
     // goes into it.
@@ -1450,6 +1484,11 @@ pub(crate) const CLONE_INTENTIONALLY_SKIPPED: &[&str] = &[];
 /// inside the caller's transaction (C4/L2-001). Groups are inserted first so
 /// each rule's `group_id` can be remapped to the clone's own group rows,
 /// keeping the same grouping semantics. Returns (groups, rules) copied.
+///
+/// Every rule row passes the same validation the rules API enforces
+/// (P0-9): a clone cannot carry a rule the write path would reject. Invalid
+/// rows are skipped with a warning, and the historical `allow`+`off`
+/// combination is repaired to `monitor` instead of dropped.
 async fn clone_site_rules<C>(
     txn: &C,
     source_id: Uuid,
@@ -1474,13 +1513,54 @@ where
         .filter(rule::Column::SiteId.eq(source_id))
         .all(txn)
         .await?;
-    let rule_count = source_rules.len();
+    let mut copied = 0usize;
     for row in source_rules {
-        clone_rule_row(row, new_id, &group_ids, timestamp)
-            .insert(txn)
-            .await?;
+        let row_id = row.id;
+        match check_rule_fields(
+            &row.name,
+            &row.expression,
+            &row.action,
+            &row.mode,
+            row.severity,
+        ) {
+            Ok(RuleRowFix::Keep) => {
+                clone_rule_row(row, new_id, &group_ids, timestamp)
+                    .insert(txn)
+                    .await?;
+                copied += 1;
+            },
+            Ok(RuleRowFix::AllowOffMonitor) => {
+                let mut node =
+                    clone_rule_row(row, new_id, &group_ids, timestamp);
+                node.mode = Set(crate::models::mode::MONITOR.to_string());
+                node.insert(txn).await?;
+                copied += 1;
+                tracing::warn!(
+                    source_rule = %row_id,
+                    "clone: rule with action=allow and mode=off was normalised to mode=monitor"
+                );
+            },
+            Err(reason) => {
+                // Cloning must not silently produce a site with less
+                // enforcement than the source. A malformed blocking rule is
+                // a configuration error to surface, not a row to skip.
+                if matches!(
+                    row.action.as_str(),
+                    "block" | "challenge" | "js_challenge"
+                ) {
+                    return Err(sea_orm::DbErr::Custom(format!(
+                        "clone: source rule {row_id} is an enforcing rule that cannot be copied ({reason})"
+                    )));
+                }
+                tracing::warn!(
+                    source_rule = %row_id,
+                    reason = %reason,
+                    "clone: source rule failed validation and was not copied"
+                );
+            },
+        }
     }
-    Ok((group_ids.len(), rule_count))
+    Ok((group_ids.len(), copied))
 }
 
 /// Builds the clone's `rule_groups` row from the source row: new id, new site,
@@ -1512,6 +1592,9 @@ fn clone_rule_row(
     let mut node: rule::ActiveModel = row.into();
     node.id = Set(Uuid::new_v4());
     node.site_id = Set(new_id);
+    // The clone has its own seed rows; carrying a managed link over would
+    // create duplicate override-only rows for the same PINGWAF id.
+    node.managed_rule_id = Set(None);
     // A group the map does not know belongs to another site (or was deleted
     // between the two reads). Carrying its id over would attach the clone's
     // rule to a foreign group, and deleting that group would then cascade into
@@ -1586,7 +1669,9 @@ async fn clone_site(
     )?;
     let mut all_domains = vec![domain.clone()];
     all_domains.extend(alternate_domains.iter().cloned());
-    ensure_domains_available(&state.db, &all_domains, None).await?;
+    ensure_domains_available(&state.db, &all_domains, None)
+        .await
+        .map_err(site_domain_conflict)?;
 
     let user_name = payload
         .name
@@ -1614,7 +1699,10 @@ async fn clone_site(
         alternate_domains,
         timestamp,
     );
-    let model = active.insert(&txn).await.map_err(map_domain_conflict)?;
+    let model = active
+        .insert(&txn)
+        .await
+        .map_err(map_site_domain_conflict)?;
 
     // Upstream pools first: nodes and routes reference them by id, so the
     // clone needs its own pool ids and a mapping from the source's.
@@ -1784,7 +1872,67 @@ async fn clone_site(
     clone_site_rows!(&txn, rate_limit_rules, source_id, new_id);
     clone_site_rows!(&txn, site_ai_crawl_settings, source_id, new_id);
     clone_site_rows!(&txn, site_ai_bot_policies, source_id, new_id);
-    clone_site_rows!(&txn, path_exceptions, source_id, new_id);
+    // Path exceptions are copied through the same validation the
+    // path-exceptions API enforces (P0-9): a clone must not inherit a row
+    // the write path would reject (empty skip_layers, unknown layer, a path
+    // that does not compile). Invalid rows are skipped with a warning.
+    let source_exceptions = path_exceptions::Entity::find()
+        .filter(path_exceptions::Column::SiteId.eq(source_id))
+        .all(&txn)
+        .await?;
+    // Capability gate: the clone copies the source's configuration, so it is
+    // the *source* site's fleet that has to be able to execute it. Judging the
+    // clone instead looked safer but was wrong twice over: a brand-new site has
+    // no agent bound to it yet (`agent_visible_site_ids` finds none until an
+    // unbound agent's owner match kicks in), so the gate either passes
+    // vacuously or — when the owner's fleet is old — blocks a clone whose rows
+    // would in fact land on the very same agents that run the source.
+    for row in &source_exceptions {
+        capabilities::ensure_path_exception_supported(
+            &txn,
+            source_id,
+            &row.match_type,
+            &row.skip_layers,
+        )
+        .await?;
+    }
+    let cloned_ip_rules = ip_access_rules::Entity::find()
+        .filter(ip_access_rules::Column::SiteId.eq(new_id))
+        .all(&txn)
+        .await?;
+    for row in &cloned_ip_rules {
+        capabilities::ensure_ip_rule_supported(
+            &txn,
+            source_id,
+            &row.path,
+            &row.match_type,
+        )
+        .await?;
+    }
+    for row in source_exceptions {
+        let row_id = row.id;
+        match check_path_exception_fields(
+            &row.path,
+            Some(&row.match_type),
+            &row.skip_layers,
+        ) {
+            Ok(_) => {
+                let mut active: path_exceptions::ActiveModel = row.into();
+                active.id = Set(Uuid::new_v4());
+                active.site_id = Set(new_id);
+                active.created_at = Set(timestamp);
+                active.updated_at = Set(timestamp);
+                active.insert(&txn).await?;
+            },
+            Err(reason) => {
+                tracing::warn!(
+                    source_exception = %row_id,
+                    reason = %reason,
+                    "clone: source path exception failed validation and was not copied"
+                );
+            },
+        }
+    }
     // Credentials and identity configuration are copied on request: the clone
     // is paused, and the operator is warned in the UI/docs that Basic Auth
     // passwords, the OIDC cookie secret and visitor grants travel with it.
@@ -1975,7 +2123,9 @@ async fn update(
 
         let mut all_domains = vec![primary.clone()];
         all_domains.extend(alternates.iter().cloned());
-        ensure_domains_available(&state.db, &all_domains, Some(id)).await?;
+        ensure_domains_available(&state.db, &all_domains, Some(id))
+            .await
+            .map_err(site_domain_conflict)?;
 
         active.domain = Set(primary);
         active.alternate_domains = Set(alternates);
@@ -2079,7 +2229,7 @@ async fn update(
         .await
         // Same backstop as create: the uniqueness check above is a pre-check,
         // the DB constraint decides under concurrency.
-        .map_err(map_domain_conflict)?;
+        .map_err(map_site_domain_conflict)?;
     tracing::info!(%id, "site updated");
     notify_config_changed(&state, id, Some(&current.email)).await;
 
@@ -4131,6 +4281,7 @@ mod tests {
             enabled: true,
             mode: "block".to_string(),
             priority: 10,
+            managed_rule_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -5170,5 +5321,53 @@ mod tests {
         );
         assert_eq!(clone.trusted_header.unwrap(), "x-real-ip");
         assert_eq!(clone.status.unwrap(), site_status::PAUSED);
+    }
+
+    /// The console renders its localised "this domain is taken" hint from
+    /// `site.domain_conflict`. The pre-check's only `BadRequest` is a hostname
+    /// conflict, so every `BadRequest` from it carries the code; everything
+    /// else keeps its default code and status.
+    #[test]
+    fn domain_conflicts_carry_their_specific_code() {
+        let conflict = ApiError::BadRequest(
+            "domain 'a.example.com' is already served by another site"
+                .to_string(),
+        );
+        let tagged = site_domain_conflict(conflict);
+        assert_eq!(tagged.code(), DOMAIN_CONFLICT_CODE);
+        assert_eq!(tagged.status(), StatusCode::BAD_REQUEST);
+        assert!(tagged.to_string().contains("already served"), "{tagged}");
+
+        for other in [
+            ApiError::NotFound("site 7 not found".to_string()),
+            ApiError::Internal("db is down".to_string()),
+        ] {
+            let expected = other.code();
+            assert_eq!(site_domain_conflict(other).code(), expected);
+        }
+    }
+
+    /// The database-side backstops (the `uq_sites_domain` unique index and the
+    /// conflict trigger) map to the same code; unrelated database failures do
+    /// not become domain conflicts.
+    #[test]
+    fn database_domain_conflicts_carry_the_specific_code() {
+        for message in [
+            "error returned by database: duplicate key value violates unique \
+             constraint \"uq_sites_domain\"",
+            "domain already in use by another site",
+            "domain \"x.example.com\" is already in use by this site",
+        ] {
+            let err =
+                map_site_domain_conflict(DbErr::Custom(message.to_string()));
+            assert_eq!(err.code(), DOMAIN_CONFLICT_CODE, "{message}");
+            assert_eq!(err.status(), StatusCode::BAD_REQUEST, "{message}");
+        }
+
+        let err = map_site_domain_conflict(DbErr::Custom(
+            "connection reset by peer".to_string(),
+        ));
+        assert_ne!(err.code(), DOMAIN_CONFLICT_CODE);
+        assert_eq!(err.code(), "internal_error");
     }
 }

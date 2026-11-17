@@ -1821,6 +1821,10 @@ List registered agents.
       "display_name": "edge-01 (backup)",
       "name": "edge-01",
       "ip_address": "10.0.1.5",
+      "public_ip": "203.0.113.7",
+      "private_ip": "10.0.1.5",
+      "peer_ip": "203.0.113.7",
+      "peer_ip_seen_at": "2024-01-01T12:00:00Z",
       "version": "0.25.0",
       "os_info": "Linux 6.1.0",
       "cpu_cores": 4,
@@ -1847,6 +1851,52 @@ node, and the node view (`GET /system/nodes`) names it `name`; carrying both
 keeps one shape for the console without breaking callers that read
 `hostname`. `last_seen` is likewise an alias of `last_heartbeat`
 (`null` = the agent has never heartbeated).
+
+Three address fields describe a node from different vantage points, and they
+answer different questions:
+
+| Field | Source | Use it when |
+|-------|--------|-------------|
+| `ip_address` | the agent's own report at registration | you want what the node calls itself |
+| `public_ip` / `private_ip` | the agent's egress/LAN probe | you want its guess at its own topology (can be stale or empty) |
+| `peer_ip` | the TCP peer of the agent's heartbeat stream, as seen by the control plane | you need the address that actually reaches the node — the only one the agent cannot misreport, and the one that survives NAT. `peer_ip_seen_at` says when that address was last observed on a live stream; IPv4 peers are canonicalised out of the dual-stack `::ffff:` form |
+
+A node behind NAT therefore shows a different `peer_ip` than `private_ip`, and
+the console prints it under the hostname.
+
+### GET /agent-upgrade/manifest
+
+Self-upgrade metadata for an agent. Requires an **agent token**
+(`Authorization: Bearer <agent token>`, the one `RegisterAgent` minted); a
+revoked agent is rejected even with a well-formed signature.
+
+**Response (200):**
+```json
+{
+  "version": "0.32.22",
+  "sha256": "9f2c…",
+  "size": 48219136,
+  "url": "/api/v1/agent-upgrade/artifact"
+}
+```
+
+`version` is the control plane's own build. `sha256` and `size` describe exactly
+the bytes `GET /agent-upgrade/artifact` will serve and are measured once from
+the running executable, so an agent can pin what it receives.
+
+### GET /agent-upgrade/artifact
+
+Streams the control plane's own executable as `application/octet-stream`.
+PingWAF ships one binary whose role is selected by `PINGWAF_MODE`, so "the
+control plane's build" *is* the artifact an agent should run. Requires an agent
+token.
+
+Response headers: `x-pingwaf-version`, `x-pingwaf-sha256`, `Content-Length`.
+
+Agents use it only when `PINGWAF_AUTO_UPGRADE=true` and `PINGWAF_UPGRADE_URL`
+names this API; they verify size and digest before replacing their binary, keep
+the previous one as `<exe>.prev`, and then re-exec. See
+[deployment.md](deployment.md#agent-self-upgrade).
 
 ### POST /agents/enroll
 
@@ -1935,30 +1985,40 @@ Deregister an agent.
 
 ### POST /agents/{agent_id}/commands
 
-Send a command to an agent.
+Send a command to an agent. The request is a flat object — the command name
+plus its parameters as top-level fields; there is no nested `payload` field.
 
 **Request:**
 ```json
 {
   "command": "block_ip",
-  "payload": {
-    "ip": "1.2.3.4",
-    "duration_secs": 3600
-  }
+  "ip_addresses": ["1.2.3.4"],
+  "duration_seconds": 3600,
+  "reason": "blocked from dashboard"
 }
 ```
 
-**Available commands:**
-| Command | Payload |
-|---------|---------|
-| `rule_update` | `{}` |
-| `config_reload` | `{}` |
-| `block_ip` | `{"ip": "single address or CIDR", "duration_secs": 3600}` |
-| `unblock_ip` | `{"ip": "single address or CIDR"}` |
-| `purge_cache` | `{"pattern": "..."}` |
-| `update_site` | `{"site_id": "..."}` |
-| `restart_agent` | `{}` |
-| `flush_logs` | `{}` — per-agent form of the broadcast below |
+All commands accept an optional `site_id` (UUID — the site the command is
+scoped to; a `404` when the caller cannot see it). Commands that carry a
+reason fall back to a default text when it is omitted.
+
+**Available commands** (`build_command` accepts exactly these; anything else
+is a `400` that echoes the full list — `unknown command '<x>'; expected
+restart, reload, purge_cache, block_ip, unblock_ip or flush_logs`):
+
+| Command | Parameters | Notes |
+|---------|------------|-------|
+| `restart` | `graceful` (default `true`), `reason` (default `requested from dashboard`) | Restarts the agent process. |
+| `reload` | — | Asks the agent to re-apply its current configuration; carries no payload. |
+| `flush_logs` | `reason` (default `requested from dashboard`) | Agent-by-agent form of the broadcast below. |
+| `purge_cache` | `urls` (array), `tags` (array) | Entries are trimmed and blanks dropped; at most 1000 urls and 100 tags, each at most 2048 characters. |
+| `block_ip` | `ip_addresses` (array, required non-empty), `duration_seconds` (optional), `reason` (optional) | Each entry accepts a single address or CIDR and is normalised; a CIDR wider than the manual-block guard is a `400`. `duration_seconds` must be `0`–`31536000`; absent and `0` both mean "until unblocked". |
+| `unblock_ip` | `ip_addresses` (array, required non-empty) | Each entry is normalised the same way so it matches the stored block key. |
+
+Note the command names: they are the REST-facing spellings (`reload`, not the
+protocol enum name `config_reload`; `restart`, not `restart_agent`). The
+protocol's internal `rule_update` / `update_site` commands are pushed by the
+control plane itself and are not accepted here.
 
 ### POST /agents/flush-logs
 
@@ -2195,22 +2255,32 @@ before this change they were seeded as `monitor` and a fresh site answered 200
 to SQLi/XSS payloads while only logging them. The restore endpoint
 (`POST /sites/{site_id}/waf/defaults`) is the deliberate exception: rules it
 re-adds come back in `monitor`, so repairing an existing site never starts
-blocking traffic that site was serving unfiltered. Seeding is matched on the
-rule name and never edits an existing row.
+blocking traffic that site was serving unfiltered. Seeding matches a stable
+managed id first and falls back to the historical rule name; it never edits an
+existing row. Seeded rows that mirror a managed rule are override-only: the
+data plane loads the managed rule itself, and the row's `enabled` / `mode`
+controls whether that managed rule is disabled or downgraded to monitor. Its
+expression, action and tags are not delivered and cannot be edited through
+the custom-rule API.
 
 ### Action / mode combination check
 
-An `action: "allow"` rule always passes the request, so pairing it with
-`mode: "block"` promises enforcement that can never happen. The combination is
+An `action: "allow"` rule is the whitelist exemption itself, so it only
+supports `mode: "monitor"`. Pairing it with `mode: "block"` promises
+enforcement that can never happen, while `mode: "off"` removes the rule from
+the engine and lets later block rules match again. Both combinations are
 rejected on create **and** on update — including an update that changes only
-one side, where the stored value of the other completes the pair — with:
+one side, where the stored value of the other completes the pair — with a
+`400`:
 
 ```
 400 action 'allow' cannot use mode 'block': an allow rule always passes the
-request, so the block mode would never apply; use 'monitor' or 'off'
-```
+request, so the block mode would never apply; use 'monitor'
 
-`allow` is accepted with `mode: "monitor"` or `mode: "off"` only.
+400 action 'allow' cannot use mode 'off': off disables the rule and its
+whitelist exemption, so later block rules run again; use 'monitor' to keep
+the allow rule active
+```
 
 ### POST /sites/{site_id}/waf/defaults
 
@@ -2324,6 +2394,35 @@ What an exception can **never** bypass, because those checks run before the
 exception is consulted: a paused site (maintenance page), a fail-closed edge
 (`fail_open = false` with no synced rules) and an active dynamic IP ban.
 
+### Agent capability requirements
+
+Path scopes are interpreted by the edge agent, so what the control plane may
+accept depends on the agent versions serving the site. An agent is bound to a
+site either explicitly (`agents.site_id`) or — when unbound — to every site
+owned by the user its API key belongs to. A site with **no serving agent is
+not gated** (there is nothing to push to), and an agent whose reported version
+cannot be parsed counts as *not* supporting the capability (fail-closed).
+
+| Capability | Minimum agent version | Evidence |
+|------------|----------------------|----------|
+| Path exceptions (`prefix` / `exact` / `wildcard`) | **≤ 0.32.16** (no gate) | `pingap-plugin/src/waf.rs` already matched `path_exceptions` in 0.32.16; the gate only covers what changed later |
+| Path scopes on **any of the five scoped write surfaces** — path exceptions, IP access rules, geo rules, basic-auth and the OIDC configuration (`prefix` / `exact` / `wildcard`) | **0.32.20** | `pingap-plugin/src/path_filter.rs` first shipped in 0.32.20 ("Path scopes for access restrictions"). For IP / geo / basic-auth / OIDC **any non-empty `path` counts** — the pre-0.32.20 protocol has no path field at all, so an old agent decodes an empty scope and the rule degrades to the whole site |
+| `regex` scopes (`match_type: "regex"`) | **0.32.20** | `capabilities::MIN_AGENT_REGEX_SCOPES`; enforced by the save-time gate below |
+| Canonical path matching — scopes matched against the dot-segment-resolved path (any saved path exception, whose `skip_layers` is always non-empty) | **0.32.21** | `capabilities::MIN_AGENT_CANONICAL_SCOPES`; CHANGELOG 0.32.21 "Scope matching uses a canonical path" |
+| Built-in rule override contract — seeded rows linked to managed rules via `managed_rule_id` (override `enabled`/`mode` instead of duplicating the rule) | **0.32.21** | CHANGELOG 0.32.21 "Seeded built-in rules now control the managed rules instead of duplicating them" |
+| Re-enabling a saved path exception (`enabled` `false` → `true` re-arms its stored scope) | same gates as the stored scope | the update gate judges the *effective* scope, so re-enabling a row the fleet cannot execute is rejected too (see the [gating notes](#post-sitessite_idpath-exceptions)) |
+| `peer_ip` — connection source address in the agent inventory | **0.32.23** | PingWAF 0.32.23 (agent inventory shows the address the control plane accepted the heartbeat stream from) |
+| Agent self-upgrade (`agent.auto_upgrade` + `agent.upgrade_url`) | **0.32.23** | PingWAF 0.32.23 "Agents can upgrade themselves to the control plane's build" |
+
+The first four rows are not just informational: all **five** scoped write
+surfaces — path exceptions, IP rules, geo rules, basic-auth and the OIDC
+configuration — plus configuration restore/rollback are **gated with `400`
+before anything is stored** (see the capability-gating notes under each
+endpoint, [POST /config-versions/{version_id}/rollback](#post-config-versionsversion_idrollback)
+and [POST /config-backups/{backup_id}/restore](#post-config-backupsbackup_idrestore)).
+The remaining rows mark the release a feature appeared in; upgrading every
+agent to the control plane's own version keeps the whole matrix satisfied.
+
 ### GET /sites/{site_id}/path-exceptions
 
 List the site's path exceptions, ordered by `path`.
@@ -2362,14 +2461,16 @@ Create an exception. Requires write access; no observation-mode gate.
 }
 ```
 
-All fields except `path` are optional. `match_type` defaults to `prefix`,
-`skip_layers` defaults to `["*"]`, `log_hits` to `false`, `enabled` to `true`.
+`path` and `skip_layers` are required. `match_type` defaults to `prefix`,
+`log_hits` to `false`, `enabled` to `true`. `skip_layers` has no implicit
+default: omit it and the request is a `400`, so a forgotten field cannot
+silently create a total bypass (`["*"]` must be explicit).
 
 | Field | Validation (violations are `400` unless stated) |
 |-------|--------------------------------------------------|
 | `path` | Required on create. 1–512 characters, must start with `/`, no whitespace or control characters. `*` is only allowed with `match_type: "wildcard"`, and there only as a single trailing `*` (`/api/*`); a bare `*` is rejected (`use path '/' with match_type prefix instead of '*'`). With `match_type: "regex"` the value is a regular expression instead — the leading-`/` and wildcard rules do not apply there, only the shared length/whitespace limits plus a compile check (see below). |
 | `match_type` | `prefix` (default) / `exact` / `wildcard` / `regex`; anything else → `unknown match_type '<x>'; expected one of prefix, exact, wildcard, regex`. |
-| `skip_layers` | Array of tokens: `*`, `waf`, `bot`, `access`, `basic_auth`, `mtls`, `ai_bot`, `rate_limit`, `challenge`. Empty array → `skip_layers must not be empty; use ["*"] to skip every layer`; unknown token → named in the error; `*` collapses the list to every layer. |
+| `skip_layers` | Array of tokens: `*`, `waf`, `bot`, `access`, `basic_auth`, `mtls`, `ai_bot`, `rate_limit`, `challenge`. Empty array → `skip_layers must not be empty; use ["*"] to skip every layer`; unknown token → named in the error; `*` collapses the list to every detection/rate/challenge layer, but never implies `mtls` or `basic_auth` (name those explicitly). |
 | `note` | At most 200 characters. |
 | `log_hits` | Default `false`. When `true`, every hit is recorded (see [Hit behaviour](#path-exception-hit-behaviour)). |
 | `enabled` | Default `true`; disabled exceptions are neither compiled nor matched. |
@@ -2378,17 +2479,48 @@ Limits: a site accepts at most **64** exceptions
 (`a site accepts at most 64 path exceptions`); `(site_id, path)` is unique — a
 duplicate is a `409` (`a path exception for '<path>' already exists on this site`).
 
+**Agent capability gating (create and update).** Before the exception is
+stored, the control plane checks every agent that serves the site (see
+[Agent capability requirements](#agent-capability-requirements) for how
+"serves" is determined) and rejects the write with a `400` when the request
+exceeds what those agents can execute:
+
+- `match_type: "regex"` requires every serving agent to be **≥ 0.32.20** —
+  the failure message is verbatim
+  `path scope is not supported by agent <name> (<version>); regex scope requires agent >= 0.32.20`
+  (`<name>` is the first offending agent's display name or hostname, `<version>`
+  its reported version).
+- Any exception with a non-empty `skip_layers` requires every serving agent to
+  be **≥ 0.32.21** —
+  `path scope is not supported by agent <name> (<version>); canonical path matching requires agent >= 0.32.21`
+  — because scopes on an older agent are matched against the raw request path,
+  so a dot-segment request could bypass the exception scope and its WAF checks
+  entirely. Since `skip_layers` must always be non-empty (see the field table
+  above), this gate applies to every stored exception. When `match_type:
+  "regex"` and a non-empty `skip_layers` **both** apply, the two bars are
+  0.32.20 (regex) and 0.32.21 (canonical matching), and the **stricter** one is
+  reported: the `400` names `canonical path matching requires agent >= 0.32.21`,
+  because an agent upgraded only to 0.32.20 would still fail the write.
+
+The gate runs on `PUT` too, judging the **effective** scope the update would
+store, not the raw payload: a payload that rewrites `path`, `match_type` or
+`skip_layers` is checked against the merged value, and flipping `enabled` from
+`false` to `true` on a row whose stored scope is gated re-runs the gate —
+re-enabling must not silently re-arm a scope the fleet cannot execute. Sending
+`{"enabled": true}` to an already-enabled row is an idempotent no-op and is
+never blocked, and a disabling or note-only edit does not change detection
+behaviour, so it is not gated either.
+
 **`match_type: "regex"`** — the `path` value is a regular expression evaluated
 with the Rust `regex` crate: unanchored `is_match` (write `^…$` yourself when
 the whole path must match), case-sensitive by default (`(?i)` opts out). The
 pattern must compile server-side; compilation uses 4 MiB `size_limit` /
 `dfa_size_limit` limits, the same budget as the WAF expression engine. An
 invalid pattern is a `400` carrying the compiler's reason
-(`invalid regex '<pattern>': <reason>`). Compatibility: agents that have not
-been upgraded receive the unknown `PATH_MATCH_REGEX = 3` and degrade to
-`prefix` semantics (fail-safe — the exception simply stops applying), so a
-regex exception does **not** take effect there; upgrade agents before relying
-on this type.
+(`invalid regex '<pattern>': <reason>`). Older agents have no regex matcher
+at all, so a regex exception is only accepted once every serving agent is at
+least 0.32.20 (see the capability gate above) — the save itself is rejected
+rather than left silently inert on the edge.
 
 **Response (200):** the created exception (same shape as the list items).
 
@@ -2399,11 +2531,12 @@ belong to this site.
 
 ### PUT /sites/{site_id}/path-exceptions/{id}
 
-Partial update: omitted fields keep their value. The observation-mode gate and
-the same validation apply. Switching `match_type` re-validates the stored
+Partial update: omitted fields keep their value. The same validation applies;
+there is no observation-mode gate. Switching `match_type` re-validates the stored
 `path` against the new type (e.g. changing to `wildcard` without a trailing
 `*` on the path is rejected). Changing `path` to a value another exception
-already uses is a `409`.
+already uses is a `409`. The [agent capability gate](#post-sitessite_idpath-exceptions)
+applies to updates as well, including re-enabling a disabled exception.
 
 ### DELETE /sites/{site_id}/path-exceptions/{id}
 
@@ -2896,6 +3029,7 @@ List access logs, newest first.
       "response_size": 5120,
       "upstream_addr": "10.0.1.50:3000",
       "upstream_latency_ms": 12,
+      "upstream_status": 200,
       "total_latency_ms": 15,
       "cache_status": null,
       "user_agent": "curl/8.4.0",
@@ -2924,6 +3058,11 @@ Rows are only as complete as the agent that produced them: `scheme`, `protocol`
 and the response fields come from agents on 0.15.0 or newer. Against an older
 agent those columns stay `null` and the console shows the request side only.
 
+`upstream_status` is the status the **origin** returned. When no origin was
+contacted — a WAF block or challenge, a cache hit, an edge error — it repeats
+the final `status_code` the client received, so new rows always carry a value;
+rows written before the field existed (or by older agents) are `null`.
+
 ### GET /logs/access/{id}
 
 One access-log row by id, same shape as the list items above (the full
@@ -2932,6 +3071,11 @@ administrators see every row; every other account only rows belonging to
 sites it owns — another tenant's row, an unassigned row (`site_id: null`) and
 an unknown id all answer **404 `access log not found`** (a non-existent and
 an unreadable row are indistinguishable by design).
+
+The detail response also carries `upstream_time`, an alias of
+`upstream_latency_ms` (milliseconds — same value, no separate column) kept for
+clients that use the documented name; `upstream_latency_ms` stays for older
+clients. The list endpoint returns only `upstream_latency_ms`.
 
 ### GET /logs/control-plane
 
@@ -3424,9 +3568,30 @@ Create an IP rule. Set either `ip_ranges` (manual mode) or `group_id` (reference
 
 `action` is `block`, `allow`, `challenge`, `js_challenge` or `basic_auth`. Sending `group_id` instead of `ip_ranges` makes the rule track the group's latest ranges. A `basic_auth` rule challenges the matched clients and continues to the remaining checks once they authenticate; configure the credentials under [Basic Auth](#basic-auth) first.
 
+**Path scope (`path`, `match_type`):** every rule also accepts an optional
+path scope — empty `path` = the whole site; a non-empty scope applies the
+rule (whatever its action) only to requests whose path matches it. The two
+fields reuse the [path-exception](#path-exceptions) `match_type` semantics
+and validation: `prefix` (default) / `exact` / `wildcard` / `regex`, a
+`regex` scope is compile-checked on save (4 MiB budget; an invalid pattern
+is a `400`), and an empty `path` is stored with `match_type: "prefix"`.
+Existing rules without a `path` behave exactly as before.
+
+**Agent capability gating (create and update):** any **non-empty `path`** —
+regex or not — requires every agent serving the site to be **≥ 0.32.20**;
+otherwise the write is rejected with a `400` whose message is verbatim
+`path scope is not supported by agent <name> (<version>); path scope requires agent >= 0.32.20`.
+The reason is all-or-nothing: the pre-0.32.20 protocol has no path field at
+all, so an old agent would decode an empty scope and apply the rule to the
+entire site — a scoped `allow` would become allow-everywhere, and a scoped
+`basic_auth` rule would demand credentials everywhere. An empty `path`
+(whole-site scope) is never gated. `PUT` judges the effective scope after the
+payload merges onto the stored row, so an update that sends only `path` still
+checks the stored `match_type`.
+
 ### PUT /sites/{site_id}/ip-rules/{rule_id}
 
-Update an IP rule (sending `ip_ranges` or `group_id` switches between manual and group mode).
+Update an IP rule (sending `ip_ranges` or `group_id` switches between manual and group mode). `path` and `match_type` are optional; sending either re-validates the pair with the other field falling back to the stored value, and `"path": ""` clears the scope back to the whole site.
 
 ### DELETE /sites/{site_id}/ip-rules/{rule_id}
 
@@ -3434,7 +3599,7 @@ Remove an IP rule.
 
 ### POST /sites/{site_id}/ip-rules/bulk
 
-Bulk import IP rules (one IP or CIDR per entry).
+Bulk import IP rules (one IP or CIDR per entry). Imported rules are site-wide — no path scope is taken from the request.
 
 **Request:**
 ```json
@@ -3727,11 +3892,31 @@ Update geo restrictions.
   "countries": ["CN", "RU", "IR"],
   "blocked_asns": ["AS13335"],
   "block_unknown": false,
-  "action": "block"
+  "action": "block",
+  "path": "",
+  "match_type": "prefix"
 }
 ```
 
 `mode` is `block_list` or `allow_list`; `blocked_asns` entries are ASN numbers, optionally prefixed with `AS`. `action` is `block`, `challenge`, `js_challenge` or `basic_auth`.
+
+**Path scope (`path`, `match_type`):** the policy also accepts an optional
+path scope — empty `path` = the whole site (stored with `match_type:
+"prefix"`); a non-empty scope skips the geo restriction for requests whose
+path does not match it. The fields follow the same
+[path-exception](#path-exceptions) `match_type` semantics and validation as
+the IP-rule scope, including the server-side compile check for `regex`
+(invalid pattern → `400`). Agents that predate a `match_type` value degrade
+it to `prefix`, so a `regex` scope needs an upgraded agent.
+
+**Agent capability gating:** saving a geo policy whose effective `path` is
+non-empty requires every agent serving the site to be **≥ 0.32.20**; the write
+is otherwise rejected with a `400`:
+`path scope is not supported by agent <name> (<version>); path scope requires agent >= 0.32.20`.
+Old agents have no path field at all: they apply the block/allow policy to
+**every** request, whereas a scoped policy is only evaluated when the request
+path matches (outside the scope the policy does not run at all). An empty
+`path` (whole-site policy) is never gated.
 
 ### GET /sites/{site_id}/geo/stats
 
@@ -3777,6 +3962,27 @@ request. It applies site-wide when `enabled` is true, and to the clients an IP
 or geo rule with the `basic_auth` action matches — an explicit `allow` rule
 exempts a client from the site-wide gate.
 
+**Path scope (`path`, `match_type`):** the gate itself also accepts an
+optional path scope — empty `path` = the whole site (stored with
+`match_type: "prefix"`); for the *site-wide* switch, requests outside the
+scope are not asked for credentials. An IP or geo rule with the
+`basic_auth` action is scoped by its own path only: once that rule matches,
+the request must authenticate even if the gate's own scope names another
+path (otherwise a matched rule would silently become a bypass). The fields
+follow the
+[path-exception](#path-exceptions) `match_type` semantics and validation
+(`regex` compile-checked within the 4 MiB budget, invalid pattern → `400`);
+old agents degrade unknown match types to `prefix`, so a `regex` scope needs
+an upgraded agent.
+
+**Agent capability gating:** saving a basic-auth configuration whose effective
+`path` is non-empty requires every agent serving the site to be **≥ 0.32.20**;
+the write is otherwise rejected with a `400`:
+`path scope is not supported by agent <name> (<version>); path scope requires agent >= 0.32.20`.
+Old agents have no path field at all, so a scoped gate would demand
+credentials for **every** request, whereas the intent is to require them only
+where the path matches. An empty `path` (whole-site gate) is never gated.
+
 Passwords are masked with `***` in responses; sending the mask back keeps the
 stored password instead of overwriting it. Site write permission is required.
 
@@ -3795,6 +4001,8 @@ site never saved one.
   "credentials": [{"username": "alice", "password": "***"}],
   "delay_seconds": 1,
   "hide_credentials": false,
+  "path": "",
+  "match_type": "prefix",
   "created_at": "2026-09-30T09:00:00Z",
   "updated_at": "2026-09-30T09:00:00Z"
 }
@@ -3805,6 +4013,9 @@ site never saved one.
 Update basic auth. `credentials` replaces the whole list when present; `realm`
 must be 1–200 characters, `delay_seconds` between 0 and 10, and usernames must
 be non-empty and unique. Enabling the gate with no credential is rejected.
+`path` and `match_type` are optional; sending either re-validates the pair
+with the other field falling back to the stored value, and `"path": ""`
+clears the scope back to the whole site.
 
 **Request:**
 ```json
@@ -3816,7 +4027,9 @@ be non-empty and unique. Enabling the gate with no credential is rejected.
     {"username": "bob", "password": "***"}
   ],
   "delay_seconds": 1,
-  "hide_credentials": true
+  "hide_credentials": true,
+  "path": "/admin",
+  "match_type": "prefix"
 }
 ```
 
@@ -3862,6 +4075,8 @@ never saved one.
   "cookie_name": "pingap_oidc",
   "session_ttl_seconds": 43200,
   "claims_to_headers": [],
+  "path": "",
+  "match_type": "prefix",
   "created_at": "2026-09-30T09:00:00Z",
   "updated_at": "2026-09-30T09:00:00Z"
 }
@@ -3885,6 +4100,24 @@ follow the mask rules above: sending `***` keeps the stored secret (rejected
 with `400` when nothing is stored — there is no old value to keep), and `""`
 clears it.
 
+**Path scope (`path`, `match_type`):** the fields scope the login gate —
+empty `path` = the whole site (stored with `match_type: "prefix"`); requests
+outside a configured scope are fully public: no redirect to the provider, no
+session check. `redirect_path` and `logout_path` are always handled first,
+so the callback and logout endpoints stay reachable regardless of the scope.
+The fields follow the [path-exception](#path-exceptions) `match_type`
+semantics and validation (`regex` compile-checked within the 4 MiB budget,
+invalid pattern → `400`); old agents degrade unknown match types to
+`prefix`, so a `regex` scope needs an upgraded agent.
+
+**Agent capability gating:** saving an OIDC configuration whose effective
+`path` is non-empty requires every agent serving the site to be **≥ 0.32.20**;
+the write is otherwise rejected with a `400`:
+`path scope is not supported by agent <name> (<version>); path scope requires agent >= 0.32.20`.
+Old agents have no path field at all, so the login gate would open or lock
+**every** path, whereas a scoped gate is only evaluated where the path matches.
+An empty `path` (whole-site gate) is never gated.
+
 **Request:**
 ```json
 {
@@ -3901,7 +4134,9 @@ clears it.
   "scopes": ["openid", "profile", "email"],
   "cookie_name": "pingap_oidc",
   "session_ttl_seconds": 43200,
-  "claims_to_headers": [{"claim": "email", "header": "X-Auth-Email"}]
+  "claims_to_headers": [{"claim": "email", "header": "X-Auth-Email"}],
+  "path": "",
+  "match_type": "prefix"
 }
 ```
 
@@ -4077,8 +4312,9 @@ saved one.
 Update challenge settings. All fields are optional; omitted fields keep their
 value. Site write permission is required. Unknown fields are rejected with
 `422 Unprocessable Entity` (`deny_unknown_fields`) — note that axum 0.8 maps
-serde deserialization rejections to 422, and the response body is plain text,
-not the unified JSON error envelope.
+serde deserialization rejections to 422; the envelope middleware rewrites the
+plain-text rejection into the unified JSON error envelope with the
+`invalid_body` code (see [400 vs 422](#400-vs-422-structure-vs-semantics)).
 
 **Request:**
 ```json
@@ -4795,6 +5031,22 @@ version through its own bundle, a global version through all of them. The
 rollback is itself recorded as a new version attributed to the operator, so
 rolling back a rollback works and the history stays linear.
 
+**Agent capability gating.** Before anything is rewritten, every path scope in
+a site-scoped snapshot is validated against the agents serving its site **as
+they are now**, not as they were when the version was recorded (a
+deployment-wide version carries no site rows, so it has nothing to validate). If any stored scope
+needs a capability the current fleet lacks — a `regex` scope before 0.32.20,
+a path exception before 0.32.21, or a scoped IP / geo / basic-auth / OIDC rule
+before 0.32.20 — the whole rollback is refused with a `400` naming the site,
+the offending agent and its version, and the missing capability; no rows are
+restored. This is fail-closed by design: a snapshot taken while the fleet was
+newer must not silently downgrade the edge (see
+[Agent capability requirements](#agent-capability-requirements) for why an
+old agent turns a scoped rule into a whole-site one). The way out is
+operational: upgrade the agents to the version named in the message and retry,
+or edit the offending scopes — clearing their `path` to the whole-site default
+— and record a new version to roll back to.
+
 **Response (200):**
 ```json
 {
@@ -4995,6 +5247,19 @@ or the `preview` endpoint) reports before/after counts, additions, removals,
 changes, owner mappings and warnings.
 
 A deployment restore requires a complete schema-2 snapshot. Missing tables are rejected, while an explicitly empty table means an empty configuration. Site ownership is restored when the original owner exists, otherwise the requesting administrator is used as the explicit default owner. Uploads claiming an unsupported algorithm, excessive KDF costs, an invalid scope, a wrong password or a mismatched checksum are refused.
+
+**Agent capability gating.** A restore is also validated against the current
+fleet before it is applied: every path scope in the snapshot is checked
+against the agents serving its site as they are now. If any scope needs a
+capability the current fleet lacks (see
+[Agent capability requirements](#agent-capability-requirements)), the entire
+restore is rejected with a `400` naming the site, the offending agent and its
+version, and the missing capability — no rows are restored and no partial
+configuration is left, exactly like the other restore failures above. The
+operational fix: upgrade the agents to the minimum named in the message and
+retry, or first restore into a state whose scopes use the whole-site default
+(empty `path`) until the fleet is upgraded. The same gate applies to
+[version rollback](#post-config-versionsversion_idrollback).
 
 ---
 
@@ -5295,13 +5560,16 @@ receive JSON responses; `GET` and `DELETE` answer `405` so probing clients
 fall back to POST. The endpoint is stateless — no `Mcp-Session-Id` is issued.
 
 Authentication reuses the console credentials: `Authorization: Bearer` with
-either a `pwk_…` API key or a user JWT. A key needs the `read` permission (and
-its owner must be an administrator) to be accepted at all; the write tools
-additionally require the `write` permission on the key. Revoked or disabled
-keys are rejected. JWT sessions run through the same account checks as the
-REST API — disabled accounts and stale tokens (superseded by a newer sign-in)
-are refused, and an account that must change its password at next sign-in is
-rejected outright since MCP offers no way to complete that flow.
+either a `pwk_…` API key or a user JWT. A key needs the `read` or `write`
+permission to be accepted at all; the write tools additionally require the
+`write` permission on the key. A key is fleet-wide (all sites, including the
+admin-only tools) only when it carries `write` **and** its owner is an
+administrator — a read-only key, including the read permission an agent
+enrolment key used to carry, only sees the sites its owner owns. Revoked or
+disabled keys are rejected. JWT sessions run through the same account checks
+as the REST API — disabled accounts and stale tokens (superseded by a newer
+sign-in) are refused, and an account that must change its password at next
+sign-in is rejected outright since MCP offers no way to complete that flow.
 
 The endpoint sits outside the REST credential rate limiter, so it is capped
 for abuse resistance instead: a JSON-RPC batch may contain at most 16 calls
@@ -5316,6 +5584,16 @@ JSON-RPC batches thereof. Notifications receive `202 Accepted`.
 Because the route hangs off the root router, the 9080 self-protection stack —
 access log, IP allowlist, WAF ([see API protection](#get-settingsapi-protection))
 — applies to `/mcp` exactly as it does to the REST API.
+
+**Data boundary.** A `write` key whose owner is an administrator is fleet-wide
+and can call the admin-only tools (control-plane audit log, defense settings,
+site pause); a `read` key only sees the sites its owner owns. The built-in AI
+assistant calls these same tools, and sends your messages plus the tool results
+— site metadata, access logs, WAF events and, for an administrator, audit
+entries — to the OpenAI-compatible provider configured under **Settings → AI
+assistant**. Enable it only where that data may leave the deployment, and keep
+`allow_write_tools` off unless you accept that a prompt-injected model could
+change live configuration.
 
 ### GET /settings/mcp
 
@@ -5458,6 +5736,7 @@ is the fleet" in one call.
       "connections": 128,
       "rps": null,
       "sites": 1,
+      "version": "0.32.22",
       "last_seen": "2024-01-01T12:00:00Z"
     }
   ],
@@ -5747,6 +6026,37 @@ execution or upstream contact:
 These responses are produced by the proxy itself; they do not appear in
 `/api/v1` error codes and do not consume an origin connection.
 
+## Response security headers
+
+Every control-plane response (`/api/v1`, the MCP endpoint and the embedded
+dashboard) carries the same browser-hardening headers. They are applied with
+**if-not-present** semantics, so a handler or a reverse proxy can override them
+deliberately — audit any override, and do not strip them.
+
+| Header | Value |
+| --- | --- |
+| `Content-Security-Policy` | `default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'` |
+| `X-Content-Type-Options` | `nosniff` |
+| `X-Frame-Options` | `DENY` |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` |
+
+Notes for operators:
+
+- **Split-origin dashboards** are the only reason to widen the policy: add the
+  API origin to `connect-src` explicitly, and keep `script-src`, `base-uri` and
+  `frame-ancestors` restrictive. Never add `'unsafe-inline'` to `script-src`.
+  One exception is built in: the `dashboard.svg?refresh=` asset answers with its
+  own `Content-Security-Policy: script-src 'unsafe-inline'` for that single
+  response, because the refresh animation uses an inline script.
+- **HSTS** is a per-site data-plane setting (enable it on the sites you proxy);
+  the control-plane listener does not set it. Terminate TLS in a proxy that
+  sends `Strict-Transport-Security`, or enable HSTS on the served sites.
+- A reverse proxy that rewrites the dashboard origin must preserve these
+  headers; see [`SECURITY.md` → Response security headers](../SECURITY.md#response-security-headers).
+- The MCP endpoint's credential and data boundary (read vs write keys, and what
+  the AI assistant forwards to a provider) is documented under
+  [MCP server](#mcp-server).
+
 ## Error Responses
 
 **Every** `4xx`/`5xx` response from `/api/v1` follows one consistent format —
@@ -5771,7 +6081,7 @@ prefix, so a wrong resource name can be grepped directly.
 |-------------|------|-------------|
 | 400 | `bad_request` | Invalid input |
 | 400 | `invalid_query` | Query string failed deserialization (e.g. `?page=abc`) |
-| 400 | `invalid_body` | Request body is not valid JSON for the endpoint's schema |
+| 400/422 | `invalid_body` | Request body is not valid JSON for the endpoint's schema (status follows axum's rejection: 400 for malformed JSON, 422 when serde rejects the value — including unknown fields on `deny_unknown_fields` endpoints) |
 | 400 | `unknown_file` | `ai-crawl/preview` `file` parameter is not `robots` or `llms` |
 | 400 | `invalid_range` | Analytics `range` parameter is not `24h`, `7d` or `30d` |
 | 401 | `unauthorized` | Missing or invalid token |
@@ -5793,6 +6103,43 @@ query strings, …) are rewritten into the same envelope: `invalid_query` and
 `invalid_body` where axum's rejection text identifies them, `rate_limited` for
 a bare `429`, and `request_failed` for any other status without a more
 specific code.
+
+### 400 vs 422: structure vs semantics
+
+Write endpoints split request-body failures into two layers, and the boundary
+is worth internalising before writing a client:
+
+- **422 `invalid_body`** — the request body does not match the endpoint's
+  **structure**: malformed JSON, a field of the wrong type, or a field the
+  schema does not know. Endpoints that accept read-modify-write payloads
+  declare `deny_unknown_fields`, so echoing back a server-owned field (for
+  example `managed_rule_id` on `POST/PUT /sites/{id}/rules`) or a typo'd key
+  is rejected instead of silently dropped — an edit that changed nothing never
+  looks successful.
+- **400 `bad_request`** — the body parsed fine but fails **semantic
+  validation**: expression syntax, enum values, constraint conflicts
+  (`allow` + `mode: "block"`), length and count limits, duplicate resources.
+
+Two concrete examples from `POST /sites/{site_id}/rules`:
+
+```json
+// Body carries an unknown field → 422 Unprocessable Entity
+{"name": "r", "expression": "http.request.uri.path contains \"/x\"",
+ "action": "block", "mode": "block", "severity": 3, "tag": "typo"}
+// → {"error": {"code": "invalid_body",
+//     "message": "Failed to deserialize the JSON body into the target type: unknown field `tag`, expected one of …"}}
+
+// Structurally valid but semantically rejected → 400 Bad Request
+{"name": "r", "expression": "http.request.uri.path contains \"/x\"",
+ "action": "block", "mode": "enforce", "severity": 3}
+// → {"error": {"code": "bad_request",
+//     "message": "unknown mode 'enforce'; allowed: off|monitor|block ('enforce' is not an API value: use 'block' to enforce)"}}
+```
+
+Note that axum 0.8 maps serde deserialization rejections to **422** (not
+400) — the failure message names the unknown field or type mismatch verbatim.
+Both statuses are normalised to the `invalid_body` code, so consumers branch
+on the code, never on the status alone.
 
 ---
 

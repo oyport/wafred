@@ -13,7 +13,7 @@ before a fix exists.
 
 Instead, report privately:
 
-| Channel | Address |
+| Channel | How to reach us |
 | --- | --- |
 | **Email (preferred)** | `security@waf.red` |
 
@@ -64,19 +64,16 @@ from which it inherits the proxy data plane.
 | Version | Status | Receives security fixes |
 | --- | --- | --- |
 | `main` | Active development | Yes — but expect breaking changes |
-| `0.25.x` (current release line, 0.25.0) | Supported | **Yes** |
-| `0.24.x` | Security fixes only | No |
-| `0.23.x` | Security fixes only | No |
-| `0.22.x` | Security fixes only | No |
-| `0.21.x` | Security fixes only | No |
-| `0.20.x` | Security fixes only | No |
-| `0.16.x` | Security fixes only | No |
-| `0.15.x` | Security fixes only | No |
-| `0.14.x` | Security fixes only | No |
-| `0.13.x` and older (pingap lineage) | Legacy | Best effort, case by case |
+| `0.32.x` (current release line, latest `0.32.27`) | Supported | **Yes** |
+| `0.31.x` | Critical security fixes only | On request, best effort |
+| `0.30.x` and older | End of life | No |
 
-Only the latest release line is guaranteed to receive security patches. If you
-run an older version, please upgrade — see
+Only the latest release line is guaranteed to receive security patches. The
+previous minor line receives critical fixes on request only, and only while an
+upgrade path exists; everything older is end-of-life and should be upgraded.
+Security fixes ship in patch releases of the current line and are listed under
+`### Security` in [`CHANGELOG.md`](./CHANGELOG.md). If you run an older version,
+please upgrade — see
 [`docs/deployment.md` → Upgrade Procedure](./docs/deployment.md#upgrade-procedure).
 
 > **Note:** prebuilt Linux (amd64/arm64) binaries are published on
@@ -195,6 +192,68 @@ control.**
       at startup and the console shows a degraded banner while it is off.
 - [ ] Protect ACME/DNS provider credentials as you would protect TLS private
       keys.
+- [ ] Passkeys (WebAuthn) need a secure context: HTTPS under a hostname, or
+      `localhost`. They do not work over plain `http://` or a bare IP. Behind a
+      TLS-terminating proxy set `PINGWAF_PASSKEY_ORIGIN` to the public origin,
+      and set `PINGWAF_PASSKEY_TRUST_FORWARDED_PROTO=true` only when that proxy
+      is the one terminating TLS — see
+      [`docs/deployment.md`](./docs/deployment.md).
+
+### Response security headers
+
+- [ ] Leave the console's built-in security headers in place. Every control-plane
+      response carries `Content-Security-Policy` (`default-src 'self'`,
+      `script-src 'self'`, `connect-src 'self'`, `frame-ancestors 'none'`,
+      `base-uri 'self'`, `form-action 'self'`), `X-Content-Type-Options:
+      nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy:
+      strict-origin-when-cross-origin`. A reverse proxy or middleware must not
+      strip or weaken them.
+- [ ] A split-origin deployment is the only reason to widen the policy: add the
+      API origin to `connect-src` explicitly and keep `frame-ancestors` and
+      `script-src` restrictive. Do not add `'unsafe-inline'` to `script-src`.
+- [ ] The headers are applied with "if not present" semantics, so a handler or
+      proxy can override them deliberately — audit any override.
+- [ ] HSTS is a site-level setting (enable it on every proxied site); the
+      control-plane listener does not set it — terminate TLS in a proxy that
+      does, or enable HSTS on the sites it serves.
+- [ ] See [`docs/api.md` → Response security headers](./docs/api.md#response-security-headers)
+      for the exact header values.
+
+### Logging and stored data
+
+- [ ] Treat the log store as a credential store. Access logs keep request and
+      response headers **verbatim**, including `Authorization`, `Cookie` and
+      `Set-Cookie`, plus up to **8 KiB** of each body (`--max-body-log-size`,
+      default `8192`). Elasticsearch receives the same documents when the
+      shipper is enabled. The default retention is **180 days**
+      (**Settings → Log retention**, 1–3650 days).
+- [ ] Restrict who can read PostgreSQL and Elasticsearch, and encrypt their
+      backups: a leaked backup hands out replayable end-user credentials —
+      including the credentials of requests the WAF blocked before they reached
+      the origin.
+- [ ] If body capture is not needed, disable it (`--max-body-log-size 0` on the
+      agent) and shorten the retention window; the console log pages keep
+      working with headers only.
+- [ ] Keep `RUST_LOG=info,sqlx=warn` in production; `debug` output includes
+      request context. See
+      [`docs/user-guide.md` → Log Management](./docs/user-guide.md#log-management).
+
+### MCP and AI data boundary
+
+- [ ] Treat MCP API keys as console credentials. A `read` key is accepted but
+      scoped to the sites its owner owns; only a `write` key whose owner is an
+      administrator is fleet-wide and can call the admin-only tools (control
+      plane audit log, defense settings, site pause). Never hand a `write` key
+      to an external AI client you do not control.
+- [ ] The built-in AI assistant calls the same tools and sends your messages and
+      the tool results — site metadata, access logs, WAF events and, for an
+      administrator, control-plane audit entries — to the OpenAI-compatible
+      provider configured under **Settings → AI assistant**. Enable it only
+      where that data may leave the deployment, and review the provider's
+      retention and data-processing terms. Keep **Allow write tools** off unless
+      you accept that a prompt-injected model could change live configuration.
+- [ ] See [`docs/user-guide.md` → MCP Server](./docs/user-guide.md#mcp-server)
+      and [→ AI Assistant](./docs/user-guide.md#ai-assistant).
 
 ### Reverse-proxy trust
 

@@ -12,7 +12,7 @@ import {
   Trash,
 } from '@phosphor-icons/react'
 import { Card, CardBody, CardHeader } from '@/components/ui/Card'
-import { useUnsavedGuard } from '@/hooks/useUnsavedGuard'
+import { useRegisterUnsaved } from '@/hooks/useUnsavedGuard'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
 import { Switch } from '@/components/ui/Switch'
@@ -34,6 +34,8 @@ import {
   type BasicAuthCredential,
   type SiteBasicAuth,
 } from '@/api/types'
+import { normalizePathScope, validatePathScope } from '@/lib/pathScope'
+import { PathScopeFields } from '@/components/waf/PathScopeFields'
 
 /** One credential row being edited; `stored` marks a password the API masked. */
 interface CredentialRow {
@@ -155,6 +157,7 @@ export function BasicAuthPanel() {
         credentials: rowsToCredentials(rows),
         delay_seconds: payload.delay_seconds,
         hide_credentials: payload.hide_credentials,
+        ...normalizePathScope(payload.path ?? '', payload.match_type ?? 'prefix'),
       }),
     onSuccess: (saved) => {
       setConfig(saved)
@@ -166,7 +169,7 @@ export function BasicAuthPanel() {
     },
   })
 
-  const unsavedDialog = useUnsavedGuard(dirty)
+  useRegisterUnsaved(dirty)
 
   // Mirrors the control plane: an enabled gate with no credential would lock
   // everyone out, so the save button stays off until one is configured.
@@ -184,7 +187,6 @@ export function BasicAuthPanel() {
 
   return (
     <div>
-      {unsavedDialog}
       <div className="mb-4 flex items-center justify-end gap-2">
         <Button
           variant="secondary"
@@ -199,7 +201,18 @@ export function BasicAuthPanel() {
             variant="primary"
             disabled={!dirty || save.isPending || Boolean(blockedReason)}
             loading={save.isPending}
-            onClick={() => config && save.mutate(config)}
+            onClick={() => {
+              if (!config) return
+              const error = validatePathScope(
+                config.path ?? '',
+                config.match_type ?? 'prefix',
+              )
+              if (error) {
+                toast.error(t('common.saveFailed'), t(error))
+                return
+              }
+              save.mutate(config)
+            }}
           >
             {t('common.save')}
           </Button>
@@ -389,6 +402,14 @@ export function BasicAuthPanel() {
                   }
                   label={t('pages.basicAuth.hideCredentials')}
                   description={t('pages.basicAuth.hideCredentialsHint')}
+                />
+                <PathScopeFields
+                  path={config.path ?? ''}
+                  matchType={config.match_type ?? 'prefix'}
+                  disabled={!canWrite}
+                  onChange={(scope) =>
+                    patch({ path: scope.path, match_type: scope.match_type })
+                  }
                 />
               </CardBody>
             </Card>

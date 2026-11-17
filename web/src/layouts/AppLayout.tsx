@@ -228,8 +228,8 @@ export function AppLayout() {
           <Button
             size="icon"
             variant="ghost"
-            className="md:hidden"
-            aria-label="Open navigation"
+            className="pw-touch-target md:hidden"
+            aria-label={t('a11y.openNavigation')}
             onClick={() => setMobileOpen(true)}
             icon={<List weight="bold" className="h-5 w-5" />}
           />
@@ -241,7 +241,7 @@ export function AppLayout() {
             <button
               type="button"
               onClick={() => setPaletteOpen(true)}
-              className="relative hidden h-9 w-64 cursor-pointer rounded-md border border-line bg-recessed text-left text-sm text-fg-subtle/70 transition-colors hover:border-focus focus:border-focus focus:outline-none lg:block"
+              className="relative hidden h-9 w-64 cursor-pointer rounded-md border border-line bg-recessed text-left text-sm text-fg-subtle transition-colors hover:border-focus focus:border-focus focus:outline-none lg:block"
             >
               <MagnifyingGlass
                 weight="duotone"
@@ -258,7 +258,7 @@ export function AppLayout() {
               variant="ghost"
               aria-label={t('search.placeholder')}
               onClick={() => setPaletteOpen(true)}
-              className="lg:hidden"
+              className="pw-touch-target lg:hidden"
               icon={<MagnifyingGlass weight="duotone" className="h-5 w-5" />}
             />
 
@@ -267,6 +267,7 @@ export function AppLayout() {
               <Button
                 size="icon"
                 variant="ghost"
+                className="pw-touch-target"
                 aria-label={t('user.language')}
                 aria-haspopup="menu"
                 aria-expanded={langMenuOpen}
@@ -298,6 +299,7 @@ export function AppLayout() {
             <Button
               size="icon"
               variant="ghost"
+              className="pw-touch-target"
               aria-label={t('theme.toggle')}
               title={t('theme.toggle')}
               onClick={toggle}
@@ -314,6 +316,7 @@ export function AppLayout() {
             <Button
               size="icon"
               variant="ghost"
+              className="pw-touch-target"
               aria-label={t('pages.assistant.open')}
               title={t('pages.assistant.open')}
               onClick={toggleAssistant}
@@ -332,7 +335,7 @@ export function AppLayout() {
                 aria-expanded={userMenuOpen}
                 aria-label={t('user.account')}
                 ref={userBtnRef}
-                className="flex items-center gap-1.5 rounded-md px-1.5 py-1 transition-colors hover:bg-recessed"
+                className="pw-touch-target flex items-center gap-1.5 rounded-md px-1.5 py-1 transition-colors hover:bg-recessed"
               >
                 <UserCircle weight="duotone" className="h-7 w-7 text-brand" />
                 <CaretDown weight="bold" className="h-3 w-3 text-fg-subtle" />
@@ -554,7 +557,7 @@ function DropdownItem({
       role={role}
       className={cn(
         'flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm transition-colors',
-        active ? 'bg-brand-soft text-brand' : 'text-fg hover:bg-recessed',
+        active ? 'bg-brand-soft text-fg-brand-strong' : 'text-fg hover:bg-recessed',
       )}
     >
       {icon}

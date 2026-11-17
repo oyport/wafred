@@ -243,14 +243,30 @@ security event shows both sides — `action: monitor` with `waf_details` ending 
 own `rule_action=block`. If the event has no `downgraded=true`, the rule itself
 was configured to observe.
 
-One combination is always rejected: an **allow** rule cannot use mode
-**block**. An allow rule passes the request before any block rule can run, so
-"block" would never apply — the console refuses the save with
-`action 'allow' cannot use mode 'block': an allow rule always passes the
-request, so the block mode would never apply; use 'monitor' or 'off'`. Choose
-**Detection** (`monitor`) to watch an allow rule, or **Off** to disable it.
-This applies to editing an existing rule too, even when you only change one of
-the two fields.
+An **allow** rule is the whitelist exemption itself, so it only supports
+**Detection** (`monitor`). Mode **block** would never apply, and mode **Off**
+would remove the rule from the engine — the whitelist disappears and later
+block rules match again. The console only offers `monitor` for `allow`, and the
+API rejects both other modes with a `400`. This applies to editing an existing
+rule too, even when you only change one of the two fields.
+
+In short: the **action** decides what happens to a request the rule matches
+(`block` / `log` / `challenge` / `allow`), the **rule mode** decides whether
+this rule actually runs, and the **site mode** is the master switch — with the
+site in Detection (`monitor`) or Off, rules are only recorded, never enforced.
+The combinations that cover the common intentions:
+
+| Goal | Action | Rule mode | Site mode |
+|------|--------|-----------|-----------|
+| Enforce the block | `block` | `block` | `block` |
+| Watch first, block later | `block` | `monitor` | anything (`monitor` recommended) |
+| Whitelist (exempt a pattern) | `allow` | `monitor` | — (`allow` cannot use `block`) |
+| Record only | `log` | any | — |
+
+`allow` + `block` is rejected by the API (400), and the dialog falls back to
+`monitor` when you switch the action. An `allow` rule is an allowlist entry:
+it wins before every other rule and is not suppressed by the site mode, so a
+whitelisted path stays reachable even while the site is in monitor/off.
 
 ### Rule Groups
 
@@ -290,7 +306,9 @@ WAFred includes built-in protection against SQL injection, XSS, remote code exec
 
 **Attack categories** (9): `sqli`, `xss`, `rce`, `lfi`, `ssrf`, `deser`, `crlf`, `xxe`, `ssti`. Each category is a two-state switch — **Block** (default) or **Log only**. Log-only keeps the family's detection and logging fully active but stops blocking its matches. There is no per-category "off": detection always runs.
 
-**Built-in rules**: each of the built-in managed rules has its own Block / Log-only switch, independent of the category switches. Batch buttons switch all rules at once. Because a family's rules (SQLi, XSS, RCE score gates) and its category switch control the same signature surface, downgrading a category also flips its family rules to log-only; switching the category back removes those per-rule downgrades, resetting any individual overrides made in between.
+**Built-in rules**: each of the built-in managed rules has its own Block / Log-only switch, independent of the category switches. Seeded rows that mirror a managed rule are controls for that rule, not separate custom rules: disabling one (`enabled=false`) removes that rule from the compiled rule set on this site — it is no longer evaluated, scored or logged — and setting it to Log-only downgrades it to monitor. Their expression/action are owned by the managed ruleset and cannot be edited through the custom-rule API. Batch buttons switch all rules at once. Because a family's rules (SQLi, XSS, RCE score gates) and its category switch control the same signature surface, downgrading a category also flips its family rules to log-only; switching the category back removes those per-rule downgrades, resetting any individual overrides made in between.
+
+Disabling a managed rule is **not** a way to stop that attack class from being blocked: the signature layer it shares with the other rules of the same family keeps running, so a disabled `SQL 注入检测` row still sees SQLi payloads blocked by the `libinjection-sqli` signature. Use **Log only** (`monitor`) when the goal is to observe a family without blocking; use **Off** at the site level only when inspection should stop entirely.
 
 **Deep inspection** enables the strict managed rule set plus deep request-body inspection. Higher interception rate at a proportional performance cost. Custom rules receive the same request-body evaluation while deep inspection is on, so body-carrying bypass attempts are caught by user-defined expressions too. On the page the two posture switches — **Under-attack mode** and **Deep inspection** — sit side by side on one row.
 
@@ -320,7 +338,7 @@ Sites → [site] → Web Protection → Path exceptions
 |-------|---------|
 | Path | Must start with `/` (except `regex`, which is a pattern), at most 512 characters, no whitespace or control characters |
 | Match type | `prefix` (default; matches by path segment — `/api` covers `/api/x`, never `/apix`), `exact`, `wildcard` (a single trailing `*`, e.g. `/api/*`), or `regex` (unanchored Rust-regex match, case-sensitive by default, use `^…$` for a full match; must compile server-side) |
-| Skip layers | `*` (every layer), or any of `waf`, `bot`, `access`, `basic_auth`, `mtls`, `ai_bot`, `rate_limit`, `challenge` — the hit skips exactly these checks. `challenge` waives **every** challenge source (WAF rule/scoring challenges, CC & rate-limit challenge actions, bot protection, IP/geo rules, the standalone challenge plugin) while blocks still enforce |
+| Skip layers | `*` (every detection/rate/challenge layer), or any of `waf`, `bot`, `access`, `basic_auth`, `mtls`, `ai_bot`, `rate_limit`, `challenge`. `*` never includes `mtls` or `basic_auth`; name those explicitly if an exception must bypass authentication. `challenge` waives **every** challenge source (WAF rule/scoring challenges, CC & rate-limit challenge actions, bot protection, IP/geo rules, the standalone challenge plugin) while blocks still enforce |
 | Note | Free text, at most 200 characters; used as the label when a hit is logged |
 | Log hits | When on, every hit is recorded as a `path_bypass` security event (action `log`) |
 | Enabled | Disabled exceptions are not evaluated |
@@ -330,6 +348,16 @@ Sites → [site] → Web Protection → Path exceptions
 in the access log; only the layers named in `skip_layers` are skipped. When
 `rate_limit` is skipped, the standalone CC rate challenge is skipped too.
 
+`*` covers the layers enforced inside the WAF plugin (WAF engine including
+request-body inspection, bot protection, IP/geo restrictions, basic auth,
+mTLS and CC). The independent cache and OIDC/visitor-auth plugins are not
+part of this list; use their own configuration to scope them.
+
+Scope matching uses a canonical path: percent-decoding, `//` collapse and
+`.`/`..` resolution run before the exception is matched, so `/api/../admin`
+cannot satisfy a `/api` exception. The original path is still what gets
+logged and proxied.
+
 **What an exception cannot bypass**, no matter which layers it names: a paused
 site (maintenance page), a fail-closed edge, and an active dynamic IP ban —
 those checks run before the exception and always enforce.
@@ -338,6 +366,41 @@ Other failures you may see when saving: a duplicate path on the same site
 (`a path exception for '<path>' already exists on this site`), a site at the
 64-exception limit, an unknown skip-layer token, or a wildcard path that does
 not end in exactly one `*`.
+
+**Why a save is rejected for agent capability:** path scopes are interpreted
+by the edge agent, so the control plane refuses — with a `400` naming the
+offending agent and version — when the agents serving the site cannot execute
+what you are saving. This applies to **all five panels** that can carry a
+scope: path exceptions, IP rules, geo restrictions, basic auth and the OIDC
+configuration. For path exceptions, a `regex` match type requires every
+serving agent to be **≥ 0.32.20** (`path scope is not supported by agent
+<name> (<version>); regex scope requires agent >= 0.32.20`), and saving any
+exception (its `skip_layers` is always non-empty) requires **≥ 0.32.21**
+(`path scope is not supported by agent <name> (<version>); canonical path
+matching requires agent >= 0.32.21`), because older agents match scopes
+against the raw request path and a dot-segment request could bypass the
+exception — and its WAF checks — entirely. When both apply, the stricter bar
+(0.32.21) is the one named in the message. For the other four panels, **any
+non-empty path scope** — regex or not — requires **≥ 0.32.20**
+(`path scope is not supported by agent <name> (<version>); path scope
+requires agent >= 0.32.20`): old agents have no path field at all, so a
+scoped `allow` rule would become allow-everywhere and a scoped basic-auth
+gate would ask for credentials on the whole site. An empty path (whole site)
+is never gated.
+
+Re-enabling counts too: turning a disabled path exception back on
+(`enabled` `false` → `true`) re-arms its stored scope, so the same gate runs
+and the save is rejected if the fleet cannot execute it. Sending
+`{"enabled": true}` to an already-enabled exception is a no-op and is never
+blocked.
+
+Restoring is gated the same way: rolling back a config version or restoring
+an encrypted backup whose snapshot contains a scope the current agents cannot
+execute is refused outright with a `400` naming the site, the agent, its
+version and the missing capability — nothing is partially applied. The fix is
+operational: upgrade the agents first (or clear the offending scope's `path`)
+and retry. A site with no bound agent is never gated, and an agent whose
+version cannot be read is treated as unsupported (fail-closed).
 
 ## Rate Limiting
 
@@ -779,7 +842,7 @@ branded answer instead of the gateway's plain default 404.
 **Access Logs**: `Logs → Access`
 - All proxied requests with timing information
 - Filter by status code, path, client IP
-- Request headers and a body preview (first 1 KiB) are stored in PostgreSQL, so requests can be inspected from the dashboard without Elasticsearch
+- Request headers and a body preview (up to 8 KiB by default — `--max-body-log-size`, `0` disables body capture) are stored in PostgreSQL, so requests can be inspected from the dashboard without Elasticsearch. Headers are kept **verbatim**, including `Authorization`, `Cookie` and `Set-Cookie`, so treat the log store as a credential store: restrict database/Elasticsearch access, encrypt their backups, and keep the retention window as short as investigations allow — see [Log Retention](#log-retention).
 - Static-asset requests (path ending in a configured suffix) that triggered no security rule are not recorded when the deployment-wide filter is on — see [Log Retention](#log-retention). Requests that did trigger a rule always appear here
 
 #### Unassigned (no Host header) traffic
@@ -898,6 +961,20 @@ Self-lockout is prevented: an administrator can neither downgrade nor disable
 their own account, and the last enabled administrator can never lose admin
 access.
 
+### Passkeys (WebAuthn)
+
+Passkeys add a phishing-resistant way to sign in. Register one from **Profile**
+(the account page at `/profile`, which also lists and renames existing
+passkeys), then use the authenticator — Touch ID, Windows Hello or a hardware
+security key — on the login page instead of typing the password. Passkeys
+require a **secure context**: HTTPS under a hostname, or `localhost`. They do
+not work over plain `http://` or a bare IP, and behind a TLS-terminating proxy
+`PINGWAF_PASSKEY_ORIGIN` must name the public origin (see
+[deployment.md](./deployment.md)). A lost device is not a lockout: sign in with
+the password, delete the old passkey on **Profile**, and register the new
+device. Administrators can turn the feature off deployment-wide with
+`PINGWAF_PASSKEY_ENABLED=false`.
+
 ### Forced First-Sign-In Password Change
 
 Accounts seeded with the shipped default password — the first administrator on
@@ -938,6 +1015,19 @@ The Agents page shows:
 - Agent version
 - Pending commands
 
+**Which address you are looking at.** A row carries three, and they answer
+different questions:
+
+- the address under the hostname (`ip_address`) is what the agent reports about
+  itself;
+- **Public IP / Private IP** (detail panel) come from the agent's own egress and
+  LAN probes — a useful guess, empty when the probe failed;
+- **Connection source** (`peer_ip`) is the address the control plane actually
+  accepted the agent's stream from. It is the one value the agent cannot
+  misreport, so it is what you need when a node sits behind NAT: the row shows
+  `via <address>` whenever it differs from the reported one, and the detail
+  panel adds how long ago that address was seen live.
+
 **Where the CPU number comes from.** The fleet view
 (`GET /api/v1/system/nodes`) labels each agent's CPU figure with a
 `cpu_source` field, and the three values read differently:
@@ -962,6 +1052,19 @@ Push commands to connected agents:
 - **Purge Cache**: Clear local cache
 - **Restart Agent**: Graceful agent restart
 
+### Fleet versions
+
+The System page (observability) now opens with a **Version** card: the control
+plane's own build, the REST API prefix, and how many agents report that same
+build. Agents on another version are listed by name and version, and agents that
+have never reported one are counted separately.
+
+This is the first thing to check when a rule behaves differently on one edge
+than another: two builds can disagree on defaults, rule semantics or config
+keys, and the card makes that visible without opening the inventory. Edges that
+opt into [self-upgrade](deployment.md#agent-self-upgrade) close the gap
+on their own; the card shows them converging.
+
 ## Access Control
 
 Per-site IP rules and geo restrictions live on one page:
@@ -979,7 +1082,7 @@ Switch between the **IP rules** and **Geo restrictions** tabs with `?tab=ip` / `
 | Rule name | Label for the rule (e.g., "Block scraper subnet") |
 | Target | A manual **IP / CIDR** list, or an **IP group reference** whose ranges always follow the group's latest contents |
 | IP/CIDR | Address or range (e.g., `192.168.1.0/24`) — manual mode only |
-| Action | `block`, `allow`, `challenge`, or `js_challenge` |
+| Action | `block`, `allow`, `challenge`, `js_challenge`, or `basic_auth` |
 | Note | Why this rule exists (audit) |
 | Priority | Lower values are matched first |
 
@@ -1013,6 +1116,31 @@ A background scheduler refreshes enabled subscriptions when their interval elaps
 One group, **Cloudflare**, is seeded on first boot: the official Cloudflare IP ranges from `https://api.cloudflare.com/client/v4/ips`, refreshed daily. It starts disabled — enable it once you know how it fits your traffic.
 
 Site IP rules can reference a group instead of enumerating ranges; see [IP Rules](#ip-rules) above.
+
+### Path Scopes for Access Restrictions
+
+All four access-control settings — **IP rules**, **geo restrictions**,
+**basic auth** and **OIDC** — accept an optional path scope made of two
+fields:
+
+| Field | Meaning |
+|-------|---------|
+| `path` | The paths the setting applies to. Empty (the default for existing settings) = the whole site. |
+| `match_type` | How `path` is interpreted: `prefix` (default) / `exact` / `wildcard` / `regex` — the same semantics as [Path Exceptions](#path-exceptions). An empty `path` is always stored as `prefix`. |
+
+Per setting, a non-matching path means:
+
+- **IP rules**: the rule does not apply — this works for the `allow`, `block`, `challenge` and `basic_auth` actions alike.
+- **Geo restrictions**: the geo policy is skipped entirely.
+- **Basic auth**: for the site-wide switch, no credentials are asked for outside the gate's scope. An IP or geo rule with the `basic_auth` action is scoped by its own path: once it matches, the request must authenticate even when the gate's scope names another path, so a matched rule is never silently turned into a bypass.
+- **OIDC**: the path is fully public — no redirect to the identity provider, no session check. The OIDC callback, logout and `both`-mode provider entry stay reachable regardless of the scope.
+
+Validation matches path exceptions: a `regex` scope is compile-checked when saved (invalid patterns are rejected with `400`), and saving any of the four settings with a **non-empty `path`** — regex or not — requires every agent serving the site to be **≥ 0.32.20**; otherwise the save is rejected with a `400` naming the agent and version (see [Path Exceptions](#path-exceptions) for the message format and the reasoning). An empty `path` (whole site) is never gated. Re-enabling a disabled path exception runs the same gate.
+
+Examples:
+
+- Ask for basic auth only under `/admin`: set the basic-auth `path` to `/admin` with `match_type: "prefix"`.
+- Restrict a country block list to the API only: set the geo `path` to `/api/*` with `match_type: "wildcard"`.
 
 ## Bot Protection
 
@@ -1058,6 +1186,8 @@ The console embeds an AI assistant that answers questions about your deployment 
 
 **Test draft** verifies the provider without saving. Once enabled, ask a question on the AI Assistant page and watch tool calls appear inline as the answer streams. Conversations are stored server-side, so history survives reloads, and the assistant is administrator-only.
 
+**Data boundary:** the assistant calls the same MCP tools as external clients. Every question and every tool result it receives — site metadata, access logs, WAF events and, for an administrator, control-plane audit entries — is sent to the provider configured above. Enable it only where that data may leave your deployment, and review the provider's retention and data-processing terms. **Allow write tools** is off by default; leave it off unless you accept that a prompt-injected model could change live configuration.
+
 ## MCP Server
 
 ```
@@ -1073,7 +1203,7 @@ claude mcp add --transport http wafred https://waf.example.com:9080/mcp \
   --header "Authorization: Bearer pwk_YOUR_KEY"
 ```
 
-Read-only credentials see only the read tools; administrators with a `write` key may also call `set_observation_mode` and `set_site_status`. The endpoint sits behind the same API protection as the console (access log, IP allowlist, WAF), so it obeys whatever **Settings → API protection** allows.
+**Scope:** a `read` key is accepted but narrowed to the sites its owner owns; only a `write` key whose owner is an administrator is fleet-wide and can call the admin-only tools (the control-plane audit log, defense settings, site pause). Read-only credentials see only the read tools; administrators with a `write` key may also call `set_observation_mode` and `set_site_status`. Treat a `write` key like a dashboard administrator credential — do not hand it to an AI client you do not control. The endpoint sits behind the same API protection as the console (access log, IP allowlist, WAF), so it obeys whatever **Settings → API protection** allows.
 
 When the console is behind a load balancer or reverse proxy, enable **Settings →
 API protection → Trust reverse proxy headers**, name the forwarded header
@@ -1098,7 +1228,10 @@ redirected away from the page.
   table, so you can see exactly which rows a change touched before deciding.
 - **Rollback** archives the live state first, restores the selected snapshot
   and pushes it to the agents, behind a confirmation. It is recorded as a new
-  version and can be rolled back in turn.
+  version and can be rolled back in turn. A rollback whose snapshot contains a
+  path scope the current agents cannot execute is refused with a `400` before
+  anything changes — upgrade the agents (or clear the offending scope's
+  `path`) and retry (see [Path Exceptions](#path-exceptions)).
 
 ### Encrypted configuration backups
 

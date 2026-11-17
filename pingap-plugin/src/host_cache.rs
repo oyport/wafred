@@ -24,10 +24,16 @@ pub const HOST_CACHE_TTL_SECS: u64 = 600;
 
 /// Soft cap on cached hosts per map: the sweep evicts the least-recently-used
 /// entries beyond it, so the bound converges within one sweep interval rather
-/// than being enforced at insert time. Generous for real deployments
-/// (control-plane site counts are far smaller) while bounding worst-case
-/// memory per host entry.
-pub const HOST_CACHE_MAX_ENTRIES: usize = 1024;
+/// than being enforced at insert time.
+///
+/// Sized for the control plane's site ceiling rather than an arbitrary 1024:
+/// a deployment with ~1000 sites averages 1.2 domains each (primary +
+/// alternate), so a 1024-entry cap made every sweep evict live entries and
+/// rebuild their compiled context on the next request — a latency spike and
+/// repeated rule compilation for a cache that was supposed to be warm. 4096
+/// leaves headroom for growth; at ~200B-2KB per entry across the six per-host
+/// maps this is single-digit MB at worst, far below the recompile cost.
+pub const HOST_CACHE_MAX_ENTRIES: usize = 4096;
 
 /// Minimum wall-clock seconds between two sweeps of one map. The CAS gate
 /// makes concurrent sweeps impossible; the interval keeps the O(N) walk rare

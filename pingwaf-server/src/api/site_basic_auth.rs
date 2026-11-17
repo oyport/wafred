@@ -14,6 +14,7 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::api::capabilities;
 use crate::api::common::{load_site_read, load_site_write, parse_uuid};
 use crate::api::error::ApiError;
 use crate::api::sites::touch_site;
@@ -53,6 +54,9 @@ pub struct BasicAuthView {
     pub credentials: Vec<BasicAuthCredential>,
     pub delay_seconds: i32,
     pub hide_credentials: bool,
+    /// Empty = the whole site.
+    pub path: String,
+    pub match_type: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -70,6 +74,11 @@ pub struct UpdateBasicAuthRequest {
     pub delay_seconds: Option<i32>,
     #[serde(default)]
     pub hide_credentials: Option<bool>,
+    /// Empty clears the scope (whole site).
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub match_type: Option<String>,
 }
 
 /// Routes contributed to `/api/v1`.
@@ -103,6 +112,8 @@ async fn update(
     let row = find_or_create(&state, id).await?;
     let stored = stored_credentials(&row)?;
     let stored_enabled = row.enabled;
+    let stored_path = row.path.clone();
+    let stored_match_type = row.match_type.clone();
     let mut active: site_basic_auth::ActiveModel = row.into();
 
     if let Some(enabled) = payload.enabled {
@@ -121,6 +132,35 @@ async fn update(
     }
     if let Some(hide) = payload.hide_credentials {
         active.hide_credentials = Set(hide);
+    }
+    if payload.path.is_some() || payload.match_type.is_some() {
+        let (path, match_type) =
+            crate::api::path_exceptions::validate_optional_path(
+                payload.path.as_deref().unwrap_or(&stored_path),
+                // A partial update that only rewrites `path` must keep the
+                // stored scope type: falling back to `None` here let
+                // `validate_optional_path` default the pair to `prefix`, which
+                // silently downgraded a regex scope (and skipped the
+                // capability gate, which then saw `prefix`).
+                Some(
+                    payload
+                        .match_type
+                        .as_deref()
+                        .unwrap_or(stored_match_type.as_str()),
+                ),
+            )?;
+        // The gate sees the effective scope (after merging onto the stored
+        // row), not the raw payload — a partial update that only sends `path`
+        // inherits the stored `match_type`.
+        capabilities::ensure_attached_scope_supported(
+            &state.db,
+            id,
+            Some(&path),
+            &match_type,
+        )
+        .await?;
+        active.path = Set(path);
+        active.match_type = Set(match_type);
     }
     if let Some(submitted) = payload.credentials {
         let merged = merge_credentials(submitted, &stored)?;
@@ -285,6 +325,8 @@ fn to_view(row: &site_basic_auth::Model) -> Result<BasicAuthView, ApiError> {
         credentials,
         delay_seconds: row.delay_seconds,
         hide_credentials: row.hide_credentials,
+        path: row.path.clone(),
+        match_type: row.match_type.clone(),
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
@@ -312,6 +354,8 @@ async fn find_or_create(
         credentials: Set(serde_json::json!([])),
         delay_seconds: Set(1),
         hide_credentials: Set(false),
+        path: Set(String::new()),
+        match_type: Set("prefix".to_string()),
         created_at: Set(now),
         updated_at: Set(now),
     }

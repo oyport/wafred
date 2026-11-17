@@ -144,30 +144,34 @@ export function BlockedIpsPage() {
       {
         key: 'select',
         header: (
-          <input
-            type="checkbox"
-            aria-label={t('common.batch.selectAll')}
-            checked={allSelected}
-            ref={(el) => {
-              if (el) el.indeterminate = someSelected
-            }}
-            onChange={toggleAll}
-            disabled={batch !== null}
-            className="h-4 w-4 cursor-pointer rounded border-border align-middle disabled:cursor-not-allowed disabled:opacity-50"
-          />
+          <label className="pw-touch-check flex items-center justify-center">
+            <input
+              type="checkbox"
+              aria-label={t('common.batch.selectAll')}
+              checked={allSelected}
+              ref={(el) => {
+                if (el) el.indeterminate = someSelected
+              }}
+              onChange={toggleAll}
+              disabled={batch !== null}
+              className="h-4 w-4 cursor-pointer rounded border-border align-middle disabled:cursor-not-allowed disabled:opacity-50"
+            />
+          </label>
         ),
         width: '1%',
         minWidth: '40px',
         cell: (r) => (
-          <input
-            type="checkbox"
-            aria-label={r.ip}
-            checked={selected.has(rowKeyOf(r))}
-            onChange={() => toggleRow(r)}
-            onClick={(e) => e.stopPropagation()}
-            disabled={batch !== null}
-            className="h-4 w-4 cursor-pointer rounded border-border align-middle disabled:cursor-not-allowed disabled:opacity-50"
-          />
+          <label className="pw-touch-check flex items-center justify-center">
+            <input
+              type="checkbox"
+              aria-label={r.ip}
+              checked={selected.has(rowKeyOf(r))}
+              onChange={() => toggleRow(r)}
+              onClick={(e) => e.stopPropagation()}
+              disabled={batch !== null}
+              className="h-4 w-4 cursor-pointer rounded border-border align-middle disabled:cursor-not-allowed disabled:opacity-50"
+            />
+          </label>
         ),
       },
       {
@@ -361,6 +365,7 @@ export function BlockedIpsPage() {
         <CardBody>
           <div className="mb-4 flex flex-wrap items-center gap-3">
             <Select
+              aria-label={t('a11y.filterBySite')}
               value={siteFilter}
               onChange={(e) => setSiteFilter(e.target.value)}
               options={[

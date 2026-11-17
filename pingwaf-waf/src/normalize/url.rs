@@ -92,6 +92,25 @@ pub fn multi_decode<'a>(input: &'a str, max_layers: usize) -> Cow<'a, str> {
     current
 }
 
+/// `true` when `input` contains a percent triplet `percent_to_bytes` would
+/// decode (`%` + two hex digits). Callers use it to skip the decode pass (and
+/// its copy) for values that merely contain a literal `%`.
+pub(crate) fn has_percent_escape(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    while let Some(pos) = input[i..].find('%') {
+        let at = i + pos;
+        if at + 2 < bytes.len()
+            && bytes[at + 1].is_ascii_hexdigit()
+            && bytes[at + 2].is_ascii_hexdigit()
+        {
+            return true;
+        }
+        i = at + 1;
+    }
+    false
+}
+
 /// Lower-case every percent-encoded triplet in `input` so that `%2E` and `%2e`
 /// compare equal in subsequent signature matching. Does NOT decode anything.
 pub fn normalize_percent_case(input: &str) -> String {

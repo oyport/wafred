@@ -13,11 +13,12 @@ fn bench_error_template(c: &mut Criterion) {
                 .replace("{{version}}", "0.14.3")
                 .replace("{{content}}", content)
                 .replace("{{error_type}}", "ConnectRefused")
+                .replace("{{status}}", "502")
         })
     });
     let parsed = ErrorTemplate::new(TEMPLATE);
     group.bench_function("parsed template", |b| {
-        b.iter(|| parsed.render("0.14.3", content, "ConnectRefused", ""))
+        b.iter(|| parsed.render("0.14.3", content, "ConnectRefused", "", "502"))
     });
     group.finish();
 }

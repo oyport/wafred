@@ -7,8 +7,13 @@ import { SkeletonCard } from '@/components/ui/Skeleton'
 import { ErrorState } from '@/components/ErrorState'
 import { wafSettingsApi, wafSettingsKeys } from '@/api/wafSettings'
 
-/** Where a posture badge can send the user. */
-export type PostureTarget = 'managed' | 'custom' | 'cc' | 'bot'
+/**
+ * Where a posture badge can send the user: the engine tab owns the engine /
+ * detection switches, `cc` owns the challenge gate and under-attack mode, and
+ * the rule surfaces map one-to-one onto their tabs. `bot` is a different site
+ * page, not a tab on this one.
+ */
+export type PostureTarget = 'engine' | 'managed' | 'custom' | 'cc' | 'bot'
 
 const CATEGORY_TONE: Record<string, BadgeTone> = {
   block: 'danger',
@@ -108,16 +113,19 @@ export function PostureOverview({
             label={t('pages.protection.postureWaf')}
             value={engine === 'on' ? on : off}
             tone={engine === 'on' ? 'success' : 'neutral'}
+            onClick={() => onNavigate('engine')}
           />
           <PostureBadge
             label={t('pages.protection.deepInspection')}
             value={detection.deep_inspection ? on : off}
             tone={detection.deep_inspection ? 'info' : 'neutral'}
+            onClick={() => onNavigate('engine')}
           />
           <PostureBadge
             label={t('pages.protection.underAttackTitle')}
             value={detection.under_attack ? on : off}
             tone={detection.under_attack ? 'danger' : 'neutral'}
+            onClick={() => onNavigate('cc')}
           />
           {enforcement.observation_mode && (
             <PostureBadge

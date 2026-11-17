@@ -439,7 +439,7 @@ export function RateLimitingPage() {
 
       {rules.length > 0 && (
         <div className="mb-4 flex flex-wrap items-center gap-4 rounded-lg border border-line bg-elevated px-4 py-3">
-          <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-brand-soft text-brand">
+          <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-brand-soft text-fg-brand-strong">
             <Lightning weight="duotone" className="h-4 w-4" />
           </span>
           <div className="min-w-0 flex-1">

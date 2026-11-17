@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,6 +21,42 @@ use persist::{
     check_format_version, content_crc32, content_matches, write_atomic,
     CacheHealth, LoadSource, CACHE_FORMAT_VERSION,
 };
+
+/// Creates the rule-cache directory owner-only (`0700`) on Unix.
+///
+/// The snapshot under it carries site TLS private keys, OIDC client secrets,
+/// ACME DNS credentials and basic-auth passwords, so the directory must not be
+/// listable or traversable by another local user. `DirBuilder::mode` only
+/// applies to directories it creates, so an existing cache directory (created
+/// by an older build with the process default, typically `0755`) is tightened
+/// explicitly. Permission failures only warn: an unusual filesystem must not
+/// stop the agent from running with a cache.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        if let Err(err) = std::fs::set_permissions(
+            dir,
+            std::fs::Permissions::from_mode(0o700),
+        ) {
+            warn!(
+                dir = %dir.display(),
+                error = %err,
+                "could not restrict cache directory permissions to 0700"
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
 
 // ─────────────────────────────────────────────────────────────
 // Serializable cache types (local mirrors of proto types)
@@ -153,11 +189,11 @@ pub struct SiteRules {
     /// family actions. `None` for sites (and snapshots) without it.
     #[serde(default)]
     pub ai_crawl: Option<AiCrawlConfig>,
-    /// Operator-curated paths that skip selected protection layers. Only
-    /// honoured while the site observes (see the WAF plugin); absent — and
-    /// empty for every snapshot written before the field existed — means the
-    /// site has no exceptions. A local mirror: the proto type carries no
-    /// serde derives, and the cache snapshot must stay serializable.
+    /// Operator-curated paths that skip selected protection layers.
+    /// Honoured in every WAF mode; absent — and empty for every snapshot
+    /// written before the field existed — means the site has no exceptions.
+    /// A local mirror: the proto type carries no serde derives, and the cache
+    /// snapshot must stay serializable.
     #[serde(default)]
     pub path_exceptions: Vec<PathExceptionConfig>,
     /// Explicit path restrictions, evaluated before any exception bypass.
@@ -176,7 +212,8 @@ pub struct PathExceptionConfig {
     /// `prefix`.
     #[serde(default)]
     pub match_type: String,
-    /// `*` collapses the list; empty means every layer (old-server shape).
+    /// `*` skips every layer; an empty list skips nothing (the control plane
+    /// rejects it, and a corrupt row must not become a total bypass).
     #[serde(default)]
     pub skip_layers: Vec<String>,
     #[serde(default)]
@@ -336,6 +373,22 @@ impl ProxyTrustConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_match_type() -> String {
+    "prefix".to_string()
+}
+
+/// Maps the proto enum to the string stored in the cache; an unknown value
+/// degrades to `prefix`, matching the control plane's default.
+fn path_match_type(value: i32) -> String {
+    match proto::PathMatchType::try_from(value) {
+        Ok(proto::PathMatchType::PathMatchExact) => "exact",
+        Ok(proto::PathMatchType::PathMatchWildcard) => "wildcard",
+        Ok(proto::PathMatchType::PathMatchRegex) => "regex",
+        _ => "prefix",
+    }
+    .to_string()
 }
 
 impl SiteRules {
@@ -562,8 +615,8 @@ impl From<i32> for WafMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WafRule {
-    pub id: String,
-    pub name: String,
+    pub id: Arc<str>,
+    pub name: Arc<str>,
     pub description: String,
     pub expression: String,
     pub action: WafAction,
@@ -653,6 +706,11 @@ pub struct IpAccessRule {
     pub action: IpAccessAction,
     pub note: String,
     pub enabled: bool,
+    /// Empty = the whole site; otherwise only matching request paths.
+    #[serde(default)]
+    pub path: String,
+    #[serde(default = "default_match_type")]
+    pub match_type: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -699,6 +757,11 @@ pub struct GeoConfig {
     pub blocked_asns: Vec<String>,
     pub block_unknown: bool,
     pub action: WafAction,
+    /// Empty = the whole site.
+    #[serde(default)]
+    pub path: String,
+    #[serde(default = "default_match_type")]
+    pub match_type: String,
 }
 
 // ─── Cache Rules ────────────────────────────────────────────
@@ -903,6 +966,11 @@ pub struct BasicAuthConfig {
     pub delay_seconds: u32,
     /// Strip the `Authorization` header once the request is authenticated.
     pub hide_credentials: bool,
+    /// Empty = the whole site.
+    #[serde(default)]
+    pub path: String,
+    #[serde(default = "default_match_type")]
+    pub match_type: String,
 }
 
 /// One accepted credential, pre-encoded by the control plane.
@@ -971,6 +1039,11 @@ pub struct OidcConfig {
     /// existed, which the plugin reads as `oidc`.
     #[serde(default)]
     pub auth_mode: String,
+    /// Empty = the whole site. Non-matching paths bypass login entirely.
+    #[serde(default)]
+    pub path: String,
+    #[serde(default = "default_match_type")]
+    pub match_type: String,
     /// Rules [`Self::access_mode`] applies. Empty with an enforcing mode
     /// denies everyone, which is why the control plane refuses to ship it.
     #[serde(default)]
@@ -1314,9 +1387,26 @@ struct CacheMetadata {
     sites_len: Option<u64>,
 }
 
+/// Unix milliseconds, used only for the persist debounce (monotonicity is
+/// not required: a backwards clock step just allows an extra write).
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 // ─────────────────────────────────────────────────────────────
 // RuleCache — the main public interface
 // ─────────────────────────────────────────────────────────────
+
+/// Minimum spacing between two rule-snapshot writes caused by control-plane
+/// updates. A full sync pushes one bundle per site; rewriting (and fsyncing)
+/// the whole snapshot per bundle is O(S²) bytes for S sites. The first update
+/// after the interval still writes synchronously, so a single change is
+/// durable immediately; a burst marks the cache dirty and the background
+/// flush loop writes it once.
+const RULE_FLUSH_DEBOUNCE_MS: u64 = 1000;
 
 /// Upper bound on dynamically blocked addresses and ranges (single IPs and
 /// CIDR nets share the `blocked_ips` map). An attacker rotating unique source
@@ -1368,6 +1458,12 @@ pub struct RuleCache {
     /// task flushes it to disk (see `flush_blocked_ips`), and shutdown
     /// persists through `persist_to_disk` as before.
     blocked_dirty: AtomicBool,
+    /// Set when a control-plane update has been applied but its snapshot
+    /// write was skipped by the debounce; the background flush loop (and
+    /// shutdown) writes it once.
+    rules_dirty: AtomicBool,
+    /// Unix milliseconds of the last rule-snapshot write (0 = never).
+    last_rules_persist_ms: AtomicU64,
     /// Outcome of the latest disk load / persist cycle, reported by the
     /// heartbeat so a silently degraded cache is visible to the operator.
     health: CacheHealth,
@@ -1391,10 +1487,13 @@ impl RuleCache {
             persist_lock: Mutex::new(()),
             health: CacheHealth::new(),
             blocked_dirty: AtomicBool::new(false),
+            rules_dirty: AtomicBool::new(false),
+            last_rules_persist_ms: AtomicU64::new(0),
         });
 
-        // Ensure cache directory exists
-        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+        // Ensure the cache directory exists and is private to the agent's
+        // user: the snapshot it holds contains site TLS private keys.
+        if let Err(e) = create_private_dir(&cache_dir) {
             warn!(error = %e, "Failed to create cache directory, running without persistence");
         } else if let Err(e) = cache.load_from_disk() {
             // load_from_disk already logged the specific failure at the
@@ -1753,8 +1852,8 @@ impl RuleCache {
             self.clear_waf_auto_blocks(&site_id);
         }
 
-        // Persist asynchronously (best effort)
-        if let Err(e) = self.persist_to_disk() {
+        // Persist (debounced: a full sync pushes one bundle per site).
+        if let Err(e) = self.persist_after_update() {
             warn!(error = %e, "Failed to persist rule cache to disk");
         }
 
@@ -1939,7 +2038,7 @@ impl RuleCache {
             }
         }
 
-        if let Err(e) = self.persist_to_disk() {
+        if let Err(e) = self.persist_after_update() {
             warn!(error = %e, "Failed to persist rule cache to disk");
         }
 
@@ -2426,6 +2525,52 @@ impl RuleCache {
         outcome
     }
 
+    /// Persist after a control-plane update, debounced to at most one write
+    /// per [`RULE_FLUSH_DEBOUNCE_MS`].
+    ///
+    /// A full sync sends one bundle per site. Persisting each one rewrites and
+    /// fsyncs the entire snapshot (O(S²) bytes for S sites), so a burst only
+    /// marks the cache dirty; the first update after the interval writes
+    /// synchronously, and the background flush loop (plus shutdown) covers
+    /// the rest.
+    fn persist_after_update(&self) -> anyhow::Result<()> {
+        let now = now_unix_ms();
+        let last = self.last_rules_persist_ms.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < RULE_FLUSH_DEBOUNCE_MS {
+            self.rules_dirty.store(true, Ordering::Release);
+            return Ok(());
+        }
+        self.rules_dirty.store(false, Ordering::Release);
+        let outcome = self.persist_to_disk();
+        match &outcome {
+            Ok(()) => {
+                self.last_rules_persist_ms.store(now, Ordering::Relaxed);
+            },
+            // Leave the flag set so the flush loop retries the write.
+            Err(_) => self.rules_dirty.store(true, Ordering::Release),
+        }
+        outcome
+    }
+
+    /// Write the rule snapshot if an update was applied since the last write.
+    /// Called by the background flush loop and on shutdown; a failed write
+    /// leaves the flag set so the next tick retries.
+    pub fn flush_rule_cache_if_dirty(&self) {
+        if !self.rules_dirty.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        match self.persist_to_disk() {
+            Ok(()) => {
+                self.last_rules_persist_ms
+                    .store(now_unix_ms(), Ordering::Relaxed);
+            },
+            Err(err) => {
+                self.rules_dirty.store(true, Ordering::Release);
+                warn!(error = %err, "Failed to flush rule cache to disk");
+            },
+        }
+    }
+
     /// The current snapshot is rolled to `sites.json.bak` before the
     /// overwrite — but only when it still parses, so a corrupt file can never
     /// evict the last known-good backup. Every file lands atomically (same-
@@ -2446,7 +2591,9 @@ impl RuleCache {
         let sites_path = self.cache_dir.join("sites.json");
         let metadata_path = self.cache_dir.join("metadata.json");
 
-        let sites_json = serde_json::to_string_pretty(&**rules)?;
+        // Compact JSON: the snapshot is machine-read only, and the whitespace
+        // cost ~25% of its size on every write (and every backup roll).
+        let sites_json = serde_json::to_string(&**rules)?;
         self.roll_backup_if_valid(&sites_path)?;
 
         write_atomic(&sites_path, sites_json.as_bytes())?;
@@ -2459,7 +2606,7 @@ impl RuleCache {
             sites_crc32: Some(content_crc32(sites_json.as_bytes())),
             sites_len: Some(sites_json.len() as u64),
         };
-        let meta_json = serde_json::to_string_pretty(&metadata)?;
+        let meta_json = serde_json::to_string(&metadata)?;
         write_atomic(&metadata_path, meta_json.as_bytes())?;
 
         // Caller holds the lock; the inner variant must not re-lock.
@@ -2471,23 +2618,57 @@ impl RuleCache {
 
     /// Copies `sites.json` and `metadata.json` to their `.bak` siblings
     /// before an overwrite, keeping the roll-over only when the current
-    /// snapshot still parses — a corrupt primary must never destroy the last
-    /// known-good backup.
+    /// snapshot still validates — a corrupt primary must never destroy the
+    /// last known-good backup.
+    ///
+    /// Validation uses the metadata stamp (CRC32 + length over the exact
+    /// bytes) instead of deserializing the whole snapshot: the old shape
+    /// parsed every site on every persist, which is the same O(S) work as the
+    /// write it was guarding. A snapshot written before the stamp existed
+    /// falls back to the full parse.
     fn roll_backup_if_valid(&self, sites_path: &Path) -> anyhow::Result<()> {
         if !sites_path.exists() {
             return Ok(());
         }
         let metadata_path = self.cache_dir.join("metadata.json");
-        // Full validation, not just a parse: a tampered-but-parseable
-        // snapshot must never evict the last known-good backup.
-        if self.read_snapshot(sites_path, &metadata_path).is_err() {
+        // Read the primary once; the backup is written from these bytes.
+        let bytes = std::fs::read(sites_path)?;
+        let valid = match std::fs::read(&metadata_path) {
+            Ok(meta_bytes) => {
+                match serde_json::from_slice::<CacheMetadata>(&meta_bytes) {
+                    Ok(meta) => {
+                        if meta.version != CACHE_FORMAT_VERSION {
+                            // The load path rejects this snapshot too, so it
+                            // must not evict the last known-good backup.
+                            false
+                        } else {
+                            match (meta.sites_crc32, meta.sites_len) {
+                                (Some(crc), Some(len)) => {
+                                    content_matches(&bytes, crc, len)
+                                },
+                                // Pre-stamp snapshot: keep the old, stronger
+                                // check for the one-time migration.
+                                _ => serde_json::from_slice::<CachedRules>(
+                                    &bytes,
+                                )
+                                .is_ok(),
+                            }
+                        }
+                    },
+                    Err(_) => {
+                        serde_json::from_slice::<CachedRules>(&bytes).is_ok()
+                    },
+                }
+            },
+            Err(_) => serde_json::from_slice::<CachedRules>(&bytes).is_ok(),
+        };
+        if !valid {
             debug!(
                 file = %sites_path.display(),
                 "current snapshot fails validation; keeping the previous backup instead of rolling it"
             );
             return Ok(());
         }
-        let bytes = std::fs::read(sites_path)?;
         write_atomic(&sites_path.with_extension("json.bak"), &bytes)?;
         if metadata_path.exists() {
             let meta_bytes = std::fs::read(&metadata_path)?;
@@ -2499,6 +2680,46 @@ impl RuleCache {
         Ok(())
     }
 
+    /// Best-effort tightening of the on-disk snapshot files to owner-only
+    /// (`0600` on Unix).
+    ///
+    /// `sites.json` (and its roll-over backup) carry site TLS private keys,
+    /// OIDC client secrets, ACME DNS credentials and basic-auth passwords;
+    /// `blocked_ips.json`/`metadata.json` are written next to them. Files
+    /// written by this build are already `0600`, but a cache written by an
+    /// older build is not, and the agent must not leave that exposure in place
+    /// across an upgrade. Failures only warn — a read-only or unusual
+    /// filesystem must not turn a usable cache into a startup failure.
+    fn harden_cache_file_permissions(&self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            for name in [
+                "sites.json",
+                "sites.json.bak",
+                "metadata.json",
+                "metadata.json.bak",
+                "blocked_ips.json",
+            ] {
+                let path = self.cache_dir.join(name);
+                if !path.exists() {
+                    continue;
+                }
+                if let Err(err) = std::fs::set_permissions(
+                    &path,
+                    std::fs::Permissions::from_mode(0o600),
+                ) {
+                    warn!(
+                        file = %path.display(),
+                        error = %err,
+                        "could not restrict cache file permissions to 0600"
+                    );
+                }
+            }
+        }
+    }
+
     /// Load rules from disk, falling back to the `.bak` snapshot when the
     /// primary fails validation.
     ///
@@ -2507,6 +2728,11 @@ impl RuleCache {
     /// total failure warns loudly because the agent then runs on empty rules
     /// until the control plane re-pushes.
     pub fn load_from_disk(&self) -> anyhow::Result<()> {
+        // A cache written by an older build (or by hand) can be
+        // world-readable. Tighten every snapshot file before it is read so the
+        // secrets it carries are never exposed even if validation fails below.
+        self.harden_cache_file_permissions();
+
         let sites_path = self.cache_dir.join("sites.json");
         let metadata_path = self.cache_dir.join("metadata.json");
 
@@ -2892,8 +3118,8 @@ impl RuleCache {
                 .custom_rules
                 .iter()
                 .map(|r| WafRule {
-                    id: r.id.clone(),
-                    name: r.name.clone(),
+                    id: Arc::from(r.id.as_str()),
+                    name: Arc::from(r.name.as_str()),
                     description: r.description.clone(),
                     expression: r.expression.clone(),
                     action: WafAction::from(r.action),
@@ -2968,6 +3194,8 @@ impl RuleCache {
             action: IpAccessAction::from(r.action),
             note: r.note.clone(),
             enabled: r.enabled,
+            path: r.path.clone(),
+            match_type: path_match_type(r.match_type),
         }
     }
 
@@ -2979,6 +3207,8 @@ impl RuleCache {
             blocked_asns: g.blocked_asns.clone(),
             block_unknown: g.block_unknown,
             action: WafAction::from(g.action),
+            path: g.path.clone(),
+            match_type: path_match_type(g.match_type),
         }
     }
 
@@ -3037,6 +3267,8 @@ impl RuleCache {
                 .collect(),
             delay_seconds: b.delay_seconds,
             hide_credentials: b.hide_credentials,
+            path: b.path.clone(),
+            match_type: path_match_type(b.match_type),
         }
     }
 
@@ -3392,6 +3624,8 @@ mod tests {
         assert_eq!(converted.redirect_url, proto_cfg.redirect_url);
         assert_eq!(converted.scopes, proto_cfg.scopes);
         assert_eq!(converted.cookie_name, proto_cfg.cookie_name);
+        assert_eq!(converted.path, proto_cfg.path);
+        assert_eq!(converted.match_type, "regex");
         assert_eq!(
             converted.session_ttl_seconds,
             proto_cfg.session_ttl_seconds
@@ -3853,6 +4087,53 @@ mod tests {
             180,
             "a rule-only sync must not reset the site-level timeout"
         );
+    }
+
+    #[test]
+    fn rule_snapshot_flush_covers_debounced_updates() {
+        // A full sync pushes one bundle per site. Persisting each bundle
+        // rewrites the whole snapshot, so the update path is debounced; the
+        // background flush (and shutdown) must still write the final state.
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            RuleCache::new(dir.path().to_path_buf(), "test".to_string())
+                .unwrap();
+        let site = |id: &str, domain: &str| proto::Site {
+            id: id.to_string(),
+            domain: domain.to_string(),
+            rules: Some(proto::RuleBundle {
+                site_id: id.to_string(),
+                config_hash: "hash-1".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        cache
+            .update_from_site_config(&proto::SiteConfig {
+                sites: vec![site("site-a", "a.example.com")],
+                ..Default::default()
+            })
+            .unwrap();
+        // A second update inside the debounce window only marks the cache
+        // dirty.
+        cache
+            .update_from_bundle(&proto::RuleBundle {
+                site_id: "site-b".to_string(),
+                config_hash: "hash-2".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        cache.flush_rule_cache_if_dirty();
+        let bytes = std::fs::read(dir.path().join("sites.json")).unwrap();
+        let rules: CachedRules = serde_json::from_slice(&bytes).unwrap();
+        assert!(rules.sites.contains_key("site-a"), "first site missing");
+        assert!(
+            rules.sites.contains_key("site-b"),
+            "debounced update missing after flush"
+        );
+        // The snapshot is compact JSON: the whitespace of the old
+        // `to_string_pretty` cost ~25% of every write and backup roll.
+        assert!(!bytes.contains(&b'\n'), "sites.json should be compact");
     }
 
     #[test]
@@ -4540,5 +4821,118 @@ mod tests {
             meta.sites_len.unwrap()
         ));
         serde_json::from_slice::<CachedRules>(&bytes).unwrap();
+    }
+
+    /// The cache directory and every snapshot file are owner-only: the
+    /// snapshot carries site TLS private keys, OIDC client secrets, ACME DNS
+    /// credentials and basic-auth passwords.
+    #[cfg(unix)]
+    #[test]
+    fn cache_directory_and_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let cache =
+            RuleCache::new(cache_dir.clone(), "test".to_string()).unwrap();
+
+        let dir_mode =
+            std::fs::metadata(&cache_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "cache directory must be owner-only");
+
+        // Two persists: the second rolls the first snapshot to `sites.json.bak`.
+        cache.persist_to_disk().unwrap();
+        cache.persist_to_disk().unwrap();
+        assert!(
+            cache_dir.join("sites.json.bak").exists(),
+            "the roll-over backup must exist for the permission check"
+        );
+
+        for name in [
+            "sites.json",
+            "sites.json.bak",
+            "metadata.json",
+            "metadata.json.bak",
+            "blocked_ips.json",
+        ] {
+            let path = cache_dir.join(name);
+            if !path.exists() {
+                continue;
+            }
+            let mode =
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{name} must be owner-only, got {mode:o}");
+        }
+    }
+
+    /// A cache written by an older build (directory `0755`, files `0644`) is
+    /// tightened the next time it is loaded.
+    #[cfg(unix)]
+    #[test]
+    fn legacy_world_readable_cache_is_hardened_on_load() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        {
+            let cache =
+                RuleCache::new(cache_dir.clone(), "test".to_string()).unwrap();
+            cache.persist_to_disk().unwrap();
+            cache.persist_to_disk().unwrap();
+        }
+
+        // Simulate a snapshot produced by the previous build: the directory
+        // and every file were created with the process default (umask 022).
+        std::fs::set_permissions(
+            &cache_dir,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        for name in [
+            "sites.json",
+            "sites.json.bak",
+            "metadata.json",
+            "metadata.json.bak",
+            "blocked_ips.json",
+        ] {
+            let path = cache_dir.join(name);
+            if path.exists() {
+                std::fs::set_permissions(
+                    &path,
+                    std::fs::Permissions::from_mode(0o644),
+                )
+                .unwrap();
+            }
+        }
+
+        let reloaded =
+            RuleCache::new(cache_dir.clone(), "test".to_string()).unwrap();
+        assert_eq!(
+            reloaded.health.status().source,
+            LoadSource::Disk,
+            "the hardened cache must still load"
+        );
+
+        let dir_mode =
+            std::fs::metadata(&cache_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "an existing cache dir must be tightened");
+        for name in [
+            "sites.json",
+            "sites.json.bak",
+            "metadata.json",
+            "metadata.json.bak",
+            "blocked_ips.json",
+        ] {
+            let path = cache_dir.join(name);
+            if !path.exists() {
+                continue;
+            }
+            let mode =
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "{name} must be tightened from 0644, got {mode:o}"
+            );
+        }
     }
 }

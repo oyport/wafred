@@ -70,7 +70,7 @@ export function MemoryDetail({ memory }: { memory: SystemMemoryMetrics | undefin
     memory.commit_percent != null ? memory.commit_percent.toFixed(1) : null
   const tone = commitTone(memory.commit_percent)
   return (
-    <Card className="p-4">
+    <Card className="h-full p-4">
       <div className="flex flex-col">
         <Row
           label={t('system.memory.vmSize')}

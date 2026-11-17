@@ -415,9 +415,9 @@ message RuleBundle {
   // server: the agent never skips logging (fail-open).
   optional LogSettings log_settings = 32;
 
-  // Path exceptions: request paths that skip selected protection layers. Only
-  // honoured while the site is in observation mode. Absent = no exceptions
-  // (old servers never send them).
+  // Path exceptions: request paths that skip selected protection layers.
+  // Honoured in every WAF mode. Absent = no exceptions (old servers never
+  // send them).
   repeated PathException path_exceptions = 33;
   // Ordered request path restrictions; evaluated before path exceptions.
   repeated PathRestriction path_restrictions = 34;
@@ -452,7 +452,8 @@ message PathException {
   string id = 1;
   string path = 2;
   PathMatchType match_type = 3;
-  // `*` collapses the list; empty means every layer (old-server shape).
+  // `*` skips every layer. An empty list skips nothing (the control plane
+  // rejects it on save; a corrupt/old row must not become a total bypass).
   repeated string skip_layers = 4;
   bool enabled = 5;
   // Write a `security_events` row on every hit. Off by default: a health
@@ -616,6 +617,9 @@ message BasicAuthConfig {
   uint32 delay_seconds = 4;
   // Strip the Authorization header before forwarding to the origin.
   bool hide_credentials = 5;
+  // Empty = the whole site.
+  string path = 6;
+  PathMatchType match_type = 7;
 }
 
 message BasicAuthCredential {
@@ -808,6 +812,10 @@ message IpAccessRule {
   IpAccessAction action = 4;
   string note = 5;
   bool enabled = 6;
+  // Empty = the whole site; otherwise the rule only applies to paths
+  // matching `match_type`.
+  string path = 7;
+  PathMatchType match_type = 8;
 }
 
 enum IpAccessAction {
@@ -826,6 +834,9 @@ message GeoConfig {
   repeated string blocked_asns = 4;
   bool block_unknown = 5;
   WafAction action = 6;
+  // Empty = the whole site.
+  string path = 7;
+  PathMatchType match_type = 8;
 }
 
 message CacheRule {
@@ -1126,6 +1137,10 @@ message LogEntry {
   // Upstream info
   string upstream_addr = 40;
   uint64 upstream_latency_ms = 41;
+  // Status returned by the origin. When no origin was contacted (WAF block,
+  // challenge, cache hit, edge error) the data plane repeats `response_status`
+  // so consumers always have a final status to show.
+  uint32 upstream_status = 42;
 
   // WAF info
   uint32 waf_score = 50;

@@ -25,10 +25,11 @@ enum Segment {
     Content,
     ErrorType,
     RequestId,
+    Status,
 }
 
 /// A pre-parsed error page template with `{{version}}`, `{{content}}`,
-/// `{{error_type}}` and `{{request_id}}` placeholders.
+/// `{{error_type}}`, `{{request_id}}` and `{{status}}` placeholders.
 #[derive(Debug, Clone)]
 pub struct ErrorTemplate {
     segments: Vec<Segment>,
@@ -53,6 +54,7 @@ impl ErrorTemplate {
                 "content" => Segment::Content,
                 "error_type" => Segment::ErrorType,
                 "request_id" => Segment::RequestId,
+                "status" => Segment::Status,
                 // Not a placeholder: keep the text and look past it.
                 _ => {
                     let end = start + 2 + len + 2;
@@ -100,19 +102,24 @@ impl ErrorTemplate {
 
     /// The page for one error, built in a single pass into a buffer of the
     /// right size.
+    ///
+    /// `status` is the HTTP status code as text (e.g. `"404"`), so the shared
+    /// page can say which failure it is rendering.
     pub fn render(
         &self,
         version: &str,
         content: &str,
         error_type: &str,
         request_id: &str,
+        status: &str,
     ) -> String {
         let mut out = String::with_capacity(
             self.literal_len
                 + version.len()
                 + content.len()
                 + error_type.len()
-                + request_id.len(),
+                + request_id.len()
+                + status.len(),
         );
         for segment in &self.segments {
             out.push_str(match segment {
@@ -121,6 +128,7 @@ impl ErrorTemplate {
                 Segment::Content => content,
                 Segment::ErrorType => error_type,
                 Segment::RequestId => request_id,
+                Segment::Status => status,
             });
         }
         out
@@ -139,11 +147,12 @@ mod tests {
             .replace("{{version}}", "1.2.3")
             .replace("{{content}}", "boom")
             .replace("{{error_type}}", "InternalError")
-            .replace("{{request_id}}", "req-1");
+            .replace("{{request_id}}", "req-1")
+            .replace("{{status}}", "404");
         let parsed = ErrorTemplate::new(template);
         assert_eq!(
             expected,
-            parsed.render("1.2.3", "boom", "InternalError", "req-1")
+            parsed.render("1.2.3", "boom", "InternalError", "req-1", "404")
         );
         assert_eq!(false, parsed.is_json());
     }
@@ -156,24 +165,47 @@ mod tests {
         assert_eq!(true, parsed.is_json());
         assert_eq!(
             r#"{"v":"1","e":"T","m":"c","x":"{{other}}","y":"{{"}"#,
-            parsed.render("1", "c", "T", "r")
+            parsed.render("1", "c", "T", "r", "500")
         );
         // A placeholder can appear more than once, and text without any is
         // returned as it is.
         assert_eq!(
             "a-a",
             ErrorTemplate::new("{{content}}-{{content}}")
-                .render("v", "a", "t", "r")
+                .render("v", "a", "t", "r", "500")
         );
         assert_eq!(
             "plain",
-            ErrorTemplate::new("plain").render("v", "c", "t", "r")
+            ErrorTemplate::new("plain").render("v", "c", "t", "r", "500")
         );
-        assert_eq!("", ErrorTemplate::new("").render("v", "c", "t", "r"));
+        assert_eq!(
+            "",
+            ErrorTemplate::new("").render("v", "c", "t", "r", "500")
+        );
         // The request id placeholder renders the id it is given.
         assert_eq!(
             "id=r9",
-            ErrorTemplate::new("id={{request_id}}").render("v", "c", "t", "r9")
+            ErrorTemplate::new("id={{request_id}}")
+                .render("v", "c", "t", "r9", "500")
+        );
+    }
+
+    #[test]
+    fn test_status_placeholder() {
+        let parsed = ErrorTemplate::new("HTTP {{status}}");
+        assert_eq!("HTTP 404", parsed.render("v", "c", "t", "r", "404"));
+        assert_eq!("HTTP 503", parsed.render("v", "c", "t", "r", "503"));
+        // Only the exact name is a placeholder: `{{status_code}}` stays
+        // literal so a custom template's unknown names survive untouched.
+        let parsed = ErrorTemplate::new("{{status_code}} {{status}}");
+        assert_eq!(
+            "{{status_code}} 429",
+            parsed.render("v", "c", "t", "r", "429")
+        );
+        // An empty status renders empty rather than leaving the braces.
+        assert_eq!(
+            "",
+            ErrorTemplate::new("{{status}}").render("", "", "", "", "")
         );
     }
 }

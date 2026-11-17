@@ -15,7 +15,21 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 # The workspace declares regex with default-features = false; the detection
 # engine needs the std backend plus Unicode-aware case folding for `(?i)`.
-regex = { workspace = true, features = ["std", "unicode-case", "unicode-perl"] }
+#
+# `perf` is spelled out on purpose: without it the regex crate falls back to
+# the PikeVM (no lazy DFA, no literal prefilter), which measured 17-49x slower
+# on this crate's detector battery. The shipped `pingwaf` binary happened to
+# enable it through feature unification with `pingora-cache`'s default regex
+# dependency, so a waf-only build (tests, examples, downstream users) silently
+# ran the slow path, and any upstream change to that dependency would have
+# degraded production the same way without a compile error. Keep this feature
+# list explicit.
+regex = { workspace = true, features = [
+    "std",
+    "unicode-case",
+    "unicode-perl",
+    "perf",
+] }
 ahash = { workspace = true }
 aho-corasick = "1"
 base64 = { workspace = true }

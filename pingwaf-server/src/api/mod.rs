@@ -15,6 +15,7 @@ pub mod blocked_ips;
 pub mod bot;
 pub mod cache;
 pub mod cache_settings;
+pub mod capabilities;
 pub mod challenge;
 pub mod common;
 pub mod config_backups;
@@ -51,6 +52,7 @@ pub mod ssl;
 pub mod state;
 pub mod system;
 pub mod system_tls;
+pub mod upgrade;
 pub mod users;
 pub(crate) mod validation;
 pub mod visitors;
@@ -61,7 +63,7 @@ use crate::tls::ConnInfo;
 use axum::extract::connect_info::ConnectInfo;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Request, State};
-use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -110,6 +112,58 @@ pub const DEFAULT_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 
 /// Attributes one control-plane request to the `control` module. The timer
 /// is a relaxed atomic add on drop, so the middleware costs nanoseconds.
+/// Header carrying the per-request correlation id, echoed back on every
+/// `/api/v1` response (successful or not) so a console error can quote the id
+/// the control plane logged.
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Longest client-supplied id that is reused verbatim. UUIDs are 36 bytes; the
+/// ceiling leaves room for gateway-generated ids without letting a caller
+/// smuggle an unbounded value into every log line.
+const MAX_REQUEST_ID_LEN: usize = 128;
+
+/// Whether a client-supplied request id is safe to echo.
+///
+/// Only visible ASCII identifier characters are accepted: the value ends up in
+/// response headers and access logs, so control characters (CR/LF in
+/// particular) and non-ASCII must not pass through. An invalid value is
+/// replaced with a fresh id instead of being rejected — the request itself is
+/// still perfectly valid.
+fn valid_request_id(value: &str) -> bool {
+    let len = value.len();
+    (1..=MAX_REQUEST_ID_LEN).contains(&len)
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        })
+}
+
+/// The id for this request: the client's well-formed one, else a fresh UUIDv4.
+fn resolve_request_id(headers: &HeaderMap) -> String {
+    headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| valid_request_id(value))
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+/// Stamps every response with `x-request-id` (T03).
+///
+/// Outermost middleware on the `/api/v1` group: the error-envelope middleware
+/// rebuilds some responses, and the header has to survive that as well, so the
+/// id is attached after the rest of the stack has produced its response.
+async fn attach_request_id(request: Request, next: Next) -> Response {
+    let id = resolve_request_id(request.headers());
+    let mut response = next.run(request).await;
+    if let Ok(value) = HeaderValue::from_str(&id) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
+    }
+    response
+}
+
 async fn record_control_module(request: Request, next: Next) -> Response {
     // Method attribution (see pingwaf-profiler): the timer books the
     // `control` module row as well.
@@ -136,6 +190,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(users::routes())
         .merge(visitors::routes())
         .merge(agents::routes())
+        .merge(upgrade::routes())
         .merge(rules::routes())
         .merge(rate_limiting::routes())
         .merge(cache::routes())
@@ -196,7 +251,10 @@ pub fn build_router(state: AppState) -> Router {
         // middlewares above (both cheap) but not CORS/compression/security
         // headers, which wrap the root router.
         .layer(middleware::from_fn(unified_error_envelope))
-        .layer(middleware::from_fn(record_control_module));
+        .layer(middleware::from_fn(record_control_module))
+        // Outermost: every `/api/v1` response — including the ones rebuilt by
+        // the error envelope above — carries the correlation id (T03).
+        .layer(middleware::from_fn(attach_request_id));
 
     let mut root = Router::new()
         .nest(API_PREFIX, api)
@@ -935,6 +993,124 @@ mod tests {
         assert_eq!(StatusCode::METHOD_NOT_ALLOWED, response.status());
         let body = body_of(response).await;
         assert_eq!("method_not_allowed", body["error"]["code"]);
+    }
+
+    /* ── x-request-id (T03) ─────────────────────────────────────────── */
+
+    fn request_id_app() -> Router {
+        Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .fallback(api_not_found)
+            .layer(middleware::from_fn(unified_error_envelope))
+            .layer(middleware::from_fn(attach_request_id))
+    }
+
+    fn request_id_of(response: &Response) -> Option<&str> {
+        response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+    }
+
+    #[test]
+    fn request_id_validation_rejects_newlines_and_oversize_values() {
+        assert!(valid_request_id("edge-42:abc.def/1"));
+        assert!(valid_request_id(&"a".repeat(MAX_REQUEST_ID_LEN)));
+        assert!(!valid_request_id(""));
+        assert!(!valid_request_id(&"a".repeat(MAX_REQUEST_ID_LEN + 1)));
+        assert!(!valid_request_id("has space"));
+        // CR/LF would let a caller forge access-log lines and extra headers.
+        assert!(!valid_request_id("line\r\nbreak"));
+        assert!(!valid_request_id("emoji-🛡"));
+    }
+
+    #[tokio::test]
+    async fn request_id_is_echoed_when_the_client_supplied_a_valid_one() {
+        use tower::ServiceExt;
+
+        let response = request_id_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/ok")
+                    .header(REQUEST_ID_HEADER, "edge-42:abc.def/1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!(Some("edge-42:abc.def/1"), request_id_of(&response));
+    }
+
+    #[tokio::test]
+    async fn request_id_is_generated_when_the_request_has_none() {
+        use tower::ServiceExt;
+
+        let response = request_id_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/ok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = request_id_of(&response).expect("a generated id");
+        uuid::Uuid::parse_str(id).expect("the generated id is a UUID");
+    }
+
+    #[tokio::test]
+    async fn request_id_replaces_a_malformed_client_value() {
+        use tower::ServiceExt;
+
+        let oversize = "a".repeat(MAX_REQUEST_ID_LEN + 1);
+        for bad in ["bad id", oversize.as_str()] {
+            let response = request_id_app()
+                .oneshot(
+                    Request::builder()
+                        .uri("/ok")
+                        .header(REQUEST_ID_HEADER, bad)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let id = request_id_of(&response).expect("an id");
+            assert_ne!(bad, id);
+            uuid::Uuid::parse_str(id).expect("replaced with a UUID");
+        }
+    }
+
+    #[tokio::test]
+    async fn request_id_survives_the_error_envelope() {
+        use tower::ServiceExt;
+
+        // The fallback's 404 is rebuilt by the envelope; the correlation id is
+        // attached after that rebuild, so it must still be present.
+        let response = request_id_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/ghosts")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::NOT_FOUND, response.status());
+        assert!(request_id_of(&response).is_some_and(|id| !id.is_empty()));
+
+        // A client-supplied id is echoed on errors too.
+        let response = request_id_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/ghosts")
+                    .header(REQUEST_ID_HEADER, "client-err-1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(Some("client-err-1"), request_id_of(&response));
     }
 
     /// Drives the middleware over real sockets, with the same listener wiring

@@ -88,6 +88,22 @@ static NAMED_ENTITIES: Lazy<AHashMap<&'static str, char>> = Lazy::new(|| {
     pairs.iter().copied().collect()
 });
 
+/// `true` when `input` contains at least one `&` that starts a decodable
+/// entity. Lets callers skip the copying decode for values that merely contain
+/// `&` (URLs in a Referer, form-encoded bodies) — `decode_entities` would
+/// return a byte-identical copy there.
+pub fn has_decodable_entity(input: &str) -> bool {
+    let mut rest = input;
+    while let Some(pos) = rest.find('&') {
+        let after = &rest[pos + 1..];
+        if try_decode_entity(after).is_some() {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
 /// Decode HTML named and numeric entities in `input`. Returns the input
 /// untouched when it contains no `&`. Slicing happens only at ASCII `&`
 /// boundaries so multi-byte UTF-8 sequences pass through verbatim.

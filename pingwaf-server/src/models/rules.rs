@@ -69,7 +69,7 @@ pub mod mode {
             OFF => 0,
             MONITOR => 1,
             BLOCK => 2,
-            _ => 0,
+            _ => 1,
         }
     }
 }
@@ -122,6 +122,11 @@ pub mod rules {
         pub enabled: bool,
         pub mode: String,
         pub priority: i32,
+        /// Stable identifier of the built-in managed rule a seeded row mirrors
+        /// (e.g. `PINGWAF-1010`). `None` for operator-created rules and for
+        /// seed rules without a managed counterpart — those travel to the
+        /// data plane as ordinary custom rules.
+        pub managed_rule_id: Option<String>,
         pub created_at: DateTimeUtc,
         pub updated_at: DateTimeUtc,
     }
@@ -300,5 +305,12 @@ mod tests {
         assert!(action::is_valid_geo(action::BASIC_AUTH));
         assert!(!action::is_valid(action::BASIC_AUTH));
         assert_eq!(5, action::to_proto(action::BASIC_AUTH));
+    }
+
+    #[test]
+    fn an_unknown_mode_degrades_to_monitor_not_off() {
+        assert_eq!(1, mode::to_proto("enforced"));
+        assert_eq!(0, mode::to_proto(mode::OFF));
+        assert_eq!(2, mode::to_proto(mode::BLOCK));
     }
 }

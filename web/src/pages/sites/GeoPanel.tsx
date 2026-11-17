@@ -21,7 +21,7 @@ import {
   ResponsiveContainer,
 } from 'recharts'
 import { Card, CardBody, CardHeader } from '@/components/ui/Card'
-import { useUnsavedGuard } from '@/hooks/useUnsavedGuard'
+import { useRegisterUnsaved } from '@/hooks/useUnsavedGuard'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
 import { Select } from '@/components/ui/Select'
@@ -42,6 +42,8 @@ import {
 import { useCanWrite } from '@/hooks'
 import { cn } from '@/lib/utils'
 import { formatCompactNumber, formatNumber } from '@/lib/format'
+import { normalizePathScope, validatePathScope } from '@/lib/pathScope'
+import { PathScopeFields } from '@/components/waf/PathScopeFields'
 import {
   GEO_ACTIONS,
   GEO_MODES,
@@ -107,6 +109,7 @@ export function GeoPanel() {
         blocked_asns: payload.blocked_asns,
         block_unknown: payload.block_unknown,
         action: payload.action,
+        ...normalizePathScope(payload.path, payload.match_type),
       }),
     onSuccess: (saved) => {
       setConfig(saved)
@@ -116,7 +119,7 @@ export function GeoPanel() {
     },
   })
 
-  const unsavedDialog = useUnsavedGuard(dirty)
+  useRegisterUnsaved(dirty)
 
   const statsData = useMemo(
     () =>
@@ -153,7 +156,6 @@ export function GeoPanel() {
 
   return (
     <div>
-      {unsavedDialog}
       <div className="mb-4 flex items-center justify-end gap-2">
         <Button
           variant="secondary"
@@ -171,7 +173,18 @@ export function GeoPanel() {
             variant="primary"
             disabled={!dirty || save.isPending}
             loading={save.isPending}
-            onClick={() => config && save.mutate(config)}
+            onClick={() => {
+              if (!config) return
+              const error = validatePathScope(
+                config.path ?? '',
+                config.match_type ?? 'prefix',
+              )
+              if (error) {
+                toast.error(t('common.saveFailed'), t(error))
+                return
+              }
+              save.mutate(config)
+            }}
           >
             {t('common.save')}
           </Button>
@@ -239,6 +252,14 @@ export function GeoPanel() {
                   onCheckedChange={(block_unknown) => patch({ block_unknown })}
                   label={t('pages.geo.blockUnknown')}
                   description={t('pages.geo.blockUnknownHint')}
+                />
+                <PathScopeFields
+                  path={config.path ?? ''}
+                  matchType={config.match_type ?? 'prefix'}
+                  disabled={!canWrite}
+                  onChange={(scope) =>
+                    patch({ path: scope.path, match_type: scope.match_type })
+                  }
                 />
               </CardBody>
             </Card>
@@ -488,7 +509,7 @@ function CountryPicker({
               <div className="sticky top-0 z-10 flex items-center justify-between gap-2 bg-recessed px-3 py-1.5">
                 <span className="text-[11px] font-semibold uppercase tracking-wide text-fg-subtle">
                   {t(`continents.${group.continent}`, group.continent)}
-                  <span className="ml-1.5 font-normal normal-case tabular-nums text-fg-subtle/70">
+                  <span className="ml-1.5 font-normal normal-case tabular-nums text-fg-subtle">
                     {selectedCount}/{codes.length}
                   </span>
                 </span>

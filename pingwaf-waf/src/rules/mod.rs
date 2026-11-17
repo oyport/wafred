@@ -24,6 +24,8 @@ pub use signatures::{
     SignatureEngine, SignatureHit, SignaturePattern,
 };
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::StackSet;
@@ -54,8 +56,8 @@ impl RuleAction {
 /// A user- or control-plane-supplied rule, parsed once and reused per request.
 #[derive(Debug, Clone)]
 pub struct CompiledRule {
-    pub id: String,
-    pub name: String,
+    pub id: Arc<str>,
+    pub name: Arc<str>,
     pub expression: Expression,
     pub action: RuleAction,
     /// 1 (info) … 5 (critical). Drives the anomaly-score contribution.
@@ -73,8 +75,8 @@ impl CompiledRule {
     /// Build a rule from its raw expression string. Returns an error if the
     /// expression fails to parse.
     pub fn compile(
-        id: impl Into<String>,
-        name: impl Into<String>,
+        id: impl Into<Arc<str>>,
+        name: impl Into<Arc<str>>,
         expression: &str,
         action: RuleAction,
         severity: u8,
@@ -130,8 +132,8 @@ fn default_paranoia() -> u8 {
 impl RuleSpec {
     pub fn compile(&self) -> anyhow::Result<CompiledRule> {
         let mut rule = CompiledRule::compile(
-            self.id.clone(),
-            self.name.clone(),
+            self.id.as_str(),
+            self.name.as_str(),
             &self.expression,
             self.action,
             self.severity,

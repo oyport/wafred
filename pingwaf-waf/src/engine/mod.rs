@@ -20,7 +20,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use pingwaf_profiler::{record_method, track_memory, Method, Module};
 use serde::{Deserialize, Serialize};
@@ -78,13 +78,31 @@ fn estimated_scan_bytes(request: &RequestData) -> usize {
         .iter()
         .map(|(name, value)| name.len() + value.len())
         .sum();
+    // A compressed body is estimated at what it will decompress to, not at
+    // its wire size: the old `wire * 8` estimate under-counted a gzip form by
+    // three orders of magnitude, so a burst of tiny bodies could reserve far
+    // less than the memory their decompression actually used.
+    let compressed = request.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-encoding")
+            && value.split(',').any(|token| {
+                matches!(
+                    token.trim().to_ascii_lowercase().as_str(),
+                    "gzip" | "x-gzip" | "deflate"
+                )
+            })
+    });
     let body_bytes = request.body.as_ref().map_or(0, |body| {
         if body.is_empty() {
             return 0;
         }
-        body.len()
-            .saturating_mul(8)
-            .clamp(4 * 1024, 4 * 1024 * 1024)
+        let decoded = if compressed {
+            body.len()
+                .saturating_mul(100)
+                .min(crate::normalize::body::MAX_DECOMPRESSED_BODY)
+        } else {
+            body.len()
+        };
+        decoded.saturating_mul(8).clamp(4 * 1024, 4 * 1024 * 1024)
     });
     request
         .path
@@ -92,6 +110,19 @@ fn estimated_scan_bytes(request: &RequestData) -> usize {
         .saturating_add(request.query.len())
         .saturating_add(header_bytes)
         .saturating_add(body_bytes)
+}
+
+/// Appends an inspection-gap marker to the verdict note, without repeating
+/// one that is already present.
+fn append_inspection_note(note: &mut Option<String>, marker: &str) {
+    match note {
+        Some(existing) if existing.contains(marker) => {},
+        Some(existing) => {
+            existing.push_str("; ");
+            existing.push_str(marker);
+        },
+        None => *note = Some(marker.to_string()),
+    }
 }
 
 /// Strips control characters from attacker-influenced fragments before they
@@ -205,6 +236,16 @@ pub struct WafEngineConfig {
     /// unlike managed rules, a custom rule's id never starts with
     /// `WAFRED-`, so membership here is the only downgrade source.
     pub monitor_custom_rules: std::collections::HashSet<String>,
+    /// Soft wall-clock ceiling for one inspection; **disabled by default**.
+    ///
+    /// When enabled, deep detection stops if it is exceeded and the verdict
+    /// carries `request=deadline`; the data plane treats that like a
+    /// truncation (event, and a rejection under the truncation policy). It is
+    /// a safety valve on top of the per-request caps, not the primary bound,
+    /// and it is opt-in because a wall-clock limit makes verdicts depend on
+    /// scheduler load: on a busy host it can skip Stage-1 detection for a
+    /// request that would otherwise block. Zero (the default) disables it.
+    pub inspection_deadline: Duration,
 }
 
 impl Default for WafEngineConfig {
@@ -224,6 +265,7 @@ impl Default for WafEngineConfig {
             monitor_managed_rules: std::collections::HashSet::new(),
             disabled_managed_rules: std::collections::HashSet::new(),
             monitor_custom_rules: std::collections::HashSet::new(),
+            inspection_deadline: Duration::ZERO,
         }
     }
 }
@@ -380,13 +422,6 @@ struct RuleRec<'a> {
 
 /// Multi-stage WAF detection engine. Clone is intentionally not derived —
 /// share an `Arc<WafEngine>` instead so the Aho-Corasick automaton stays put.
-/// A typed body field (form member / JSON member) above this decoded length
-/// is treated as pasted bulk content — code, documents, uploaded HTML — and
-/// weighted like a blob. Real injection payloads are short; pasted content
-/// routinely carries the same markers (`<script>`, quote+keyword runs,
-/// CRLF) as attacks.
-const FIELD_STRONG_MAX_LEN: usize = 256;
-
 /// Immutable per-profile WAF material shared by every site with the same
 /// detection level and stack set. The Aho-Corasick automaton and the compiled
 /// managed rules are identical across those sites; only custom rules and
@@ -463,6 +498,17 @@ pub struct WafEngine {
     monitor_stacks: StackSet,
     monitor_managed_rules: std::collections::HashSet<String>,
     monitor_custom_rules: std::collections::HashSet<String>,
+    inspection_deadline: Duration,
+    /// Categories covered by a managed rule on the per-rule monitor switch.
+    ///
+    /// The stage-1 critical fast path cannot tell which managed rule a
+    /// signature hit will feed, so it uses this set: a monitored rule may
+    /// suppress the fast path for the category it belongs to, and only that
+    /// category. The previous shape disabled the fast path for every family
+    /// as soon as any managed rule was monitored, which silently downgraded
+    /// command injection / path traversal / SSRF / deserialization to
+    /// monitor-only (2026-11-13 audit, P1).
+    fast_path_monitored: CategorySet,
 }
 
 impl std::fmt::Debug for WafEngine {
@@ -518,7 +564,7 @@ impl WafEngine {
                 base.managed_rules
                     .iter()
                     .filter(|r| {
-                        !config.disabled_managed_rules.contains(r.id.as_str())
+                        !config.disabled_managed_rules.contains(r.id.as_ref())
                     })
                     .cloned(),
             );
@@ -529,6 +575,17 @@ impl WafEngine {
         // not need an off branch. Custom rules cannot match the
         // `WAFRED-` guard and are left untouched.
         rules.extend(config.rules.iter().cloned().map(Arc::new));
+
+        let mut fast_path_monitored = CategorySet::EMPTY;
+        for rule in &rules {
+            if !config.monitor_managed_rules.contains(rule.id.as_ref()) {
+                continue;
+            }
+            if let Some(category) = managed_rule_category(rule) {
+                fast_path_monitored = fast_path_monitored
+                    .union(CategorySet::from_category(category));
+            }
+        }
 
         Self {
             signatures: Arc::clone(&base.signatures),
@@ -543,6 +600,8 @@ impl WafEngine {
             monitor_stacks: config.monitor_stacks,
             monitor_managed_rules: config.monitor_managed_rules.clone(),
             monitor_custom_rules: config.monitor_custom_rules.clone(),
+            inspection_deadline: config.inspection_deadline,
+            fast_path_monitored,
         }
     }
 
@@ -558,6 +617,24 @@ impl WafEngine {
         !scoped.is_empty() && self.monitor_stacks.intersects(scoped)
     }
 
+    /// Records a Stage-1 critical hit unless its category is suppressed by
+    /// the per-rule monitor switch.
+    ///
+    /// `critical_hit` gates the critical fast path. A monitored managed rule
+    /// may only suppress the category it belongs to: monitoring one noisy
+    /// SQLi rule must not disable the fast path for command injection.
+    fn note_critical_hit(
+        &self,
+        category: AttackCategory,
+        monitored: bool,
+        critical_hit: &mut bool,
+    ) {
+        if monitored || self.fast_path_monitored.contains_category(category) {
+            return;
+        }
+        *critical_hit = true;
+    }
+
     /// `true` when a Stage-2 rule is downgraded to monitor-only. Managed
     /// rules downgrade through the category/stack/per-rule sets; custom
     /// rules only through the explicit per-rule monitor set (the control
@@ -566,7 +643,7 @@ impl WafEngine {
         if !rule.id.starts_with("WAFRED-") {
             return self.monitor_custom_rules.contains(rule.id.as_str());
         }
-        if self.monitor_managed_rules.contains(rule.id.as_str()) {
+        if self.monitor_managed_rules.contains(rule.id.as_ref()) {
             return true;
         }
         match managed_rule_category(rule) {
@@ -624,6 +701,26 @@ impl WafEngine {
 
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Configured name of the rule with `id`, for event attribution.
+    ///
+    /// Linear over the engine's rule set; only called when a verdict produces
+    /// a security event, never on the clean-pass path. This replaces the
+    /// per-site `id -> name` map the plugin used to keep: the engine already
+    /// holds every rule (including the managed ones), so the map was a second
+    /// copy of the same strings for each site.
+    pub fn rule_name(&self, id: &str) -> Option<&str> {
+        // Managed rules are excluded on purpose: the plugin's old per-site
+        // map only covered custom rules, and the event's `rule_name` for a
+        // managed-rule hit is empty by contract. Keep that behaviour so the
+        // access/security event payload does not change.
+        self.rules
+            .iter()
+            .find(|rule| {
+                rule.id.as_ref() == id && !rule.id.starts_with("PINGWAF-")
+            })
+            .map(|rule| rule.name.as_ref())
     }
 
     /// Main inspection entry point.
@@ -712,8 +809,19 @@ impl WafEngine {
             normalize_started.elapsed().as_nanos() as u64,
         );
         // Kept for the verdict: a body that was only partly inspected must
-        // not read as a clean pass in the event stream.
-        let body_inspection = normalized.body_inspection.clone();
+        // not read as a clean pass in the event stream. Normalization
+        // truncations (query/form/value/body caps) are folded into the same
+        // note so the data plane can reject a padded request in strict mode.
+        let mut inspection_note = normalized.body_inspection.detail();
+        if let Some(note) = normalized.truncation.detail() {
+            match inspection_note.as_mut() {
+                Some(existing) => {
+                    existing.push_str("; ");
+                    existing.push_str(&note);
+                },
+                None => inspection_note = Some(note),
+            }
+        }
         // The decoded values are the biggest structure the inspection builds;
         // report what they hold for as long as this inspection owns them.
         let decoded_bytes: usize = normalized
@@ -731,6 +839,12 @@ impl WafEngine {
         // verdict details name the first one and aggregate the rest (D17).
         let mut surfaces: Vec<Surface> = Vec::new();
         let mut critical_hit = false;
+        // Soft per-request deadline: a safety valve for pathological inputs
+        // that still fit the per-request caps. Exceeding it stops deep
+        // detection and marks the verdict, never silently passes.
+        let inspection_deadline = (!self.inspection_deadline.is_zero())
+            .then(|| Instant::now() + self.inspection_deadline);
+        let mut deadline_hit = false;
 
         // Reused scan buffers: a full request costs one allocation here
         // instead of one per inspected value.
@@ -739,7 +853,16 @@ impl WafEngine {
 
         // ----- Stage 1: signatures + libinjection over every decoded value -----
         let stage1_started = Instant::now();
-        for value in &normalized.decoded_values {
+        for (index, value) in normalized.decoded_values.iter().enumerate() {
+            // Checking every 16 values keeps the clock read off the hot path
+            // while still bounding the overrun to a few values.
+            if index % 16 == 0
+                && inspection_deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                deadline_hit = true;
+                break;
+            }
             let needle = value.decoded.as_ref();
             if needle.is_empty() {
                 continue;
@@ -817,11 +940,12 @@ impl WafEngine {
                             needle,
                             value.source != ValueSource::Body,
                         ));
+                // A typed body field is never demoted by length: filler is
+                // free, so "long enough" was a zero-cost bypass (2026-11-13
+                // audit, P1). Only unstructured body blobs are weak.
                 let weak = (is_meta_header && reflected_family)
                     || (value.source == ValueSource::Body
-                        && (!value.field
-                            || (value.decoded.len() > FIELD_STRONG_MAX_LEN
-                                && !self.level.is_strict()))
+                        && !value.field
                         && reflected_family);
                 // A bare "union select" without statement structure is a
                 // search phrase: the needle and its libinjection twin
@@ -871,7 +995,11 @@ impl WafEngine {
                     critical = true;
                 }
                 if critical && !search_phrase && !monitored {
-                    critical_hit = true;
+                    self.note_critical_hit(
+                        hit.category,
+                        monitored,
+                        &mut critical_hit,
+                    );
                 }
                 if !search_phrase {
                     if value.source == ValueSource::Path
@@ -930,7 +1058,11 @@ impl WafEngine {
                     StackSet::GENERIC,
                 );
                 if !monitored {
-                    critical_hit = true;
+                    self.note_critical_hit(
+                        AttackCategory::SqlInjection,
+                        monitored,
+                        &mut critical_hit,
+                    );
                 }
                 self.scorer.add_category_hit_ex(
                     &mut breakdown,
@@ -958,7 +1090,11 @@ impl WafEngine {
                     StackSet::GENERIC,
                 );
                 if !monitored {
-                    critical_hit = true;
+                    self.note_critical_hit(
+                        AttackCategory::CommandInjection,
+                        monitored,
+                        &mut critical_hit,
+                    );
                 }
                 self.scorer.add_category_hit_ex(
                     &mut breakdown,
@@ -986,7 +1122,11 @@ impl WafEngine {
                     StackSet::GENERIC,
                 );
                 if !monitored {
-                    critical_hit = true;
+                    self.note_critical_hit(
+                        AttackCategory::PathTraversal,
+                        monitored,
+                        &mut critical_hit,
+                    );
                 }
                 self.scorer.add_category_hit_ex(
                     &mut breakdown,
@@ -1015,10 +1155,7 @@ impl WafEngine {
             let (is_sqli, sqli_fp) = detect_sqli(needle);
             if is_sqli {
                 let weak = is_meta_header
-                    || (value.source == ValueSource::Body
-                        && (!value.field
-                            || (value.decoded.len() > FIELD_STRONG_MAX_LEN
-                                && !self.level.is_strict())));
+                    || (value.source == ValueSource::Body && !value.field);
                 // Same zero-score rule as the needle gate: a union-select
                 // or into-file fingerprint without statement structure is
                 // a search phrase, and the needle hit for it is skipped
@@ -1048,7 +1185,11 @@ impl WafEngine {
                     StackSet::GENERIC,
                 );
                 if critical && !search_phrase && !monitored {
-                    critical_hit = true;
+                    self.note_critical_hit(
+                        AttackCategory::SqlInjection,
+                        monitored,
+                        &mut critical_hit,
+                    );
                 }
                 if !search_phrase {
                     self.scorer.add_category_hit_ex(
@@ -1083,16 +1224,17 @@ impl WafEngine {
                             value.source != ValueSource::Body,
                         ));
                 let weak = is_meta_header
-                    || (value.source == ValueSource::Body
-                        && (!value.field
-                            || (value.decoded.len() > FIELD_STRONG_MAX_LEN
-                                && !self.level.is_strict())));
+                    || (value.source == ValueSource::Body && !value.field);
                 let (severity, critical) =
                     if weak { (2, false) } else { (5, true) };
                 let monitored =
                     self.hit_monitored(AttackCategory::Xss, StackSet::GENERIC);
                 if critical && !collected_js_uri && !monitored {
-                    critical_hit = true;
+                    self.note_critical_hit(
+                        AttackCategory::Xss,
+                        monitored,
+                        &mut critical_hit,
+                    );
                 }
                 if !collected_js_uri {
                     self.scorer.add_category_hit_ex(
@@ -1121,8 +1263,7 @@ impl WafEngine {
             if let Some(shape) = detect_deser_shape(needle) {
                 let weak = is_meta_header
                     || (value.source == ValueSource::Body
-                        && (!value.field
-                            || value.decoded.len() > FIELD_STRONG_MAX_LEN)
+                        && !value.field
                         && !self.level.is_strict());
                 let (severity, critical) = if weak {
                     (2, false)
@@ -1136,7 +1277,11 @@ impl WafEngine {
                     StackSet::GENERIC,
                 );
                 if critical && !monitored {
-                    critical_hit = true;
+                    self.note_critical_hit(
+                        AttackCategory::Deserialization,
+                        monitored,
+                        &mut critical_hit,
+                    );
                 }
                 self.scorer.add_category_hit_ex(
                     &mut breakdown,
@@ -1165,7 +1310,11 @@ impl WafEngine {
                     StackSet::GENERIC,
                 );
                 if !monitored {
-                    critical_hit = true;
+                    self.note_critical_hit(
+                        AttackCategory::CommandInjection,
+                        monitored,
+                        &mut critical_hit,
+                    );
                 }
                 self.scorer.add_category_hit_ex(
                     &mut breakdown,
@@ -1188,7 +1337,11 @@ impl WafEngine {
                     StackSet::GENERIC,
                 );
                 if !monitored {
-                    critical_hit = true;
+                    self.note_critical_hit(
+                        AttackCategory::CommandInjection,
+                        monitored,
+                        &mut critical_hit,
+                    );
                 }
                 self.scorer.add_category_hit_ex(
                     &mut breakdown,
@@ -1209,7 +1362,11 @@ impl WafEngine {
                 let monitored =
                     self.hit_monitored(AttackCategory::Ssrf, StackSet::GENERIC);
                 if !monitored {
-                    critical_hit = true;
+                    self.note_critical_hit(
+                        AttackCategory::Ssrf,
+                        monitored,
+                        &mut critical_hit,
+                    );
                 }
                 self.scorer.add_category_hit_ex(
                     &mut breakdown,
@@ -1232,7 +1389,11 @@ impl WafEngine {
                     StackSet::GENERIC,
                 );
                 if !monitored {
-                    critical_hit = true;
+                    self.note_critical_hit(
+                        AttackCategory::PathTraversal,
+                        monitored,
+                        &mut critical_hit,
+                    );
                 }
                 self.scorer.add_category_hit_ex(
                     &mut breakdown,
@@ -1261,7 +1422,11 @@ impl WafEngine {
                 if let Some(container) = detect_expr_injection(needle) {
                     self.scorer.add_expr_hit_ex(&mut breakdown, expr_monitored);
                     if !expr_monitored {
-                        critical_hit = true;
+                        self.note_critical_hit(
+                            AttackCategory::TemplateInjection,
+                            expr_monitored,
+                            &mut critical_hit,
+                        );
                     }
                     recs.push(HitRec::Expr {
                         container,
@@ -1282,7 +1447,11 @@ impl WafEngine {
                     // re-block what the critical gate let through.
                     self.scorer.add_expr_hit_ex(&mut breakdown, expr_monitored);
                     if !expr_monitored {
-                        critical_hit = true;
+                        self.note_critical_hit(
+                            AttackCategory::TemplateInjection,
+                            expr_monitored,
+                            &mut critical_hit,
+                        );
                     }
                     recs.push(HitRec::Expr {
                         container: "js-call",
@@ -1321,7 +1490,11 @@ impl WafEngine {
                 self.signatures.pattern(hit.pattern).stack,
             );
             if critical && !monitored {
-                critical_hit = true;
+                self.note_critical_hit(
+                    hit.category,
+                    monitored,
+                    &mut critical_hit,
+                );
             }
             // Mirror of the decoded-value gate: CI/Deser shapes found on the
             // resolved path keep their aggregate score but stay out of the
@@ -1405,7 +1578,7 @@ impl WafEngine {
                 continue;
             }
             let mut matched = self.matched_from(&recs, &[]);
-            matched.push(rule.id.clone());
+            matched.push(rule.id.to_string());
             return WafVerdict {
                 action: WafAction::Pass,
                 score: breakdown.total_u8(),
@@ -1429,11 +1602,20 @@ impl WafEngine {
             stage1_started.elapsed().as_nanos() as u64,
         );
 
+        if deadline_hit {
+            append_inspection_note(&mut inspection_note, "request=deadline");
+        }
+
         // ----- Fast-path Block on critical Stage-1 hit -----
+        // `critical_hit` is only set for a hit that is neither
+        // category/stack-monitored nor covered by a managed rule on the
+        // per-rule monitor switch (see `note_critical_hit`), so a monitored
+        // rule suppresses its own category without disabling the shortcut
+        // for every other family.
         if self.fast_path_block_on_critical && critical_hit {
             let mut details = self.details_from(&recs, &[]);
-            if let Some(note) = body_inspection.detail() {
-                details.push(note);
+            if let Some(note) = inspection_note.as_deref() {
+                details.push(note.to_string());
             }
             return self.finalize_verdict(
                 &mut breakdown,
@@ -1487,15 +1669,16 @@ impl WafEngine {
                     unreachable!("allow rules handled in pre-pass")
                 },
                 RuleAction::Log => {
-                    // OWASP CRS anomaly-scoring semantics, kept deliberately:
-                    // a log-action hit feeds the same aggregate (including
-                    // the blocking subset), so several low-severity log hits
-                    // — or log hits stacked on signature hits — can cross
-                    // the threshold and block. Operators who want a rule to
-                    // never contribute to blocking use the per-rule monitor
-                    // switch instead, which routes through
-                    // `add_severity_hit_ex(monitored=true)`.
-                    self.scorer.add_severity_hit(&mut breakdown, rule.severity);
+                    // The action is "record only": the hit stays visible in
+                    // the aggregate score and event stream, but it must not
+                    // push the blocking subset over the threshold. A single
+                    // log rule used to be able to turn several stacked
+                    // warnings into a 403.
+                    self.scorer.add_severity_hit_ex(
+                        &mut breakdown,
+                        rule.severity,
+                        true,
+                    );
                 },
                 RuleAction::Block => {
                     self.scorer.add_severity_hit_ex(
@@ -1506,7 +1689,7 @@ impl WafEngine {
                     if !rule_monitored {
                         forced_action = Some(WafAction::Block);
                         if enforced_block.is_none() {
-                            enforced_block = Some(rule.id.clone());
+                            enforced_block = Some(rule.id.to_string());
                         }
                     }
                 },
@@ -1521,7 +1704,7 @@ impl WafEngine {
                     {
                         forced_action = Some(WafAction::Challenge);
                         if enforced_challenge.is_none() {
-                            enforced_challenge = Some(rule.id.clone());
+                            enforced_challenge = Some(rule.id.to_string());
                         }
                     }
                 },
@@ -1558,8 +1741,8 @@ impl WafEngine {
             // A clean verdict must still carry the fact that the body was
             // only partly inspected; otherwise a blind spot is indistinguish-
             // able from a genuinely clean request.
-            if let Some(note) = body_inspection.detail() {
-                verdict.details = note;
+            if let Some(note) = inspection_note.as_deref() {
+                verdict.details = note.to_string();
             }
             return verdict;
         }
@@ -1576,8 +1759,8 @@ impl WafEngine {
             _ => None,
         };
         let mut details = self.details_from(&recs, &rule_recs);
-        if let Some(note) = body_inspection.detail() {
-            details.push(note);
+        if let Some(note) = inspection_note.as_deref() {
+            details.push(note.to_string());
         }
         self.finalize_verdict(
             &mut breakdown,
@@ -2047,6 +2230,138 @@ mod tests {
         assert!(v.matched_rules.contains(&"WAFRED-1002".to_string()));
         assert!(v.breakdown.total > 0);
         assert!(v.details.contains("[monitored]"));
+
+        // The production configuration enables the critical fast path; the
+        // per-rule monitor switch must still win over it.
+        let cfg = WafEngineConfig {
+            monitor_managed_rules: ["PINGWAF-1002".to_string()]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let v = WafEngine::new(&cfg).inspect(&r);
+        assert_eq!(v.action, WafAction::Monitor);
+        assert!(v.matched_rules.contains(&"PINGWAF-1002".to_string()));
+        assert!(v.details.contains("[monitored]"));
+    }
+
+    /// A per-rule monitor switch may only suppress the fast path for the
+    /// category that rule belongs to (2026-11-13 audit, P1). The previous
+    /// implementation disabled the critical fast path for every family as
+    /// soon as any managed rule was monitored, so monitoring one noisy SQLi
+    /// rule silently downgraded command injection / traversal / SSRF /
+    /// deserialization to monitor-only.
+    #[test]
+    fn monitoring_one_family_keeps_the_critical_fast_path_for_others() {
+        let cfg = WafEngineConfig {
+            monitor_managed_rules: ["PINGWAF-1002".to_string()]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let v = WafEngine::new(&cfg).inspect(&req(
+            "GET",
+            "/api/users",
+            "q=$(whoami)",
+        ));
+        assert_eq!(v.action, WafAction::Block, "details: {}", v.details);
+
+        // The monitored category itself still loses the fast path and is
+        // decided by Stage 2 (PINGWAF-1002 is on monitor in this config).
+        let v = WafEngine::new(&cfg).inspect(&req(
+            "GET",
+            "/api/users",
+            "id=1' OR 1=1 --",
+        ));
+        assert_eq!(v.action, WafAction::Monitor, "details: {}", v.details);
+    }
+
+    /// Regression (2026-11-13 audit, P1): padding a form field past the old
+    /// 256-byte "bulk content" threshold used to demote the hit to a 2-point
+    /// weak signal. Filler is free, so that was a zero-cost bypass; typed body
+    /// fields are now never demoted by length.
+    #[test]
+    fn padded_body_field_probe_blocks() {
+        for e in [engine(), strict_engine()] {
+            let mut r = req("POST", "/login", "");
+            r.headers.push((
+                "Content-Type".into(),
+                "application/x-www-form-urlencoded".into(),
+            ));
+            r.body = Some(bytes::Bytes::from(format!(
+                "password={}' OR 1=1 --",
+                "A".repeat(300)
+            )));
+            let v = e.inspect(&r);
+            assert_eq!(v.action, WafAction::Block, "details: {}", v.details);
+        }
+    }
+
+    /// The soft deadline is a safety valve, not the primary bound: when it
+    /// trips, deep detection stops and the verdict says so instead of reading
+    /// as a clean pass.
+    #[test]
+    fn inspection_deadline_is_reported() {
+        let cfg = WafEngineConfig {
+            inspection_deadline: Duration::from_nanos(1),
+            ..Default::default()
+        };
+        let v =
+            WafEngine::new(&cfg).inspect(&req("GET", "/", "id=1' OR 1=1--"));
+        assert!(v.details.contains("request=deadline"), "{}", v.details);
+    }
+
+    /// Regression (2026-11-13 audit, P1): a request whose scan surface was
+    /// truncated must carry that fact in the verdict. The old behaviour
+    /// dropped the bytes and returned a clean pass, so "pad the payload past
+    /// an internal cap" was a stable bypass.
+    #[test]
+    fn truncated_scan_surface_is_visible_in_the_verdict() {
+        let e = engine();
+
+        let query = (0..300)
+            .map(|i| format!("k{i}=v"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let v = e.inspect(&req("GET", "/", &query));
+        assert!(
+            v.details.contains("request=truncated(query-params)"),
+            "{}",
+            v.details
+        );
+
+        let body = (0..600)
+            .map(|i| format!("k{i}=v"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let mut form = req("POST", "/login", "");
+        form.headers.push((
+            "content-type".into(),
+            "application/x-www-form-urlencoded".into(),
+        ));
+        form.body = Some(bytes::Bytes::from(body));
+        let v = e.inspect(&form);
+        assert!(
+            v.details.contains("request=truncated(form-params)"),
+            "{}",
+            v.details
+        );
+
+        // A body past the parse/scan cap is reported, not silently cut.
+        let mut big = req("POST", "/upload", "");
+        big.headers.push((
+            "content-type".into(),
+            "application/x-www-form-urlencoded".into(),
+        ));
+        big.body =
+            Some(bytes::Bytes::from(format!("q={}", "A".repeat(300 * 1024))));
+        let v = e.inspect(&big);
+        assert!(
+            v.details.contains("request=truncated(")
+                && v.details.contains("body-scan-cap"),
+            "{}",
+            v.details
+        );
     }
 
     /// D17: the verdict names the request surface a hit came from instead of
@@ -2331,6 +2646,46 @@ mod tests {
         let v = e.inspect(&req("GET", "/secret/data", ""));
         assert!(matches!(v.action, WafAction::Block | WafAction::Monitor));
         assert!(v.matched_rules.contains(&"BLOCK-SECRET".to_string()));
+    }
+
+    #[test]
+    fn compile_keeps_a_shared_rule_id() {
+        // The control plane's per-site rule bundle owns one `Arc<str>` per
+        // id/name; compilation must keep the pointer instead of copying the
+        // string, so a site's engine and its cache entry share the bytes.
+        let id: std::sync::Arc<str> = std::sync::Arc::from("SHARED-1");
+        let rule = CompiledRule::compile(
+            std::sync::Arc::clone(&id),
+            "shared name",
+            r#"http.request.uri.path eq "/x""#,
+            RuleAction::Block,
+            3,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&rule.id, &id));
+    }
+
+    #[test]
+    fn rule_name_lookup_covers_custom_rules_only() {
+        let custom = CompiledRule::compile(
+            "CUSTOM-NAME",
+            "custom display name",
+            r#"http.request.uri.path starts_with "/x""#,
+            RuleAction::Block,
+            3,
+            Vec::new(),
+        )
+        .unwrap();
+        let e = WafEngine::new(&WafEngineConfig {
+            rules: vec![custom],
+            ..Default::default()
+        });
+        assert_eq!(e.rule_name("CUSTOM-NAME"), Some("custom display name"));
+        // Managed rules are excluded: the plugin's old per-site name map only
+        // covered custom rules, so a managed-rule event carries no name.
+        assert_eq!(e.rule_name("PINGWAF-1001"), None);
+        assert_eq!(e.rule_name("missing"), None);
     }
 
     /// L3-006: when a custom rule enforces the block, `enforced_rule_id`
@@ -3135,7 +3490,7 @@ mod tests {
         let names: Vec<&str> = req_data
             .decoded_values
             .iter()
-            .map(|v| v.name.as_str())
+            .map(|v| v.name.as_ref())
             .collect();
         // The container string is gone; members are addressed by path.
         assert!(
@@ -3217,7 +3572,7 @@ mod tests {
             .decoded_values
             .iter()
             .filter(|v| v.source == ValueSource::Body && v.field)
-            .map(|v| v.name.as_str())
+            .map(|v| v.name.as_ref())
             .collect();
         assert!(names.contains(&"q"), "values: {names:?}");
         assert!(names.contains(&"page"), "values: {names:?}");

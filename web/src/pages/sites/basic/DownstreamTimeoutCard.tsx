@@ -8,6 +8,7 @@ import { useToast } from '@/components/ui/Toast'
 import { sitesApi, siteKeys } from '@/api/sites'
 import { errorMessage } from '@/api/errors'
 import { useCanWrite } from '@/hooks'
+import { useRegisterUnsaved } from '@/hooks/useUnsavedGuard'
 import type { Site } from '@/api/types'
 
 const MIN_SECONDS = 1
@@ -35,6 +36,8 @@ export function DownstreamTimeoutCard({ site }: { site: Site }) {
     parsed >= MIN_SECONDS &&
     parsed <= MAX_SECONDS
   const dirty = valid && parsed !== saved
+  // Aggregated by `SiteDetailPage`, which owns the single leave-guard dialog.
+  useRegisterUnsaved(dirty)
 
   const save = useMutation({
     mutationFn: (seconds: number) =>

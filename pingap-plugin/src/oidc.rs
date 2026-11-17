@@ -22,6 +22,7 @@ use super::jwt::{
 };
 use super::{Error, get_duration_conf, get_hash_key, get_str_conf};
 use super::{get_step_conf, get_str_slice_conf};
+use crate::path_filter::PathFilter;
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -116,6 +117,9 @@ pub struct Oidc {
     own_headers: Vec<HeaderName>,
     /// Whether a signed-in user may enter, and what that depends on.
     access: AccessPolicy,
+    /// Empty scope = the gate applies to the whole site. Callback/logout are
+    /// handled before this filter.
+    path: Option<PathFilter>,
     /// How a visitor signs in at this site: only the provider, only a local
     /// account, or both. `access` decides who may enter *after* signing in;
     /// this decides how they sign in at all.
@@ -524,6 +528,23 @@ impl TryFrom<&PluginConf> for Oidc {
                 "logout_path can not be the redirect_path".to_string(),
             ));
         }
+        let path_scope = match PathFilter::compile(
+            &get_str_conf(value, "path"),
+            &get_str_conf(value, "match_type"),
+        ) {
+            Ok(scope) => scope,
+            Err(err) => {
+                // Dropping the whole plugin would make the site's login gate
+                // disappear (fail-open). Gate the whole site instead; the
+                // control plane refuses invalid regexes on save, so this is
+                // only reachable through a restored/hand-written row.
+                warn!(
+                    error = %err,
+                    "oidc path scope failed to compile; gating the whole site"
+                );
+                None
+            },
+        };
         let redirect_url = Some(get_str_conf(value, "redirect_url"))
             .filter(|url| !url.is_empty());
         if let Some(url) = &redirect_url {
@@ -612,6 +633,7 @@ impl TryFrom<&PluginConf> for Oidc {
             claims_to_headers,
             own_headers,
             access,
+            path: path_scope,
             auth_mode,
             client,
             provider: ArcSwapOption::empty(),
@@ -1925,6 +1947,21 @@ Xy9d98XlTMj+HdE8reX0ymEIpLbCDnS5WhaUEhNcxGGHktUH/3e9BlrR
         assert_eq!(true, plugin.unseal::<SessionData>(&sealed).is_none());
     }
 
+    /// A path outside the configured scope is not gated at all.
+    #[tokio::test]
+    async fn a_path_outside_the_scope_skips_the_gate() {
+        let plugin =
+            new_plugin("path = \"/admin\"\nmatch_type = \"prefix\"\n").unwrap();
+        let mut session =
+            new_session("GET /public HTTP/1.1\r\nHost: app.test\r\n\r\n").await;
+        let mut ctx = Ctx::default();
+        let result = plugin
+            .handle_request(PluginStep::Request, &mut session, &mut ctx)
+            .await
+            .unwrap();
+        assert!(matches!(result, RequestPluginResult::Skipped));
+    }
+
     /// Who has no session is sent to the provider, or told so; who has
     /// one goes on, with what the provider said of them in the headers.
     #[tokio::test]
@@ -3121,6 +3158,35 @@ Pz7glwkTfq+X/7U/TTdWanLivIQqzKjyNBu3kgzx7GeUYcjtuw4RKof6
             Oidc::new(&toml::from_str::<PluginConf>(conf).unwrap())?;
         plugin.client = test_client();
         Ok(plugin)
+    }
+
+    #[test]
+    fn a_configured_path_scope_compiles() {
+        let plugin = plugin_from(
+            "auth_mode = \"local\"\n\
+             cookie_secret = \"0123456789abcdef0123456789abcdef\"\n\
+             path = \"/admin\"\n\
+             match_type = \"prefix\"\n",
+        )
+        .expect("scope builds");
+        let scope = plugin.path.as_ref().expect("path scope");
+        assert!(scope.matches("/admin/users"));
+        assert!(!scope.matches("/public"));
+    }
+
+    #[test]
+    fn an_invalid_path_regex_falls_back_to_the_whole_site() {
+        let plugin = plugin_from(
+            "auth_mode = \"local\"\n\
+             cookie_secret = \"0123456789abcdef0123456789abcdef\"\n\
+             path = \"^/broken(\"\n\
+             match_type = \"regex\"\n",
+        )
+        .expect("a bad scope must not remove the login gate");
+        assert!(
+            plugin.path.is_none(),
+            "fallback is the whole site, not a disabled plugin"
+        );
     }
 
     /// A `local` site has no provider, so demanding its credentials would

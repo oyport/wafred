@@ -72,7 +72,15 @@ you want, and any alternative you considered.
 ## Security Issues
 
 **Do not open a public issue for a vulnerability.** Follow the private
-disclosure process in [`SECURITY.md`](./SECURITY.md).
+disclosure process in [`SECURITY.md`](./SECURITY.md). Two private channels are
+monitored:
+
+- [GitHub private vulnerability reporting](https://github.com/shuaiZend/PingWAF/security/advisories/new) (preferred — tracked, and the fastest route to a fix)
+- `security@pingwaf.com` (monitored by at least two maintainers)
+
+Include the affected version, deployment mode, reproduction steps and attack
+prerequisites; redact tokens and passwords. We acknowledge reports within three
+business days and coordinate disclosure after the fix ships (or at 90 days).
 
 ## Development Environment
 

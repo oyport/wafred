@@ -12,10 +12,59 @@ use sea_orm::{
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::api::capabilities::{
+    attached_scope_requirements, path_exception_requirements,
+    site_agents_below, ScopeRequirement,
+};
+use crate::api::error::ApiError;
+use crate::api::validation::{
+    check_path_exception_fields, check_rule_fields, RuleRowFix,
+};
 use crate::config_catalog::{
     merge_shallow, normalise_tables, query_rows, rows_for, spec_for,
     tables_for, Filter, TableSpec, VersionScope, INSTANCE_SETTING_KEYS,
 };
+
+/// Errors [`prepare_restore`] can produce.
+///
+/// The distinction exists for DR-03: a capability rejection must reach the
+/// operator as a `400 BadRequest` (a validation outcome, exactly like the
+/// write-path gate in `api/capabilities.rs`), while everything else stays a
+/// storage error. Callers that only carry `DbErr` (the rollback path in
+/// `config_history.rs`) convert a rejection into `DbErr::Custom`, which still
+/// aborts the transaction before any row is written.
+#[derive(Debug)]
+pub enum RestoreError {
+    Db(DbErr),
+    /// The snapshot carries a scope the current agent fleet cannot execute.
+    /// The message names the site, the agent, its version and the missing
+    /// capability; no row has been written when this is returned.
+    AgentTooOld(String),
+}
+
+impl From<DbErr> for RestoreError {
+    fn from(err: DbErr) -> Self {
+        Self::Db(err)
+    }
+}
+
+impl From<RestoreError> for DbErr {
+    fn from(err: RestoreError) -> Self {
+        match err {
+            RestoreError::Db(db_err) => db_err,
+            RestoreError::AgentTooOld(message) => DbErr::Custom(message),
+        }
+    }
+}
+
+impl From<RestoreError> for ApiError {
+    fn from(err: RestoreError) -> Self {
+        match err {
+            RestoreError::Db(db_err) => db_err.into(),
+            RestoreError::AgentTooOld(message) => Self::BadRequest(message),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RestoreOptions {
@@ -486,6 +535,82 @@ async fn validate_references<C: ConnectionTrait>(
     Ok(())
 }
 
+/// What [`sanitise_restored_row`] decided about one snapshot row.
+#[derive(Debug, PartialEq, Eq)]
+enum RowSanitisation {
+    /// The row is valid; restore it as it stands.
+    Keep,
+    /// The row was repaired in place (historical state the data plane can
+    /// no longer express); restore it and report the rewrite.
+    Rewritten(&'static str),
+    /// The row violates the write-path validation and must not be restored.
+    /// The reason is reported as a warning — never silently dropped.
+    Skip(String),
+}
+
+/// Validates one restored rule or path-exception row against the same
+/// checks the write API applies (P0-9): a restore must not bypass
+/// `api/rules.rs` and `api/path_exceptions.rs` validation just because the
+/// rows arrive from a snapshot instead of a handler.
+///
+/// `allow`+`off` rules are repaired to `monitor` — the same normalisation
+/// migration 000096 and the restore transaction apply — rather than dropped,
+/// because that combination is a known historical state, not garbage. Every
+/// other violation skips the row and names it in the plan's warnings.
+fn sanitise_restored_row(table: &str, row: &mut Value) -> RowSanitisation {
+    match table {
+        "rules" => {
+            let name = json_key(row, "name").unwrap_or_default();
+            let expression = json_key(row, "expression").unwrap_or_default();
+            let rule_action = json_key(row, "action").unwrap_or_default();
+            let rule_mode = json_key(row, "mode").unwrap_or_default();
+            let severity =
+                row.get("severity").and_then(Value::as_i64).unwrap_or(3) as i32;
+            match check_rule_fields(
+                &name,
+                &expression,
+                &rule_action,
+                &rule_mode,
+                severity,
+            ) {
+                Ok(RuleRowFix::AllowOffMonitor) => {
+                    row["mode"] = json!(crate::models::mode::MONITOR);
+                    RowSanitisation::Rewritten(
+                        "action=allow with mode=off normalised to monitor",
+                    )
+                },
+                Ok(RuleRowFix::Keep) => RowSanitisation::Keep,
+                Err(reason) => RowSanitisation::Skip(reason),
+            }
+        },
+        "site_path_exceptions" => {
+            let path = json_key(row, "path").unwrap_or_default();
+            let match_type = row.get("match_type").and_then(Value::as_str);
+            let empty: Vec<String> = Vec::new();
+            let skip_layers: Vec<String> = row
+                .get("skip_layers")
+                .and_then(Value::as_array)
+                .map(|layers| {
+                    layers
+                        .iter()
+                        .filter_map(|layer| layer.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or(empty);
+            match check_path_exception_fields(&path, match_type, &skip_layers) {
+                Ok((path, match_type, layers)) => {
+                    row["path"] = json!(path);
+                    row["match_type"] = json!(match_type);
+                    row["skip_layers"] = json!(layers);
+                    RowSanitisation::Keep
+                },
+                Err(reason) => RowSanitisation::Skip(reason),
+            }
+        },
+        _ => RowSanitisation::Keep,
+    }
+}
+
 fn compute_change(
     spec: &TableSpec,
     live: &[Value],
@@ -526,7 +651,181 @@ fn compute_change(
     }
 }
 
+/// DR-03: scope requirements a restored row imposes on the agent fleet.
+///
+/// This is the row-to-requirement half of the same decision the write APIs
+/// make through `api/capabilities.rs` — a restore must not smuggle in a scope
+/// that write path would have rejected. Returns an empty list for rows that
+/// carry no gateable scope (including an empty/absent `path`, which is the
+/// historical whole-site scope and works on every agent).
+fn row_scope_requirements(table: &str, row: &Value) -> Vec<ScopeRequirement> {
+    match table {
+        "site_path_exceptions" => {
+            let match_type = json_key(row, "match_type").unwrap_or_default();
+            let skip_layers: Vec<String> = row
+                .get("skip_layers")
+                .and_then(Value::as_array)
+                .map(|layers| {
+                    layers
+                        .iter()
+                        .filter_map(|layer| layer.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            path_exception_requirements(&match_type, &skip_layers)
+        },
+        // Optional scopes attached to access/identity rules. `path` is read
+        // as `Option` on purpose: an absent column and an explicit empty
+        // string both mean "whole site" and impose no requirement.
+        "ip_access_rules" | "geo_rules" | "site_basic_auth" | "site_oidc" => {
+            let path = row.get("path").and_then(Value::as_str);
+            let match_type = json_key(row, "match_type").unwrap_or_default();
+            attached_scope_requirements(path, &match_type)
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// The rejection message for a restore blocked by an under-capable agent.
+/// Site, agent name, agent version, capability and minimum are all named so
+/// the operator can act without opening the database.
+fn restore_rejection_message(
+    site: &str,
+    agent: &str,
+    version: &str,
+    requirement: &ScopeRequirement,
+) -> String {
+    format!(
+        "restore rejected: site {site} needs agent >= {} for {}, \
+         but agent {agent} reports {version}",
+        requirement.min, requirement.label
+    )
+}
+
+/// site_id → human-readable label for rejection messages: the domain when
+/// the snapshot carries one, the raw id otherwise (a restore without the
+/// `sites` table must still be able to name the site it rejects).
+fn site_domains_for(site_rows: &[Value]) -> BTreeMap<Uuid, String> {
+    site_rows
+        .iter()
+        .filter_map(|row| {
+            let id = uuid_field(row, "id")?;
+            let domain = json_key(row, "domain")
+                .filter(|domain| !domain.trim().is_empty())
+                .unwrap_or_else(|| id.to_string());
+            Some((id, domain))
+        })
+        .collect()
+}
+
+/// DR-03 gate: rejects the whole restore when any restored row needs a
+/// capability the current fleet cannot deliver.
+///
+/// Runs inside the caller's transaction, before [`apply_restore`] deletes or
+/// inserts anything, so a rejection leaves the live configuration untouched.
+/// Rows are grouped per site and requirement and one
+/// [`site_agents_below`] query per `(site, min)` decides; the message cites
+/// the first agent reported below the bar, the same wording contract as the
+/// write-path gate.
+async fn ensure_plan_scopes_supported<C: ConnectionTrait>(
+    db: &C,
+    tables: &[PreparedTable],
+) -> Result<(), RestoreError> {
+    // site_id -> (min, label) -> first offending row, for the message.
+    let mut needed: BTreeMap<
+        Uuid,
+        BTreeMap<(&'static str, &'static str), String>,
+    > = BTreeMap::new();
+    let mut site_rows: Vec<Value> = Vec::new();
+    for prepared in tables {
+        if prepared.spec.name == "sites" {
+            site_rows.extend(prepared.rows.iter().cloned());
+        }
+        for row in &prepared.rows {
+            let requirements = row_scope_requirements(prepared.spec.name, row);
+            if requirements.is_empty() {
+                continue;
+            }
+            let Some(site_id) = uuid_field(row, "site_id") else {
+                continue;
+            };
+            let row_id = json_key(row, "id").unwrap_or_default();
+            for requirement in requirements {
+                needed
+                    .entry(site_id)
+                    .or_default()
+                    .entry((requirement.min, requirement.label))
+                    .or_insert_with(|| {
+                        format!("{} row {row_id}", prepared.spec.name)
+                    });
+            }
+        }
+    }
+    // One lookup per (site, minimum); agents are few but visibility is a
+    // per-agent query, so the queries are deduplicated first — a large
+    // restore costs one query per distinct requirement, not per row.
+    let mut lookups: BTreeSet<(Uuid, &'static str)> = BTreeSet::new();
+    for (site_id, requirements) in &needed {
+        for key in requirements.keys() {
+            let (min, _) = *key;
+            lookups.insert((*site_id, min));
+        }
+    }
+    let mut below_cache: HashMap<(Uuid, &'static str), Vec<(String, String)>> =
+        HashMap::new();
+    for (site_id, min) in &lookups {
+        let below = site_agents_below(db, *site_id, min)
+            .await
+            .map_err(|err| RestoreError::Db(DbErr::Custom(err.to_string())))?;
+        below_cache.insert((*site_id, *min), below);
+    }
+    let site_domains = site_domains_for(&site_rows);
+    for (site_id, requirements) in &needed {
+        let site = site_domains
+            .get(site_id)
+            .cloned()
+            .unwrap_or_else(|| site_id.to_string());
+        for ((min, label), example) in requirements {
+            let (min, label) = (*min, *label);
+            let below = &below_cache[&(*site_id, min)];
+            if let Some((agent, version)) = below.first() {
+                tracing::warn!(
+                    site = %site,
+                    table_row = %example,
+                    requirement_min = min,
+                    requirement_label = label,
+                    agent = %agent,
+                    agent_version = %version,
+                    "restore rejected: restored configuration needs a capability the agent fleet cannot deliver"
+                );
+                return Err(RestoreError::AgentTooOld(
+                    restore_rejection_message(
+                        &site,
+                        agent,
+                        version,
+                        &ScopeRequirement { min, label },
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Plans a restore and gates it on agent capabilities before anything is
+/// written. See [`ensure_plan_scopes_supported`] for the DR-03 rejection.
 pub async fn prepare_restore<C: ConnectionTrait>(
+    db: &C,
+    scope: VersionScope,
+    snapshot: &Value,
+    options: RestoreOptions,
+) -> Result<RestorePlan, RestoreError> {
+    let plan = prepare_restore_inner(db, scope, snapshot, options).await?;
+    ensure_plan_scopes_supported(db, &plan.tables).await?;
+    Ok(plan)
+}
+
+async fn prepare_restore_inner<C: ConnectionTrait>(
     db: &C,
     scope: VersionScope,
     snapshot: &Value,
@@ -571,6 +870,7 @@ pub async fn prepare_restore<C: ConnectionTrait>(
     let mut prepared = Vec::new();
     let mut owner_changes = Vec::new();
     let mut columns = HashMap::new();
+    let mut warnings = Vec::new();
 
     for spec in tables_for(scope) {
         let Some(rows) = rows_for(schema, &tables, spec.name)? else {
@@ -647,7 +947,43 @@ pub async fn prepare_restore<C: ConnectionTrait>(
             })
             .unwrap_or_default();
         let mut merged = Vec::with_capacity(rows.len());
-        for row in rows {
+        for mut row in rows {
+            // Rule and path-exception rows must satisfy the same validation
+            // the write API enforces: a restore cannot smuggle in what
+            // `api/rules.rs` / `api/path_exceptions.rs` would reject. Invalid
+            // rows are skipped and reported, not silently dropped; the
+            // historical `allow`+`off` rule state is repaired instead.
+            let row_id = json_key(&row, "id").unwrap_or_default();
+            match sanitise_restored_row(spec.name, &mut row) {
+                RowSanitisation::Keep => {},
+                RowSanitisation::Rewritten(what) => warnings.push(format!(
+                    "{spec_name} row {row_id}: {what}",
+                    spec_name = spec.name
+                )),
+                RowSanitisation::Skip(reason) => {
+                    // Dropping a blocking/challenge rule tightens the site;
+                    // dropping an invalid one is different: the restore first
+                    // deletes the site's whole rule set, so silently skipping
+                    // it would erase a real security rule. Fail the whole
+                    // restore instead of reporting success with less cover.
+                    if spec.name == "rules"
+                        && matches!(
+                            json_key(&row, "action").as_deref(),
+                            Some("block" | "challenge" | "js_challenge")
+                        )
+                    {
+                        return Err(DbErr::Custom(format!(
+                            "{} row {row_id} is an enforcing rule that cannot be restored ({reason}); restore aborted",
+                            spec.name
+                        )));
+                    }
+                    warnings.push(format!(
+                        "{spec_name} row {row_id}: invalid ({reason}); skipped",
+                        spec_name = spec.name
+                    ));
+                    continue;
+                },
+            }
             let restored = merge_row(
                 db,
                 spec,
@@ -699,7 +1035,6 @@ pub async fn prepare_restore<C: ConnectionTrait>(
 
     validate_references(db, &prepared).await?;
 
-    let mut warnings = Vec::new();
     let mut prune_site_ids = Vec::new();
     if scope == VersionScope::Deployment {
         for row in live_sites {
@@ -906,6 +1241,14 @@ pub async fn apply_restore(
             .rows_by_table
             .insert(prepared.spec.name.to_string(), prepared.rows.len());
     }
+    // A backup taken before the allow+off fix can restore a whitelist that
+    // the engine would drop. Normalise it here as well as in migration 000096
+    // and in the data plane, so a restore cannot reintroduce the regression.
+    txn.execute_unprepared(
+        "UPDATE rules SET mode = 'monitor' \
+         WHERE action = 'allow' AND mode = 'off'",
+    )
+    .await?;
     Ok(report)
 }
 
@@ -982,5 +1325,258 @@ mod tests {
     fn certificate_tables_are_the_only_key_match_checks() {
         assert!(is_certificate_table("site_certificates"));
         assert!(!is_certificate_table("visitor_passkeys"));
+    }
+
+    fn rule_row(action: &str, mode: &str, expression: &str) -> Value {
+        json!({
+            "id": Uuid::new_v4(),
+            "site_id": Uuid::new_v4(),
+            "name": "block admin scanners",
+            "expression": expression,
+            "action": action,
+            "severity": 3,
+            "mode": mode,
+            "enabled": true,
+        })
+    }
+
+    /// A fully legal rule row restores untouched.
+    #[test]
+    fn valid_rule_rows_are_kept() {
+        let mut row = rule_row(
+            "block",
+            "block",
+            r#"http.request.path contains "/admin""#,
+        );
+        assert_eq!(
+            RowSanitisation::Keep,
+            sanitise_restored_row("rules", &mut row)
+        );
+    }
+
+    /// P0-9: the historical `allow`+`off` combination is repaired to
+    /// `monitor` — the same normalisation migration 000096 and the restore
+    /// transaction apply — instead of being dropped or restored as-is.
+    #[test]
+    fn allow_off_rules_are_normalised_to_monitor() {
+        let mut row = rule_row(
+            "allow",
+            "off",
+            r#"http.request.headers["user-agent"] contains "friend""#,
+        );
+        match sanitise_restored_row("rules", &mut row) {
+            RowSanitisation::Rewritten(_) => {},
+            other => panic!("expected a rewrite, got {other:?}"),
+        }
+        assert_eq!("monitor", row["mode"]);
+    }
+
+    #[test]
+    fn invalid_rule_rows_are_skipped_and_named() {
+        // allow cannot promise enforcement with mode=block.
+        let mut row = rule_row(
+            "allow",
+            "block",
+            r#"http.request.headers["user-agent"] contains "friend""#,
+        );
+        assert!(matches!(
+            sanitise_restored_row("rules", &mut row),
+            RowSanitisation::Skip(_)
+        ));
+        // Unknown mode.
+        let mut row = rule_row("block", "enforce", r#"true"#);
+        assert!(matches!(
+            sanitise_restored_row("rules", &mut row),
+            RowSanitisation::Skip(_)
+        ));
+        // Unknown action.
+        let mut row = rule_row("quarantine", "block", r#"true"#);
+        assert!(matches!(
+            sanitise_restored_row("rules", &mut row),
+            RowSanitisation::Skip(_)
+        ));
+        // An expression the data plane would drop.
+        let mut row = rule_row("block", "block", "and and");
+        assert!(matches!(
+            sanitise_restored_row("rules", &mut row),
+            RowSanitisation::Skip(_)
+        ));
+    }
+
+    fn exception_row(
+        path: &str,
+        match_type: &str,
+        skip_layers: Value,
+    ) -> Value {
+        json!({
+            "id": Uuid::new_v4(),
+            "site_id": Uuid::new_v4(),
+            "path": path,
+            "match_type": match_type,
+            "skip_layers": skip_layers,
+            "enabled": true,
+        })
+    }
+
+    /// A valid path exception is kept, with the list normalisation applied.
+    #[test]
+    fn valid_path_exceptions_are_kept() {
+        let mut row = exception_row(
+            "/health",
+            "exact",
+            json!(["waf", "rate_limit", "waf"]),
+        );
+        assert_eq!(
+            RowSanitisation::Keep,
+            sanitise_restored_row("site_path_exceptions", &mut row)
+        );
+        assert_eq!(json!(["waf", "rate_limit"]), row["skip_layers"]);
+    }
+
+    #[test]
+    fn invalid_path_exceptions_are_skipped_and_named() {
+        // skip_layers must not be empty — an empty list would restore a row
+        // that skips nothing but still looks like a bypass in the console.
+        let mut row = exception_row("/health", "exact", json!([]));
+        assert!(matches!(
+            sanitise_restored_row("site_path_exceptions", &mut row),
+            RowSanitisation::Skip(_)
+        ));
+        // Unknown layer names are rejected, not ignored.
+        let mut row = exception_row("/health", "exact", json!(["everything"]));
+        assert!(matches!(
+            sanitise_restored_row("site_path_exceptions", &mut row),
+            RowSanitisation::Skip(_)
+        ));
+        // A regex that does not compile.
+        let mut row = exception_row("(", "regex", json!(["waf"]));
+        assert!(matches!(
+            sanitise_restored_row("site_path_exceptions", &mut row),
+            RowSanitisation::Skip(_)
+        ));
+        // A wildcard needs one trailing `*`.
+        let mut row =
+            exception_row("/api/*/status", "wildcard", json!(["waf"]));
+        assert!(matches!(
+            sanitise_restored_row("site_path_exceptions", &mut row),
+            RowSanitisation::Skip(_)
+        ));
+    }
+
+    /// Tables without row-level validation pass through untouched.
+    #[test]
+    fn other_tables_are_not_touched() {
+        let mut row = json!({"id": 1, "anything": "goes"});
+        assert_eq!(
+            RowSanitisation::Keep,
+            sanitise_restored_row("waf_settings", &mut row)
+        );
+    }
+
+    fn scope_row(table: &str, path: &str, match_type: &str) -> Value {
+        let mut row = json!({
+            "id": Uuid::new_v4(),
+            "site_id": Uuid::new_v4(),
+            "match_type": match_type,
+        });
+        if !path.is_empty() {
+            row["path"] = json!(path);
+        }
+        if table == "site_path_exceptions" {
+            row["skip_layers"] = json!([]);
+        }
+        row
+    }
+
+    /// DR-03: the row-to-requirement mapping must agree with the write-path
+    /// gate — a whole-site scope (empty or absent `path`) is ungated, any
+    /// non-empty scope needs the path-filter feature, and regex additionally
+    /// needs the matcher.
+    #[test]
+    fn restored_rows_map_to_the_same_requirements_as_the_write_path() {
+        for table in [
+            "ip_access_rules",
+            "geo_rules",
+            "site_basic_auth",
+            "site_oidc",
+        ] {
+            // Whole-site scope: no requirement, not even for a 0.32.16 agent.
+            assert!(
+                row_scope_requirements(table, &scope_row(table, "", "prefix"))
+                    .is_empty(),
+                "{table} with an empty path must not be gated"
+            );
+            // No `path` column at all (v1 snapshot shape): not gated either.
+            let mut row = scope_row(table, "", "prefix");
+            row.as_object_mut()
+                .expect("scope_row builds an object")
+                .remove("path");
+            assert!(
+                row_scope_requirements(table, &row).is_empty(),
+                "{table} with no path column must not be gated"
+            );
+            // Non-empty scope: needs the path-filter feature.
+            assert_eq!(
+                row_scope_requirements(
+                    table,
+                    &scope_row(table, "/admin", "prefix")
+                ),
+                vec![ScopeRequirement {
+                    min: crate::api::capabilities::MIN_AGENT_PATH_SCOPES,
+                    label: crate::api::capabilities::PATH_SCOPE_LABEL
+                }],
+                "{table} with a scope must require path scopes"
+            );
+        }
+
+        // A regex path exception needs the matcher.
+        let mut row = scope_row("site_path_exceptions", "/api/.*", "regex");
+        row["skip_layers"] = json!(["waf"]);
+        let requirements = row_scope_requirements("site_path_exceptions", &row);
+        assert_eq!(requirements.len(), 2);
+        assert_eq!(requirements[0].min, "0.32.21");
+        assert_eq!(requirements[1].min, "0.32.20");
+
+        // Plain prefix exception without skip_layers: ungated.
+        let row = scope_row("site_path_exceptions", "/health", "prefix");
+        assert!(row_scope_requirements("site_path_exceptions", &row).is_empty());
+
+        // Unrelated tables are never gated.
+        assert!(row_scope_requirements("rules", &json!({})).is_empty());
+    }
+
+    /// DR-03: the rejection names the site, the agent, its version, the
+    /// missing capability and the minimum — everything an operator needs to
+    /// fix the fleet.
+    #[test]
+    fn rejection_message_names_site_agent_version_and_minimum() {
+        let message = restore_rejection_message(
+            "pursearea.cn",
+            "edge-1",
+            "0.32.16",
+            &ScopeRequirement {
+                min: "0.32.21",
+                label: "canonical path matching",
+            },
+        );
+        assert_eq!(
+            message,
+            "restore rejected: site pursearea.cn needs agent >= 0.32.21 \
+             for canonical path matching, but agent edge-1 reports 0.32.16"
+        );
+    }
+
+    /// A restored row whose site cannot be resolved still gates on the id.
+    #[test]
+    fn unknown_sites_fall_back_to_their_id_in_the_rejection() {
+        let site_id = Uuid::new_v4();
+        let site = site_domains_for(&[json!({
+            "id": site_id,
+            // No `domain` column: restore rejection must still identify it.
+        })]);
+        assert_eq!(
+            site.get(&site_id).map(String::as_str),
+            Some(site_id.to_string().as_str())
+        );
     }
 }

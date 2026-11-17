@@ -22,9 +22,13 @@
   --color-text-default: #1d1d1d;
   --color-text-subtle: #666666;
   --color-text-strong: #000000;
+  /* Brand-coloured text that must stay readable on the brand-tinted surfaces
+     (active nav item, `bg-brand-soft` chips). The plain brand orange is a
+     background colour — on white it is only ~2.6:1, so it never names text. */
+  --color-text-brand-strong: #9a3d00;
   --color-text-inverse: #ffffff;
   --color-text-link: #0051c3;
-  --color-text-danger: #e54d2a;
+  --color-text-danger: #b93a1c;
   --color-text-success: #18794e;
 
   /* Border */
@@ -63,11 +67,15 @@
   --color-bg-overlay: rgba(0, 0, 0, 0.7);
 
   --color-text-default: #e8e8e8;
-  --color-text-subtle: #a0a0a0;
+  /* ≥5.5:1 on both #1d1d1d and #2a2a2a; the old #a0a0a0 dipped under 5:1 on
+     the elevated surface (UX-17). */
+  --color-text-subtle: #a8a8a8;
   --color-text-strong: #ffffff;
+  /* Brand-coloured text for dark surfaces: ~9:1 on #1d1d1d / #2a2a2a. */
+  --color-text-brand-strong: #ffb066;
   --color-text-inverse: #1d1d1d;
   --color-text-link: #52a9ff;
-  --color-text-danger: #ff6340;
+  --color-text-danger: #ff8a66;
   --color-text-success: #30a46c;
 
   --color-border-line: #3a3a3a;
@@ -100,6 +108,9 @@
   --color-fg: var(--color-text-default);
   --color-fg-subtle: var(--color-text-subtle);
   --color-fg-strong: var(--color-text-strong);
+  /* Readable brand text (text-fg-brand-strong): never use `text-brand` for
+     words — the orange is a surface colour. */
+  --color-fg-brand-strong: var(--color-text-brand-strong);
   --color-fg-inverse: var(--color-text-inverse);
   --color-link: var(--color-text-link);
   --color-fg-danger: var(--color-text-danger);
@@ -288,6 +299,60 @@ body {
   font-family: var(--font-mono);
   font-variant-ligatures: none;
   font-feature-settings: "zero" 1;
+}
+
+/* ============================================================
+   Mobile ergonomics (UX-08)
+
+   On phones — and on any coarse pointer, which is what a tablet or a
+   touch laptop reports — interactive controls keep at least a 44×44 CSS
+   px hit area (WCAG 2.5.5 / Apple HIG). Only the hit area grows: the
+   desktop layout and the visual size of a control are unchanged.
+
+   `.pw-touch-target` is the opt-in class for icon-only controls whose
+   visual box is smaller than 44px (header icon buttons, pagination
+   arrows, row actions). Text buttons and selects are covered by the
+   element rules below.
+   ============================================================ */
+@media (max-width: 767px), (pointer: coarse) {
+  .pw-touch-target {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  /* Text buttons and form controls are row items, so raising their
+     minimum height cannot reflow inline prose. Inline text links (`a`)
+     are deliberately excluded. */
+  button,
+  select,
+  [role="switch"] {
+    min-height: 44px;
+  }
+
+  /* Sidebar / drawer navigation rows (inline text links stay compact). */
+  nav a.flex {
+    min-height: 44px;
+  }
+
+  /* Text fields and textareas are the remaining 36px controls in filter bars. */
+  input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"]),
+  textarea {
+    min-height: 44px;
+  }
+
+  /* Icon-only buttons: `Button` renders a lone <svg> when it has no text, so
+     the hit area can be widened without changing the component. */
+  button:has(> svg:only-child) {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  /* Checkbox / radio rows: the wrapping <label> is the real hit target, so a
+     page adds this class to that row for a 44px tap height (the box itself
+     keeps its visual size). */
+  .pw-touch-check {
+    min-height: 44px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

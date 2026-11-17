@@ -13,6 +13,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   ShieldWarning,
+  Warning,
   ListDashes,
   MagnifyingGlass,
   DownloadSimple,
@@ -60,6 +61,7 @@ import {
 import { requestLines, responseLines, type RawLine } from '@/lib/rawHttp'
 import {
   formatDateTime,
+  formatDateTimeWithZone,
   formatLatency,
   formatLogTime,
   formatNumber,
@@ -140,6 +142,194 @@ function ruleLink(event: SecurityEvent): string {
   }
 }
 
+/* ── Query validation (UX-16) ──────────────────────────────────── */
+
+/**
+ * Enumerated query values: the one-click candidates offered for a typo, plus
+ * the predicate that decides whether a value is acceptable at all. The parser
+ * already rejects some of these (e.g. `status:abc`); the others (`action`,
+ * `method`, `cache_status`, `latency`) are accepted verbatim by the parser and
+ * would otherwise silently match nothing.
+ */
+const QUERY_VALUE_VALIDATORS: Record<
+  string,
+  { values: string[]; hintKey: string; accepts: (value: string) => boolean }
+> = {
+  status: {
+    values: ['4xx', '5xx', '200', '403', '404', '429', '500'],
+    hintKey: 'statusValues',
+    accepts: (value) => /^[1-5]xx$/i.test(value) || /^\d{3}$/.test(value),
+  },
+  method: {
+    values: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'],
+    hintKey: 'methodValues',
+    accepts: (value) =>
+      ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].includes(
+        value.toUpperCase(),
+      ),
+  },
+  action: {
+    values: ['block', 'challenge', 'js_challenge', 'log', 'allow'],
+    hintKey: 'actionValues',
+    accepts: (value) =>
+      ['block', 'challenge', 'js_challenge', 'log', 'allow'].includes(
+        value.toLowerCase(),
+      ),
+  },
+  cache_status: {
+    values: ['hit', 'miss', 'bypass'],
+    hintKey: 'cacheValues',
+    accepts: (value) =>
+      ['hit', 'miss', 'bypass'].includes(value.toLowerCase()),
+  },
+  latency: {
+    values: ['>200', '>1000'],
+    hintKey: 'latencyValues',
+    accepts: (value) => /^>=?\d+$/.test(value),
+  },
+  min_latency_ms: {
+    values: ['>200', '>1000'],
+    hintKey: 'latencyValues',
+    accepts: (value) => /^>=?\d+$/.test(value),
+  },
+}
+
+/** Splits the draft on whitespace, honouring double quotes (parser mirror). */
+function splitQueryTokens(input: string): string[] {
+  const tokens: string[] = []
+  let current = ''
+  let quoted = false
+  for (const char of input) {
+    if (char === '"') {
+      quoted = !quoted
+      continue
+    }
+    if (!quoted && /\s/.test(char)) {
+      if (current.trim()) tokens.push(current.trim())
+      current = ''
+      continue
+    }
+    current += char
+  }
+  if (current.trim()) tokens.push(current.trim())
+  return tokens
+}
+
+type QueryIssue =
+  | { kind: 'field'; token: string; field: string; candidates: string[] }
+  | {
+      kind: 'value'
+      token: string
+      field: string
+      value: string
+      candidates: string[]
+      hintKey?: string
+    }
+
+/** Levenshtein distance, capped — only used to rank a handful of field names. */
+function editDistance(a: string, b: string): number {
+  if (a === b) return 0
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i)
+  for (let i = 1; i <= a.length; i += 1) {
+    let diagonal = prev[0]
+    prev[0] = i
+    for (let j = 1; j <= b.length; j += 1) {
+      const above = prev[j]
+      prev[j] = Math.min(
+        prev[j] + 1,
+        prev[j - 1] + 1,
+        diagonal + (a[i - 1] === b[j - 1] ? 0 : 1),
+      )
+      diagonal = above
+    }
+  }
+  return prev[b.length]
+}
+
+/** Field names worth suggesting for a misspelt token (prefix first, then fuzzy). */
+function suggestFields(raw: string, fields: LogQueryField[]): string[] {
+  if (!raw) return []
+  const names = fields.flatMap((f) => [f.name, ...(f.aliases ?? [])])
+  const prefix = names.filter(
+    (name) => name.startsWith(raw) || raw.startsWith(name),
+  )
+  const fuzzy = names.filter(
+    (name) =>
+      !prefix.includes(name) && editDistance(raw, name) <= 2 && raw.length >= 3,
+  )
+  return [...new Set([...prefix, ...fuzzy])].slice(0, 3)
+}
+
+/**
+ * Validates the *draft* query before it is committed, so an illegal field or
+ * value is reported inline with candidates instead of being silently dropped
+ * by the parser and sending a search that ignores part of what was typed.
+ */
+function validateLogQuery(draft: string, tab: Tab): QueryIssue[] {
+  const { unknown } = parseLogQuery(draft, tab)
+  const fields = logQueryFieldsFor(tab)
+  const canonical = new Map<string, LogQueryField>()
+  for (const field of fields) {
+    canonical.set(field.name, field)
+    for (const alias of field.aliases ?? []) canonical.set(alias, field)
+  }
+
+  const issues: QueryIssue[] = unknown.map((token) => {
+    const separator = token.indexOf(':')
+    const rawField = (
+      separator > 0 ? token.slice(0, separator) : token
+    )
+      .toLowerCase()
+      .replace(/-/g, '_')
+    const rawValue = separator > 0 ? token.slice(separator + 1) : ''
+    const field = canonical.get(rawField)
+    if (field) {
+      const meta = QUERY_VALUE_VALIDATORS[field.name]
+      return {
+        kind: 'value',
+        token,
+        field: rawField,
+        value: rawValue,
+        candidates: meta?.values ?? [],
+        hintKey: meta?.hintKey,
+      }
+    }
+    return {
+      kind: 'field',
+      token,
+      field: rawField,
+      candidates: suggestFields(rawField, fields),
+    }
+  })
+
+  // Fields the parser accepts verbatim but the backend only matches on a
+  // closed value set: a typo there filters everything out without a word.
+  const flagged = new Set(unknown)
+  for (const token of splitQueryTokens(draft)) {
+    if (flagged.has(token)) continue
+    const separator = token.indexOf(':')
+    if (separator <= 0) continue
+    const rawField = token
+      .slice(0, separator)
+      .toLowerCase()
+      .replace(/-/g, '_')
+    const value = token.slice(separator + 1).trim()
+    const field = canonical.get(rawField)
+    if (!field) continue
+    const meta = QUERY_VALUE_VALIDATORS[field.name]
+    if (!meta || meta.accepts(value)) continue
+    issues.push({
+      kind: 'value',
+      token,
+      field: rawField,
+      value,
+      candidates: meta.values,
+      hintKey: meta.hintKey,
+    })
+  }
+  return issues
+}
+
 export function LogsPage() {
   const { t } = useTranslation()
   const toast = useToast()
@@ -217,6 +407,12 @@ export function LogsPage() {
     () => parseLogQuery(searchText, tab),
     [searchText, tab],
   )
+
+  // UX-16: validate the draft as it is typed so an illegal field/value is
+  // reported inline (with candidates) instead of being silently ignored when
+  // the query is committed.
+  const draftIssues = useMemo(() => validateLogQuery(draft, tab), [draft, tab])
+  const [searchBlocked, setSearchBlocked] = useState(false)
 
   const params = useMemo<LogQueryParams>(() => {
     const base: LogQueryParams = {
@@ -341,6 +537,14 @@ export function LogsPage() {
 
   /** Enter in the search box: commit the draft and fold in any date filters. */
   const commitSearch = () => {
+    // A query the parser would only partly understand must not fire: the
+    // user sees which token is wrong and can fix it from the inline hints.
+    if (draftIssues.length > 0) {
+      setSearchBlocked(true)
+      document.getElementById('log-search')?.focus()
+      return
+    }
+    setSearchBlocked(false)
     const parsed = parseLogQuery(draft, tab)
     const patch: Record<string, string | null> = { q: draft.trim() }
     if (parsed.params.from) {
@@ -353,6 +557,24 @@ export function LogsPage() {
     if (parsed.params.site_id) patch.site_id = parsed.params.site_id
     if (parsed.params.unassigned) patch.site_id = 'none'
     updateQuery(patch)
+  }
+
+  /** Replaces an invalid token with a candidate offered by the inline hint. */
+  const applyIssueFix = (issue: QueryIssue, candidate: string) => {
+    const replacement =
+      issue.kind === 'field'
+        ? `${candidate}:${issue.token.slice(issue.token.indexOf(':') + 1)}`
+        : `${issue.field}:${candidate}`
+    const fixed = draft.replace(issue.token, replacement)
+    setDraft(fixed)
+    setSearchBlocked(false)
+    requestAnimationFrame(() => {
+      const el = document.getElementById('log-search') as HTMLInputElement | null
+      if (el) {
+        el.focus()
+        el.setSelectionRange(fixed.length, fixed.length)
+      }
+    })
   }
 
   const resetQuery = () => {
@@ -613,7 +835,10 @@ export function LogsPage() {
       sortable: true,
       width: '1%',
       cell: (r) => (
-        <span className="pw-mono whitespace-nowrap text-xs text-fg-subtle">
+        <span
+          className="pw-mono whitespace-nowrap text-xs text-fg-subtle"
+          title={formatDateTimeWithZone(r.timestamp)}
+        >
           {formatLogTime(r.timestamp)}
         </span>
       ),
@@ -719,7 +944,10 @@ export function LogsPage() {
       sortable: true,
       width: '1%',
       cell: (r) => (
-        <span className="pw-mono whitespace-nowrap text-xs text-fg-subtle">
+        <span
+          className="pw-mono whitespace-nowrap text-xs text-fg-subtle"
+          title={formatDateTimeWithZone(r.timestamp)}
+        >
           {formatLogTime(r.timestamp)}
         </span>
       ),
@@ -838,7 +1066,10 @@ export function LogsPage() {
       sortable: true,
       width: '1%',
       cell: (r) => (
-        <span className="pw-mono whitespace-nowrap text-xs text-fg-subtle">
+        <span
+          className="pw-mono whitespace-nowrap text-xs text-fg-subtle"
+          title={formatDateTimeWithZone(r.timestamp)}
+        >
           {formatLogTime(r.timestamp)}
         </span>
       ),
@@ -938,6 +1169,175 @@ export function LogsPage() {
     },
   ]
 
+  /* ── Mobile cards (UX-08) ─────────────────────────────────────
+     Below 768px the desktop tables (≈1000px wide) become stacked cards, so a
+     phone viewport does not need a blind horizontal scroll to reach the
+     status/action column. Each card is a single button: the whole row is the
+     hit area (≥44px) and keyboard focus lands on it directly. */
+  const cardClass =
+    'flex w-full flex-col gap-1.5 px-4 py-3 text-left transition-colors hover:bg-recessed'
+
+  const securityCard = (r: SecurityEvent) => (
+    <button
+      key={r.id}
+      type="button"
+      onClick={() => setSelectedEvent(r)}
+      className={cardClass}
+    >
+      <span className="flex items-center justify-between gap-2">
+        <span
+          className="pw-mono text-xs text-fg-subtle"
+          title={formatDateTimeWithZone(r.timestamp)}
+        >
+          {formatLogTime(r.timestamp)}
+        </span>
+        <span className="flex shrink-0 items-center gap-1.5">
+          {r.score != null && (
+            <span
+              className={cn(
+                'tabular-nums text-xs',
+                r.score >= 50 ? 'font-medium text-fg-danger' : 'text-fg-subtle',
+              )}
+            >
+              {r.score}
+            </span>
+          )}
+          <Badge tone={ACTION_TONE[r.action] ?? 'neutral'}>
+            {t(`actions.${r.action}`, r.action)}
+          </Badge>
+        </span>
+      </span>
+      <span className="block min-w-0">
+        <span className="block truncate text-[13px] text-fg">
+          <span className="pw-mono">{r.method}</span>{' '}
+          <span className="pw-mono">{r.path ?? '—'}</span>
+        </span>
+        {r.host && (
+          <span className="block truncate text-[11px] text-fg-subtle">{r.host}</span>
+        )}
+      </span>
+      <span className="flex items-center justify-between gap-2 text-xs">
+        <span className="pw-mono truncate text-fg">
+          {r.country_code ? `${countryFlag(r.country_code)} ` : ''}
+          {r.client_ip}
+        </span>
+        <span className="truncate text-fg-subtle">
+          {r.rule_name ?? r.rule_id ?? '—'}
+        </span>
+      </span>
+      {!siteId && r.site_id == null && (
+        <Badge tone="warning" size="sm">
+          {t('pages.logs.unassigned')}
+        </Badge>
+      )}
+    </button>
+  )
+
+  const accessCard = (r: AccessLog) => (
+    <button
+      key={r.id}
+      type="button"
+      onClick={() => setSelectedLog(r)}
+      className={cardClass}
+    >
+      <span className="flex items-center justify-between gap-2">
+        <span
+          className="pw-mono text-xs text-fg-subtle"
+          title={formatDateTimeWithZone(r.timestamp)}
+        >
+          {formatLogTime(r.timestamp)}
+        </span>
+        <span className="flex shrink-0 items-center gap-1.5">
+          {r.status_code ? (
+            <Badge tone={statusTone(r.status_code)}>{r.status_code}</Badge>
+          ) : null}
+          {r.total_latency_ms != null && (
+            <span className="tabular-nums text-xs text-fg-subtle">
+              {formatLatency(r.total_latency_ms)}
+            </span>
+          )}
+        </span>
+      </span>
+      <span className="block min-w-0">
+        <span className="block truncate text-[13px] text-fg">
+          <span className="pw-mono">{r.method}</span>{' '}
+          <span className="pw-mono">{r.path ?? '—'}</span>
+        </span>
+        {r.host && (
+          <span className="block truncate text-[11px] text-fg-subtle">{r.host}</span>
+        )}
+      </span>
+      <span className="flex items-center justify-between gap-2 text-xs">
+        <span className="pw-mono truncate text-fg">
+          {r.country_code ? `${countryFlag(r.country_code)} ` : ''}
+          {r.client_ip}
+        </span>
+        <span className="flex shrink-0 items-center gap-2 text-fg-subtle">
+          {r.cache_status && (
+            <span
+              className={cn(
+                'pw-mono',
+                r.cache_status === 'hit' ? 'text-fg-success' : 'text-fg-subtle',
+              )}
+            >
+              {r.cache_status}
+            </span>
+          )}
+          {r.response_size != null && (
+            <span className="tabular-nums">{formatSize(r.response_size)}</span>
+          )}
+        </span>
+      </span>
+      {!siteId && r.site_id == null && (
+        <Badge tone="warning" size="sm">
+          {t('pages.logs.unassigned')}
+        </Badge>
+      )}
+    </button>
+  )
+
+  const controlCard = (r: ControlPlaneAccessLog) => (
+    <button
+      key={r.id}
+      type="button"
+      onClick={() => setSelectedControl(r)}
+      className={cardClass}
+    >
+      <span className="flex items-center justify-between gap-2">
+        <span
+          className="pw-mono text-xs text-fg-subtle"
+          title={formatDateTimeWithZone(r.timestamp)}
+        >
+          {formatLogTime(r.timestamp)}
+        </span>
+        <span className="flex shrink-0 items-center gap-1.5">
+          {r.status_code ? (
+            <Badge tone={statusTone(r.status_code)}>{r.status_code}</Badge>
+          ) : null}
+          <Badge tone={CONTROL_ACTION_TONE[r.action] ?? 'neutral'}>
+            {t(`actions.${r.action}`, r.action)}
+          </Badge>
+        </span>
+      </span>
+      <span className="block min-w-0">
+        <span className="block truncate text-[13px] text-fg">
+          <span className="pw-mono">{r.method}</span>{' '}
+          <span className="pw-mono">
+            {r.path}
+            {r.query_string ? `?${r.query_string}` : ''}
+          </span>
+        </span>
+        {r.host && (
+          <span className="block truncate text-[11px] text-fg-subtle">{r.host}</span>
+        )}
+      </span>
+      <span className="flex items-center justify-between gap-2 text-xs">
+        <span className="pw-mono truncate text-fg">{r.client_ip}</span>
+        <span className="truncate text-fg-subtle">{r.reason ?? '—'}</span>
+      </span>
+    </button>
+  )
+
   const tabs: { value: Tab; label: string; icon: typeof ShieldWarning; count?: number }[] = [
     { value: 'security', label: t('pages.logs.securityTab'), icon: ShieldWarning },
     { value: 'access', label: t('pages.logs.accessTab'), icon: ListDashes },
@@ -1002,7 +1402,7 @@ export function LogsPage() {
       />
 
       {/* Tabs */}
-      <div className="mb-4 flex gap-1 border-b border-line">
+      <div className="mb-4 flex gap-1 overflow-x-auto border-b border-line">
         {tabs.map((entry) => {
           const Icon = entry.icon
           return (
@@ -1015,7 +1415,7 @@ export function LogsPage() {
                 })
               }
               className={cn(
-                '-mb-px inline-flex items-center gap-2 border-b-2 px-3 py-2.5 text-sm font-medium transition-colors',
+                'pw-touch-target -mb-px inline-flex shrink-0 items-center gap-2 border-b-2 px-3 py-2.5 text-sm font-medium transition-colors',
                 tab === entry.value
                   ? 'border-brand text-fg-strong'
                   : 'border-transparent text-fg-subtle hover:text-fg',
@@ -1050,6 +1450,10 @@ export function LogsPage() {
                     onKeyDown={handleSearchKeyDown}
                     onBlur={() => setSuggest(null)}
                     autoComplete="off"
+                    aria-invalid={draftIssues.length > 0 || undefined}
+                    aria-describedby={
+                      draftIssues.length > 0 ? 'log-search-issues' : undefined
+                    }
                   />
                   {suggest !== null && suggestions.length > 0 && (
                     <div className="absolute left-0 right-0 top-full z-30 mt-1 overflow-hidden rounded-md border border-line bg-elevated py-1 shadow-lg">
@@ -1093,8 +1497,57 @@ export function LogsPage() {
                   {t('common.search')}
                 </Button>
               </div>
+              {draftIssues.length > 0 && (
+                <div
+                  id="log-search-issues"
+                  role="status"
+                  aria-live="polite"
+                  className="mt-1.5 flex flex-col gap-1"
+                >
+                  {draftIssues.map((issue) => (
+                    <p
+                      key={issue.token}
+                      className="flex flex-wrap items-center gap-1.5 text-xs text-fg-warning"
+                    >
+                      <Warning weight="fill" className="h-3.5 w-3.5 shrink-0" aria-hidden />
+                      <span>
+                        {issue.kind === 'field'
+                          ? t('logs.unknownField', { field: issue.field })
+                          : t('logs.invalidValue', {
+                              field: issue.field,
+                              value: issue.value,
+                            })}
+                      </span>
+                      {issue.candidates.length > 0 && (
+                        <>
+                          <span className="text-fg-subtle">{t('logs.didYouMean')}</span>
+                          {issue.candidates.map((candidate) => (
+                            <button
+                              key={candidate}
+                              type="button"
+                              aria-label={t('logs.useCandidate', { token: candidate })}
+                              onClick={() => applyIssueFix(issue, candidate)}
+                              className="pw-mono rounded border border-line bg-recessed px-1.5 py-0.5 text-[11px] text-fg transition-colors hover:border-brand hover:text-fg-strong"
+                            >
+                              {candidate}
+                            </button>
+                          ))}
+                        </>
+                      )}
+                      {issue.kind === 'value' && issue.hintKey && (
+                        <span className="text-fg-subtle">
+                          {t(`logs.${issue.hintKey}`)}
+                        </span>
+                      )}
+                    </p>
+                  ))}
+                  {searchBlocked && (
+                    <p className="text-xs text-fg-danger">{t('logs.fixBeforeSearch')}</p>
+                  )}
+                </div>
+              )}
               {parsedQuery.unknown.length > 0 && (
-                <p className="mt-1.5 text-xs text-fg-warning">
+                <p className="mt-1.5 text-xs text-fg-subtle">
                   {t('pages.logs.searchUnknown', {
                     tokens: parsedQuery.unknown.join(' '),
                   })}
@@ -1210,31 +1663,50 @@ export function LogsPage() {
               />
             ) : (
               <>
-                {tab === 'security' ? (
-                  <Table
-                    columns={securityColumns}
-                    data={rows as SecurityEvent[]}
-                    rowKey={(r) => String(r.id)}
-                    dense
-                    onRowClick={(r) => setSelectedEvent(r)}
-                  />
-                ) : tab === 'access' ? (
-                  <Table
-                    columns={accessColumns}
-                    data={rows as AccessLog[]}
-                    rowKey={(r) => String(r.id)}
-                    dense
-                    onRowClick={(r) => setSelectedLog(r)}
-                  />
-                ) : (
-                  <Table
-                    columns={controlColumns}
-                    data={rows as ControlPlaneAccessLog[]}
-                    rowKey={(r) => String(r.id)}
-                    dense
-                    onRowClick={(r) => setSelectedControl(r)}
-                  />
-                )}
+                {/* Phones get stacked cards; the desktop table starts at md. */}
+                <ul className="divide-y divide-line md:hidden">
+                  {tab === 'security'
+                    ? (rows as SecurityEvent[]).map((r) => (
+                        <li key={r.id}>{securityCard(r)}</li>
+                      ))
+                    : tab === 'access'
+                      ? (rows as AccessLog[]).map((r) => (
+                          <li key={r.id}>{accessCard(r)}</li>
+                        ))
+                      : (rows as ControlPlaneAccessLog[]).map((r) => (
+                          <li key={r.id}>{controlCard(r)}</li>
+                        ))}
+                </ul>
+                <div className="hidden md:block">
+                  {tab === 'security' ? (
+                    <Table
+                      columns={securityColumns}
+                      data={rows as SecurityEvent[]}
+                      rowKey={(r) => String(r.id)}
+                      dense
+                      scrollLabel={t('mobile.logsTable')}
+                      onRowClick={(r) => setSelectedEvent(r)}
+                    />
+                  ) : tab === 'access' ? (
+                    <Table
+                      columns={accessColumns}
+                      data={rows as AccessLog[]}
+                      rowKey={(r) => String(r.id)}
+                      dense
+                      scrollLabel={t('mobile.logsTable')}
+                      onRowClick={(r) => setSelectedLog(r)}
+                    />
+                  ) : (
+                    <Table
+                      columns={controlColumns}
+                      data={rows as ControlPlaneAccessLog[]}
+                      rowKey={(r) => String(r.id)}
+                      dense
+                      scrollLabel={t('mobile.logsTable')}
+                      onRowClick={(r) => setSelectedControl(r)}
+                    />
+                  )}
+                </div>
                 <Pagination
                   page={page}
                   pageSize={pageSize}
@@ -1326,6 +1798,7 @@ export function LogsPage() {
                 <Button
                   size="icon"
                   variant="ghost"
+                  className="pw-touch-target"
                   aria-label={t('pages.logs.searchThisIp')}
                   icon={<MagnifyingGlass weight="duotone" className="h-4 w-4" />}
                   onClick={() => searchValue('client_ip', selectedEvent.client_ip)}
@@ -1335,6 +1808,7 @@ export function LogsPage() {
                 <Button
                   size="icon"
                   variant="secondary"
+                  className="pw-touch-target"
                   aria-label={t('pages.logs.blockIp')}
                   icon={<Prohibit weight="duotone" className="h-4 w-4" />}
                   disabled={!selectedEvent.site_id || !canWrite}
@@ -1351,6 +1825,7 @@ export function LogsPage() {
                 <Button
                   size="icon"
                   variant="secondary"
+                  className="pw-touch-target"
                   aria-label={t('pages.logs.addToIpGroup')}
                   icon={<Users weight="duotone" className="h-4 w-4" />}
                   disabled={!canWrite}
@@ -1450,9 +1925,20 @@ export function LogsPage() {
                 [t('pages.logs.upstream'), selectedFull.upstream_addr],
                 [
                   t('pages.logs.upstreamLatency'),
+                  selectedFull.upstream_time != null ||
                   selectedFull.upstream_latency_ms != null
-                    ? formatLatency(selectedFull.upstream_latency_ms)
+                    ? formatLatency(
+                        selectedFull.upstream_time ??
+                          selectedFull.upstream_latency_ms!,
+                      )
                     : undefined,
+                ],
+                [
+                  t('pages.logs.upstreamStatus'),
+                  selectedFull.upstream_status != null &&
+                  selectedFull.upstream_status > 0
+                    ? String(selectedFull.upstream_status)
+                    : '—',
                 ],
                 [
                   t('pages.logs.latency'),

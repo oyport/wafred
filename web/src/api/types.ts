@@ -521,6 +521,12 @@ export interface RuleGroup {
 /** `models::rules::rules::Model` */
 export interface Rule {
   id: string
+  /**
+   * Set when this row overrides a built-in (seed) rule. The server only
+   * accepts `enabled`/`mode` changes for such rows and the original rule's
+   * URL/expression are read-only — the dialog must not submit other fields.
+   */
+  managed_rule_id?: string | null
   group_id: string | null
   site_id: string
   name: string
@@ -855,6 +861,10 @@ export interface AccessLogSummary {
   response_size: number | null
   upstream_addr: string | null
   upstream_latency_ms: number | null
+  /** Alias of `upstream_latency_ms`, returned by the single-log detail. */
+  upstream_time?: number | null
+  /** Origin status; repeats `status_code` when the edge answered itself. */
+  upstream_status?: number | null
   total_latency_ms: number | null
   cache_status: string | null
   user_agent: string | null
@@ -1110,6 +1120,15 @@ export interface Agent {
   public_ip: string | null
   /** LAN address, with loopback and container bridges filtered out. */
   private_ip: string | null
+  /**
+   * Address the control plane accepted the agent's gRPC stream from.
+   *
+   * The one address the agent cannot misreport: unlike `public_ip` (its own
+   * egress probe) this is the TCP peer, so it survives NAT.
+   */
+  peer_ip: string | null
+  /** When `peer_ip` was last observed on a live stream. */
+  peer_ip_seen_at: string | null
   version: string | null
   os_info: string | null
   cpu_cores: number | null
@@ -2120,6 +2139,10 @@ export interface IpRule {
   group_id: string | null
   group_name?: string | null
   action: IpRuleAction | string
+  /** Path scope; empty = every path of the site. */
+  path: string
+  /** How `path` matches; the server stores `prefix` when `path` is empty. */
+  match_type: PathMatchType | string
   note: string | null
   enabled: boolean
   priority: number
@@ -2133,6 +2156,9 @@ export interface CreateIpRuleRequest {
   group_id?: string
   ip_ranges?: string[]
   action?: IpRuleAction | string
+  /** Empty = every path (the server then stores `prefix`). */
+  path?: string
+  match_type?: PathMatchType | string
   note?: string | null
   enabled?: boolean
   priority?: number
@@ -2406,6 +2432,10 @@ export interface GeoConfig {
   blocked_asns: string[]
   block_unknown: boolean
   action: GeoAction | string
+  /** Path scope; empty = every path of the site. */
+  path: string
+  /** How `path` matches; the server stores `prefix` when `path` is empty. */
+  match_type: PathMatchType | string
 }
 
 export type UpdateGeoRequest = Partial<Omit<GeoConfig, 'site_id'>>
@@ -2430,6 +2460,10 @@ export interface SiteBasicAuth {
   delay_seconds: number
   /** Strip the `Authorization` header once a request is authenticated. */
   hide_credentials: boolean
+  /** Path scope; empty = every path of the site. */
+  path: string
+  /** How `path` matches; the server stores `prefix` when `path` is empty. */
+  match_type: PathMatchType | string
   created_at: string
   updated_at: string
 }
@@ -2442,6 +2476,8 @@ export type UpdateBasicAuthRequest = Partial<
     | 'credentials'
     | 'delay_seconds'
     | 'hide_credentials'
+    | 'path'
+    | 'match_type'
   >
 >
 
@@ -2821,6 +2857,10 @@ export interface SiteOidc {
   auth_scope: 'site' | 'path'
   access_mode: OidcAccessMode
   access_rules: OidcAccessRule[]
+  /** Path scope; empty = every path of the site. */
+  path: string
+  /** How `path` matches; the server stores `prefix` when `path` is empty. */
+  match_type: PathMatchType | string
   created_at: string
   updated_at: string
 }
@@ -2847,6 +2887,8 @@ export type UpdateOidcRequest = Partial<
     | 'auth_scope'
     | 'access_mode'
     | 'access_rules'
+    | 'path'
+    | 'match_type'
   >
 > & {
   provider_id?: string | null

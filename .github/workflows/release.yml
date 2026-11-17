@@ -18,6 +18,15 @@ name: Release
 #
 # Releases are Linux-only (server deployments). Both matrix legs use the
 # default OpenSSL backend, matching the Dockerfile.
+#
+# Supply-chain metadata: every release asset is covered by a signed SLSA build
+# provenance attestation (`actions/attest-build-provenance`) and an SPDX SBOM
+# (`anchore/sbom-action`), both attached to the workflow run / release. The
+# per-arch container images are deliberately built without buildx provenance
+# and SBOM: `docker manifest create` (below) can only merge plain image
+# manifests, and attestation manifests would make the per-arch tags manifest
+# lists. Switching the merge step to `docker buildx imagetools create` would
+# allow image attestations too (tracked as a follow-up).
 
 on:
   push:
@@ -156,6 +165,10 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: write # upload assets into the release created above
+      # Build provenance: sign the release assets with the workflow's OIDC
+      # identity and store the attestation on the repository.
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -260,6 +273,28 @@ jobs:
           ls -lh "$ASSET.tar.xz" "$ASSET.tar.gz" \
                  "$ASSET.tar.xz.sha256" "$ASSET.tar.gz.sha256"
 
+      # SBOM for the source tree that produced the archive. `dir:` (not the
+      # tarball) is deliberate: syft's `dir:` source cannot scan a single file,
+      # and scanning the repository's Cargo.lock gives a dependency inventory
+      # that is actually useful. `target/` is excluded because it contains the
+      # build output, not dependencies.
+      - name: Generate SPDX SBOM
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b "$RUNNER_TEMP/bin" v1.42.3
+          "$RUNNER_TEMP/bin/syft" scan dir:. \
+            --exclude './target/**' \
+            -o "spdx-json=pingwaf-${{ matrix.plat }}-${{ matrix.arch }}.spdx.json"
+
+      # Signed SLSA provenance for both archives: consumers can verify with
+      # `gh attestation verify pingwaf-linux-amd64.tar.gz --repo <repo>`.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            pingwaf-${{ matrix.plat }}-${{ matrix.arch }}.tar.xz
+            pingwaf-${{ matrix.plat }}-${{ matrix.arch }}.tar.gz
+
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
@@ -343,8 +378,13 @@ jobs:
           file: ./Dockerfile.runtime
           platforms: ${{ matrix.platform }}
           push: true
-          # Disable provenance/SBOM so each per-arch tag is a plain image
-          # manifest (not a manifest list), which docker manifest create requires.
+          # provenance/SBOM stay off for the per-arch image build on purpose:
+          # buildx attaches them as extra manifests in the image index, and the
+          # `docker manifest create` step below can only merge plain image
+          # manifests — an attested per-arch tag is a manifest list and the
+          # merge fails. The release *tarballs* carry a signed SLSA provenance
+          # and an SPDX SBOM instead; adding image attestations requires
+          # switching the merge to `docker buildx imagetools create`.
           provenance: false
           sbom: false
           tags: ghcr.io/oyport/wafred:${{ steps.version.outputs.value }}-${{ matrix.arch }}

@@ -171,6 +171,7 @@ export function ManagedRulesPanel() {
                       </span>
                       {linked && (
                         <span
+                          role="img"
                           title={t('pages.protection.categories.linkageHint')}
                           aria-label={t('pages.protection.categories.linkageHint')}
                         >

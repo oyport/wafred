@@ -287,7 +287,7 @@ WAFRED_CONFIG=/etc/wafred/wafred.toml wafred all-in-one   # 等价写法
 
 ## 🤝 参与贡献
 
-欢迎贡献代码！在提交 Pull Request 前，请先阅读 **[CONTRIBUTING.md](./CONTRIBUTING.md)**；如需负责任地报告安全漏洞，请见 **[SECURITY.md](./SECURITY.md)**。
+欢迎贡献代码！在提交 Pull Request 前，请先阅读 **[CONTRIBUTING.md](./CONTRIBUTING.md)**；如需负责任地报告安全漏洞，请见 **[SECURITY.md](./SECURITY.md)**——请通过 [GitHub 私密漏洞报告](https://github.com/shuaiZend/PingWAF/security/advisories/new) 或 `security@pingwaf.com` 私密提交，切勿在公开 Issue 中披露漏洞细节。
 
 ---
 

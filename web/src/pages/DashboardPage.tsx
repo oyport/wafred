@@ -36,6 +36,7 @@ import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
 import { Select } from '@/components/ui/Select'
 import { EmptyState } from '@/components/ui/EmptyState'
+import { Tooltip as InfoTooltip } from '@/components/ui/Tooltip'
 import { Table, type Column } from '@/components/ui/Table'
 import { ErrorState } from '@/components/ErrorState'
 import { DonutChart } from '@/components/charts/DonutChart'
@@ -48,13 +49,21 @@ import { useSitesList } from '@/hooks'
 import { buildLogsDrillDownUrl } from '@/lib/logDrillDown'
 import { cn } from '@/lib/utils'
 import {
+  failureReference,
+  useRetryBackoff,
+} from '@/lib/errorMessages'
+import {
+  displayTimeZone,
   formatBitrate,
   formatBucket,
   formatCompactNumber,
+  formatDateTimeWithZone,
   formatLatency,
   formatNumber,
   formatPercent,
+  formatRawValue,
   formatSize,
+  formatTime,
 } from '@/lib/format'
 import type { RangeQuery, TopPath, TrafficRange } from '@/api/types'
 
@@ -307,19 +316,48 @@ export function DashboardPage() {
   const egressAvg =
     egress && spanMs > 0 ? (egress.total_bytes * 8) / (spanMs / 1000) : undefined
 
+  /** Multi-line tooltip body for a KPI: definition, window and sample size (UX-20). */
+  const metricHelp = (key: string, sampleCount: number) => (
+    <span className="flex max-w-64 flex-col gap-0.5 whitespace-normal text-left">
+      <span className="font-medium text-fg">
+        {t(`pages.dashboard.metricHelp.${key}`)}
+      </span>
+      <span>{t('pages.dashboard.metricWindow', { hours })}</span>
+      <span>
+        {t('pages.dashboard.metricSample', {
+          count: formatNumber(sampleCount),
+        })}
+      </span>
+      <span>{t('format.timezone', { zone: displayTimeZone() })}</span>
+    </span>
+  )
+
   const stats = [
     {
       key: 'requests',
       label: t('pages.dashboard.requestsWindow'),
-      value: s ? formatCompactNumber(s.requests) : undefined,
-      sub: s ? t('pages.dashboard.uniqueIps', { count: formatCompactNumber(s.unique_ips) }) : undefined,
+      // A zero in the selected window is "no data", not a value (UX-20).
+      value: s && s.requests > 0 ? formatCompactNumber(s.requests) : undefined,
+      empty: s?.requests === 0,
+      raw: s ? formatRawValue(s.requests) : null,
+      help: metricHelp('requests', s?.requests ?? 0),
+      sub: s
+        ? t('pages.dashboard.uniqueIps', { count: formatCompactNumber(s.unique_ips) })
+        : undefined,
       icon: ArrowsDownUp,
       tone: 'text-link bg-focus/10',
+      detailsTo: '/traffic',
     },
     {
       key: 'egress',
       label: t('pages.dashboard.egressWindow'),
-      value: egress ? formatSize(egress.total_bytes) : undefined,
+      value:
+        egress && egress.total_bytes > 0
+          ? formatSize(egress.total_bytes)
+          : undefined,
+      empty: egress?.total_bytes === 0,
+      raw: egress ? `${formatRawValue(egress.total_bytes)} B` : null,
+      help: metricHelp('egress', egress?.buckets.length ?? 0),
       sub:
         egressAvg !== undefined
           ? `${t('pages.traffic.avgBitrate')}: ${formatBitrate(egressAvg)}`
@@ -330,52 +368,94 @@ export function DashboardPage() {
     {
       key: 'blocked',
       label: t('pages.dashboard.blockedWindow'),
-      value: s ? formatCompactNumber(s.blocked_requests) : undefined,
+      value:
+        s && s.blocked_requests > 0
+          ? formatCompactNumber(s.blocked_requests)
+          : undefined,
+      empty: s?.blocked_requests === 0,
+      raw: s ? formatRawValue(s.blocked_requests) : null,
+      help: metricHelp('blocked', s?.blocked_requests ?? 0),
       sub: s
-        ? t('pages.dashboard.attackers', { count: formatCompactNumber(s.distinct_attackers) })
+        ? t('pages.dashboard.attackers', {
+            count: formatCompactNumber(s.distinct_attackers),
+          })
         : undefined,
       icon: ShieldSlash,
       tone: 'text-fg-danger bg-danger/12',
+      detailsTo: '/logs?tab=security',
     },
     {
       key: 'security',
       label: t('pages.dashboard.securityEvents'),
-      value: s ? formatCompactNumber(s.security_events) : undefined,
+      value:
+        s && s.security_events > 0
+          ? formatCompactNumber(s.security_events)
+          : undefined,
+      empty: s?.security_events === 0,
+      raw: s ? formatRawValue(s.security_events) : null,
+      help: metricHelp('security', s?.security_events ?? 0),
       sub: s
-        ? t('pages.dashboard.rulesTriggered', { count: formatCompactNumber(s.rules_triggered) })
+        ? t('pages.dashboard.rulesTriggered', {
+            count: formatCompactNumber(s.rules_triggered),
+          })
         : undefined,
       icon: Lightning,
       tone: 'text-brand bg-brand-soft',
+      detailsTo: '/logs?tab=security',
     },
     {
       key: 'agents',
       label: t('pages.dashboard.activeAgents'),
       value: agents.data ? `${onlineAgents}/${totalAgents}` : undefined,
+      empty: false,
+      raw: agents.data ? `${onlineAgents} / ${totalAgents}` : null,
+      help: metricHelp('agents', totalAgents),
       sub: agents.data
         ? t('pages.dashboard.agentsOnline', { count: onlineAgents })
         : undefined,
       icon: Desktop,
       tone: 'text-fg-success bg-success/12',
+      detailsTo: '/agents',
     },
     {
       key: 'cache',
       label: t('pages.dashboard.cacheHitRate'),
-      value: s ? formatPercent(s.cache_hit_rate) : undefined,
-      sub: s ? `${formatCompactNumber(s.cache_hits)} ${t('nav.caching')}` : undefined,
+      value:
+        s && s.requests > 0 ? formatPercent(s.cache_hit_rate) : undefined,
+      empty: s?.requests === 0,
+      raw: s ? formatPercent(s.cache_hit_rate) : null,
+      help: metricHelp('cache', s?.requests ?? 0),
+      sub: s
+        ? `${formatCompactNumber(s.cache_hits)} ${t('nav.caching')}`
+        : undefined,
       icon: Database,
       tone: 'text-fg-success bg-success/12',
     },
     {
       key: 'latency',
       label: t('pages.dashboard.avgLatency'),
-      value: s ? formatLatency(s.avg_latency_ms) : undefined,
+      value:
+        s && s.requests > 0 ? formatLatency(s.avg_latency_ms) : undefined,
+      empty: s?.requests === 0,
+      raw: s ? `${formatRawValue(s.avg_latency_ms)} ms` : null,
+      help: metricHelp('latency', s?.requests ?? 0),
       sub: s
-        ? `${t('pages.dashboard.errors')}: ${formatCompactNumber(s.client_errors + s.server_errors)}`
+        ? `${t('pages.dashboard.errors')}: ${formatCompactNumber(
+            s.client_errors + s.server_errors,
+          )}`
         : undefined,
       icon: Gauge,
       tone: 'text-fg bg-recessed',
+      detailsTo: '/traffic',
     },
   ]
+
+  // UX-10: a stable support reference per failure, plus a backoff-gated retry.
+  const summaryReference = useMemo(
+    () => (summary.error ? failureReference(summary.error) : null),
+    [summary.error],
+  )
+  const retrySummary = useRetryBackoff(() => void summary.refetch())
 
   const pathColumns: Column<TopPath>[] = [
     {
@@ -455,7 +535,19 @@ export function DashboardPage() {
 
       {/* Stat cards */}
       {summary.isError && !summary.data ? (
-        <ErrorState error={summary.error} onRetry={() => summary.refetch()} retrying={summary.isFetching} />
+        <ErrorState
+          error={summary.error}
+          reference={summaryReference}
+          onRetry={retrySummary.run}
+          retrying={summary.isFetching || retrySummary.waiting}
+          action={
+            retrySummary.waiting ? (
+              <span className="text-xs text-fg-subtle">
+                {t('errors.retryIn', { seconds: retrySummary.waitSeconds })}
+              </span>
+            ) : undefined
+          }
+        />
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6">
           {stats.map((stat) => {
@@ -466,20 +558,52 @@ export function DashboardPage() {
                   <span className={cn('flex h-9 w-9 items-center justify-center rounded-lg', stat.tone)}>
                     <Icon weight="duotone" className="h-[18px] w-[18px]" />
                   </span>
+                  <InfoTooltip content={stat.help}>
+                    <button
+                      type="button"
+                      aria-label={t('pages.dashboard.metricHelpLabel', { metric: stat.label })}
+                      className="rounded-full p-0.5 text-fg-subtle transition-colors hover:bg-recessed hover:text-fg"
+                    >
+                      <Info weight="duotone" className="h-4 w-4" />
+                    </button>
+                  </InfoTooltip>
                 </div>
-                {stat.value === undefined ? (
+                {stat.value === undefined && !stat.empty ? (
                   <div className="mt-3">
                     <Skeleton className="h-7 w-20" />
                     <Skeleton className="mt-2 h-3 w-24" />
                   </div>
                 ) : (
                   <>
-                    <p className="mt-3 text-2xl font-semibold tracking-tight text-fg-strong tabular-nums">
-                      {stat.value}
-                    </p>
+                    {stat.empty ? (
+                      // UX-20: an empty window is not "0" — say so explicitly.
+                      <p className="mt-3 text-sm font-medium text-fg-subtle">
+                        {t('pages.dashboard.noDataInWindow')}
+                      </p>
+                    ) : (
+                      <p
+                        // UX-12: compact KPIs keep the exact figure one hover away.
+                        title={
+                          stat.raw
+                            ? t('format.rawValue', { value: stat.raw })
+                            : undefined
+                        }
+                        className="mt-3 text-2xl font-semibold tracking-tight text-fg-strong tabular-nums"
+                      >
+                        {stat.value}
+                      </p>
+                    )}
                     <p className="mt-0.5 text-[13px] text-fg-subtle">{stat.label}</p>
-                    {stat.sub && (
-                      <p className="mt-1 text-xs text-fg-subtle/80 tabular-nums">{stat.sub}</p>
+                    {stat.sub && !stat.empty && (
+                      <p className="mt-1 text-xs text-fg-subtle tabular-nums">{stat.sub}</p>
+                    )}
+                    {'detailsTo' in stat && stat.detailsTo && !stat.empty && (
+                      <Link
+                        to={stat.detailsTo}
+                        className="mt-1 inline-block text-xs font-medium text-link hover:underline"
+                      >
+                        {t('pages.dashboard.viewDetails')}
+                      </Link>
                     )}
                   </>
                 )}
@@ -526,12 +650,12 @@ export function DashboardPage() {
                   </p>
                 </div>
                 {activeVisitors.data?.as_of && (
-                  <span className="text-xs text-fg-subtle tabular-nums">
+                  <span
+                    className="text-xs text-fg-subtle tabular-nums"
+                    title={formatDateTimeWithZone(activeVisitors.data.as_of)}
+                  >
                     {t('pages.dashboard.asOf')}{' '}
-                    {new Date(activeVisitors.data.as_of).toLocaleTimeString([], {
-                      hour: '2-digit',
-                      minute: '2-digit',
-                    })}
+                    {formatTime(activeVisitors.data.as_of)}
                   </span>
                 )}
               </div>
@@ -951,13 +1075,13 @@ function SystemCpuCard() {
             {snap.cpu.process_cpu_percent.toFixed(1)}%
           </p>
           <p className="mt-0.5 text-[13px] text-fg-subtle">{t('pages.dashboard.cpuCard.processCpu')}</p>
-          <p className="mt-1 text-xs text-fg-subtle/80 tabular-nums">
+          <p className="mt-1 text-xs text-fg-subtle tabular-nums">
             {t('pages.dashboard.cpuCard.hostCpu')}:{' '}
             <span className="font-medium text-fg">{snap.cpu.host_cpu_percent.toFixed(1)}%</span>
             <span className="mx-2 text-fg-subtle/40">·</span>
             {t('pages.dashboard.cpuCard.cores')}: {snap.cpu.cores}
           </p>
-          <p className="mt-0.5 text-xs text-fg-subtle/70 tabular-nums">
+          <p className="mt-0.5 text-xs text-fg-subtle tabular-nums">
             {t('pages.dashboard.cpuCard.rss')}: {snap.memory.rss}
           </p>
         </>

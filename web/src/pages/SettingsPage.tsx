@@ -69,6 +69,11 @@ import { mcpApi, mcpKeys } from '@/api/mcp'
 import { ipGroupKeys, ipGroupsApi } from '@/api/ipGroups'
 import { systemApi } from '@/api/system'
 import { ApiError } from '@/api/client'
+import {
+  DOCS_BASE_URL,
+  failureReference,
+  useRetryBackoff,
+} from '@/lib/errorMessages'
 import { errorMessage, handleApiError } from '@/api/errors'
 import { useAuthStore } from '@/stores/authStore'
 import { useCanWrite } from '@/hooks'
@@ -256,7 +261,7 @@ function AppearanceCard({
                   className={cn(
                     'flex flex-col items-center gap-2 rounded-lg border p-4 text-sm transition-all',
                     active
-                      ? 'border-brand bg-brand-soft text-brand'
+                      ? 'border-brand bg-brand-soft text-fg-brand-strong'
                       : 'border-line text-fg-subtle hover:border-fill hover:text-fg',
                   )}
                 >
@@ -283,7 +288,7 @@ function AppearanceCard({
                   className={cn(
                     'inline-flex items-center gap-2 rounded-md border px-4 py-2 text-sm transition-colors',
                     active
-                      ? 'border-brand bg-brand-soft text-brand'
+                      ? 'border-brand bg-brand-soft text-fg-brand-strong'
                       : 'border-line text-fg-subtle hover:border-fill hover:text-fg',
                   )}
                 >
@@ -1088,7 +1093,7 @@ function ErrorPagesCard({ canWrite }: { canWrite: boolean }) {
                           className={cn(
                             'flex h-12 w-12 shrink-0 items-center justify-center rounded-lg text-lg font-bold tabular-nums',
                             page?.enabled
-                              ? 'bg-brand-soft text-brand'
+                              ? 'bg-brand-soft text-fg-brand-strong'
                               : 'bg-recessed text-fg-subtle',
                           )}
                         >
@@ -1503,6 +1508,31 @@ function ControlPlaneTlsCard({ canWrite }: { canWrite: boolean }) {
     certificate.expires_in_days <= 30 &&
     certificate.expires_in_days >= 0
 
+  // UX-15: the browser only accepts a certificate whose SANs cover the host
+  // the console is open on, so the quick-fix panel ships the exact openssl
+  // invocation (CN + SAN already filled in) instead of a docs-only pointer.
+  const sanHost = host || 'pingwaf.local'
+  const opensslCommand = [
+    'openssl req -new -newkey rsa:2048 -nodes \\',
+    '  -keyout pingwaf-control-plane.key \\',
+    '  -out pingwaf-control-plane.csr \\',
+    `  -subj "/CN=${sanHost}" \\`,
+    `  -addext "subjectAltName=DNS:${sanHost}"`,
+  ].join('\n')
+  const copyOpenssl = async () => {
+    try {
+      await navigator.clipboard.writeText(opensslCommand)
+      toast.success(t('pages.settings.tlsOpensslCopied'))
+    } catch {
+      toast.error(t('pages.settings.copyFailed'))
+    }
+  }
+  const statusRetry = useRetryBackoff(() => void status.refetch())
+  const statusReference = useMemo(
+    () => (status.error ? failureReference(status.error) : null),
+    [status.error],
+  )
+
   return (
     <Card>
       <CardHeader
@@ -1523,8 +1553,9 @@ function ControlPlaneTlsCard({ canWrite }: { canWrite: boolean }) {
           <ErrorState
             variant="inline"
             error={status.error}
-            onRetry={() => status.refetch()}
-            retrying={status.isFetching}
+            reference={statusReference}
+            onRetry={statusRetry.run}
+            retrying={status.isFetching || statusRetry.waiting}
           />
         ) : !view ? (
           <SkeletonRows rows={3} columns={2} />
@@ -1657,6 +1688,46 @@ function ControlPlaneTlsCard({ canWrite }: { canWrite: boolean }) {
               >
                 {t('pages.settings.tlsGenerate')}
               </Button>
+            </div>
+            <div className="rounded-md border border-line bg-recessed px-3 py-3">
+              <p className="text-[13px] font-medium text-fg">
+                {t('pages.settings.tlsFixCta')}
+              </p>
+              <p className="mt-1 text-xs leading-relaxed text-fg-subtle">
+                {t('pages.settings.tlsRequestHint')}
+              </p>
+              <p className="mt-1 text-xs leading-relaxed text-fg-subtle">
+                {t('pages.settings.tlsAcmeHint')}
+              </p>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <Button
+                  size="sm"
+                  disabled={!canWrite}
+                  icon={<UploadSimple weight="duotone" className="h-4 w-4" />}
+                  onClick={() => setUploadOpen(true)}
+                >
+                  {t('pages.settings.tlsUpload')}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  icon={<Copy weight="duotone" className="h-4 w-4" />}
+                  onClick={() => void copyOpenssl()}
+                >
+                  {t('pages.settings.tlsCopyOpenssl')}
+                </Button>
+                <a
+                  href={`${DOCS_BASE_URL}/deployment`}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                  className="text-xs font-medium text-link hover:underline"
+                >
+                  {t('pages.settings.tlsOpenDocs')}
+                </a>
+              </div>
+              <pre className="pw-mono mt-3 overflow-x-auto whitespace-pre rounded border border-line bg-elevated px-3 py-2 text-[11px] leading-relaxed text-fg-subtle">
+                {opensslCommand}
+              </pre>
             </div>
             <p className="flex items-start gap-2 text-xs leading-relaxed text-fg-subtle">
               <Certificate weight="duotone" className="mt-0.5 h-4 w-4 shrink-0" />

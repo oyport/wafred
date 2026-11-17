@@ -1,7 +1,7 @@
 import { useMemo, useState, type ReactNode } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AreaChart,
   Area,
@@ -35,6 +35,9 @@ import {
 import { PageHeader } from '@/components/PageHeader'
 import { TopIpsTable, TopRulesTable } from '@/components/waf/TopRankingTables'
 import { Card, CardBody, CardHeader } from '@/components/ui/Card'
+import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
+import { useToast } from '@/components/ui/Toast'
+import { useCanWrite } from '@/hooks'
 import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
 import { Table, type Column } from '@/components/ui/Table'
@@ -48,6 +51,7 @@ import { DonutChart } from '@/components/charts/DonutChart'
 import { geoApi, geoKeys } from '@/api/geo'
 import { WorldMapChart } from '@/components/charts/WorldMapChart'
 import { buildLogsDrillDownUrl } from '@/lib/logDrillDown'
+import { withBlockedBotPolicy } from '@/lib/aiBots'
 import { cn } from '@/lib/utils'
 import {
   formatBitrate,
@@ -705,6 +709,52 @@ export function AiBotsPanel({
     () => [...(overview?.rows ?? [])].sort((a, b) => b.requests - a.requests),
     [overview],
   )
+  const canWrite = useCanWrite()
+  const toast = useToast()
+  const queryClient = useQueryClient()
+  const [pendingBlock, setPendingBlock] = useState<AiCrawlerRow | null>(null)
+
+  // The quick-block action writes one per-family override; the server replaces
+  // the whole policy list, so read the current posture first and keep the
+  // other families untouched.
+  const settingsQuery = useQuery({
+    queryKey: aiCrawlKeys.settings(siteId ?? ''),
+    queryFn: () => aiCrawlApi.get(siteId as string),
+    enabled: Boolean(siteId),
+  })
+  const blockMutation = useMutation({
+    mutationFn: async (row: AiCrawlerRow) => {
+      if (!siteId) throw new Error('a site is required to block a bot')
+      const current = settingsQuery.data ?? (await aiCrawlApi.get(siteId))
+      return aiCrawlApi.update(siteId, {
+        policies: withBlockedBotPolicy(current.policies, row.bot_id),
+      })
+    },
+    onSuccess: (_saved, row) => {
+      toast.success(
+        t('pages.traffic.aiBots.blockedToast', { name: row.name }),
+      )
+      setPendingBlock(null)
+      if (siteId) {
+        void queryClient.invalidateQueries({
+          queryKey: aiCrawlKeys.settings(siteId),
+        })
+        void queryClient.invalidateQueries({
+          queryKey: aiCrawlKeys.aiBots(siteId, range),
+        })
+      }
+    },
+    onError: (error) => {
+      toast.error(
+        t('pages.traffic.aiBots.blockFailed'),
+        error instanceof Error ? error.message : undefined,
+      )
+    },
+  })
+  const isBlocked = (row: AiCrawlerRow) =>
+    settingsQuery.data?.policies?.some(
+      (policy) => policy.bot_id === row.bot_id && policy.action === 'block',
+    ) ?? false
 
   const columns: Column<AiCrawlerRow>[] = [
     {
@@ -774,6 +824,31 @@ export function AiBotsPanel({
           <span className="text-[13px] text-fg-subtle">—</span>
         ),
     },
+    {
+      key: 'actions',
+      header: t('pages.traffic.aiBots.colActions'),
+      align: 'right',
+      width: '1%',
+      cell: (r) => {
+        if (!siteId || !canWrite) return null
+        if (isBlocked(r)) {
+          return (
+            <Badge tone="danger" size="sm">
+              {t('pages.traffic.aiBots.alreadyBlocked')}
+            </Badge>
+          )
+        }
+        return (
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => setPendingBlock(r)}
+          >
+            {t('pages.traffic.aiBots.block')}
+          </Button>
+        )
+      },
+    },
   ]
 
   return (
@@ -834,6 +909,17 @@ export function AiBotsPanel({
             </div>
           </>
         )}
+        <ConfirmDialog
+          open={pendingBlock !== null}
+          onClose={() => setPendingBlock(null)}
+          onConfirm={() => pendingBlock && blockMutation.mutate(pendingBlock)}
+          title={t('pages.traffic.aiBots.blockConfirmTitle', {
+            name: pendingBlock?.name ?? '',
+          })}
+          description={t('pages.traffic.aiBots.blockConfirmDescription')}
+          confirmLabel={t('pages.traffic.aiBots.block')}
+          loading={blockMutation.isPending}
+        />
       </CardBody>
     </Card>
   )
@@ -873,7 +959,7 @@ function SummaryCard({
       ? 'bg-danger/12 text-fg-danger'
       : tone === 'success'
         ? 'bg-success/12 text-fg-success'
-        : 'bg-brand-soft text-brand'
+        : 'bg-brand-soft text-fg-brand-strong'
   return (
     <Card padded>
       <div className="flex items-center justify-between gap-3" title={hint}>

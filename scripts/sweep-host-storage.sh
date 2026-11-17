@@ -16,10 +16,16 @@
 #
 #   1. Stopped containers. Their writable layers go with them.
 #   2. Dangling images (`<none>`) — the leftover of every rebuild.
-#   3. Unused volumes, unless --keep-volumes.
+#   3. Unused volumes, only with --prune-volumes. Volumes whose name starts
+#      with `waf_` (the compose project's database/TLS/data volumes) are always
+#      kept: the compose project being stopped during an upgrade must never let
+#      a cleanup delete the database or the control-plane TLS material.
 #   4. Images not referenced by a running container and older than --days.
 #      This is what removes the old release candidates and the `rust:` /
-#      `node:` build images a host accumulated while building.
+#      `node:` build images a host accumulated while building. The newest
+#      --keep-images (default 2) PingWAF images are always kept: a rollback
+#      needs the previous image, and deleting it turns a rollback into a
+#      re-download (or a failure when the registry is unreachable).
 #   5. Journal logs, vacuumed to --journal-size (default 200M).
 #   6. Stale files under /tmp, if --tmp-days is given.
 #
@@ -30,7 +36,10 @@
 #
 #   --dry-run          report only, remove nothing
 #   --days N           keep images younger than N days (default 7)
-#   --keep-volumes     do not prune unused volumes
+#   --keep-images N    always keep the newest N PingWAF images (default 2)
+#   --keep-volumes     accepted for compatibility; volumes are kept by default
+#   --prune-volumes    also remove unused volumes, except `waf_*` (the PingWAF
+#                      compose project's data/database/TLS volumes)
 #   --journal-size S   journal cap, e.g. 200M (default 200M; 'skip' to leave)
 #   --tmp-days N       delete /tmp entries older than N days (default: off)
 #   --quiet            summary only
@@ -42,7 +51,8 @@ set -euo pipefail
 
 dry_run=0
 days=7
-keep_volumes=0
+keep_images=2
+keep_volumes=1
 journal_size=200M
 tmp_days=0
 quiet=0
@@ -55,7 +65,9 @@ Usage: scripts/sweep-host-storage.sh [options]
 
   --dry-run          report only, remove nothing
   --days N           keep images younger than N days (default 7)
-  --keep-volumes     do not prune unused volumes
+  --keep-images N    always keep the newest N PingWAF images (default 2)
+  --keep-volumes     accepted for compatibility; volumes are kept by default
+  --prune-volumes    remove unused volumes except waf_* (PingWAF data volumes)
   --journal-size S   journal cap, e.g. 200M (default 200M; 'skip' to leave)
   --tmp-days N       delete /tmp entries older than N days (default: off)
   --quiet            summary only
@@ -69,7 +81,16 @@ while [ $# -gt 0 ]; do
 	--days)
 		[ $# -ge 2 ] || { echo "sweep-host-storage: --days needs a value" >&2; exit 2; }
 		days=$2; shift 2 ;;
+	--keep-images)
+		[ $# -ge 2 ] || { echo "sweep-host-storage: --keep-images needs a value" >&2; exit 2; }
+		case "$2" in
+		''|*[!0-9]*) echo "sweep-host-storage: --keep-images must be a non-negative number" >&2; exit 2 ;;
+		esac
+		keep_images=$2
+		shift 2
+		;;
 	--keep-volumes) keep_volumes=1; shift ;;
+	--prune-volumes) keep_volumes=0; shift ;;
 	--journal-size)
 		[ $# -ge 2 ] || { echo "sweep-host-storage: --journal-size needs a value" >&2; exit 2; }
 		journal_size=$2; shift 2 ;;
@@ -136,11 +157,27 @@ $runtime container prune -f >/dev/null 2>&1 || say "  (container prune failed; c
 say "pruning dangling images"
 $runtime image prune -f >/dev/null 2>&1 || say "  (image prune failed; continuing)"
 
-# 3. Unused volumes, unless asked to keep them. Anonymous volumes are excluded
-#    by the runtime itself; a named one still in use is never touched.
+# 3. Unused volumes, only with --prune-volumes, and never the PingWAF ones.
+#    `volume prune` has no exclusion filter, so candidate volumes are removed
+#    one at a time: `volume rm` refuses a volume that is still in use, and the
+#    `waf_` prefix (the compose project's postgres/TLS/data volumes) is always
+#    kept — a stopped compose project must not lose its database to a cleanup.
 if [ "$keep_volumes" -eq 0 ]; then
-	say "pruning unused volumes"
-	$runtime volume prune -f >/dev/null 2>&1 || say "  (volume prune failed; continuing)"
+	say "pruning unused volumes (keeping waf_*)"
+	volumes_pruned=0
+	while IFS= read -r vol; do
+		[ -n "$vol" ] || continue
+		case "$vol" in
+		waf_*)
+			say "  keeping PingWAF volume $vol"
+			continue
+			;;
+		esac
+		if $runtime volume rm "$vol" >/dev/null 2>&1; then
+			volumes_pruned=$((volumes_pruned + 1))
+		fi
+	done < <($runtime volume ls --format '{{.Name}}' 2>/dev/null)
+	say "  removed $volumes_pruned volume(s)"
 fi
 
 # 4. Old images not backing a running container.
@@ -150,12 +187,34 @@ fi
 #    refuses anything in use. `--filter until=` exists on docker but not on the
 #    podman on the demo host, so the portable path is used for both.
 say "removing images older than ${days}d that no running container uses"
+# Never remove the newest N PingWAF images: the previous release is the rollback
+# target for an upgrade, and re-pulling it may be impossible.
+kept_images=""
+if [ "$keep_images" -gt 0 ]; then
+	kept_images=$(
+		$runtime images --format '{{.Repository}}:{{.Tag}} {{.ID}} {{.CreatedAt}}' 2>/dev/null \
+			| grep -E '(^|/)pingwaf:' \
+			| sort -k3,4 -r \
+			| head -n "$keep_images" \
+			| awk '{ print $2 }' \
+			| sort -u \
+			| tr '\n' ' '
+	)
+fi
 in_use=$(
 	$runtime ps --format '{{.Image}}' 2>/dev/null | sort -u
 )
 removed=0
 while IFS=' ' read -r id created; do
 	[ -n "$id" ] || continue
+	if [ -n "$kept_images" ]; then
+		case " $kept_images " in
+		*" $id "*)
+			say "  keeping recent PingWAF image $id"
+			continue
+			;;
+		esac
+	fi
 	# `--format {{.CreatedAt}}` is an absolute timestamp; compare on epoch via
 	# `date`, which both GNU and BSD understand for this form.
 	age_days=$(

@@ -9,6 +9,11 @@ export interface SelectOption {
 }
 
 export interface SelectProps extends SelectHTMLAttributes<HTMLSelectElement> {
+  /**
+   * Visible label, rendered as `<label htmlFor>` so the control is named by
+   * text and clicking the label focuses the select. Filter selects inside a
+   * toolbar pass `aria-label` instead (a visible label would break the row).
+   */
   label?: ReactNode
   hint?: ReactNode
   error?: ReactNode
@@ -23,6 +28,7 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
   ) => {
     const generatedId = useId()
     const selectId = id ?? generatedId
+    const describedById = `${selectId}-description`
 
     return (
       <div className={cn('flex flex-col gap-1.5', containerClassName)}>
@@ -36,6 +42,7 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
             ref={ref}
             id={selectId}
             aria-invalid={error ? true : undefined}
+            aria-describedby={error || hint ? describedById : undefined}
             className={cn(
               'h-9 w-full appearance-none rounded-md border bg-elevated pl-3 pr-9 text-sm text-fg',
               'transition-[border-color,box-shadow] duration-150',
@@ -60,9 +67,9 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
           />
         </div>
         {error ? (
-          <p className="text-xs text-fg-danger">{error}</p>
+          <p id={describedById} className="text-xs text-fg-danger">{error}</p>
         ) : hint ? (
-          <p className="text-xs text-fg-subtle">{hint}</p>
+          <p id={describedById} className="text-xs text-fg-subtle">{hint}</p>
         ) : null}
       </div>
     )

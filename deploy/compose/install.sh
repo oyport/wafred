@@ -82,6 +82,42 @@ validate_port() { # $1 option, $2 value
     (( 10#$2 >= 1 && 10#$2 <= 65535 )) || die "$1 must be between 1 and 65535"
 }
 
+random_hex() { # $1 bytes (default 32) -> lowercase hex
+    local bytes="${1:-32}"
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex "$bytes"
+    else
+        od -An -tx1 -N "$bytes" /dev/urandom | tr -d ' \n'
+    fi
+}
+
+latest_release_tag() {
+    local url="https://api.github.com/repos/${REPO}/releases/latest" tag=""
+    if command -v curl >/dev/null 2>&1; then
+        tag="$(curl -fsSL --proto '=https' "$url" 2>/dev/null \
+            | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            | head -n1)"
+    elif command -v wget >/dev/null 2>&1; then
+        tag="$(wget -qO- "$url" 2>/dev/null \
+            | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            | head -n1)"
+    fi
+    printf '%s' "${tag#v}"
+}
+
+random_password() { # $1 length (default 32) -> alphanumeric password
+    local length="${1:-32}" raw=""
+    if command -v openssl >/dev/null 2>&1; then
+        raw="$(openssl rand -base64 48 2>/dev/null | tr -dc 'A-Za-z0-9' || true)"
+    else
+        raw="$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' || true)"
+    fi
+    if (( ${#raw} < length )); then
+        raw="${raw}$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' || true)"
+    fi
+    printf '%s' "${raw:0:length}"
+}
+
 reject_control_chars() { # $1 label, $2 value
     if [[ "$2" == *[[:cntrl:]]* ]]; then
         die "$1 must not contain control characters"
@@ -232,8 +268,24 @@ validate_port "--admin-port" "$ADMIN_PORT"
 validate_port "--grpc-port" "$GRPC_PORT"
 
 if [[ -z "$REF" ]]; then
-    if [[ "$TAG" == "latest" ]]; then
+    if [[ "$TAG" == "main" ]]; then
+        # `main` is the unstable development branch: allow it only when asked
+        # for explicitly, and say so.
+        warn "tag 'main' is the unstable development snapshot; pin a release tag for production"
         REF="main"
+    elif [[ "$TAG" == "latest" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            # A dry run must not depend on the network; show what will happen.
+            REF="<latest-release-tag>"
+        else
+            resolved="$(latest_release_tag)"
+            if [[ -z "$resolved" ]]; then
+                die "cannot resolve the latest release tag (GitHub API unreachable); pass --tag <version>"
+            fi
+            TAG="$resolved"
+            REF="v${TAG}"
+            printf 'Resolved latest release: %s\n' "$TAG"
+        fi
     else
         REF="v${TAG#v}"
     fi
@@ -266,7 +318,7 @@ WAFred Docker Compose install plan
   compose file : ${COMPOSE_URL}
   image        : ${IMAGE_REPO}:${TAG}
   directory    : $(cd "$(dirname "$DIR")" 2>/dev/null && pwd || pwd)/$(basename "$DIR")
-  image tag    : ${TAG}
+  image tag    : $([[ "$TAG" == "latest" ]] && echo "latest release (resolved at install)" || echo "$TAG")
   admin e-mail : ${ADMIN_EMAIL}
   admin passwd : $([[ "$ADMIN_PASSWORD" == "wafred123" ]] && echo "default (forced change on first login)" || echo "custom")
   tls sans     : ${TLS_SANS:-none (covers the hostname used to reach the console)}
@@ -352,7 +404,15 @@ a minute to answer. Follow it with:
 
   cd $(pwd) && docker compose logs -f wafred
 
+Data volumes are never removed by this script, and "docker compose down" keeps
+them too: only "docker compose down -v" (never use it) or deleting the volumes
+by hand would destroy the database and the control-plane TLS material.
+
 Upgrade later with:
 
   cd $(pwd) && docker compose pull && docker compose up -d
+
+The .env keeps PINGWAF_SECRET_KEY and the administrator password; back it up
+(0600) before a --force re-run, and do not rotate the instance key: sealed
+notification/AI/backup credentials become unreadable.
 EOF

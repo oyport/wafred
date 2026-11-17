@@ -52,6 +52,14 @@ const docs = {
       minutes: 7,
       topics: ["REST", "gRPC", "auth", "automatisation"],
     },
+    {
+      slug: "security",
+      icon: "lock",
+      title: "Sécurité",
+      lead: "Signaler une vulnérabilité en privé, connaître les versions corrigées et durcir l'instance avant exposition.",
+      minutes: 8,
+      topics: ["divulgation", "versions", "durcissement", "secrets"],
+    },
   ],
   sidebarLabel: "Documentation",
   screenshot: {

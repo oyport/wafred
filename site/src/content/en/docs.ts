@@ -52,6 +52,14 @@ const docs = {
       minutes: 7,
       topics: ["REST", "gRPC", "auth", "automation"],
     },
+    {
+      slug: "security",
+      icon: "lock",
+      title: "Security",
+      lead: "Report vulnerabilities privately, see which versions receive fixes, and harden an instance before exposure.",
+      minutes: 8,
+      topics: ["disclosure", "supported versions", "hardening", "secrets"],
+    },
   ],
   sidebarLabel: "Documentation",
   screenshot: {

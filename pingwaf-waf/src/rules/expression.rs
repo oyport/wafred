@@ -16,6 +16,7 @@
 //! value    := STRING | NUMBER | BOOL | "{" (STRING|NUMBER)+ "}"
 //! ```
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
@@ -715,7 +716,7 @@ pub struct EvalContext<'a> {
     pub body: Option<&'a str>,
     /// Lower-cased header names paired with original-cased values.
     pub headers: &'a [(String, String)],
-    pub cookies: &'a [(String, String)],
+    pub cookies: &'a [(Cow<'a, str>, Cow<'a, str>)],
     pub client_ip: &'a str,
     pub parsed_ip: Option<IpAddr>,
     pub country_code: Option<&'a str>,
@@ -727,11 +728,14 @@ pub struct EvalContext<'a> {
 }
 
 impl EvalContext<'_> {
+    /// Case-insensitive header lookup. Header names arrive lower-cased from
+    /// `http::HeaderName`, but the needle comes from a rule expression that
+    /// may be written in any case, so the comparison stays case-insensitive
+    /// without allocating a lowercased copy per evaluation.
     pub fn header(&self, name: &str) -> Option<&str> {
-        let needle = name.to_ascii_lowercase();
         self.headers
             .iter()
-            .find(|(k, _)| *k == needle)
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
 
@@ -739,7 +743,7 @@ impl EvalContext<'_> {
         self.cookies
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+            .map(|(_, v)| &**v)
     }
 }
 
@@ -967,7 +971,7 @@ mod tests {
     /// Owns the data the borrowed [`EvalContext`] refers to.
     struct TestCtx {
         headers: Vec<(String, String)>,
-        cookies: Vec<(String, String)>,
+        cookies: Vec<(Cow<'static, str>, Cow<'static, str>)>,
     }
 
     impl TestCtx {
@@ -1030,6 +1034,18 @@ mod tests {
     #[test]
     fn parses_header_lookup() {
         assert_eval(r#"http.request.headers["x-custom"] eq "hello""#, true);
+    }
+
+    #[test]
+    fn header_lookup_is_case_insensitive() {
+        // Rule authors may write `X-Custom`; header names arrive lower-cased
+        // and the lookup must not allocate a lowercased needle per request.
+        assert_eval(r#"http.request.headers["X-Custom"] eq "hello""#, true);
+        assert_eval(
+            r#"http.request.headers["CONTENT-TYPE"] contains "json""#,
+            true,
+        );
+        assert_eval(r#"http.request.headers["missing"] eq "x""#, false);
     }
 
     #[test]

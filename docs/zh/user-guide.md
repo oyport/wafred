@@ -214,3 +214,48 @@
 因此：源站若以 brotli 或 zstd 压缩响应（此前会被整体透传、替换不生效），现在
 替换照常工作。
 详见：[Response Body Replacement](../user-guide.md#response-body-replacement)。
+
+## 安全相关摘要（Security）
+
+> 本节是中文摘要，完整细节以英文原文为准；逐项加固步骤见
+> [SECURITY.md 加固清单](../../SECURITY.md#hardening-checklist)。
+
+### 密钥与加固
+
+- `PINGWAF_JWT_SECRET` 与 `PINGWAF_SECRET_KEY` 都应为 **32 字节随机值**（`openssl rand -hex 32`）。
+  前者签名登录 token；后者加密通知渠道口令、AI Provider Key 与备份目标凭据，未设置时这些字段以明文入库（仅 WARN），
+  且目前**没有在线轮换**——备份与轮换步骤见 [SECURITY.md](../../SECURITY.md#credentials-and-secrets)。
+- 默认管理员口令必须在首次登录时修改；compose 与安装器不提供默认口令（安装器生成随机口令并只打印一次）。
+- `.env` 权限 `600`、不入版本库；优先使用 secret manager。详见 [deployment.md](./deployment.md)。
+
+### 日志与敏感数据
+
+访问日志会**原样**保存请求/响应头（含 `Authorization`、`Cookie`、`Set-Cookie`）与最多 8 KiB 的 body，
+默认保留 180 天。请把 PostgreSQL 与 Elasticsearch 视作凭据存储：限制读取、加密备份、按需缩短保留期，
+不需要 body 时用 `--max-body-log-size 0` 关闭。详见英文
+[Log Management](../user-guide.md#log-management) 与 [Log Retention](../user-guide.md#log-retention)。
+
+### MCP 数据边界
+
+MCP 的 `read` key 只能看到**其属主拥有的站点**；只有「key 带 `write` 且属主是管理员」才是 fleet-wide
+（可调用控制面审计日志、防御设置等 admin-only 工具）。`write` key 等同管理员凭据，不要交给不受控的 AI 客户端。
+详见英文 [MCP Server](../user-guide.md#mcp-server) 与 [api.md 的 MCP 章节](./api.md)。
+
+### AI 助手数据边界
+
+内置 AI 助手调用与 MCP 相同的工具，会把用户消息与工具结果（站点元数据、访问日志、WAF 事件，管理员还包括
+控制面审计条目）发送给 **Settings → AI assistant** 配置的第三方 provider。仅在该数据允许离开部署时启用，
+并审阅 provider 的保留与数据处理条款；`allow_write_tools` 默认关闭，非必要不要打开。
+详见英文 [AI Assistant](../user-guide.md#ai-assistant)。
+
+### Passkey（WebAuthn）
+
+Passkey 需要安全上下文：HTTPS 主机名或 `localhost`；`http://` 或裸 IP 不可用，反代后需设
+`PINGWAF_PASSKEY_ORIGIN`。丢失设备时用口令登录后在 **Profile** 删除旧 passkey 并重新注册。
+详见英文 [Passkeys (WebAuthn)](../user-guide.md#passkeys-webauthn)。
+
+### 安全响应头
+
+控制台与 API 会下发 CSP（`default-src 'self'`、`script-src 'self'`、`frame-ancestors 'none'` 等）、
+`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY` 与 `Referrer-Policy`；反向代理不得剥离或放宽，
+分源部署只应显式放宽 `connect-src`。详见 [api.md → Response security headers](../api.md#response-security-headers)。

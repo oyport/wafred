@@ -1,5 +1,6 @@
-import type { ReactNode } from 'react'
+import { useMemo, type ReactNode } from 'react'
 import {
+  Clock,
   CloudSlash,
   Lock,
   MagnifyingGlass,
@@ -8,7 +9,13 @@ import {
 } from '@phosphor-icons/react'
 import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/Button'
-import { classifyError, errorMessage, type ErrorKind } from '@/api/errors'
+import { errorMessage } from '@/api/errors'
+import {
+  classifyFailure,
+  docsUrl,
+  failureReference,
+  type FailureKind,
+} from '@/lib/errorMessages'
 import { cn } from '@/lib/utils'
 
 export interface ErrorStateProps {
@@ -24,39 +31,23 @@ export interface ErrorStateProps {
   className?: string
   /** `inline` renders a compact strip instead of a centred panel. */
   variant?: 'panel' | 'inline'
+  /** Documentation link shown next to the retry action; defaults to none. */
+  docUrl?: string | null
+  /** Support reference (client-minted today — the API has no request id). */
+  reference?: string | null
 }
 
-const KIND_ICON: Record<ErrorKind, ReactNode> = {
+const KIND_ICON: Record<FailureKind, ReactNode> = {
   unauthorized: <Lock weight="duotone" className="h-6 w-6" />,
   forbidden: <Lock weight="duotone" className="h-6 w-6" />,
   not_found: <MagnifyingGlass weight="duotone" className="h-6 w-6" />,
+  rate_limited: <Clock weight="duotone" className="h-6 w-6" />,
   conflict: <Warning weight="duotone" className="h-6 w-6" />,
   validation: <Warning weight="duotone" className="h-6 w-6" />,
   server_error: <WarningOctagon weight="duotone" className="h-6 w-6" />,
   network: <CloudSlash weight="duotone" className="h-6 w-6" />,
+  timeout: <CloudSlash weight="duotone" className="h-6 w-6" />,
   unknown: <WarningOctagon weight="duotone" className="h-6 w-6" />,
-}
-
-const KIND_TITLE_KEY: Record<ErrorKind, string> = {
-  unauthorized: 'errors.sessionExpiredTitle',
-  forbidden: 'errors.forbiddenTitle',
-  not_found: 'errors.notFoundTitle',
-  conflict: 'errors.conflictTitle',
-  validation: 'errors.validationTitle',
-  server_error: 'errors.serverErrorTitle',
-  network: 'errors.networkTitle',
-  unknown: 'errors.unknownTitle',
-}
-
-const KIND_HINT_KEY: Record<ErrorKind, string> = {
-  unauthorized: 'errors.sessionExpiredHint',
-  forbidden: 'errors.forbiddenHint',
-  not_found: 'errors.notFoundHint',
-  conflict: 'errors.conflictHint',
-  validation: 'errors.validationHint',
-  server_error: 'errors.serverErrorHint',
-  network: 'errors.networkHint',
-  unknown: 'errors.unknownHint',
 }
 
 /**
@@ -75,13 +66,25 @@ export function ErrorState({
   action,
   className,
   variant = 'panel',
+  docUrl,
+  reference,
 }: ErrorStateProps) {
   const { t } = useTranslation()
-  const kind = classifyError(error)
+  const failure = classifyFailure(error)
+  const kind = failure.kind
   const detail = description ?? errorMessage(error)
 
-  const heading = title ?? t(KIND_TITLE_KEY[kind])
-  const hint = t(KIND_HINT_KEY[kind])
+  const heading = title ?? t(failure.titleKey)
+  const hint = t(failure.hintKey)
+  const docs = docUrl === undefined ? docsUrl(failure.docSlug) : docUrl
+  const docLabel = t('errors.openDocs')
+  // T03: prefer the server's `x-request-id`; fall back to the client reference
+  // so every failure still has something an operator can quote.
+  const effectiveReference = useMemo(
+    () => reference ?? failureReference(error),
+    [reference, error],
+  )
+  const referenceLabel = t('errors.reference', { id: effectiveReference })
 
   if (variant === 'inline') {
     return (
@@ -99,6 +102,16 @@ export function ErrorState({
         {detail && <span className="min-w-0 flex-1 truncate text-fg-subtle">{detail}</span>}
         <span className="ml-auto flex items-center gap-2">
           {action}
+          {docs && (
+            <a
+              href={docs}
+              target="_blank"
+              rel="noreferrer noopener"
+              className="text-xs font-medium text-link hover:underline"
+            >
+              {docLabel}
+            </a>
+          )}
           {onRetry && (
             <Button size="sm" variant="secondary" loading={retrying} onClick={onRetry}>
               {t('common.retry')}
@@ -127,7 +140,7 @@ export function ErrorState({
           {detail}
         </p>
       )}
-      {(onRetry || action) && (
+      {(onRetry || action || docs) && (
         <div className="mt-5 flex items-center gap-2">
           {action}
           {onRetry && (
@@ -135,7 +148,20 @@ export function ErrorState({
               {t('common.retry')}
             </Button>
           )}
+          {docs && (
+            <a
+              href={docs}
+              target="_blank"
+              rel="noreferrer noopener"
+              className="text-[13px] font-medium text-link hover:underline"
+            >
+              {docLabel}
+            </a>
+          )}
         </div>
+      )}
+      {referenceLabel && (
+        <p className="pw-mono mt-3 text-[11px] text-fg-subtle">{referenceLabel}</p>
       )}
     </div>
   )

@@ -118,7 +118,7 @@ export function OriginPoolsSection({
       sortable: true,
       cell: (n) => (
         <div className="flex items-center gap-2">
-          <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-brand-soft text-brand">
+          <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-brand-soft text-fg-brand-strong">
             <Globe weight="duotone" className="h-3.5 w-3.5" />
           </span>
           <span className="pw-mono text-[13px] font-medium text-fg-strong">{n.address}</span>
@@ -249,7 +249,7 @@ export function OriginPoolsSection({
                         <span className="flex items-center gap-1">
                           <Lock weight="duotone" className="h-3.5 w-3.5" />
                           <span className="pw-mono">{pool.sni}</span>
-                          <span className="text-fg-subtle/70">
+                          <span className="text-fg-subtle">
                             {(pool.verify_cert ?? siteOriginVerifyCert) ===
                             null
                               ? t('pages.basic.certFollowGlobal')

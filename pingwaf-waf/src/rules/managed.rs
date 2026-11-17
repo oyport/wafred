@@ -36,14 +36,18 @@ struct ManagedSpec {
 /// body, a well-formed session id, and — for the session-file-write variant —
 /// a NUL byte right after the part headers.
 ///
-/// Both condition groups share the same prefix, so it is built once here
-/// rather than copied. The media type is matched case-insensitively (`(?i)`):
-/// RFC 2045 makes type/subtype case-insensitive on the wire, while the
-/// `contains` operator is a byte-exact substring test, so `MULTIPART/FORM-DATA`
-/// would otherwise walk straight past the rule. The progress field name stays
-/// case-sensitive on purpose — PHP compares it byte-exactly against
-/// `session.upload_progress.name`, so folding case would only add false
-/// positives.
+/// Both condition groups share the same prefix, so it is built once here and
+/// hoisted out of the disjunction — `(P and A) or (P and B)` is
+/// `P and (A or B)`. That matters at evaluation time: `P` starts with a
+/// `contains` over the whole request body, and the previous shape evaluated
+/// it twice for every POST (the left branch failed and the right branch
+/// re-scanned the same bytes). The media type is matched case-insensitively
+/// (`(?i)`): RFC 2045 makes type/subtype case-insensitive on the wire, while
+/// the `contains` operator is a byte-exact substring test, so
+/// `MULTIPART/FORM-DATA` would otherwise walk straight past the rule. The
+/// progress field name stays case-sensitive on purpose — PHP compares it
+/// byte-exactly against `session.upload_progress.name`, so folding case would
+/// only add false positives.
 fn php_upload_progress_expression() -> String {
     let prefix = concat!(
         r#"http.request.body contains "PHP_SESSION_UPLOAD_PROGRESS" and "#,
@@ -54,15 +58,12 @@ fn php_upload_progress_expression() -> String {
     [
         "(",
         prefix,
-        " and (",
+        ") and (",
         r#"http.request.cookies["PHPSESSID"] matches "^[0-9A-Za-z,-]{16,256}$""#,
         r#" or http.request.body matches 'name="PHPSESSID"[^\x0d\x0a]*"#,
         r#"\x0d\x0a([^\x0d\x0a]+\x0d\x0a)*\x0d\x0a[0-9A-Za-z,-]{16,256}'"#,
-        r#" or http.request.uri.query matches 'PHPSESSID=[0-9A-Za-z,-]{16,256}'))"#,
-        " or (",
-        prefix,
-        " and ",
-        r#"http.request.body matches 'Content-Disposition:\s*form-data;\s*name="[^"]+"#,
+        r#" or http.request.uri.query matches 'PHPSESSID=[0-9A-Za-z,-]{16,256}'"#,
+        r#" or http.request.body matches 'Content-Disposition:\s*form-data;\s*name="[^"]+"#,
         r#"\x0d\x0a([^\x0d\x0a]+\x0d\x0a)*\x0d\x0a[\s\S]{0,32}\x00')"#,
     ]
     .concat()
@@ -356,16 +357,16 @@ fn stack_names(stacks: StackSet) -> Vec<String> {
 pub fn managed_rule_catalogue(level: WafLevel) -> Vec<ManagedRuleInfo> {
     let normal_rules = default_managed_rules(WafLevel::Normal);
     let normal_ids: std::collections::HashSet<&str> =
-        normal_rules.iter().map(|r| r.id.as_str()).collect();
+        normal_rules.iter().map(|r| r.id.as_ref()).collect();
     default_managed_rules(level)
         .into_iter()
         .map(|r| {
             let category =
                 managed_rule_category(&r).map(|c| c.as_str().to_string());
             ManagedRuleInfo {
-                strict_only: !normal_ids.contains(r.id.as_str()),
-                id: r.id,
-                name: r.name,
+                strict_only: !normal_ids.contains(r.id.as_ref()),
+                id: r.id.to_string(),
+                name: r.name.to_string(),
                 action: r.action.as_str().to_string(),
                 severity: r.severity,
                 tags: r.tags,
@@ -399,6 +400,8 @@ pub(crate) fn managed_rule_category(
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::*;
     use crate::rules::expression::{evaluate, EvalContext};
 
@@ -442,7 +445,7 @@ mod tests {
     fn find<'r>(rules: &'r [CompiledRule], id: &str) -> &'r CompiledRule {
         rules
             .iter()
-            .find(|r| r.id == id)
+            .find(|r| r.id.as_ref() == id)
             .unwrap_or_else(|| panic!("{id} missing"))
     }
 
@@ -450,7 +453,7 @@ mod tests {
     fn request_ctx<'a>(
         body: Option<&'a str>,
         headers: &'a [(String, String)],
-        cookies: &'a [(String, String)],
+        cookies: &'a [(Cow<'a, str>, Cow<'a, str>)],
     ) -> EvalContext<'a> {
         EvalContext {
             body,
@@ -467,10 +470,10 @@ mod tests {
         )]
     }
 
-    fn session_cookie() -> Vec<(String, String)> {
+    fn session_cookie() -> Vec<(Cow<'static, str>, Cow<'static, str>)> {
         vec![(
-            "PHPSESSID".to_string(),
-            "abcdefghijklmnopqrstuvwxyz".to_string(),
+            Cow::Borrowed("PHPSESSID"),
+            Cow::Borrowed("abcdefghijklmnopqrstuvwxyz"),
         )]
     }
 
@@ -723,7 +726,8 @@ mod tests {
         ));
 
         // 9. a session id shorter than PHP's minimum is not the shape either.
-        let short_cookie = vec![("PHPSESSID".to_string(), "abc".to_string())];
+        let short_cookie =
+            vec![(Cow::Borrowed("PHPSESSID"), Cow::Borrowed("abc"))];
         assert!(!evaluate(
             &rule.expression,
             &request_ctx(Some(progress), &ct, &short_cookie)

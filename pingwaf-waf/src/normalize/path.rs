@@ -3,11 +3,29 @@
 //! attempts like `/a/../../etc/passwd` resolve to `/etc/passwd` before the
 //! Aho-Corasick automaton sees them.
 
+use std::borrow::Cow;
+
 /// Normalize a URL path. The fragment (`#...`) is dropped, query strings are
 /// expected to be split off by the caller.
-pub fn normalize(path: &str) -> String {
+///
+/// Returns the input borrowed when it is already in normalized form, which is
+/// the common case (no `%`, no `//`, no dot segments, no fragment). The
+/// predicate covers every case in which the slow path could change the bytes;
+/// see the tests at the bottom for the exact shapes.
+pub fn normalize(path: &str) -> Cow<'_, str> {
+    if !path.is_empty()
+        && !path.contains('#')
+        && !path.contains("//")
+        && !path.contains("/.")
+        && path != "."
+        && path != ".."
+        && !path.starts_with("./")
+        && !path.starts_with("../")
+    {
+        return Cow::Borrowed(path);
+    }
     if path.is_empty() {
-        return "/".to_string();
+        return Cow::Owned("/".to_string());
     }
     // Strip fragment first — it never reaches the server but attackers use it
     // to hide payloads from naive log inspection.
@@ -44,7 +62,7 @@ pub fn normalize(path: &str) -> String {
         // Preserve a trailing slash from the original path.
         out.push('/');
     }
-    out
+    Cow::Owned(out)
 }
 
 #[cfg(test)]
