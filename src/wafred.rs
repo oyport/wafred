@@ -2397,6 +2397,9 @@ mod tests {
             .any(|addr| extract_port(addr).parse::<u16>() == Ok(port))
     }
 
+    fn expected_ipv6_only(addr: &str) -> Option<bool> {
+        all_addrs_ipv6(addr).then_some(false)
+    }
     use pingwaf_agent::cache::{
         CacheRule as AgentCacheRule, CachedRules, GlobalCacheSettings,
         OidcAccessRule, OidcHeaderClaim, ProxyTrustConfig, ResponseReplaceRule,
@@ -3956,10 +3959,12 @@ mod tests {
 
         assert_eq!(config.servers.len(), 2);
         let http = config.servers.get("wafred").expect("http server");
-        assert_eq!(http.addr, "0.0.0.0:80");
+        assert!(listens_on([http.addr.as_str()], 80));
+        assert_eq!(http.ipv6_only, expected_ipv6_only(&http.addr));
         assert_eq!(http.global_certificates, Some(false));
         let tls = config.servers.get("wafred_tls").expect("tls server");
-        assert_eq!(tls.addr, "0.0.0.0:443");
+        assert!(listens_on([tls.addr.as_str()], 443));
+        assert_eq!(tls.ipv6_only, expected_ipv6_only(&tls.addr));
         assert_eq!(tls.global_certificates, Some(true));
         let names = tls.locations.as_deref().expect("tls locations");
         assert_eq!(names, http.locations.as_deref().expect("http locations"));
@@ -4095,10 +4100,12 @@ mod tests {
 
         assert_eq!(config.servers.len(), 2);
         let server = config.servers.get("wafred").expect("server");
-        assert_eq!(server.addr, "0.0.0.0:80");
+        assert!(listens_on([server.addr.as_str()], 80));
+        assert_eq!(server.ipv6_only, expected_ipv6_only(&server.addr));
         assert_eq!(server.global_certificates, Some(false));
         let tls = config.servers.get("wafred_tls").expect("tls server");
-        assert_eq!(tls.addr, "0.0.0.0:443");
+        assert!(listens_on([tls.addr.as_str()], 443));
+        assert_eq!(tls.ipv6_only, expected_ipv6_only(&tls.addr));
         assert_eq!(tls.global_certificates, Some(true));
     }
 
