@@ -44,6 +44,104 @@ fatal()   { error "$@"; exit 1; }
 
 has() { command -v "$1" >/dev/null 2>&1; }
 
+# Cryptographically random lowercase hex string (default 32 bytes / 64 chars).
+random_hex() {
+    local bytes="${1:-32}"
+    if has openssl; then
+        openssl rand -hex "$bytes"
+    else
+        od -An -tx1 -N "$bytes" /dev/urandom | tr -d ' \n'
+    fi
+}
+
+# Cryptographically random alphanumeric password (32 characters by default).
+random_password() {
+    local length="${1:-32}" raw=""
+    if has openssl; then
+        raw="$(openssl rand -base64 48 2>/dev/null | tr -dc 'A-Za-z0-9' || true)"
+    else
+        raw="$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' || true)"
+    fi
+    if (( ${#raw} < length )); then
+        raw="${raw}$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' || true)"
+    fi
+    printf '%s' "${raw:0:length}"
+}
+
+# Percent-decodes one URL component. Only used for the PostgreSQL connectivity
+# probe below, where the value is handed to libpq through the environment.
+url_decode() {
+    local value="$1" out="" char hex i=0
+    if [[ "$value" != *%* ]]; then
+        printf '%s' "$value"
+        return 0
+    fi
+    while (( i < ${#value} )); do
+        char="${value:i:1}"
+        if [[ "$char" == "%" ]] && (( i + 2 < ${#value} )); then
+            hex="${value:i+1:2}"
+            if [[ "$hex" =~ ^[0-9A-Fa-f]{2}$ ]]; then
+                out="${out}$(printf "\\x${hex}")"
+                i=$((i + 3))
+                continue
+            fi
+        fi
+        out="${out}${char}"
+        i=$((i + 1))
+    done
+    printf '%s' "$out"
+}
+
+# PostgreSQL connectivity probe that never puts the password on the command
+# line: the URL is split into the standard libpq environment variables and
+# `psql` is invoked without `-d`. Returns non-zero when the URL cannot be
+# parsed or the connection fails.
+postgres_reachable() {
+    local url="$1" rest userinfo user pass host port hostport path dbname
+    rest="${url#*://}"
+    [[ "$rest" == "$url" ]] && return 2
+    if [[ "$rest" == *@* ]]; then
+        userinfo="${rest%@*}"
+        rest="${rest##*@}"
+    else
+        userinfo=""
+    fi
+    user="${userinfo%%:*}"
+    if [[ "$userinfo" == *:* ]]; then
+        pass="${userinfo#*:}"
+    else
+        pass=""
+    fi
+    hostport="${rest%%/*}"
+    hostport="${hostport%%\?*}"
+    path=""
+    if [[ "$rest" == */* ]]; then
+        path="${rest#*/}"
+    fi
+    host=""
+    port=""
+    if [[ "$hostport" == \[*\]* ]]; then
+        host="${hostport#[}"
+        host="${host%%]*}"
+        if [[ "$hostport" == *"]:"* ]]; then
+            port="${hostport##*]:}"
+        fi
+    elif [[ "$hostport" == *:* ]]; then
+        host="${hostport%%:*}"
+        port="${hostport##*:}"
+    else
+        host="$hostport"
+    fi
+    dbname="${path%%\?*}"
+    [[ -z "$host" ]] && return 2
+    PGPASSWORD="$(url_decode "$pass")" \
+    PGHOST="$host" \
+    PGPORT="${port:-5432}" \
+    PGUSER="$(url_decode "${user:-postgres}")" \
+    PGDATABASE="$(url_decode "${dbname:-postgres}")" \
+        psql -w -c "SELECT 1" >/dev/null 2>&1
+}
+
 # Host part of a URL, without scheme, credentials, port or path. Handles both
 # `host:port` and `[IPv6]:port`, so the warning below can print a usable
 # `openssl s_client -connect host:9090` line.
