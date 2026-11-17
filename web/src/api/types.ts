@@ -1,7 +1,7 @@
 /**
  * Wire types for the WAFred control-plane REST API (`/api/v1`).
  *
- * Everything mirrors the Rust `serde` structs in `pingwaf-server/src/api/*`
+ * Everything mirrors the Rust `serde` structs in `wafred-server/src/api/*`
  * exactly — field names are `snake_case` and enum-ish values are the short
  * lowercase strings persisted in PostgreSQL (`block`, `active`, `online`, …).
  */

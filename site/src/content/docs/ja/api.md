@@ -35,7 +35,7 @@ curl -s https://localhost:9080/api/v1/sites -H "Authorization: Bearer $TOKEN"
 
 ## gRPC
 
-エージェントは `9090` の `ControlPlane` サービスを使います。定義は `pingwaf-proto/proto/control_plane.proto` にあり、`RegisterAgent`、`Heartbeat`、`SyncRules`、`ShipLogs`、`ShipCertEvents`、`ShipMetrics`、`GetSiteConfig` と、チャレンジに使う訪問者セッション RPC を含みます。既定は TLS で、`grpc_tls_mode = "off"` は信頼できるネットワーク専用です。
+エージェントは `9090` の `ControlPlane` サービスを使います。定義は `wafred-proto/proto/control_plane.proto` にあり、`RegisterAgent`、`Heartbeat`、`SyncRules`、`ShipLogs`、`ShipCertEvents`、`ShipMetrics`、`GetSiteConfig` と、チャレンジに使う訪問者セッション RPC を含みます。既定は TLS で、`grpc_tls_mode = "off"` は信頼できるネットワーク専用です。
 
 ## API キー
 

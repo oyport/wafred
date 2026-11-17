@@ -147,8 +147,8 @@ test.describe('WAF protection page — UI expectations', () => {
       await openProtection(page, app.adminUrl, siteId)
       await expect(page.getByRole('heading', { name: 'Web Protection' })).toBeVisible()
 
-      // Six entry points, Overview selected, no seventh/legacy tab left over.
-      await expect(page.getByRole('tab')).toHaveCount(6)
+      // WAFred adds path restrictions alongside the upstream protection tabs.
+      await expect(page.getByRole('tab')).toHaveCount(7)
       await expect(page.getByRole('tab', { name: 'Overview' })).toHaveAttribute(
         'aria-selected',
         'true',
@@ -157,6 +157,7 @@ test.describe('WAF protection page — UI expectations', () => {
         'Managed rules',
         'Custom rules',
         'Path exceptions',
+        'Path restrictions',
         'Rate limiting & challenge',
       ]) {
         await expect(page.getByRole('tab', { name })).toBeVisible()
@@ -233,7 +234,7 @@ test.describe('WAF protection page — UI expectations', () => {
       expect(await postureStat(page, 'Active rules')).toMatch(/^\d+\/\d+$/)
       // The seeded built-in group is visible and explained (phase + priority).
       await expect(page.getByRole('heading', { name: 'Rule groups' })).toBeVisible()
-      await expect(page.getByText('PingWAF 内置防护').first()).toBeVisible()
+      await expect(page.getByText('WAFred 内置防护').first()).toBeVisible()
 
       // Column headers an operator needs to read a rule at a glance.
       for (const header of [
@@ -495,9 +496,8 @@ test.describe('WAF protection page — UI expectations', () => {
           'the posture banner must keep reporting the site rule set while a search filter is active',
         )
         .toBe(bannerBefore)
-      // The filtered-empty state renders the "missing rule pack" CTA, not the
-      // Reset button, so there is nothing safe to click here; the finally block
-      // deletes the site.
+      await page.getByRole('button', { name: 'Reset', exact: true }).click()
+      await expect(page.getByText(/^\d+ rules$/).first()).toHaveText(`${seededCount} rules`)
     } finally {
       await deleteSiteIfPresent(page, app.adminUrl, domain)
     }

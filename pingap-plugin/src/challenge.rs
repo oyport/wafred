@@ -398,7 +398,7 @@ fn brand_page(
   <h1>{heading}</h1>
   <p class="msg">{message_html}</p>
   <div class="details">{details}</div>
-  <p class="brand">Protected by <b>WAFred</b></p>
+  <p class="brand">Protected by <a href="https://waf.red" target="_blank" rel="noopener"><b>WAFred</b></a></p>
 </div>
 </body>
 </html>"##,
@@ -1319,7 +1319,7 @@ mod tests {
         ];
         for (label, body) in pages {
             assert!(
-                body.contains(r#"href="https://www.pingwaf.com""#),
+                body.contains(r#"href="https://waf.red""#),
                 "{label}: {body}"
             );
             assert!(body.contains(r#"rel="noopener""#), "{label}: {body}");
@@ -1623,7 +1623,7 @@ cookie_secret = "test-secret"
         path_exceptions: Vec<proto::PathException>,
     ) -> (
         tokio::sync::MutexGuard<'static, ()>,
-        Arc<PingWafAgent>,
+        Arc<WafredAgent>,
         tempfile::TempDir,
     ) {
         let lock = lock_agent().await;

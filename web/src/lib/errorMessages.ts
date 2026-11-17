@@ -109,7 +109,7 @@ export interface FailureInfo {
 }
 
 /** Public documentation base — the official site's `/docs` route. */
-export const DOCS_BASE_URL = 'https://www.pingwaf.com/docs'
+export const DOCS_BASE_URL = 'https://waf.red/docs'
 
 /** Absolute documentation URL for a slug, or `null` when there is none. */
 export function docsUrl(slug: string | null | undefined): string | null {

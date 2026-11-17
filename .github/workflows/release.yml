@@ -284,16 +284,16 @@ jobs:
             | sh -s -- -b "$RUNNER_TEMP/bin" v1.42.3
           "$RUNNER_TEMP/bin/syft" scan dir:. \
             --exclude './target/**' \
-            -o "spdx-json=pingwaf-${{ matrix.plat }}-${{ matrix.arch }}.spdx.json"
+            -o "spdx-json=wafred-${{ matrix.plat }}-${{ matrix.arch }}.spdx.json"
 
       # Signed SLSA provenance for both archives: consumers can verify with
-      # `gh attestation verify pingwaf-linux-amd64.tar.gz --repo <repo>`.
+      # `gh attestation verify wafred-linux-amd64.tar.gz --repo <repo>`.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
-            pingwaf-${{ matrix.plat }}-${{ matrix.arch }}.tar.xz
-            pingwaf-${{ matrix.plat }}-${{ matrix.arch }}.tar.gz
+            wafred-${{ matrix.plat }}-${{ matrix.arch }}.tar.xz
+            wafred-${{ matrix.plat }}-${{ matrix.arch }}.tar.gz
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4

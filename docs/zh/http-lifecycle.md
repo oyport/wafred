@@ -165,9 +165,9 @@ Server-Timing: waf;dur=2, upstream;dur=41, cache;desc="miss", total;dur=44
 
 - `x-cache-status` 仍是专用的缓存状态响应头；`cache;desc` 重复同一个 phase，
   让一个响应头同时覆盖耗时与缓存状态。
-- 若源站自带了 `Server-Timing`，PingWAF 的计时会**追加在它前面**（逗号分隔），
+- 若源站自带了 `Server-Timing`，WAFred 的计时会**追加在它前面**（逗号分隔），
   不会覆盖。
-- 未经过 WAF 插件的响应（如 unmatched-host 404）不带 PingWAF 计时。
+- 未经过 WAF 插件的响应（如 unmatched-host 404）不带 WAFred 计时。
 
 用 curl 查看：
 

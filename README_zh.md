@@ -38,7 +38,7 @@
 
 <img src="./asset/readme-architecture.svg" alt="WAFred 架构：客户端经 HTTP/HTTPS 接入边缘 Agent；每个 Agent 通过 gRPC 双向流与控制面同步规则与遥测；只有干净流量继续到源站" width="1000">
 
-控制面与数据面通过 `ControlPlane` gRPC 服务通信（定义于 [`control_plane.proto`](./pingwaf-proto/proto/control_plane.proto)），共包含 7 个 RPC：
+控制面与数据面通过 `ControlPlane` gRPC 服务通信（定义于 [`control_plane.proto`](./wafred-proto/proto/control_plane.proto)），共包含 7 个 RPC：
 
 | RPC | 类型 | 用途 |
 | --- | --- | --- |
@@ -157,11 +157,11 @@ PingWAF 两行为来源项目自行回放（有效口径 96.6%，见上），WAF
 
 | Crate | 职责 |
 | --- | --- |
-| [`pingwaf-proto`](./pingwaf-proto) | 控制面 gRPC 协议定义（单一来源：`control_plane.proto`） |
-| [`pingwaf-server`](./pingwaf-server) | 控制面：Axum REST + tonic gRPC + SeaORM/PostgreSQL + ES 日志 + 内嵌前端 + Agent 健康监控 |
-| [`pingwaf-agent`](./pingwaf-agent) | 数据面 Agent：连接控制面、规则缓存 + 磁盘持久化、回传日志/指标、接收命令 |
-| [`pingwaf-waf`](./pingwaf-waf) | 检测引擎：归一化 → 签名 → 表达式 → 异常评分 |
-| [`pingwaf-challenge`](./pingwaf-challenge) | 动态挑战子系统：JS 5 秒盾、交互式挑战、PoW、浏览器指纹、HMAC 签名 clearance cookie |
+| [`pingwaf-proto`](./wafred-proto) | 控制面 gRPC 协议定义（单一来源：`control_plane.proto`） |
+| [`pingwaf-server`](./wafred-server) | 控制面：Axum REST + tonic gRPC + SeaORM/PostgreSQL + ES 日志 + 内嵌前端 + Agent 健康监控 |
+| [`pingwaf-agent`](./wafred-agent) | 数据面 Agent：连接控制面、规则缓存 + 磁盘持久化、回传日志/指标、接收命令 |
+| [`pingwaf-waf`](./wafred-waf) | 检测引擎：归一化 → 签名 → 表达式 → 异常评分 |
+| [`pingwaf-challenge`](./wafred-challenge) | 动态挑战子系统：JS 5 秒盾、交互式挑战、PoW、浏览器指纹、HMAC 签名 clearance cookie |
 | `pingwaf-profiler` / `pingwaf-system`（无 README） | 进程内 CPU/内存归因与快照，经 `/api/v1/system/profile` 与 `/api/v1/system/metrics` 提供 |
 
 WAFred 的操作入口使用 `wafred` 命令、`WAFRED_*` 环境变量、`wafred.service`、

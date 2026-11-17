@@ -24,7 +24,7 @@ WAFred 把系统拆成两个进程，它们共用同一个二进制。**控制�
 
 ## gRPC 契约
 
-唯一真源是 `pingwaf-proto/proto/control_plane.proto`，服务由 7 个 RPC 组成：
+唯一真源是 `wafred-proto/proto/control_plane.proto`，服务由 7 个 RPC 组成：
 
 | RPC | 类型 | 用途 |
 | --- | --- | --- |

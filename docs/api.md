@@ -1887,13 +1887,13 @@ the running executable, so an agent can pin what it receives.
 ### GET /agent-upgrade/artifact
 
 Streams the control plane's own executable as `application/octet-stream`.
-PingWAF ships one binary whose role is selected by `PINGWAF_MODE`, so "the
+WAFred ships one binary whose role is selected by `WAFRED_MODE`, so "the
 control plane's build" *is* the artifact an agent should run. Requires an agent
 token.
 
-Response headers: `x-pingwaf-version`, `x-pingwaf-sha256`, `Content-Length`.
+Response headers: `x-wafred-version`, `x-wafred-sha256`, `Content-Length`.
 
-Agents use it only when `PINGWAF_AUTO_UPGRADE=true` and `PINGWAF_UPGRADE_URL`
+Agents use it only when `WAFRED_AUTO_UPGRADE=true` and `WAFRED_UPGRADE_URL`
 names this API; they verify size and digest before replacing their binary, keep
 the previous one as `<exe>.prev`, and then re-exec. See
 [deployment.md](deployment.md#agent-self-upgrade).
@@ -2403,6 +2403,14 @@ owned by the user its API key belongs to. A site with **no serving agent is
 not gated** (there is nothing to push to), and an agent whose reported version
 cannot be parsed counts as *not* supporting the capability (fail-closed).
 
+The WAFred 1.0.0 release predates these path-scope updates. Updated WAFred
+1.0.0 agents report `1.0.0+wafredpath1`; a plain `1.0.0` agent is treated as
+unsupported for these scoped changes until it is updated and reconnects.
+The version numbers in the table record when the capabilities appeared in the
+upstream project. If an older agent reconnects after scoped settings already
+exist, the control plane logs a warning; update that agent before it serves
+traffic because registration alone does not block the old agent.
+
 | Capability | Minimum agent version | Evidence |
 |------------|----------------------|----------|
 | Path exceptions (`prefix` / `exact` / `wildcard`) | **≤ 0.32.16** (no gate) | `pingap-plugin/src/waf.rs` already matched `path_exceptions` in 0.32.16; the gate only covers what changed later |
@@ -2411,8 +2419,8 @@ cannot be parsed counts as *not* supporting the capability (fail-closed).
 | Canonical path matching — scopes matched against the dot-segment-resolved path (any saved path exception, whose `skip_layers` is always non-empty) | **0.32.21** | `capabilities::MIN_AGENT_CANONICAL_SCOPES`; CHANGELOG 0.32.21 "Scope matching uses a canonical path" |
 | Built-in rule override contract — seeded rows linked to managed rules via `managed_rule_id` (override `enabled`/`mode` instead of duplicating the rule) | **0.32.21** | CHANGELOG 0.32.21 "Seeded built-in rules now control the managed rules instead of duplicating them" |
 | Re-enabling a saved path exception (`enabled` `false` → `true` re-arms its stored scope) | same gates as the stored scope | the update gate judges the *effective* scope, so re-enabling a row the fleet cannot execute is rejected too (see the [gating notes](#post-sitessite_idpath-exceptions)) |
-| `peer_ip` — connection source address in the agent inventory | **0.32.23** | PingWAF 0.32.23 (agent inventory shows the address the control plane accepted the heartbeat stream from) |
-| Agent self-upgrade (`agent.auto_upgrade` + `agent.upgrade_url`) | **0.32.23** | PingWAF 0.32.23 "Agents can upgrade themselves to the control plane's build" |
+| `peer_ip` — connection source address in the agent inventory | **0.32.23** | WAFred 0.32.23 (agent inventory shows the address the control plane accepted the heartbeat stream from) |
+| Agent self-upgrade (`agent.auto_upgrade` + `agent.upgrade_url`) | **0.32.23** | WAFred 0.32.23 "Agents can upgrade themselves to the control plane's build" |
 
 The first four rows are not just informational: all **five** scoped write
 surfaces — path exceptions, IP rules, geo rules, basic-auth and the OIDC
@@ -3746,7 +3754,7 @@ bot verification or proxy trust get their configuration re-pushed
 immediately.
 
 Subscription fetches refuse to contact non-public networks. Three layers apply
-(`pingwaf-server/src/subscription.rs`):
+(`wafred-server/src/subscription.rs`):
 
 * **No redirects.** The fetch client sets `redirect::Policy::none()`, so a
   public source cannot answer with a `302 -> http://169.254.169.254/` and slip

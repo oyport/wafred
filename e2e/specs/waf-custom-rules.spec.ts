@@ -269,10 +269,10 @@ test.describe('WAF custom rules', () => {
         )
         .toBe(403)
 
-      // The branded block page must name PingWAF, the rule that fired and the
+      // The branded block page must name WAFred, the rule that fired and the
       // request id the operator can quote in a support ticket.
       expect(blockedBody).toContain('Request Blocked')
-      expect(blockedBody).toContain('PingWAF Security')
+      expect(blockedBody).toContain('WAFred Security')
       expect(blockedBody).toContain(editedName)
       const requestIdMatch = blockedBody.match(
         /Request ID\s*\n?\s*([0-9a-fA-F]{8,64})/,

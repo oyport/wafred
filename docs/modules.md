@@ -8,7 +8,7 @@
 
 ## Trust boundaries
 
-PingWAF adds a control plane on top of the pingap proxy engine. The security
+WAFred adds a control plane on top of the pingap proxy engine. The security
 model rests on the boundaries below; a change that lets one side reach the
 other's data is a security regression, not a feature. The hardening steps for
 each boundary are in [`SECURITY.md`](../SECURITY.md#hardening-checklist).
@@ -16,7 +16,7 @@ each boundary are in [`SECURITY.md`](../SECURITY.md#hardening-checklist).
 ### Control plane (`pingwaf-server`)
 
 Holds PostgreSQL, every tenant's configuration and logs, administrator
-credentials, the JWT signing secret and the `PINGWAF_SECRET_KEY` used to seal
+credentials, the JWT signing secret and the `WAFRED_SECRET_KEY` used to seal
 stored secrets. It is reachable only by:
 
 - **administrators** over the console/API (TLS, self-signed until a real
@@ -44,7 +44,7 @@ hosts without a synced bundle), configurable per site and globally.
 The database is a **secret store**: site TLS private keys, HTTP basic-auth
 credentials in clear text, OIDC cookie secrets, the generated JWT secret and
 the sealed channel/AI/backup credentials all live there. At-rest sealing of the
-last group depends on `PINGWAF_SECRET_KEY`; without it those fields are clear
+last group depends on `WAFRED_SECRET_KEY`; without it those fields are clear
 text. Backups and replicas must be protected like the control plane itself —
 see [deployment.md → Backup & Recovery](deployment.md#backup--recovery).
 
@@ -55,7 +55,7 @@ a bearer JWT; it relies on the response security headers
 ([api.md → Response security headers](api.md#response-security-headers)) and on
 passkeys requiring a secure context (HTTPS or `localhost`). Sessions are bound
 to an account token version, so a password change, role change, disable or
-`pingwaf user reset-password` revokes them immediately.
+`wafred user reset-password` revokes them immediately.
 
 ### Third parties
 
@@ -66,7 +66,7 @@ reviewed as an egress path:
 | --- | --- | --- |
 | AI provider (OpenAI-compatible) | Chat messages and MCP tool results: site metadata, access logs, WAF events, and for administrators control-plane audit entries | Only when the assistant is enabled; write tools are off by default. See [user-guide.md → AI Assistant](user-guide.md#ai-assistant) |
 | Webhooks (WeCom/DingTalk/generic) | Alert title/message/details | URLs are SSRF-checked against private ranges |
-| SMTP relay | Notification e-mails | Credentials sealed with `PINGWAF_SECRET_KEY` |
+| SMTP relay | Notification e-mails | Credentials sealed with `WAFRED_SECRET_KEY` |
 | Elasticsearch | The same log documents as PostgreSQL (headers and bodies included) | Optional shipper; index retention is independent |
 | ACME / DNS provider, GeoIP | Certificate order data / login IPs | Credentials sealed; GeoIP URL is SSRF-checked |
 

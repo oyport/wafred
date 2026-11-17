@@ -83,9 +83,9 @@ characters), `--admin-email` (`WAFRED_ADMIN_EMAIL`, default
 `--admin-email` / `--admin-password` only **seed** the first administrator when
 the `users` table is empty, and that account is created with a forced password
 change. Changing the flags later does not rotate an existing account — use
-`pingwaf user reset-password` (which also revokes every session).
+`wafred user reset-password` (which also revokes every session).
 
-`PINGWAF_SECRET_KEY` has no flag and is read from the environment only. It
+`WAFRED_SECRET_KEY` has no flag and is read from the environment only. It
 seals notification-channel secrets, the AI provider API key and backup-target
 credentials at rest; set it to 32 random bytes (`openssl rand -hex 32`), because
 without it those fields are stored in clear text (only a warning is logged).
@@ -109,8 +109,8 @@ highest-value ones the CLI can read the value from a file instead:
 
 | Flag | Environment variable | Reads |
 | --- | --- | --- |
-| `--db-url-file` | `PINGWAF_DB_URL_FILE` | PostgreSQL connection string (`server`, `all-in-one`, and every maintenance command) |
-| `--api-key-file` | `PINGWAF_API_KEY_FILE` | Agent enrollment API key (`agent`, `all-in-one`) |
+| `--db-url-file` | `WAFRED_DB_URL_FILE` | PostgreSQL connection string (`server`, `all-in-one`, and every maintenance command) |
+| `--api-key-file` | `WAFRED_API_KEY_FILE` | Agent enrollment API key (`agent`, `all-in-one`) |
 
 The file content is trimmed (surrounding whitespace and the trailing newline)
 and used as the whole value; an unreadable or **empty** file aborts with exit
@@ -121,9 +121,9 @@ value is visible in the process list.
 
 For scripts and CI, write the secret to a `0600` file (or use the environment
 variable / systemd `EnvironmentFile=` — the host installer writes
-`PINGWAF_SECRET_KEY` to `/etc/pingwaf/pingwaf.env` for exactly this reason) and
+`WAFRED_SECRET_KEY` to `/etc/wafred/wafred.env` for exactly this reason) and
 pass `--db-url-file` / `--api-key-file`. `--jwt-secret` and `--admin-password`
-have no file variant yet: use `PINGWAF_JWT_SECRET` / `PINGWAF_ADMIN_PASSWORD`,
+have no file variant yet: use `WAFRED_JWT_SECRET` / `WAFRED_ADMIN_PASSWORD`,
 and run the installer with `--dry-run` first so the resolved plan — not the
 secret — is what gets logged.
 
@@ -143,15 +143,15 @@ the instance secrets. Its security-relevant behaviour:
 
 - **Release checksum** — the release asset's `.sha256` sidecar is downloaded and
   verified; a missing, malformed or mismatching checksum aborts the install.
-- **Administrator password** — when `--admin-password` / `PINGWAF_ADMIN_PASSWORD`
+- **Administrator password** — when `--admin-password` / `WAFRED_ADMIN_PASSWORD`
   is empty, a random password is generated and printed **once** at the end.
   There is no built-in default password.
-- **`PINGWAF_SECRET_KEY`** — generated when unset and written to
-  `/etc/pingwaf/pingwaf.env` (mode `0600`, owned by `pingwaf`); the shipped unit
-  reads it via `EnvironmentFile=-/etc/pingwaf/pingwaf.env`. An existing key is
+- **`WAFRED_SECRET_KEY`** — generated when unset and written to
+  `/etc/wafred/wafred.env` (mode `0600`, owned by `wafred`); the shipped unit
+  reads it via `EnvironmentFile=-/etc/wafred/wafred.env`. An existing key is
   kept on upgrade — rotating it silently would make sealed channel/AI/backup
   credentials unreadable.
-- **Listen addresses** — `--listen-public` (`PINGWAF_LISTEN_PUBLIC=1`) binds the
+- **Listen addresses** — `--listen-public` binds the
   dashboard (`9080`) and gRPC (`9090`) on `0.0.0.0`; **without it both bind
   `127.0.0.1` only**. Expose them through a TLS reverse proxy (or a private
   interface plus firewall) and change the administrator password first.

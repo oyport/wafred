@@ -24,6 +24,8 @@ export interface Column<T> {
   width?: string
   /** Prevent dense tables from collapsing important columns on narrow screens. */
   minWidth?: string
+  /** Keep short values and action controls on one line. */
+  nowrap?: boolean
   className?: string
 }
 
@@ -144,8 +146,16 @@ export function Table<T>({
 
   return (
     <div className={cn('w-full', className)}>
-      <div className="overflow-x-auto rounded-lg border border-line">
-        <table
+      <div className="relative">
+        <div
+          ref={scrollRef}
+          role="region"
+          aria-label={scrollLabel ?? t('mobile.scrollableTable')}
+          onScroll={updateOverflow}
+          className="overflow-x-auto rounded-lg border border-line"
+          tabIndex={0}
+        >
+          <table
           className="w-full border-collapse text-sm"
           style={tableMinWidth ? { minWidth: tableMinWidth } : undefined}
         >
@@ -245,6 +255,7 @@ export function Table<T>({
                         className={cn(
                           cellPad,
                           'text-fg align-middle',
+                          col.nowrap && 'whitespace-nowrap',
                           alignClass[col.align ?? 'left'],
                           col.className,
                         )}

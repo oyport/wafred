@@ -35,7 +35,7 @@ Las llamadas por sitio pasan por el límite de tenant (`load_site_read` / `load_
 
 ## gRPC
 
-Los agentes usan el servicio `ControlPlane` en el puerto `9090`, definido en `pingwaf-proto/proto/control_plane.proto`: `RegisterAgent`, `Heartbeat`, `SyncRules`, `ShipLogs`, `ShipCertEvents`, `ShipMetrics`, `GetSiteConfig` y los RPC de sesión de visitantes del flujo de desafíos. TLS es el valor por defecto; `grpc_tls_mode = "off"` solo para redes de confianza.
+Los agentes usan el servicio `ControlPlane` en el puerto `9090`, definido en `wafred-proto/proto/control_plane.proto`: `RegisterAgent`, `Heartbeat`, `SyncRules`, `ShipLogs`, `ShipCertEvents`, `ShipMetrics`, `GetSiteConfig` y los RPC de sesión de visitantes del flujo de desafíos. TLS es el valor por defecto; `grpc_tls_mode = "off"` solo para redes de confianza.
 
 ## API keys
 

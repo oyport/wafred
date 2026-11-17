@@ -829,6 +829,16 @@ fn failure_event(refusal: &Refusal) -> Option<(&'static str, u32, String)> {
 }
 
 impl Oidc {
+    /// Path restrictions select requests independently of a site-wide scope.
+    fn protects_request_path(&self, path: &str, selected_by_waf: bool) -> bool {
+        path == PROVIDER_ENTRY_PATH
+            || if self.site_wide {
+                self.path.as_ref().is_none_or(|scope| scope.matches(path))
+            } else {
+                selected_by_waf
+            }
+    }
+
     /// Creates the plugin from its configuration.
     ///
     /// The configuration carries `client_secret` and `cookie_secret`, so
@@ -1573,14 +1583,13 @@ impl Plugin for Oidc {
                 self.logout(session, ctx).await,
             ));
         }
-        if !self.site_wide
-            && path != PROVIDER_ENTRY_PATH
-            && !ctx
+        let selected_by_waf = !self.site_wide
+            && ctx
                 .state
                 .request_id
                 .as_deref()
-                .is_some_and(crate::waf::pending_path_requires_oidc)
-        {
+                .is_some_and(crate::waf::pending_path_requires_oidc);
+        if !self.protects_request_path(&path, selected_by_waf) {
             return Ok(RequestPluginResult::Skipped);
         }
         if let Some(data) = self.session(session, now_sec()) {
@@ -1960,6 +1969,22 @@ Xy9d98XlTMj+HdE8reX0ymEIpLbCDnS5WhaUEhNcxGGHktUH/3e9BlrR
             .await
             .unwrap();
         assert!(matches!(result, RequestPluginResult::Skipped));
+    }
+
+    #[test]
+    fn path_restriction_selection_is_not_narrowed_by_site_scope() {
+        let site =
+            new_plugin("path = \"/admin\"\nmatch_type = \"prefix\"\n").unwrap();
+        assert!(site.protects_request_path("/admin/users", false));
+        assert!(!site.protects_request_path("/private", false));
+
+        let rule_gate = new_plugin(
+            "site_wide = false\npath = \"/admin\"\nmatch_type = \"prefix\"\n",
+        )
+        .unwrap();
+        assert!(rule_gate.protects_request_path("/private", true));
+        assert!(!rule_gate.protects_request_path("/admin", false));
+        assert!(rule_gate.protects_request_path(PROVIDER_ENTRY_PATH, false));
     }
 
     /// Who has no session is sent to the provider, or told so; who has

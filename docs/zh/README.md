@@ -72,11 +72,11 @@ WAFred 在 `pingap` 代理基础之上新增了 **7 个 WAF 专属 crate**。
 
 | Crate | 职责 |
 | --- | --- |
-| [pingwaf-proto](../../pingwaf-proto) | 控制面 gRPC 协议定义（单一来源：`control_plane.proto`） |
-| [pingwaf-server](../../pingwaf-server) | 控制面：Axum REST + tonic gRPC + SeaORM/PostgreSQL + ES 日志 + 内嵌前端 + Agent 健康监控 |
-| [pingwaf-agent](../../pingwaf-agent) | 数据面 Agent：连接控制面、规则缓存 + 磁盘持久化、回传日志/指标、接收命令 |
-| [pingwaf-waf](../../pingwaf-waf) | 检测引擎：归一化 → 签名 → 表达式 → 异常评分 |
-| [pingwaf-challenge](../../pingwaf-challenge) | 动态挑战：JS 5 秒盾、交互式挑战、PoW、浏览器指纹、HMAC clearance cookie |
+| [pingwaf-proto](../../wafred-proto) | 控制面 gRPC 协议定义（单一来源：`control_plane.proto`） |
+| [pingwaf-server](../../wafred-server) | 控制面：Axum REST + tonic gRPC + SeaORM/PostgreSQL + ES 日志 + 内嵌前端 + Agent 健康监控 |
+| [pingwaf-agent](../../wafred-agent) | 数据面 Agent：连接控制面、规则缓存 + 磁盘持久化、回传日志/指标、接收命令 |
+| [pingwaf-waf](../../wafred-waf) | 检测引擎：归一化 → 签名 → 表达式 → 异常评分 |
+| [pingwaf-challenge](../../wafred-challenge) | 动态挑战：JS 5 秒盾、交互式挑战、PoW、浏览器指纹、HMAC clearance cookie |
 | `pingwaf-profiler`（无 README） | 模块/方法 CPU 与内存归因表，经 `/api/v1/system/profile` 提供 |
 | `pingwaf-system`（无 README） | 进程/主机 CPU 快照与内存/cgroup 核算，经 `/api/v1/system/metrics` 提供 |
 

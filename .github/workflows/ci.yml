@@ -84,7 +84,7 @@ jobs:
         # (stable is a superset, the MSRV leg guards the floor).
         toolchain: ["1.96.0", stable]
     env:
-      # pingwaf-proto/build.rs honours PROTOC; point it at the apt-installed
+      # wafred-proto/build.rs honours PROTOC; point it at the apt-installed
       # protoc so the tonic/prost gRPC stubs are generated instead of the empty
       # placeholder build.rs writes when protoc is missing.
       PROTOC: /usr/bin/protoc
@@ -347,7 +347,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     env:
-      # Same reason as in the rust job: pingwaf-proto/build.rs honours PROTOC.
+      # Same reason as in the rust job: wafred-proto/build.rs honours PROTOC.
       PROTOC: /usr/bin/protoc
     steps:
       - name: Checkout

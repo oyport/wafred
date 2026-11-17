@@ -32,9 +32,9 @@ import { webStorage } from '@/lib/storage'
 const MAX_RESULTS = 10
 /** How many recently-run commands are remembered and shown on an empty query. */
 const RECENT_LIMIT = 5
-const RECENT_KEY = 'pingwaf.palette.recent'
+const RECENT_KEY = 'wafred.palette.recent'
 /** Official docs entry point, opened by the "documentation" action. */
-const DOCS_URL = 'https://www.pingwaf.com/docs'
+const DOCS_URL = 'https://waf.red/docs'
 
 interface Command {
   id: string

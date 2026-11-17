@@ -75,8 +75,8 @@ you want, and any alternative you considered.
 disclosure process in [`SECURITY.md`](./SECURITY.md). Two private channels are
 monitored:
 
-- [GitHub private vulnerability reporting](https://github.com/shuaiZend/PingWAF/security/advisories/new) (preferred — tracked, and the fastest route to a fix)
-- `security@pingwaf.com` (monitored by at least two maintainers)
+- [GitHub private vulnerability reporting](https://github.com/oyport/wafred/security/advisories/new) (preferred — tracked, and the fastest route to a fix)
+- `security@waf.red` (monitored by at least two maintainers)
 
 Include the affected version, deployment mode, reproduction steps and attack
 prerequisites; redact tokens and passwords. We acknowledge reports within three
@@ -120,7 +120,7 @@ cargo install cargo-msrv --version 0.18.4
 ```
 
 > ⚠️ **Install `protoc` before your first `cargo build`.** If it is missing,
-> [`pingwaf-proto/build.rs`](./pingwaf-proto/build.rs) writes a placeholder
+> [`wafred-proto/build.rs`](./wafred-proto/build.rs) writes a placeholder
 > instead of the real gRPC code and only emits a `cargo:warning`. The failure
 > surfaces later as baffling "cannot find type" errors in `pingwaf-server` and
 > `pingwaf-agent`. Recover with:
@@ -170,12 +170,12 @@ cargo build --bin wafred --no-default-features --features tls-rustls,full
 | Path | What lives there |
 | --- | --- |
 | `src/` | Binary entry points (`pingap`, `wafred`), CLI parsing, process management |
-| `pingwaf-server/` | Control plane: Axum REST API, dashboard serving, gRPC server, SeaORM entities and migrations |
-| `pingwaf-agent/` | Data plane agent: gRPC client, config, local rule cache, heartbeat and log shipping |
-| `pingwaf-proto/` | `control_plane.proto` and the generated gRPC stubs (needs `protoc`) |
-| `pingwaf-waf/` | Detection engine: input normalisation, Aho-Corasick + libinjection-style SQLi/XSS fast path, expression rule engine with anomaly scoring (`WafVerdict`) |
-| `pingwaf-challenge/` | JS challenge, clearance cookies, browser fingerprinting |
-| `pingwaf-profiler/, pingwaf-system/` | In-process instrumentation: module/method wall-clock and memory attribution behind `GET /api/v1/system/profile`, and process/host CPU plus memory/cgroup snapshots behind `GET /api/v1/system/metrics` (the pprof endpoints were removed) |
+| `wafred-server/` | Control plane: Axum REST API, dashboard serving, gRPC server, SeaORM entities and migrations |
+| `wafred-agent/` | Data plane agent: gRPC client, config, local rule cache, heartbeat and log shipping |
+| `wafred-proto/` | `control_plane.proto` and the generated gRPC stubs (needs `protoc`) |
+| `wafred-waf/` | Detection engine: input normalisation, Aho-Corasick + libinjection-style SQLi/XSS fast path, expression rule engine with anomaly scoring (`WafVerdict`) |
+| `wafred-challenge/` | JS challenge, clearance cookies, browser fingerprinting |
+| `wafred-profiler/, wafred-system/` | In-process instrumentation: module/method wall-clock and memory attribution behind `GET /api/v1/system/profile`, and process/host CPU plus memory/cgroup snapshots behind `GET /api/v1/system/metrics` (the pprof endpoints were removed) |
 | `pingap-*` | The inherited proxy stack: cache, certificates, ACME, config, plugins, proxy, upstream, logging, observability |
 | `web/` | React 19 + TypeScript + Vite dashboard (Tailwind v4, Zustand, TanStack Query, i18next) |
 | `docs/` | English documentation; `docs/zh/` holds the Chinese mirror |

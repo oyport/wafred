@@ -9,6 +9,7 @@ describe('parseTab', () => {
     expect(parseTab('managed')).toBe('managed')
     expect(parseTab('custom')).toBe('custom')
     expect(parseTab('paths')).toBe('paths')
+    expect(parseTab('restrictions')).toBe('restrictions')
     expect(parseTab('cc')).toBe('cc')
   })
 

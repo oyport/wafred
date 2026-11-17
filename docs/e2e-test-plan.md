@@ -1,4 +1,4 @@
-# PingWAF End-to-End Test Plan
+# WAFred End-to-End Test Plan
 
 - Applies to: every release from `0.32.23` onward (the plan is versioned with
   the product; a change to scope re-issues this document)

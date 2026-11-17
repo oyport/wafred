@@ -58,7 +58,7 @@ function SectionHeading({ title, hint }: { title: string; hint?: string }) {
 }
 
 /**
- * Web protection for one site, organised as six entries (UX-09):
+ * Web protection for one site, organised as seven entries:
  *
  * - **Overview** — the live posture card, the site-wide enforcement-mode
  *   switch (the downgrade path carries a confirmation) and the recent
@@ -128,6 +128,7 @@ export function ProtectionPage() {
     managed: t('pages.protection.tabManaged'),
     custom: t('pages.protection.tabCustom'),
     paths: t('pages.protection.tabPaths'),
+    restrictions: t('pages.protection.tabPathRestrictions'),
     cc: t('pages.protection.tabCc'),
   }
 
@@ -205,6 +206,11 @@ export function ProtectionPage() {
             icon: <PathIcon weight="duotone" className="h-4 w-4" />,
           },
           {
+            value: 'restrictions',
+            label: tabLabels.restrictions,
+            icon: <ShieldCheck weight="duotone" className="h-4 w-4" />,
+          },
+          {
             value: 'cc',
             label: tabLabels.cc,
             icon: <Cloud weight="duotone" className="h-4 w-4" />,
@@ -212,46 +218,200 @@ export function ProtectionPage() {
         ]}
       />
 
-        <Tabs
-          variant="pill"
-          className="mb-5"
-          value={tab}
-          onChange={setTab}
-          items={[
-            {
-              value: 'managed',
-              label: t('pages.protection.tabManaged'),
-              icon: <Sliders weight="duotone" className="h-4 w-4" />,
-            },
-            {
-              value: 'custom',
-              label: t('pages.protection.tabCustom'),
-              icon: <ShieldCheck weight="duotone" className="h-4 w-4" />,
-            },
-            {
-              value: 'cc',
-              label: t('pages.protection.tabCc'),
-              icon: <Cloud weight="duotone" className="h-4 w-4" />,
-            },
-            {
-              value: 'paths',
-              label: t('pages.protection.tabPaths'),
-              icon: <PathIcon weight="duotone" className="h-4 w-4" />,
-            },
-            {
-              value: 'restrictions',
-              label: t('pages.protection.tabPathRestrictions'),
-              icon: <ShieldCheck weight="duotone" className="h-4 w-4" />,
-            },
-          ]}
-        />
+      {/* ── Overview: posture, high-risk switch, recent changes ──────────── */}
+      {tab === 'overview' && (
+        <div role="tabpanel" aria-label={tabLabels.overview} className="flex flex-col gap-5">
+          <PostureOverview siteId={siteId} onNavigate={handlePostureNavigate} />
+          <EnforcementModeCard />
+          <RecentChangesCard siteId={siteId} canWrite={canWrite} />
+        </div>
+      )}
 
-        {tab === 'managed' && <ManagedRulesPanel />}
-        {tab === 'custom' && <CustomRulesPanel />}
-        {tab === 'cc' && <MitigationPanel />}
-        {tab === 'paths' && <PathExceptionsPanel />}
-        {tab === 'restrictions' && <PathRestrictionsPanel />}
-      </section>
+      {/* ── Engine & detection ──────────────────────────────────────────── */}
+      {tab === 'engine' && (
+        <div role="tabpanel" aria-label={tabLabels.engine}>
+          <section className="mb-6">
+            <SectionHeading
+              title={t('pages.protection.engineTitle')}
+              hint={t('pages.protection.engineHint')}
+            />
+            {settingsQuery.isPending ? (
+              <SkeletonCard className="h-16" />
+            ) : (
+              <div
+                className={`flex flex-wrap items-center justify-between gap-4 rounded-lg border px-4 py-3 ${
+                  engineOn ? 'border-line bg-elevated' : 'border-warning/45 bg-warning/10'
+                }`}
+              >
+                <span className="flex min-w-0 items-center gap-3">
+                  <span
+                    className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${
+                      engineOn ? 'bg-brand-soft text-fg-brand-strong' : 'bg-warning/15 text-fg-warning'
+                    }`}
+                  >
+                    <ShieldCheck weight="duotone" className="h-5 w-5" />
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block text-sm font-semibold text-fg-strong">
+                      {t('pages.protection.engineTitle')}
+                    </span>
+                    <span className="mt-0.5 block text-[13px] text-fg-subtle">
+                      {t('pages.protection.engineCardHint')}
+                    </span>
+                    {!engineOn && (
+                      <span className="mt-1.5 block text-xs text-fg-warning">
+                        {t('pages.protection.engineOffWarn')}
+                      </span>
+                    )}
+                  </span>
+                </span>
+                <Switch
+                  size="md"
+                  checked={engineOn}
+                  disabled={!canWrite || updateSettings.isPending}
+                  aria-label={t('pages.protection.engineTitle')}
+                  onCheckedChange={(waf_enabled) => {
+                    if (waf_enabled) {
+                      updateSettings.mutate({ waf_enabled: true })
+                      return
+                    }
+                    setEngineOffAck(false)
+                    setConfirmEngineOff(true)
+                  }}
+                />
+              </div>
+            )}
+          </section>
+
+          <section>
+            <SectionHeading
+              title={t('pages.protection.detectionTitle')}
+              hint={t('pages.protection.detectionHint')}
+            />
+            <div className="flex flex-col gap-4">
+              <div className="grid items-start gap-4 lg:grid-cols-2">
+                {settingsQuery.isPending ? (
+                  <SkeletonCard className="h-16" />
+                ) : (
+                  <div
+                    className={`flex flex-wrap items-center justify-between gap-4 rounded-lg border px-4 py-3 ${
+                      settings?.advanced_mode
+                        ? 'border-danger/45 bg-danger/10'
+                        : 'border-line bg-elevated'
+                    }`}
+                  >
+                    <span className="flex min-w-0 items-center gap-3">
+                      <span
+                        className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${
+                          settings?.advanced_mode
+                            ? 'bg-danger/15 text-fg-danger'
+                            : 'bg-recessed text-fg-subtle'
+                        }`}
+                      >
+                        <Lightning weight="duotone" className="h-5 w-5" />
+                      </span>
+                      <span className="min-w-0">
+                        <span className="block text-sm font-semibold text-fg-strong">
+                          {t('pages.protection.deepInspection')}
+                        </span>
+                        <span className="mt-0.5 block text-[13px] text-fg-subtle">
+                          {t('pages.protection.deepInspectionHint')}
+                        </span>
+                        <span className="mt-1.5 flex items-center gap-1.5 text-xs text-fg-warning">
+                          <Gauge weight="duotone" className="h-3.5 w-3.5 shrink-0" />
+                          {t('pages.protection.performanceHint')}
+                        </span>
+                      </span>
+                    </span>
+                    <Switch
+                      size="md"
+                      checked={settings?.advanced_mode ?? false}
+                      disabled={!canWrite || updateSettings.isPending}
+                      aria-label={t('pages.protection.deepInspection')}
+                      onCheckedChange={(advanced_mode) => updateSettings.mutate({ advanced_mode })}
+                    />
+                  </div>
+                )}
+                {settingsQuery.isPending ? (
+                  <SkeletonCard className="h-16" />
+                ) : (
+                  <div className="flex flex-wrap items-center justify-between gap-4 rounded-lg border border-line bg-elevated px-4 py-3">
+                    <span className="flex min-w-0 items-center gap-3">
+                      <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-recessed text-fg-subtle">
+                        <Gauge weight="duotone" className="h-5 w-5" />
+                      </span>
+                      <span className="min-w-0">
+                        <span className="block text-sm font-semibold text-fg-strong">
+                          {t('pages.protection.paranoiaTitle')}
+                        </span>
+                        <span className="mt-0.5 block text-[13px] text-fg-subtle">
+                          {t('pages.protection.paranoiaCardHint')}
+                        </span>
+                        <span className="mt-2 flex items-center gap-1">
+                          {[1, 2, 3, 4].map((level) => {
+                            const active = (settings?.paranoia_level ?? 2) === level
+                            return (
+                              <button
+                                key={level}
+                                type="button"
+                                disabled={!canWrite || updateSettings.isPending}
+                                aria-label={`${t('pages.protection.paranoiaTitle')} ${level}`}
+                                aria-pressed={active}
+                                onClick={() => updateSettings.mutate({ paranoia_level: level })}
+                                className={cn(
+                                  'h-7 w-9 rounded-md border text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60',
+                                  active
+                                    ? 'border-brand bg-brand-soft text-fg-brand-strong'
+                                    : 'border-line text-fg-subtle hover:border-fill hover:bg-recessed',
+                                )}
+                              >
+                                {level}
+                              </button>
+                            )
+                          })}
+                        </span>
+                      </span>
+                    </span>
+                  </div>
+                )}
+              </div>
+              <BodyStageTimeoutCard
+                settings={settings}
+                canWrite={canWrite}
+                pending={updateSettings.isPending}
+                onCommit={(secs) => updateSettings.mutate({ body_stage_timeout_secs: secs })}
+              />
+              <ObservationModeCard />
+            </div>
+          </section>
+        </div>
+      )}
+
+      {tab === 'managed' && (
+        <div role="tabpanel" aria-label={tabLabels.managed}>
+          <ManagedRulesPanel />
+        </div>
+      )}
+      {tab === 'custom' && (
+        <div role="tabpanel" aria-label={tabLabels.custom}>
+          <CustomRulesPanel />
+        </div>
+      )}
+      {tab === 'paths' && (
+        <div role="tabpanel" aria-label={tabLabels.paths}>
+          <PathExceptionsPanel />
+        </div>
+      )}
+      {tab === 'restrictions' && (
+        <div role="tabpanel" aria-label={tabLabels.restrictions}>
+          <PathRestrictionsPanel />
+        </div>
+      )}
+      {tab === 'cc' && (
+        <div role="tabpanel" aria-label={tabLabels.cc}>
+          <MitigationPanel />
+        </div>
+      )}
 
       <ConfirmDialog
         open={confirmEngineOff}

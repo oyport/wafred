@@ -24,7 +24,7 @@ The dashboard is compiled into the binary with `rust-embed`, so there is no sepa
 
 ## The gRPC contract
 
-The single source of truth is `pingwaf-proto/proto/control_plane.proto`. Seven RPCs make up the service:
+The single source of truth is `wafred-proto/proto/control_plane.proto`. Seven RPCs make up the service:
 
 | RPC | Kind | Purpose |
 | --- | --- | --- |

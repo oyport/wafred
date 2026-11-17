@@ -77,7 +77,7 @@ use pingwaf_waf::{
     WafVerdict,
 };
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -615,6 +615,47 @@ fn resolve_path_bypass(site: &SiteContext, path: &str) -> Option<PathBypass> {
     site.path_exceptions.as_ref()?.match_path(path).cloned()
 }
 
+type PathExceptionCacheEntry =
+    (Arc<CacheSiteRules>, Option<Arc<PathExceptions>>);
+
+static PATH_EXCEPTION_CACHE: LazyLock<
+    DashMap<String, PathExceptionCacheEntry>,
+> = LazyLock::new(DashMap::new);
+
+/// Resolve exceptions even when the WAF did not create a pending entry.
+pub(crate) fn path_exception_skips_challenge(host: &str, path: &str) -> bool {
+    let Some(agent) = WafredAgent::instance() else {
+        return false;
+    };
+    let Some(site_rules) = agent.get_rules_for_domain(host) else {
+        return false;
+    };
+    if site_rules.path_exceptions.is_empty() {
+        return false;
+    }
+    let cached = PATH_EXCEPTION_CACHE
+        .get(host)
+        .filter(|entry| Arc::ptr_eq(&entry.0, &site_rules))
+        .map(|entry| entry.1.clone());
+    let compiled = cached.unwrap_or_else(|| {
+        let compiled =
+            PathExceptions::build(&site_rules.path_exceptions).map(Arc::new);
+        if PATH_EXCEPTION_CACHE.len() > 256 {
+            PATH_EXCEPTION_CACHE.clear();
+        }
+        PATH_EXCEPTION_CACHE.insert(
+            host.to_string(),
+            (Arc::clone(&site_rules), compiled.clone()),
+        );
+        compiled
+    });
+    compiled.is_some_and(|compiled| {
+        compiled.match_path(path).is_some_and(|bypass| {
+            bypass.layers.skips_challenge() || bypass.layers.skips("rate_limit")
+        })
+    })
+}
+
 const MAX_PATH_RESTRICTION_COUNTERS: usize = 100_000;
 const PATH_RESTRICTION_COUNTER_GC_SECS: u64 = 15;
 
@@ -630,9 +671,7 @@ enum PathRestrictionAction {
 struct CompiledPathRestriction {
     id: String,
     name: String,
-    path: String,
-    match_type: String,
-    regex: Option<Regex>,
+    path: PathFilter,
     expression: Option<Expression>,
     action: PathRestrictionAction,
     threshold: u32,
@@ -694,16 +733,13 @@ impl CompiledPathRestriction {
                 return None;
             },
         };
-        let regex = if rule.match_type == "regex" {
-            match compile_path_regex(&rule.path) {
-                Ok(regex) => Some(regex),
-                Err(error) => {
-                    warn!(rule = %rule.id, error = %error, "path restriction regex failed to compile; rule ignored");
-                    return None;
-                },
-            }
-        } else {
-            None
+        let path = match PathFilter::compile(&rule.path, &rule.match_type) {
+            Ok(Some(path)) => path,
+            Ok(None) => return None,
+            Err(error) => {
+                warn!(rule = %rule.id, error = %error, "path restriction failed to compile; rule ignored");
+                return None;
+            },
         };
         let expression = if rule.expression.trim().is_empty() {
             None
@@ -748,9 +784,7 @@ impl CompiledPathRestriction {
             } else {
                 rule.name.clone()
             },
-            path: rule.path.clone(),
-            match_type: rule.match_type.clone(),
-            regex,
+            path,
             expression,
             action,
             threshold: rule.threshold,
@@ -766,20 +800,7 @@ impl CompiledPathRestriction {
     }
 
     fn matches_path(&self, path: &str) -> bool {
-        match self.match_type.as_str() {
-            "exact" => path == self.path,
-            "wildcard" => path.starts_with(self.path.trim_end_matches('*')),
-            "regex" => self
-                .regex
-                .as_ref()
-                .is_some_and(|regex| regex.is_match(path)),
-            _ => {
-                path == self.path
-                    || path
-                        .strip_prefix(self.path.as_str())
-                        .is_some_and(|rest| rest.starts_with('/'))
-            },
-        }
+        self.path.matches(path)
     }
 
     fn active_now(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
@@ -1003,6 +1024,8 @@ struct SiteContext {
     /// Operator-curated path exceptions, compiled; `None` when the site has
     /// none enabled. Honoured in every WAF mode, including block mode.
     path_exceptions: Option<Arc<PathExceptions>>,
+    /// A body-based allow rule can overturn a header-only block verdict.
+    allow_rules_need_body: bool,
     /// Explicit route restrictions; evaluated before exception bypasses.
     path_restrictions: Option<Arc<PathRestrictions>>,
     /// Whether OIDC is available and configured for path-scoped gates.
@@ -1064,6 +1087,15 @@ impl SiteContext {
             ),
             path_exceptions: PathExceptions::build(&site_rules.path_exceptions)
                 .map(Arc::new),
+            allow_rules_need_body: waf_cfg
+                .filter(|cfg| cfg.enabled && cfg.mode != CacheWafMode::Off)
+                .is_some_and(|cfg| {
+                    cfg.custom_rules.iter().any(|rule| {
+                        rule.enabled
+                            && rule.action == CacheWafAction::Allow
+                            && rule.expression.contains("request.body")
+                    })
+                }),
             path_restrictions: PathRestrictions::build(
                 &site_rules.path_restrictions,
             )
@@ -2295,12 +2327,10 @@ fn clearance_valid(value: Option<String>, site_key: &str) -> bool {
     let Some(value) = value else {
         return false;
     };
-    let Some(agent) = WafredAgent::instance() else {
-        return false;
-    };
-    let secret_path =
-        Path::new(&agent.config.cache_dir).join("challenge_cookie_secret");
-    {
+    let secret_path = WafredAgent::instance().map(|agent| {
+        Path::new(&agent.config.cache_dir).join("challenge_cookie_secret")
+    });
+    if let Some(path) = secret_path.as_ref() {
         let cached =
             CLEARANCE_MANAGER.read().unwrap_or_else(|e| e.into_inner());
         if let Some((cached_path, manager)) = cached.as_ref()
@@ -4861,14 +4891,6 @@ impl Plugin for WafPlugin {
             .is_some_and(|bypass| bypass.layers.skips("rate_limit"));
         let mut pending_registered = false;
         if agent.is_some() {
-            // Only the access log needs this capped copy. Building it before
-            // the `agent.is_some()` gate made a standalone deployment clone
-            // every header for a PendingAccess that was never created.
-            let log_headers = cap_headers(
-                headers
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value.as_str())),
-            );
             pending_registered = register_pending_access(
                 &request_id,
                 PendingAccess {
@@ -5888,6 +5910,35 @@ impl Plugin for WafPlugin {
                 request_id = %request_id,
                 "body stage timeout; flushing withheld body upstream (fail-open)"
             );
+            // A header-phase block awaiting a body-based allow rule still
+            // applies when the body never arrives in time.
+            let mut fallback_counted = false;
+            if let Some(dv) = entry.deferred.as_ref()
+                && dv.header_block
+            {
+                let outcome = self.enforce_verdict(
+                    WafredAgent::instance().as_ref(),
+                    &dv.site_id,
+                    &request_id,
+                    &dv.host,
+                    &dv.request_data,
+                    &dv.choice,
+                    dv.context.as_ref(),
+                    dv.observe,
+                    dv.skip_challenge,
+                    false,
+                    false,
+                );
+                if let VerdictOutcome::Respond(response) = outcome {
+                    return Ok(Some(with_server_timing(
+                        response,
+                        ctx,
+                        session,
+                        Instant::now(),
+                    )));
+                }
+                fallback_counted = true;
+            }
             if let Some(agent) = WafredAgent::instance()
                 && let Some(dv) = entry.deferred.as_ref()
             {
@@ -5935,7 +5986,7 @@ impl Plugin for WafPlugin {
                     user_identity: String::new(),
                 });
             }
-            if !fallback_counted && let Some(agent) = PingWafAgent::instance() {
+            if !fallback_counted && let Some(agent) = WafredAgent::instance() {
                 // The request phase deferred its count to the body phase;
                 // this timeout is the body phase's final word.
                 agent.record_request(false);
@@ -6331,6 +6382,30 @@ pub(crate) mod tests {
     use pingwaf_challenge::ClearanceLevel;
     use pingwaf_proto::control_plane as proto;
     use tokio_test::io::Builder;
+
+    #[test]
+    fn path_restrictions_use_canonical_paths_and_enforce_thresholds() {
+        let rule = CachePathRestriction {
+            id: "rule-1".to_string(),
+            path: "/admin".to_string(),
+            match_type: "prefix".to_string(),
+            action: "block".to_string(),
+            threshold: 2,
+            period_seconds: 60,
+            block_duration_seconds: 30,
+            enabled: true,
+            ..Default::default()
+        };
+        let restrictions = PathRestrictions::build(&[rule]).unwrap();
+        let compiled = &restrictions.rules[0];
+        assert!(compiled.matches_path("/public/../admin/users"));
+        assert!(!compiled.matches_path("/admin/../public"));
+        assert!(!restrictions.over_threshold(compiled, "192.0.2.1", 61));
+        assert!(!restrictions.over_threshold(compiled, "192.0.2.1", 62));
+        assert!(restrictions.over_threshold(compiled, "192.0.2.1", 63));
+        assert!(!restrictions.over_threshold(compiled, "192.0.2.2", 63));
+        assert!(!restrictions.over_threshold(compiled, "192.0.2.1", 120));
+    }
 
     #[test]
     fn deferred_body_entry_limit_tracks_the_per_request_cap() {
@@ -7872,6 +7947,7 @@ inspect_body = true"###,
                 waf_triggered: false,
                 path_bypasses_challenge: false,
                 path_bypasses_rate_limit: false,
+                path_requires_oidc: false,
                 start: Instant::now(),
             }
         }
@@ -9475,7 +9551,7 @@ inspect_body = true"###,
         rules: Vec<proto::WafRule>,
     ) -> (
         tokio::sync::MutexGuard<'static, ()>,
-        Arc<PingWafAgent>,
+        Arc<WafredAgent>,
         tempfile::TempDir,
     ) {
         let installed = install_test_agent().await;
@@ -11202,7 +11278,7 @@ inspect_body = true"###,
     #[tokio::test]
     async fn clearance_is_valid_without_an_agent() {
         let _guard = lock_agent().await;
-        PingWafAgent::set_agent_instance(None);
+        WafredAgent::set_agent_instance(None);
 
         let secret = resolve_cookie_secret("");
         let manager = CookieManager::new(secret.as_bytes(), 3600);

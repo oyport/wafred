@@ -41,7 +41,7 @@ body:
     attributes:
       label: Location / 定位信息
       description: Narrowest stable pointer — `file:line`, `METHOD /api/v1/path`, or a scenario ID from docs/e2e-test-plan.md. / 最精确且稳定的定位。
-      placeholder: "pingwaf-server/src/api/capabilities.rs:177 或 POST /sites/{id}/path-exceptions 或 E2E-05"
+      placeholder: "wafred-server/src/api/capabilities.rs:177 或 POST /sites/{id}/path-exceptions 或 E2E-05"
     validations:
       required: true
 

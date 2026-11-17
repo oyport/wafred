@@ -122,9 +122,9 @@ TLS_SANS=""
 LISTEN_PUBLIC=false
 # Instance key for the at-rest sealing of notification/AI/backup credentials.
 # Taken from the environment when set; otherwise generated once and persisted
-# in ${CONFIG_DIR}/pingwaf.env (0600). Never rotate it silently: previously
+# in ${CONFIG_DIR}/wafred.env (0600). Never rotate it silently: previously
 # sealed credentials cannot be opened with a new key.
-PINGWAF_SECRET_KEY="${PINGWAF_SECRET_KEY:-}"
+WAFRED_SECRET_KEY="${WAFRED_SECRET_KEY:-}"
 ADMIN_PASSWORD_GENERATED=false
 DRY_RUN=false
 # "" decides from the command line, "true"/"false" are explicit opt-ins.
@@ -159,7 +159,7 @@ Options:
   --db-url URL             PostgreSQL connection string
   --admin-email EMAIL      Seed administrator e-mail (server / all-in-one)
   --admin-password PASS    Seed administrator password. When omitted (and no
-                           PINGWAF_ADMIN_PASSWORD) a random password is
+                           WAFRED_ADMIN_PASSWORD) a random password is
                            generated and printed exactly once at the end.
   --tls-sans NAMES         Comma separated dashboard certificate names
   --listen-public          Bind the dashboard/REST API (9080) and the agent
@@ -622,8 +622,8 @@ if [[ -z "$ADMIN_PASSWORD" ]]; then
     ADMIN_PASSWORD="$(random_password)"
     ADMIN_PASSWORD_GENERATED=true
 fi
-if [[ -z "$PINGWAF_SECRET_KEY" ]]; then
-    PINGWAF_SECRET_KEY="$(random_hex 32)"
+if [[ -z "$WAFRED_SECRET_KEY" ]]; then
+    WAFRED_SECRET_KEY="$(random_hex 32)"
 fi
 
 if [[ "$OS" == "darwin" ]]; then
@@ -684,7 +684,7 @@ verify_checksum() {
 # Rejects an archive that would write outside the temp directory (absolute
 # paths, `..` components) or that is not the expected single release directory.
 verify_archive_members() {
-    local archive="$1" list="${TMPDIR}/members.txt" prefix="pingwaf-${OS}-${ARCH}/"
+    local archive="$1" list="${TMPDIR}/members.txt" prefix="wafred-${OS}-${ARCH}/"
     case "$archive" in
         *.tar.xz) tar -tJf "$archive" > "$list" ;;
         *.tar.gz) tar -tzf "$archive" > "$list" ;;
@@ -767,7 +767,7 @@ esac
 # The release archive contains exactly one binary with this name. There is no
 # "first executable" fallback: an unexpected archive layout is an error, not an
 # invitation to install an arbitrary file.
-BINARY_PATH="$(find "${TMPDIR}/pingwaf-${OS}-${ARCH}" -name "$BINARY_NAME" -type f | head -n1)"
+BINARY_PATH="$(find "${TMPDIR}/wafred-${OS}-${ARCH}" -name "$BINARY_NAME" -type f | head -n1)"
 if [[ -z "$BINARY_PATH" ]]; then
     fatal "Binary '${BINARY_NAME}' not found in the verified archive."
 fi
@@ -788,7 +788,7 @@ fi
 
 info "Installing binary to ${INSTALL_DIR}/${BINARY_NAME}..."
 # The binary must be root-owned: it is executed by the systemd unit (as the
-# unprivileged pingwaf user) and may be run by an operator. `mv` preserves the
+# unprivileged wafred user) and may be run by an operator. `mv` preserves the
 # installing user's ownership, so the owner/mode are normalised afterwards.
 if [[ -w "$INSTALL_DIR" ]]; then
     mv "$BINARY_PATH" "${INSTALL_DIR}/${BINARY_NAME}"
@@ -843,9 +843,9 @@ write_config() {
     local config_file="${CONFIG_DIR}/wafred.toml"
     if [[ -f "$config_file" ]]; then
         warn "Config file already exists at ${config_file}, leaving it untouched."
-        if grep -q '^admin_password = "pingwaf123"' "$config_file" 2>/dev/null; then
+        if grep -q '^admin_password = "wafred123"' "$config_file" 2>/dev/null; then
             warn "WARNING: ${config_file} still uses the public default administrator password."
-            warn "Change it now: pingwaf user reset-password --email ${ADMIN_EMAIL} (or via the dashboard)."
+            warn "Change it now: wafred user reset-password --email ${ADMIN_EMAIL} (or via the dashboard)."
         fi
         warn "Values from this run (control-plane URL, API key, admin account, TLS names,"
         warn "database) were not applied. In agent mode this file is authoritative:"
@@ -984,25 +984,25 @@ EOF
 # would make every previously sealed notification/AI/backup credential
 # unreadable, and there is no automatic re-encryption.
 write_secret_env_file() {
-    local env_file="${CONFIG_DIR}/pingwaf.env" cmd=""
+    local env_file="${CONFIG_DIR}/wafred.env" cmd=""
     [[ -w "$CONFIG_DIR" ]] || cmd="sudo"
 
-    if [[ -f "$env_file" ]] && grep -q '^PINGWAF_SECRET_KEY=' "$env_file" 2>/dev/null; then
+    if [[ -f "$env_file" ]] && grep -q '^WAFRED_SECRET_KEY=' "$env_file" 2>/dev/null; then
         info "Keeping the existing ${env_file} (rotating it would break sealed credentials)."
         return 0
     fi
 
     (umask 077; $cmd tee "$env_file" >/dev/null <<EOF
-# PingWAF environment secrets — mode 0600, read by the systemd unit.
+# WAFred environment secrets — mode 0600, read by the systemd unit.
 #
-# PINGWAF_SECRET_KEY seals notification channel / AI provider / backup target
+# WAFRED_SECRET_KEY seals notification channel / AI provider / backup target
 # credentials at rest. Treat this file like the database itself: rotating the
 # key makes previously sealed credentials unreadable (there is no automatic
 # re-encryption), so back it up and do not regenerate it on upgrade.
-PINGWAF_SECRET_KEY=${PINGWAF_SECRET_KEY}
+WAFRED_SECRET_KEY=${WAFRED_SECRET_KEY}
 EOF
     )
-    # systemd reads EnvironmentFile as root before dropping to User=pingwaf, so
+    # systemd reads EnvironmentFile as root before dropping to User=wafred, so
     # the instance key stays root-only: the service process never needs to read
     # this file itself.
     if ! $cmd chown root:root "$env_file" 2>/dev/null; then
@@ -1152,9 +1152,9 @@ LimitNOFILE=65536
 ${agent_env}
 # Log level; the default keeps sqlx's per-statement log out of the way:
 Environment=RUST_LOG=info,sqlx=warn
-# Instance secrets (PINGWAF_SECRET_KEY) live in a 0600 file; the leading dash
+# Instance secrets (WAFRED_SECRET_KEY) live in a 0600 file; the leading dash
 # keeps the unit working when the file does not exist (e.g. an agent node).
-EnvironmentFile=-${CONFIG_DIR}/pingwaf.env
+EnvironmentFile=-${CONFIG_DIR}/wafred.env
 
 # The data plane binds 80/443 while running as the unprivileged wafred user.
 # Ambient capabilities are the only form that survives NoNewPrivileges=true;
@@ -1358,8 +1358,8 @@ else
     if [[ "$ADMIN_PASSWORD_GENERATED" == "true" ]]; then
         echo "  ${YELLOW}⚠ Save the generated administrator password now: it is not shown again.${NO_COLOR}"
     fi
-    echo "  ${YELLOW}⚠ Back up ${CONFIG_DIR}/pingwaf.toml and ${CONFIG_DIR}/pingwaf.env.${NO_COLOR}"
-    echo "  ${YELLOW}   Do NOT regenerate the JWT secret or PINGWAF_SECRET_KEY: previously sealed${NO_COLOR}"
+    echo "  ${YELLOW}⚠ Back up ${CONFIG_DIR}/wafred.toml and ${CONFIG_DIR}/wafred.env.${NO_COLOR}"
+    echo "  ${YELLOW}   Do NOT regenerate the JWT secret or WAFRED_SECRET_KEY: previously sealed${NO_COLOR}"
     echo "  ${YELLOW}   credentials become unreadable and sessions are invalidated. Change the${NO_COLOR}"
     echo "  ${YELLOW}   administrator password from the dashboard (Settings → Account) instead.${NO_COLOR}"
     echo ""
@@ -1374,13 +1374,13 @@ else
     echo "               secrets in ${CONFIG_DIR} are kept. Then: sudo systemctl restart ${SERVICE_NAME}"
     echo "    Rollback:  re-run with --version <previous> (older releases stay on GitHub),"
     echo "               then: sudo systemctl restart ${SERVICE_NAME}"
-    echo "    Backup:    sudo tar -czf pingwaf-config-\$(date +%F).tgz -C / etc/pingwaf"
-    echo "               sudo chmod 600 pingwaf-config-*.tgz   # it holds the admin password and keys"
+    echo "    Backup:    sudo tar -czf wafred-config-\$(date +%F).tgz -C / etc/wafred"
+    echo "               sudo chmod 600 wafred-config-*.tgz   # it holds the admin password and keys"
     echo "    Uninstall: sudo systemctl disable --now ${SERVICE_NAME}"
     echo "               sudo rm -f /etc/systemd/system/${SERVICE_NAME}.service"
     echo "               sudo rm -f ${INSTALL_DIR}/${BINARY_NAME}"
     echo "               keep (or back up) ${CONFIG_DIR} and ${DATA_DIR}; remove the account with:"
-    echo "               sudo userdel pingwaf"
+    echo "               sudo userdel wafred"
     echo "    Never delete ${DATA_DIR} or drop the database before taking a backup."
     echo ""
 fi

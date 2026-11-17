@@ -107,7 +107,7 @@ with the preset's extensions and TTLs and disables the preset.
 
 ## gRPC
 
-Agents use the `ControlPlane` service on port `9090`, defined in `pingwaf-proto/proto/control_plane.proto`. It carries `RegisterAgent`, `Heartbeat`, `SyncRules`, `ShipLogs`, `ShipCertEvents`, `ShipMetrics` and `GetSiteConfig`, plus the visitor session RPCs used by the challenge flow. TLS is the default; `grpc_tls_mode = "off"` is a deliberate downgrade for trusted networks only.
+Agents use the `ControlPlane` service on port `9090`, defined in `wafred-proto/proto/control_plane.proto`. It carries `RegisterAgent`, `Heartbeat`, `SyncRules`, `ShipLogs`, `ShipCertEvents`, `ShipMetrics` and `GetSiteConfig`, plus the visitor session RPCs used by the challenge flow. TLS is the default; `grpc_tls_mode = "off"` is a deliberate downgrade for trusted networks only.
 
 ## API keys
 

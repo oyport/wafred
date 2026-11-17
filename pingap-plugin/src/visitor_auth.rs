@@ -12,7 +12,7 @@
 //! question about a visitor (`does this password match`, `which sites may they
 //! enter`) goes to the control plane over gRPC, and a control plane that cannot
 //! be reached is a refusal rather than a pass. See
-//! `pingwaf-server/src/grpc/visitor_auth.rs`.
+//! `wafred-server/src/grpc/visitor_auth.rs`.
 //!
 //! # Why the challenge is the WAF's
 //!

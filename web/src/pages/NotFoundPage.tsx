@@ -5,7 +5,7 @@ import { EmptyState } from '@/components/ui/EmptyState'
 import { Button } from '@/components/ui/Button'
 
 /** Public product site, offered from the 404 as the way out of a dead link. */
-export const WEBSITE_URL = 'https://www.pingwaf.com'
+export const WEBSITE_URL = 'https://waf.red'
 
 /**
  * Full 404 page for the console router.

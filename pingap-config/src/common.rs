@@ -1097,7 +1097,7 @@ impl LocationConf {
     ///   `~regex` location has no prefix, and neither has a location without a
     ///   `path`, so both are configuration errors instead of silent no-ops.
     ///
-    /// The control plane's route API (`pingwaf-server/src/api/sites.rs`)
+    /// The control plane's route API (`wafred-server/src/api/sites.rs`)
     /// enforces the same shape before storing a route; that crate cannot
     /// depend on this one, so the rule is mirrored there. The data plane
     /// (`pingap-location`) calls this very function and, because its input

@@ -111,7 +111,7 @@ const langLabels: Record<string, string> = { en: 'English', zh: '中文', ja: '�
 const PROJECT_URL = 'https://github.com/oyport/wafred'
 
 /** Original project from which WAFred was derived. */
-const PINGWAF_SOURCE_URL = 'https://github.com/shuaiZend/PingWAF'
+const WAFRED_SOURCE_PROJECT_URL = 'https://github.com/shuaiZend/PingWAF'
 
 /** Upstream proxy engine shown in the About card. */
 const UPSTREAM_URL = 'https://github.com/cloudflare/pingora'
@@ -1511,11 +1511,11 @@ function ControlPlaneTlsCard({ canWrite }: { canWrite: boolean }) {
   // UX-15: the browser only accepts a certificate whose SANs cover the host
   // the console is open on, so the quick-fix panel ships the exact openssl
   // invocation (CN + SAN already filled in) instead of a docs-only pointer.
-  const sanHost = host || 'pingwaf.local'
+  const sanHost = host || 'wafred.local'
   const opensslCommand = [
     'openssl req -new -newkey rsa:2048 -nodes \\',
-    '  -keyout pingwaf-control-plane.key \\',
-    '  -out pingwaf-control-plane.csr \\',
+    '  -keyout wafred-control-plane.key \\',
+    '  -out wafred-control-plane.csr \\',
     `  -subj "/CN=${sanHost}" \\`,
     `  -addext "subjectAltName=DNS:${sanHost}"`,
   ].join('\n')
@@ -3096,7 +3096,7 @@ function AboutCard() {
                   components={{
                     source: (
                       <a
-                        href={PINGWAF_SOURCE_URL}
+                        href={WAFRED_SOURCE_PROJECT_URL}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="font-medium text-brand hover:underline"

@@ -194,8 +194,8 @@ control.**
       keys.
 - [ ] Passkeys (WebAuthn) need a secure context: HTTPS under a hostname, or
       `localhost`. They do not work over plain `http://` or a bare IP. Behind a
-      TLS-terminating proxy set `PINGWAF_PASSKEY_ORIGIN` to the public origin,
-      and set `PINGWAF_PASSKEY_TRUST_FORWARDED_PROTO=true` only when that proxy
+      TLS-terminating proxy set `WAFRED_PASSKEY_ORIGIN` to the public origin,
+      and set `WAFRED_PASSKEY_TRUST_FORWARDED_PROTO=true` only when that proxy
       is the one terminating TLS — see
       [`docs/deployment.md`](./docs/deployment.md).
 

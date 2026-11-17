@@ -41,7 +41,7 @@ Strict + 请求体检测档的开放漏报：41 条（658 − 617）。
 | body 档家族（rce 4、xss 3、lfi 3、other 3、ssti 1、crlf 1） | 15 | 反射型 XSS 散文、HTML 上传、携带 `/bin/sh` 的 CI 载荷——Strict 档成员级检测的结构性代价 |
 
 Normal 档的 4 条是 `PINGWAF-1040` ×2（质询）、`XSS-007` ×1、`SQL-001` ×1。规则级归因来自
-`pingwaf-waf/examples/_fp_triage.rs`（打印 `matched_rules` 与 `details`）。
+`wafred-waf/examples/_fp_triage.rs`（打印 `matched_rules` 与 `details`）。
 
 ## 4. 回归与确定性
 

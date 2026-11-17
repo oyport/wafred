@@ -23,9 +23,9 @@ Restart=always
 RestartSec=5
 LimitNOFILE=65536
 Environment=RUST_LOG=info,sqlx=warn
-# Instance secrets (PINGWAF_SECRET_KEY) live in a 0600 file written by
+# Instance secrets (WAFRED_SECRET_KEY) live in a 0600 file written by
 # install.sh; the leading dash keeps the unit working when it does not exist.
-EnvironmentFile=-/etc/pingwaf/pingwaf.env
+EnvironmentFile=-/etc/wafred/wafred.env
 # Uncomment to read settings from a file — the environment above wins over it,
 # and a command-line flag wins over both. The path must exist: a named
 # configuration file that cannot be read stops the process at startup.

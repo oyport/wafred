@@ -68,12 +68,11 @@ WORKDIR /app
 
 # 2b.【关键修复】预热前必须拷入：
 #     - build.rs（根 Cargo.toml 声明 build = "build.rs"，缺失会导致预热 cargo build 立即失败）
-#     - pingwaf-proto/proto/（pingwaf-proto/build.rs 需要 control_plane.proto 生成 gRPC stub）
+#     - wafred-proto/proto/（wafred-proto/build.rs 需要 control_plane.proto 生成 gRPC stub）
 #     - 根 Cargo.toml/lock + 全部 25 个成员的 Cargo.toml
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY .cargo/ .cargo/
-COPY pingwaf-proto/proto/ pingwaf-proto/proto/
-COPY vendor/ vendor/
+COPY wafred-proto/proto/ wafred-proto/proto/
 
 # Copy all workspace member Cargo.toml files for dependency resolution
 COPY pingap-core/Cargo.toml pingap-core/
@@ -95,13 +94,13 @@ COPY pingap-sentry/Cargo.toml pingap-sentry/
 COPY pingap-pyroscope/Cargo.toml pingap-pyroscope/
 COPY pingap-imageoptim/Cargo.toml pingap-imageoptim/
 COPY pingap-webhook/Cargo.toml pingap-webhook/
-COPY pingwaf-proto/Cargo.toml pingwaf-proto/
-COPY pingwaf-profiler/Cargo.toml pingwaf-profiler/
-COPY pingwaf-system/Cargo.toml pingwaf-system/
-COPY pingwaf-server/Cargo.toml pingwaf-server/
-COPY pingwaf-agent/Cargo.toml pingwaf-agent/
-COPY pingwaf-waf/Cargo.toml pingwaf-waf/
-COPY pingwaf-challenge/Cargo.toml pingwaf-challenge/
+COPY wafred-proto/Cargo.toml wafred-proto/
+COPY wafred-profiler/Cargo.toml wafred-profiler/
+COPY wafred-system/Cargo.toml wafred-system/
+COPY wafred-server/Cargo.toml wafred-server/
+COPY wafred-agent/Cargo.toml wafred-agent/
+COPY wafred-waf/Cargo.toml wafred-waf/
+COPY wafred-challenge/Cargo.toml wafred-challenge/
 
 # 2c. 创建 dummy 源文件，让 cargo 能通过 manifest 解析并编译第三方依赖
 #     benches/bench.rs 是根 Cargo.toml 的 [[bench]] target，manifest 解析期必须存在；
@@ -114,17 +113,17 @@ RUN mkdir -p src && echo "fn main() {}" > src/main.rs \
        pingap-certificate pingap-discovery pingap-health pingap-location \
        pingap-logger pingap-plugin pingap-proxy pingap-upstream pingap-acme \
        pingap-performance pingap-otel pingap-sentry pingap-pyroscope \
-       pingap-imageoptim pingap-webhook pingwaf-profiler pingwaf-system \
-       pingwaf-server \
-       pingwaf-agent \
-       pingwaf-waf pingwaf-challenge; do \
+       pingap-imageoptim pingap-webhook wafred-profiler wafred-system \
+       wafred-server \
+       wafred-agent \
+       wafred-waf wafred-challenge; do \
        mkdir -p "$dir/src" && echo "" > "$dir/src/lib.rs"; \
     done \
     && for bench_dir in pingap-core pingap-cache pingap-util pingap-location \
        pingap-logger pingap-proxy pingap-upstream; do \
        mkdir -p "$bench_dir/benches" && echo "fn main() {}" > "$bench_dir/benches/bench.rs"; \
     done \
-    && mkdir -p pingwaf-proto/src && echo "" > pingwaf-proto/src/lib.rs
+    && mkdir -p wafred-proto/src && echo "" > wafred-proto/src/lib.rs
 
 # 2d. 依赖预热构建（修复：build.rs 与 proto/ 已前置 COPY，预热现在真正生效）
 #     编译产物留在镜像层中，供 CI type=gha/type=registry 缓存后端正确导出和恢复
@@ -140,7 +139,6 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
 # 2e. 拷真实源码（任何源码变化让此层及以下失效，但 2d 的缓存层仍命中）
 COPY src/ src/
 COPY benches/ benches/
-COPY vendor/ vendor/
 # src/plugin/admin.rs embeds dist/ via rust-embed (resolved against the root
 # crate's manifest dir /app), so the folder must exist at compile time.
 COPY dist/ dist/
@@ -163,15 +161,15 @@ COPY pingap-sentry/ pingap-sentry/
 COPY pingap-pyroscope/ pingap-pyroscope/
 COPY pingap-imageoptim/ pingap-imageoptim/
 COPY pingap-webhook/ pingap-webhook/
-COPY pingwaf-proto/ pingwaf-proto/
-COPY pingwaf-profiler/ pingwaf-profiler/
-COPY pingwaf-system/ pingwaf-system/
-COPY pingwaf-server/ pingwaf-server/
-COPY pingwaf-agent/ pingwaf-agent/
-COPY pingwaf-waf/ pingwaf-waf/
-COPY pingwaf-challenge/ pingwaf-challenge/
+COPY wafred-proto/ wafred-proto/
+COPY wafred-profiler/ wafred-profiler/
+COPY wafred-system/ wafred-system/
+COPY wafred-server/ wafred-server/
+COPY wafred-agent/ wafred-agent/
+COPY wafred-waf/ wafred-waf/
+COPY wafred-challenge/ wafred-challenge/
 
-# 2f. 前端产物（供 pingwaf-server/src/frontend.rs 的 rust-embed #[folder = "../web/dist/"]）
+# 2f. 前端产物（供 wafred-server/src/frontend.rs 的 rust-embed #[folder = "../web/dist/"]）
 COPY --from=frontend-builder /app/web/dist/ web/dist/
 
 # 2g. 最终构建：touch 使 workspace crate 的 mtime 指纹失效（排除 target/ 避免污染生成代码），

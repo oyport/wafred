@@ -222,7 +222,7 @@
 
 ### 密钥与加固
 
-- `PINGWAF_JWT_SECRET` 与 `PINGWAF_SECRET_KEY` 都应为 **32 字节随机值**（`openssl rand -hex 32`）。
+- `WAFRED_JWT_SECRET` 与 `WAFRED_SECRET_KEY` 都应为 **32 字节随机值**（`openssl rand -hex 32`）。
   前者签名登录 token；后者加密通知渠道口令、AI Provider Key 与备份目标凭据，未设置时这些字段以明文入库（仅 WARN），
   且目前**没有在线轮换**——备份与轮换步骤见 [SECURITY.md](../../SECURITY.md#credentials-and-secrets)。
 - 默认管理员口令必须在首次登录时修改；compose 与安装器不提供默认口令（安装器生成随机口令并只打印一次）。
@@ -251,7 +251,7 @@ MCP 的 `read` key 只能看到**其属主拥有的站点**；只有「key 带 `
 ### Passkey（WebAuthn）
 
 Passkey 需要安全上下文：HTTPS 主机名或 `localhost`；`http://` 或裸 IP 不可用，反代后需设
-`PINGWAF_PASSKEY_ORIGIN`。丢失设备时用口令登录后在 **Profile** 删除旧 passkey 并重新注册。
+`WAFRED_PASSKEY_ORIGIN`。丢失设备时用口令登录后在 **Profile** 删除旧 passkey 并重新注册。
 详见英文 [Passkeys (WebAuthn)](../user-guide.md#passkeys-webauthn)。
 
 ### 安全响应头

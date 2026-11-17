@@ -77,7 +77,7 @@ curl -s https://localhost:9080/api/v1/sites -H "Authorization: Bearer $TOKEN"
 
 ## gRPC
 
-Agent 使用 `9090` 上的 `ControlPlane` 服务，定义在 `pingwaf-proto/proto/control_plane.proto`。它承载 `RegisterAgent`、`Heartbeat`、`SyncRules`、`ShipLogs`、`ShipCertEvents`、`ShipMetrics`、`GetSiteConfig`，以及挑战流程使用的访客会话 RPC。TLS 为默认；`grpc_tls_mode = "off"` 只应在可信网络内使用。
+Agent 使用 `9090` 上的 `ControlPlane` 服务，定义在 `wafred-proto/proto/control_plane.proto`。它承载 `RegisterAgent`、`Heartbeat`、`SyncRules`、`ShipLogs`、`ShipCertEvents`、`ShipMetrics`、`GetSiteConfig`，以及挑战流程使用的访客会话 RPC。TLS 为默认；`grpc_tls_mode = "off"` 只应在可信网络内使用。
 
 ## API Key
 

@@ -71,6 +71,19 @@ export function CustomRulesPanel() {
     enabled: Boolean(siteId),
   })
 
+  // The search query only describes the visible rows. Keep the site-wide
+  // counts separate so filtering cannot change the protection summary.
+  const siteRulesQuery = useQuery({
+    queryKey: ruleKeys.list(siteId),
+    queryFn: () => rulesApi.list(siteId),
+    enabled: Boolean(siteId),
+  })
+  const enabledRulesQuery = useQuery({
+    queryKey: ruleKeys.list(siteId, { enabled: true, page_size: 1 }),
+    queryFn: () => rulesApi.list(siteId, { enabled: true, page_size: 1 }),
+    enabled: Boolean(siteId),
+  })
+
   const groupsQuery = useQuery({
     queryKey: ruleKeys.groups(siteId),
     queryFn: () => rulesApi.listGroups(siteId),
@@ -83,10 +96,15 @@ export function CustomRulesPanel() {
   const groups = useMemo(() => groupsQuery.data ?? [], [groupsQuery.data])
 
   /** Derived exactly the way the control plane derives it for the agents. */
-  const waf = useMemo(
-    () => deriveWafConfig(allRules, groups),
-    [allRules, groups],
-  )
+  const waf = useMemo(() => {
+    const derived = deriveWafConfig(siteRulesQuery.data?.items ?? [], groups)
+    return {
+      ...derived,
+      active_rules: enabledRulesQuery.data?.total ?? derived.active_rules,
+      total_rules: siteRulesQuery.data?.total ?? derived.total_rules,
+    }
+  }, [siteRulesQuery.data, enabledRulesQuery.data, groups])
+  const emptyRulePack = !debouncedSearch && !groupFilter && !enabledFilter && waf.total_rules === 0
 
   // The banner must reflect the *enforced* posture, which lives in the
   // settings row (mode + paranoia level), not in a re-derivation from the
@@ -253,17 +271,22 @@ export function CustomRulesPanel() {
     [groups, t],
   )
 
-  const loading =
-    rulesQuery.isPending || groupsQuery.isPending || settingsQuery.isPending
-  const failed = (rulesQuery.isError && !rulesQuery.data) || (groupsQuery.isError && !groupsQuery.data)
+  const loading = rulesQuery.isPending || siteRulesQuery.isPending || enabledRulesQuery.isPending ||
+    groupsQuery.isPending || settingsQuery.isPending
+  const failed = (rulesQuery.isError && !rulesQuery.data) ||
+    (siteRulesQuery.isError && !siteRulesQuery.data) ||
+    (enabledRulesQuery.isError && !enabledRulesQuery.data) ||
+    (groupsQuery.isError && !groupsQuery.data)
 
   return (
     <div>
       {failed ? (
         <ErrorState
-          error={rulesQuery.error ?? groupsQuery.error}
+          error={rulesQuery.error ?? siteRulesQuery.error ?? enabledRulesQuery.error ?? groupsQuery.error}
           onRetry={() => {
             void rulesQuery.refetch()
+            void siteRulesQuery.refetch()
+            void enabledRulesQuery.refetch()
             void groupsQuery.refetch()
           }}
           retrying={rulesQuery.isFetching}
@@ -339,6 +362,8 @@ export function CustomRulesPanel() {
                       loading={rulesQuery.isFetching}
                       onClick={() => {
                         void rulesQuery.refetch()
+                        void siteRulesQuery.refetch()
+                        void enabledRulesQuery.refetch()
                         void groupsQuery.refetch()
                       }}
                       icon={<ArrowClockwise weight="duotone" className="h-3.5 w-3.5" />}
@@ -494,17 +519,17 @@ export function CustomRulesPanel() {
                   className="py-12"
                   icon={<Shield weight="duotone" className="h-8 w-8" />}
                   title={
-                    allRules.length === 0
+                    emptyRulePack
                       ? t('pages.waf.emptyTitle')
                       : t('pages.waf.noResults')
                   }
                   description={
-                    allRules.length === 0
+                    emptyRulePack
                       ? t('pages.waf.emptyDescription')
                       : t('pages.waf.noResultsDescription')
                   }
                   action={
-                    allRules.length === 0 ? (
+                    emptyRulePack ? (
                       canWrite ? (
                         <div className="flex items-center gap-2">
                           <Button

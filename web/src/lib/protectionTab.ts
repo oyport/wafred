@@ -1,4 +1,4 @@
-export type ProtectionTab = 'managed' | 'custom' | 'cc' | 'paths' | 'restrictions'
+export type ProtectionTab = 'overview' | 'engine' | 'managed' | 'custom' | 'paths' | 'restrictions' | 'cc'
 
 /**
  * Tabs accepted from `?tab=`, in display order. Every entry must stay in this
@@ -7,11 +7,13 @@ export type ProtectionTab = 'managed' | 'custom' | 'cc' | 'paths' | 'restriction
  * `overview`, and the panel never opens.
  */
 export const PROTECTION_TABS: ProtectionTab[] = [
+  'overview',
+  'engine',
   'managed',
   'custom',
-  'cc',
   'paths',
   'restrictions',
+  'cc',
 ]
 
 /**

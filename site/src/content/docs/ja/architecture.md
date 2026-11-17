@@ -24,7 +24,7 @@ WAFred は 1 つのバイナリを共有する 2 つのプロセスに分かれ�
 
 ## gRPC 契約
 
-唯一の正解は `pingwaf-proto/proto/control_plane.proto` で、7 つの RPC から構成されます。
+唯一の正解は `wafred-proto/proto/control_plane.proto` で、7 つの RPC から構成されます。
 
 | RPC | 種別 | 用途 |
 | --- | --- | --- |

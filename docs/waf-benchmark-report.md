@@ -118,7 +118,7 @@ G1 主基线的恶意样本（black）按类目拦截情况：
 
 ## 5. 生效规则面与命中情况
 
-静态模式生效的是引擎托管规则集（`pingwaf-waf/src/rules/managed.rs`，13 条）：
+静态模式生效的是引擎托管规则集（`wafred-waf/src/rules/managed.rs`，13 条）：
 
 | 规则 | 语义 | 动作 | PL | 备注 |
 |---|---|---|---|---|
@@ -225,11 +225,11 @@ G1 主基线的恶意样本（black）按类目拦截情况：
 | `log_event` 无 agent 静默返回 | pingap-plugin/src/waf.rs:1796-1804 |
 | auto-block 仅 agent 在位 | pingap-plugin/src/waf.rs:2595-2606 |
 | 规则编译失败静默丢弃 | pingap-plugin/src/waf.rs:1687-1734 |
-| 引擎 monitor 降级与 Stage-1 短路 | pingwaf-waf/src/engine/mod.rs:371-379, 461-466 |
-| 托管 13 条规则定义 | pingwaf-waf/src/rules/managed.rs:17-140 |
+| 引擎 monitor 降级与 Stage-1 短路 | wafred-waf/src/engine/mod.rs:371-379, 461-466 |
+| 托管 13 条规则定义 | wafred-waf/src/rules/managed.rs:17-140 |
 | 默认信任 XFF | pingap-core/src/http_header.rs:415-424 |
-| 控制面 PL= max(severity)、ml/threshold TODO | pingwaf-server/src/grpc/config.rs:669-694 |
-| 控制面播种 11 条默认规则 | pingwaf-server/src/defaults.rs:111-202 |
+| 控制面 PL= max(severity)、ml/threshold TODO | wafred-server/src/grpc/config.rs:669-694 |
+| 控制面播种 11 条默认规则 | wafred-server/src/defaults.rs:111-202 |
 
 ## 9. 拦截级别落地与实测（Normal / Strict）
 

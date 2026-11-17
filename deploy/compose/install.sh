@@ -18,6 +18,7 @@ TAG="${WAFRED_TAG:-latest}"
 DIR="${WAFRED_COMPOSE_DIR:-wafred}"
 ADMIN_EMAIL="${WAFRED_ADMIN_EMAIL:-admin@wafred.local}"
 ADMIN_PASSWORD="${WAFRED_ADMIN_PASSWORD:-wafred123}"
+SECRET_KEY="${WAFRED_SECRET_KEY:-}"
 TLS_SANS="${WAFRED_TLS_SANS:-}"
 HTTP_PORT="${WAFRED_HTTP_PORT:-80}"
 HTTPS_PORT="${WAFRED_HTTPS_PORT:-443}"
@@ -353,9 +354,39 @@ else
 fi
 
 ENV_PRESERVED=false
+EXISTING_SECRET_KEY=""
+if [[ -f .env ]]; then
+    EXISTING_SECRET_KEY="$(sed -n 's/^WAFRED_SECRET_KEY=//p' .env | head -n1)"
+    case "$EXISTING_SECRET_KEY" in
+        \"*\") EXISTING_SECRET_KEY="${EXISTING_SECRET_KEY:1:${#EXISTING_SECRET_KEY}-2}" ;;
+        \'*\') EXISTING_SECRET_KEY="${EXISTING_SECRET_KEY:1:${#EXISTING_SECRET_KEY}-2}" ;;
+    esac
+fi
+if [[ -n "$EXISTING_SECRET_KEY" ]]; then
+    # Never silently rotate the key used to seal values already stored in DB.
+    SECRET_KEY="$EXISTING_SECRET_KEY"
+elif [[ -z "$SECRET_KEY" ]]; then
+    SECRET_KEY="$(random_hex 32)"
+fi
+
 if [[ -f .env && "$FORCE" != "true" ]]; then
     ENV_PRESERVED=true
     printf 'Keeping existing %s/.env\n' "$(pwd)"
+    if [[ -z "$EXISTING_SECRET_KEY" ]]; then
+        umask 077
+        env_tmp="$(mktemp ./.env.XXXXXX)"
+        SECRET_KEY_FOR_AWK="$(env_value "$SECRET_KEY")" awk '
+            /^WAFRED_SECRET_KEY=/ { print "WAFRED_SECRET_KEY=" ENVIRON["SECRET_KEY_FOR_AWK"]; seen=1; next }
+            { print }
+            END { if (!seen) print "WAFRED_SECRET_KEY=" ENVIRON["SECRET_KEY_FOR_AWK"] }
+        ' .env > "$env_tmp"
+        chmod 600 "$env_tmp"
+        mv "$env_tmp" .env
+    fi
+    export WAFRED_SECRET_KEY="$SECRET_KEY"
+    if [[ -f .env ]]; then
+        chmod 600 .env
+    fi
     if [[ "$IMAGE_PROXY_ENABLED" == "true" ]]; then
         # Change only the image source; preserve passwords and other settings.
         umask 077
@@ -375,6 +406,7 @@ else
         if [[ "$IMAGE_PROXY_ENABLED" == "true" ]]; then printf 'WAFRED_IMAGE=%s\n' "$IMAGE_REPO"; fi
         printf 'WAFRED_ADMIN_EMAIL=%s\n' "$(env_value "$ADMIN_EMAIL")"
         printf 'WAFRED_ADMIN_PASSWORD=%s\n' "$(env_value "$ADMIN_PASSWORD")"
+        printf 'WAFRED_SECRET_KEY=%s\n' "$(env_value "$SECRET_KEY")"
         if [[ -n "$TLS_SANS" ]]; then printf 'WAFRED_TLS_SANS=%s\n' "$(env_value "$TLS_SANS")"; fi
         if [[ "$HTTP_PORT" != "80" ]]; then printf 'WAFRED_HTTP_PORT=%s\n' "$HTTP_PORT"; fi
         if [[ "$HTTPS_PORT" != "443" ]]; then printf 'WAFRED_HTTPS_PORT=%s\n' "$HTTPS_PORT"; fi
@@ -412,7 +444,7 @@ Upgrade later with:
 
   cd $(pwd) && docker compose pull && docker compose up -d
 
-The .env keeps PINGWAF_SECRET_KEY and the administrator password; back it up
+The .env keeps WAFRED_SECRET_KEY and the administrator password; back it up
 (0600) before a --force re-run, and do not rotate the instance key: sealed
 notification/AI/backup credentials become unreadable.
 EOF

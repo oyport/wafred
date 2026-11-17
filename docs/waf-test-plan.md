@@ -22,7 +22,7 @@ one carries its own test obligation.
 
 | Change | Behaviour | Test obligation |
 |---|---|---|
-| Managed rule set | 15 rules defined; Normal assembles 13, `WAFRED-1061` and `WAFRED-1070` are Strict-only (`pingwaf-waf/src/rules/managed.rs`) | Assert both normal and strict assembly counts; a Strict-only rule must never fire on the Normal tier |
+| Managed rule set | 15 rules defined; Normal assembles 13, `WAFRED-1061` and `WAFRED-1070` are Strict-only (`wafred-waf/src/rules/managed.rs`) | Assert both normal and strict assembly counts; a Strict-only rule must never fire on the Normal tier |
 | Request-body decompression | `gzip` / `x-gzip` / `deflate` decoded, capped at 1 MiB (`MAX_DECOMPRESSED_BODY`); `br` and `zstd` are **not** decoded and are reported as uninspected (`normalize/body.rs`) | Compressed payload must be detected; oversize body must be truncated and marked, not silently passed; unsupported encoding must be observable |
 | Resource ceilings | Expression: 16 KiB / 512 tokens / depth 64 / 4 MiB regex cache / 512 entries. Normalisation: 256 query pairs, 2 048 decoded values, 8 KiB per value, JSON depth 6, 64 values, 4 KiB each, 64 multipart parts, b64 depth 2, 16 KiB. Process scan budget: 128 MiB default, clamped 8 MiB – 1 GiB (`engine/mod.rs`) | Ceiling must truncate, never panic and never fail open silently; budget exhaustion must keep scanning headers and URI |
 | Monitor downgrade | Category (`monitor_categories`), backend stack (`monitor_stacks`) and single-rule monitors feed the total score but not the blocking score (`engine/mod.rs`, `pingap-plugin/src/waf.rs`) | An empty monitor set must be bit-identical to the previous behaviour; a downgraded hit must stay visible in the verdict detail |
@@ -68,7 +68,7 @@ therefore a set of crate-level tests that pin the mapping rather than a separate
 integration crate. Two directions must be pinned:
 
 - control plane → agent cache → `build_site_engine` → verdict, using the
-  in-process agent handle (`pingwaf-agent/src/lib.rs`) instead of a live gRPC
+  in-process agent handle (`wafred-agent/src/lib.rs`) instead of a live gRPC
   server;
 - static TOML → plugin config → engine config, including every default and
   clamp listed in §1.

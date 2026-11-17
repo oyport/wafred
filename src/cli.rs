@@ -80,10 +80,10 @@ pub struct CommonOpts {
     pub db_url: String,
 
     /// Read the PostgreSQL connection string from a file instead of
-    /// `--db-url`/`PINGWAF_DB_URL`. The file content is trimmed and used as
+    /// `--db-url`/`WAFRED_DB_URL`. The file content is trimmed and used as
     /// the whole connection string, keeping its password out of the process
     /// list (`ps`) and shell history.
-    #[arg(long, env = "PINGWAF_DB_URL_FILE")]
+    #[arg(long, env = "WAFRED_DB_URL_FILE")]
     pub db_url_file: Option<PathBuf>,
 
     /// HTTP admin/API listen address
@@ -214,9 +214,9 @@ pub struct AgentOpts {
     pub api_key: String,
 
     /// Read the agent API key from a file instead of `--api-key`/
-    /// `PINGWAF_API_KEY`. The file content is trimmed, keeping the key out of
+    /// `WAFRED_API_KEY`. The file content is trimmed, keeping the key out of
     /// the process list (`ps`) and shell history.
-    #[arg(long, env = "PINGWAF_API_KEY_FILE")]
+    #[arg(long, env = "WAFRED_API_KEY_FILE")]
     pub api_key_file: Option<PathBuf>,
 
     /// Local rule cache directory
@@ -261,7 +261,7 @@ pub struct AgentOpts {
     /// is off unless asked for; it also requires --upgrade-url
     #[arg(
         long,
-        env = "PINGWAF_AUTO_UPGRADE",
+        env = "WAFRED_AUTO_UPGRADE",
         default_value = "false",
         num_args = 0..=1,
         default_missing_value = "true",
@@ -272,7 +272,7 @@ pub struct AgentOpts {
     /// Control plane REST base URL for self-upgrade, e.g.
     /// https://cp.example.com:9080. It cannot be derived from the gRPC URL, so
     /// auto-upgrade stays disabled while this is unset
-    #[arg(long, env = "PINGWAF_UPGRADE_URL")]
+    #[arg(long, env = "WAFRED_UPGRADE_URL")]
     pub upgrade_url: Option<String>,
 }
 
@@ -327,8 +327,8 @@ pub struct AllInOneOpts {
     pub api_key: String,
 
     /// Read the agent API key from a file instead of `--api-key`/
-    /// `PINGWAF_API_KEY` (see `pingwaf agent --help`).
-    #[arg(long, env = "PINGWAF_API_KEY_FILE")]
+    /// `WAFRED_API_KEY` (see `wafred agent --help`).
+    #[arg(long, env = "WAFRED_API_KEY_FILE")]
     pub api_key_file: Option<PathBuf>,
 
     /// Local rule cache directory
@@ -386,9 +386,9 @@ pub struct DbOpts {
     pub db_url: String,
 
     /// Read the PostgreSQL connection string from a file instead of
-    /// `--db-url`/`PINGWAF_DB_URL` (keeps the password out of the process
+    /// `--db-url`/`WAFRED_DB_URL` (keeps the password out of the process
     /// list and shell history).
-    #[arg(long, env = "PINGWAF_DB_URL_FILE")]
+    #[arg(long, env = "WAFRED_DB_URL_FILE")]
     pub db_url_file: Option<PathBuf>,
 }
 
@@ -592,6 +592,128 @@ fn wants_version(args: &[String]) -> bool {
         .any(|arg| arg == "--version" || arg == "-V")
 }
 
+/// Reads one secret from a file: surrounding whitespace and the trailing
+/// newline are trimmed, and an empty file is refused instead of silently
+/// configuring an empty password/key.
+fn load_secret_file(path: &Path, flag: &str) -> Result<String, String> {
+    let value = std::fs::read_to_string(path).map_err(|err| {
+        format!("{flag} {} cannot be read: {err}", path.display())
+    })?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{flag} {} is empty", path.display()));
+    }
+    Ok(value.to_string())
+}
+
+fn apply_db_file(db: &mut DbOpts) -> Result<(), String> {
+    if let Some(path) = db.db_url_file.as_deref() {
+        db.db_url = load_secret_file(path, "--db-url-file")?;
+    }
+    Ok(())
+}
+
+fn apply_common_file(common: &mut CommonOpts) -> Result<(), String> {
+    if let Some(path) = common.db_url_file.as_deref() {
+        common.db_url = load_secret_file(path, "--db-url-file")?;
+    }
+    Ok(())
+}
+
+fn apply_api_key_file(
+    api_key: &mut String,
+    file: Option<&Path>,
+) -> Result<(), String> {
+    if let Some(path) = file {
+        *api_key = load_secret_file(path, "--api-key-file")?;
+    }
+    Ok(())
+}
+
+fn apply_user_subcommand(command: &mut UserSubcommand) -> Result<(), String> {
+    match command {
+        UserSubcommand::List(db) => apply_db_file(db),
+        UserSubcommand::AddAdmin(opts) => apply_db_file(&mut opts.db),
+        UserSubcommand::ResetPassword(opts) => apply_db_file(&mut opts.db),
+    }
+}
+
+fn apply_mode_subcommand(command: &mut ModeCommand) -> Result<(), String> {
+    match command {
+        ModeCommand::Observe(db)
+        | ModeCommand::Enforce(db)
+        | ModeCommand::Status(db) => apply_db_file(db),
+    }
+}
+
+fn apply_security_subcommand(
+    command: &mut SecurityCommand,
+) -> Result<(), String> {
+    match command {
+        SecurityCommand::Status(db) => apply_db_file(db),
+        SecurityCommand::Allowlist(opts) => apply_db_file(&mut opts.db),
+    }
+}
+
+fn apply_config_subcommand(command: &mut ConfigCommand) -> Result<(), String> {
+    match command {
+        ConfigCommand::History(opts) => apply_db_file(&mut opts.db),
+        ConfigCommand::Show(opts) => apply_db_file(&mut opts.db),
+        ConfigCommand::Rollback(opts) => apply_db_file(&mut opts.db),
+    }
+}
+
+/// Resolves `--db-url-file` / `--api-key-file` over the inline values.
+///
+/// The file wins over `--db-url`/`--api-key` (and their environment
+/// variables): a caller that passes both gets the file, and the inline-secret
+/// warning below still tells them the inline value was visible.
+fn apply_secret_files(command: &mut WafredCommand) -> Result<(), String> {
+    match command {
+        WafredCommand::Server(opts) => apply_common_file(&mut opts.common),
+        WafredCommand::AllInOne(opts) => {
+            apply_common_file(&mut opts.common)?;
+            apply_api_key_file(&mut opts.api_key, opts.api_key_file.as_deref())
+        },
+        WafredCommand::Agent(opts) => {
+            apply_api_key_file(&mut opts.api_key, opts.api_key_file.as_deref())
+        },
+        WafredCommand::User { command } => apply_user_subcommand(command),
+        WafredCommand::Mode { command } => apply_mode_subcommand(command),
+        WafredCommand::Security { command } => {
+            apply_security_subcommand(command)
+        },
+        WafredCommand::Config { command } => apply_config_subcommand(command),
+    }
+}
+
+/// True when `flag` appears as `--flag` or `--flag=...` in the raw argv.
+fn flag_present(argv: &[String], flag: &str) -> bool {
+    let prefix = format!("{flag}=");
+    argv.iter()
+        .skip(1)
+        .any(|arg| arg == flag || arg.starts_with(&prefix))
+}
+
+/// Warnings for secrets passed inline: argv is visible to other local users
+/// through the process list (`ps`) and often ends up in shell history/CI logs.
+/// A `--db-url-file` / `--api-key-file` alternative is offered instead.
+fn inline_secret_warnings(argv: &[String]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (flag, file_flag, env) in [
+        ("--db-url", "--db-url-file", "WAFRED_DB_URL_FILE"),
+        ("--api-key", "--api-key-file", "WAFRED_API_KEY_FILE"),
+    ] {
+        if flag_present(argv, flag) && !flag_present(argv, file_flag) {
+            warnings.push(format!(
+                "{flag} is visible to other local users in the process list; \
+                 prefer {file_flag} or the {env} environment variable"
+            ));
+        }
+    }
+    warnings
+}
+
 /// Parse the WAFred CLI from command line arguments.
 ///
 /// If `WAFRED_MODE` is set but no subcommand is given on the command line,
@@ -634,7 +756,15 @@ pub fn parse_wafred_cli() -> WafredCli {
         },
     }
 
-    WafredCli::parse_from(argv)
+    let mut cli = WafredCli::parse_from(argv);
+    if let Err(err) = apply_secret_files(&mut cli.command) {
+        eprintln!("wafred: {err}");
+        std::process::exit(1);
+    }
+    for warning in inline_secret_warnings(&args) {
+        eprintln!("warning: {warning}");
+    }
+    cli
 }
 
 #[cfg(test)]
@@ -852,35 +982,35 @@ mod tests {
 
     #[test]
     fn db_url_file_is_trimmed_and_wins_over_the_inline_value() {
-        let file = secret_file("postgres://file:pw@db:5432/pingwaf\n\n");
+        let file = secret_file("postgres://file:pw@db:5432/wafred\n\n");
         let path = file.path().to_str().unwrap();
-        let mut cli = PingWafCli::try_parse_from([
-            "pingwaf",
+        let mut cli = WafredCli::try_parse_from([
+            "wafred",
             "server",
-            "--db-url=postgres://inline:pw@inline:5432/pingwaf",
+            "--db-url=postgres://inline:pw@inline:5432/wafred",
             &format!("--db-url-file={path}"),
         ])
         .unwrap();
         apply_secret_files(&mut cli.command).unwrap();
-        let PingWafCommand::Server(opts) = cli.command else {
+        let WafredCommand::Server(opts) = cli.command else {
             panic!("expected the server mode");
         };
-        assert_eq!(opts.common.db_url, "postgres://file:pw@db:5432/pingwaf");
+        assert_eq!(opts.common.db_url, "postgres://file:pw@db:5432/wafred");
     }
 
     #[test]
     fn agent_api_key_file_is_applied() {
         let file = secret_file("pwk_from_file\n");
         let path = file.path().to_str().unwrap();
-        let mut cli = PingWafCli::try_parse_from([
-            "pingwaf",
+        let mut cli = WafredCli::try_parse_from([
+            "wafred",
             "agent",
             "--api-key=pwk_inline",
             &format!("--api-key-file={path}"),
         ])
         .unwrap();
         apply_secret_files(&mut cli.command).unwrap();
-        let PingWafCommand::Agent(opts) = cli.command else {
+        let WafredCommand::Agent(opts) = cli.command else {
             panic!("expected the agent mode");
         };
         assert_eq!(opts.api_key, "pwk_from_file");
@@ -888,31 +1018,31 @@ mod tests {
 
     #[test]
     fn maintenance_commands_accept_a_db_url_file() {
-        let file = secret_file("postgres://file:pw@db:5432/pingwaf");
+        let file = secret_file("postgres://file:pw@db:5432/wafred");
         let path = file.path().to_str().unwrap();
-        let mut cli = PingWafCli::try_parse_from([
-            "pingwaf",
+        let mut cli = WafredCli::try_parse_from([
+            "wafred",
             "user",
             "list",
             &format!("--db-url-file={path}"),
         ])
         .unwrap();
         apply_secret_files(&mut cli.command).unwrap();
-        let PingWafCommand::User {
+        let WafredCommand::User {
             command: UserSubcommand::List(opts),
         } = cli.command
         else {
             panic!("expected the user list command");
         };
-        assert_eq!(opts.db_url, "postgres://file:pw@db:5432/pingwaf");
+        assert_eq!(opts.db_url, "postgres://file:pw@db:5432/wafred");
     }
 
     #[test]
     fn empty_or_missing_secret_files_are_refused() {
         let empty = secret_file("  \n");
         let path = empty.path().to_str().unwrap();
-        let mut cli = PingWafCli::try_parse_from([
-            "pingwaf",
+        let mut cli = WafredCli::try_parse_from([
+            "wafred",
             "server",
             &format!("--db-url-file={path}"),
         ])
@@ -920,8 +1050,8 @@ mod tests {
         let err = apply_secret_files(&mut cli.command).unwrap_err();
         assert!(err.contains("is empty"), "unexpected error: {err}");
 
-        let mut cli = PingWafCli::try_parse_from([
-            "pingwaf",
+        let mut cli = WafredCli::try_parse_from([
+            "wafred",
             "server",
             "--db-url-file=/nonexistent/secret-file",
         ])
@@ -937,14 +1067,14 @@ mod tests {
         };
 
         let warnings =
-            inline_secret_warnings(&argv(&["pingwaf", "server", "--db-url=x"]));
+            inline_secret_warnings(&argv(&["wafred", "server", "--db-url=x"]));
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("--db-url"));
         assert!(warnings[0].contains("--db-url-file"));
 
         assert!(
             inline_secret_warnings(&argv(&[
-                "pingwaf",
+                "wafred",
                 "server",
                 "--db-url-file=/run/secrets/db-url",
             ]))
@@ -952,7 +1082,7 @@ mod tests {
         );
 
         let warnings = inline_secret_warnings(&argv(&[
-            "pingwaf",
+            "wafred",
             "agent",
             "--api-key=pwk_x",
         ]));
@@ -961,7 +1091,7 @@ mod tests {
 
         assert!(
             inline_secret_warnings(&argv(&[
-                "pingwaf",
+                "wafred",
                 "agent",
                 "--api-key-file=/run/secrets/api-key",
             ]))
@@ -971,7 +1101,7 @@ mod tests {
         // Values passed through the environment are not in argv, so no
         // warning is emitted for them.
         assert!(
-            inline_secret_warnings(&argv(&["pingwaf", "server"])).is_empty()
+            inline_secret_warnings(&argv(&["wafred", "server"])).is_empty()
         );
     }
 
@@ -980,11 +1110,11 @@ mod tests {
         let argv = |args: &[&str]| {
             args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>()
         };
-        let args = argv(&["pingwaf", "server", "--db-url", "x"]);
+        let args = argv(&["wafred", "server", "--db-url", "x"]);
         assert!(flag_present(&args, "--db-url"));
-        let args = argv(&["pingwaf", "server", "--db-url=x"]);
+        let args = argv(&["wafred", "server", "--db-url=x"]);
         assert!(flag_present(&args, "--db-url"));
-        let args = argv(&["pingwaf", "server", "--db-url-file=x"]);
+        let args = argv(&["wafred", "server", "--db-url-file=x"]);
         assert!(!flag_present(&args, "--db-url"));
     }
 }

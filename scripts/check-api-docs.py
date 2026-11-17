@@ -8,7 +8,7 @@ the gate that keeps them in step.
 
 What it compares
 ----------------
-* Every `.route(...)` registered by `pingwaf-server/src/api/*.rs`, with the HTTP
+* Every `.route(...)` registered by `wafred-server/src/api/*.rs`, with the HTTP
   methods taken from the method-router chain (`get(a).post(b)`) and the path
   from the first string literal.
 * Every `### METHOD /path` heading in `docs/api.md`.
@@ -40,7 +40,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-API_DIR = REPO_ROOT / "pingwaf-server" / "src" / "api"
+API_DIR = REPO_ROOT / "wafred-server" / "src" / "api"
 DOCS = REPO_ROOT / "docs" / "api.md"
 
 METHODS = ("get", "post", "put", "patch", "delete", "head", "options")

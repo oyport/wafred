@@ -63,6 +63,9 @@ services:
     environment:
       - WAFRED_DB_URL=postgres://wafred:${POSTGRES_PASSWORD:-wafred}@postgres:5432/wafred
       - WAFRED_MODE=all-in-one
+      # Stable instance key for encrypting notification, AI and backup secrets.
+      # The compose installer generates and preserves this value in .env.
+      - WAFRED_SECRET_KEY=${WAFRED_SECRET_KEY:-}
       # The placeholder is safe to keep: the control plane detects it and
       # persists a random JWT secret on first boot. Set WAFRED_JWT_SECRET to pin your
       # own instead.

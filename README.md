@@ -38,7 +38,7 @@ A single **control plane** defines sites, rules and policies; one or many **data
 
 <img src="./asset/readme-architecture.svg" alt="WAFred architecture: clients reach edge agents over HTTP/HTTPS; each agent streams rules and telemetry with the control plane over a gRPC bidirectional stream; only clean traffic continues to the origin" width="1000">
 
-The control plane and the data plane talk over the `ControlPlane` gRPC service (defined in [`control_plane.proto`](./pingwaf-proto/proto/control_plane.proto)) with seven RPCs:
+The control plane and the data plane talk over the `ControlPlane` gRPC service (defined in [`control_plane.proto`](./wafred-proto/proto/control_plane.proto)) with seven RPCs:
 
 | RPC | Kind | Purpose |
 | --- | --- | --- |
@@ -181,11 +181,11 @@ tables, the cross-vendor comparison with Cloudflare / SafeLine / ModSecurity
 
 | Crate | Responsibility |
 | --- | --- |
-| [`pingwaf-proto`](./pingwaf-proto) | Control-plane gRPC protocol definitions (single source: `control_plane.proto`) |
-| [`pingwaf-server`](./pingwaf-server) | Control plane: Axum REST + tonic gRPC + SeaORM/PostgreSQL + ES logs + embedded frontend + agent health monitoring |
-| [`pingwaf-agent`](./pingwaf-agent) | Data-plane agent: connects to the control plane, caches rules with disk persistence, ships logs/metrics, receives commands |
-| [`pingwaf-waf`](./pingwaf-waf) | Detection engine: normalize → signatures → expression → anomaly score |
-| [`pingwaf-challenge`](./pingwaf-challenge) | Dynamic challenges: JS 5-second shield, interactive challenge, PoW, fingerprinting, HMAC clearance cookies |
+| [`pingwaf-proto`](./wafred-proto) | Control-plane gRPC protocol definitions (single source: `control_plane.proto`) |
+| [`pingwaf-server`](./wafred-server) | Control plane: Axum REST + tonic gRPC + SeaORM/PostgreSQL + ES logs + embedded frontend + agent health monitoring |
+| [`pingwaf-agent`](./wafred-agent) | Data-plane agent: connects to the control plane, caches rules with disk persistence, ships logs/metrics, receives commands |
+| [`pingwaf-waf`](./wafred-waf) | Detection engine: normalize → signatures → expression → anomaly score |
+| [`pingwaf-challenge`](./wafred-challenge) | Dynamic challenges: JS 5-second shield, interactive challenge, PoW, fingerprinting, HMAC clearance cookies |
 | `pingwaf-profiler` / `pingwaf-system` (no README) | In-process CPU/memory attribution and snapshots served at `/api/v1/system/profile` and `/api/v1/system/metrics` |
 
 The `pingwaf-*` crate names and source paths remain as inherited internal

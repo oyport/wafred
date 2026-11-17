@@ -183,10 +183,10 @@ Notes:
 
 - `x-cache-status` remains the dedicated cache header; the `cache;desc` metric
   repeats the same phase so one header covers both timing and cache state.
-- If the origin set its own `Server-Timing`, PingWAF's timings are **prepended**
+- If the origin set its own `Server-Timing`, WAFred's timings are **prepended**
   to it (comma-separated), never overwritten.
 - Responses served without touching the WAF plugin (e.g. unmatched-host 404)
-  carry no PingWAF timings.
+  carry no WAFred timings.
 
 Check it with curl:
 

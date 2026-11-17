@@ -50,7 +50,7 @@ transport, not from detection. Per-sample attribution stays in
 
 The Normal tier's 4 are `PINGWAF-1040` ×2 (challenged), `XSS-007` ×1 and
 `SQL-001` ×1. Per-rule attribution came from
-`pingwaf-waf/examples/_fp_triage.rs`, which prints `matched_rules` and `details`.
+`wafred-waf/examples/_fp_triage.rs`, which prints `matched_rules` and `details`.
 
 ## 4. Regression and determinism
 

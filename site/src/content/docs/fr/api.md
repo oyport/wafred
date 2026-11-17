@@ -35,7 +35,7 @@ Les appels par site passent par la frontière de locataire (`load_site_read` / `
 
 ## gRPC
 
-Les agents utilisent le service `ControlPlane` sur le port `9090`, défini dans `pingwaf-proto/proto/control_plane.proto` : `RegisterAgent`, `Heartbeat`, `SyncRules`, `ShipLogs`, `ShipCertEvents`, `ShipMetrics`, `GetSiteConfig`, plus les RPC de session visiteur du flux de défis. TLS est la valeur par défaut ; `grpc_tls_mode = "off"` ne vaut que pour un réseau de confiance.
+Les agents utilisent le service `ControlPlane` sur le port `9090`, défini dans `wafred-proto/proto/control_plane.proto` : `RegisterAgent`, `Heartbeat`, `SyncRules`, `ShipLogs`, `ShipCertEvents`, `ShipMetrics`, `GetSiteConfig`, plus les RPC de session visiteur du flux de défis. TLS est la valeur par défaut ; `grpc_tls_mode = "off"` ne vaut que pour un réseau de confiance.
 
 ## Clés d'API
 

@@ -147,7 +147,7 @@ python3 tools/waf-bench/summarize.py /tmp/waf-bench/*.jsonl > /tmp/waf-bench/sum
 静态 TOML 模式只加载引擎托管规则，控制面播种的站点默认规则需用 agent 离线模式：
 
 1. 用临时脚本构造 `cache/sites.json`（规则表达式逐字取自
-   `pingwaf-server/src/defaults.rs`；站点 PL 由控制面按
+   `wafred-server/src/defaults.rs`；站点 PL 由控制面按
    `max(规则 severity)` 推导 = 4，站点 `mode = block`）。
 2. `./target/debug/wafred agent --server-url http://127.0.0.1:1 --cache-dir <dir> --fail-open`
    ——数据面凭磁盘缓存启动（无证书时只绑 80 端口），gRPC 断连重试噪音可忽略。

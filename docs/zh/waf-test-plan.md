@@ -16,7 +16,7 @@
 
 | 变化 | 行为 | 测试义务 |
 |---|---|---|
-| 托管规则集 | 共定义 15 条；Normal 档装配 13 条，`WAFRED-1061`、`WAFRED-1070` 仅 Strict 装配（`pingwaf-waf/src/rules/managed.rs`） | 断言两档装配条数；Strict-only 规则在 Normal 档必须永不命中 |
+| 托管规则集 | 共定义 15 条；Normal 档装配 13 条，`WAFRED-1061`、`WAFRED-1070` 仅 Strict 装配（`wafred-waf/src/rules/managed.rs`） | 断言两档装配条数；Strict-only 规则在 Normal 档必须永不命中 |
 | 请求体解压 | 解码 `gzip` / `x-gzip` / `deflate`，上限 1 MiB（`MAX_DECOMPRESSED_BODY`）；`br`、`zstd` **不解码**并标记为未检测（`normalize/body.rs`） | 压缩载荷必须拦得住；超限必须截断并标记，不能静默放行；不支持的编码必须可观测 |
 | 资源上限 | 表达式：16 KiB / 512 token / 深度 64 / 正则缓存 4 MiB / 512 条。归一化：query 256 对、解码值 2 048 个、单值 8 KiB、JSON 深度 6、64 值 × 4 KiB、multipart 64 段、b64 深度 2、16 KiB。进程扫描预算：默认 128 MiB，clamp 8 MiB – 1 GiB（`engine/mod.rs`） | 上限必须截断、不得 panic、不得静默 fail-open；预算耗尽时仍须扫描头部与 URI |
 | 监听降级 | 分类（`monitor_categories`）、后端栈（`monitor_stacks`）、单规则三类监听只进总分、不进拦截分（`engine/mod.rs`、`pingap-plugin/src/waf.rs`） | 监听集为空时判决必须与旧实现逐位一致；被降级的命中必须在判决详情里可见 |
@@ -56,7 +56,7 @@ graph TB
 
 本仓库目前没有 `tests/` 目录，契约层因此是一组固定映射关系的 crate 内测试，而不是独立的集成 crate。两个方向必须钉住：
 
-- 控制面 → agent 缓存 → `build_site_engine` → 判决，使用进程内 agent 句柄（`pingwaf-agent/src/lib.rs`），不启真实 gRPC 服务；
+- 控制面 → agent 缓存 → `build_site_engine` → 判决，使用进程内 agent 句柄（`wafred-agent/src/lib.rs`），不启真实 gRPC 服务；
 - 静态 TOML → 插件配置 → 引擎配置，覆盖 §1 中列出的每个默认值与 clamp 边界。
 
 ### 2.3 L3 —— 端到端

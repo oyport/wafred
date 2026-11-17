@@ -20,7 +20,7 @@ PingWAF 本身包含从 [`vicanso/pingap`](https://github.com/vicanso/pingap)
 | 归属 | 模块 | 说明 |
 |---|---|---|
 | **上游继承**（深度改造后维护） | `pingap-{acme,cache,certificate,config,core,discovery,health,imageoptim,location,logger,otel,performance,plugin,proxy,pyroscope,sentry,upstream,util,webhook}` | 反向代理底座：Pingora 生命周期、TLS/ACME、上游 LB、边缘缓存、插件框架及 `pingap-plugin/src/` 下的约 30 个内置插件 |
-| **WAFred 自有** | `pingwaf-{server,proto,agent,waf,challenge,profiler,system}` | 控制面（Axum API + SeaORM + gRPC 服务）、协议真源、数据面 agent、WAF 检测引擎、挑战子系统、插桩归因与系统观测 |
+| **WAFred 自有** | `wafred-{server,proto,agent,waf,challenge,profiler,system}` | 控制面（Axum API + SeaORM + gRPC 服务）、协议真源、数据面 agent、WAF 检测引擎、挑战子系统、插桩归因与系统观测；内部 Cargo 包名仍为 `pingwaf-*` |
 | **WAFred 自有** | `web/` | 内嵌管理控制台（WAFred DB-backed 界面；`pingap-*` 配置结构体的管理页属 pingap 兼容模式遗留） |
 | **WAFred 自有** | `src/`（根 bin） | CLI 装配：`wafred`（唯一 WAFred 命令）与 `pingap`（代理兼容模式入口）共用 `src/main.rs` |
 
@@ -28,7 +28,16 @@ PingWAF 本身包含从 [`vicanso/pingap`](https://github.com/vicanso/pingap)
 
 ## 上游同步流程
 
-上游修复**按需人工搬运**，不做批量合并：
+来源 PingWAF 仓库用于对比历史修复与功能，不做自动或周期性同步。每次同步都要以 WAFred 当前代码为准处理命名、数据库迁移、部署标识、权限和安全策略；不得直接覆盖本地品牌改动。
+
+### 已对比：PingWAF `v0.32.17` → `v0.32.31`（2026-11-17）
+
+- WAFred 1.0.0 的代码状态与 PingWAF `v0.32.17` 最接近；本次检查至来源仓库提交 `f2a40f67`（`v0.32.31`），合并提交为 `7b50c618`。
+- 移入路径范围访问控制、受认证保护且默认关闭的 Agent 自升级、Agent 对端地址/版本展示与访问日志上游状态和 `Server-Timing` 数据。
+- 移入请求扫描资源限制、Passkey/MCP 权限校验、挑战通行凭据 Host 绑定、双栈客户端地址规范化、Agent 快照持久化和 TLS 握手超时等修复。
+- 迁移与托管规则 ID 均按 WAFred 本地编号/命名空间适配；原有 094–096 本地迁移保留，上游新增迁移使用不冲突的唯一标识。WAFred 品牌、演示访问策略、部署路径和外部运行标识以本地版本为准。
+
+未来来源更新继续**按需人工对比与适配**：
 
 1. 配置并抓取 pingap 技术上游（本地 remote 名为 `pingap-upstream`）：
    `git remote add pingap-upstream https://github.com/vicanso/pingap.git`，
@@ -81,7 +90,7 @@ PingWAF 本身包含从 [`vicanso/pingap`](https://github.com/vicanso/pingap)
 
 - **对外发布物为 `wafred`**：`release.yml` 只发布 WAFred 二进制和归档，`install.sh` 只安装 `wafred`；systemd 单元名为 `wafred.service`；Docker 镜像为 `ghcr.io/oyport/wafred`。
 - `pingap` bin 是上游兼容模式入口（读取上游风格的 `pingap.toml` 配置、复用 pingap-mode 管理页），**不随 release 发布**，仅用于本地兼容验证；`pingap.service` 已删除，勿再引入。
-- 根 Cargo package 和唯一 WAFred 命令名为 `wafred`。`pingwaf` 命令与 `PINGWAF_*` 环境变量不再接受；systemd 单元、服务账户、配置/数据路径、PostgreSQL 账户/数据库、ES 默认索引前缀和内置规则 ID 全部使用 WAFred 标识。现有 PingWAF 部署不会自动迁移，需按发布说明手动迁移。内部 `pingwaf-*` Rust crate 名、gRPC 包与消息标识、`X-PingWAF-Ray` 头暂时保留为代码/协议标识。
+- 根 Cargo package 和唯一 WAFred 命令名为 `wafred`。`pingwaf` 命令与 `PINGWAF_*` 环境变量不再接受；systemd 单元、服务账户、配置/数据路径、PostgreSQL 账户/数据库、ES 默认索引前缀和内置规则 ID 全部使用 WAFred 标识。现有 PingWAF 部署不会自动迁移，需按发布说明手动迁移。内部 `pingwaf-*` Rust crate 名，以及 WAFred 1.0.0 已使用的 `/_pingwaf/*` 内置端点、`__pingwaf_clearance` Cookie、`X-PingWAF-Ray` 与 `x-pingwaf-mitigated` 协议头暂时保留，避免破坏既有站点集成。
 - `pingwaf-source` Git remote 只用于查看本项目的来源历史，不用于同步新功能；目标 remote `origin` 指向 `oyport/wafred`。
 
 ## 测试归属
@@ -90,7 +99,7 @@ CI 的 `cargo test --workspace` 与 `make test` **同时覆盖**两边，不按�
 
 | 改动落在 | 主要验证 | 说明 |
 |---|---|---|
-| `pingwaf-*`、`web/` | `cargo test -p <crate>` + 前端 `tsc -b` / `vitest run` | WAF/控制面/数据面逻辑 |
+| `wafred-*`、`web/` | `cargo test -p <crate>` + 前端 `tsc -b` / `vitest run` | WAF/控制面/数据面逻辑，Cargo 包名仍使用 `pingwaf-*` |
 | `pingap-*` | `cargo test -p <crate>` + `make test`（链路集成） | 代理栈行为，注意与 WAF 插件的交互 |
 | 请求链 / TLS / 发布物 | `make test` + `make lint-rustls` + `make test-rustls` | 双 TLS 后端与端到端链路 |
 

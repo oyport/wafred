@@ -214,7 +214,7 @@ fn ipv6_wildcard_bindable() -> bool {
 /// canonicalises back to `a.b.c.d`. Hosts that cannot bind IPv6 fall back to
 /// the IPv4 wildcard instead of failing to start.
 ///
-/// Overrides, in order: `env_key`, then `legacy_key` (the `PINGWAF_ANALYSIS_*`
+/// Overrides, in order: `env_key`, then `legacy_key` (the `WAFRED_ANALYSIS_*`
 /// spelling the dhat analysis harness still sets), then the default.
 pub(crate) fn public_listen_addr(
     env_key: &str,
@@ -650,18 +650,18 @@ fn site_oidc_plugin(
                 "oidc_cookie_name".to_string(),
                 toml::Value::String(oidc.cookie_name.clone()),
             );
-            // `both` puts this gate first: outside the OIDC scope it must
-            // step aside exactly like the OIDC plugin does.
-            if !oidc.path.is_empty() {
-                visitor.insert(
-                    "scope_path".to_string(),
-                    toml::Value::String(oidc.path.clone()),
-                );
-                visitor.insert(
-                    "scope_match_type".to_string(),
-                    toml::Value::String(oidc.match_type.clone()),
-                );
-            }
+        }
+        // The visitor gate must honour the same site-wide scope whether the
+        // site offers local sign-in alone or together with OIDC.
+        if oidc.site_wide && !oidc.path.is_empty() {
+            visitor.insert(
+                "scope_path".to_string(),
+                toml::Value::String(oidc.path.clone()),
+            );
+            visitor.insert(
+                "scope_match_type".to_string(),
+                toml::Value::String(oidc.match_type.clone()),
+            );
         }
         let name = format!("{site_id}_visitor_auth");
         plugins.insert(name.clone(), visitor);
@@ -1428,13 +1428,16 @@ fn cached_rules_to_pingap_config(
              fail until one is issued or uploaded"
         );
     }
-    // Analysis-only override: a non-root macOS run cannot bind 80/443.
-    // These variables are intentionally read only in the dhat analysis branch;
-    // production continues to use the fixed public listener addresses.
-    let analysis_http_addr = std::env::var("WAFRED_ANALYSIS_HTTP_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:80".to_string());
-    let analysis_https_addr = std::env::var("WAFRED_ANALYSIS_HTTPS_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:443".to_string());
+    let public_http_addr = public_listen_addr(
+        "WAFRED_LISTEN_HTTP_ADDR",
+        "WAFRED_ANALYSIS_HTTP_ADDR",
+        80,
+    );
+    let public_https_addr = public_listen_addr(
+        "WAFRED_LISTEN_HTTPS_ADDR",
+        "WAFRED_ANALYSIS_HTTPS_ADDR",
+        443,
+    );
     let mut servers: HashMap<String, PingapServerConf> = HashMap::new();
     servers.insert(
         "wafred".to_string(),
@@ -2166,6 +2169,7 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
                 "starting WAFred in Agent mode (data plane only)"
             );
             let agent = pingwaf_agent::start_agent(*config).await?;
+            let upgrade = pingwaf_agent::upgrade::spawn(Arc::clone(&agent));
             info!("WAFred agent is running, starting data plane proxy");
 
             // Start the data plane proxy in the background
@@ -3396,6 +3400,8 @@ mod tests {
             ],
             auth_mode: "both".to_string(),
             site_wide: true,
+            path: "/admin".to_string(),
+            match_type: "prefix".to_string(),
         });
 
         let config = cached_rules_to_pingap_config(
@@ -4565,7 +4571,7 @@ tls_key = \"NEWKEY\"
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         const KEYS: [&str; 2] =
-            ["PINGWAF_LISTEN_HTTP_ADDR", "PINGWAF_ANALYSIS_HTTP_ADDR"];
+            ["WAFRED_LISTEN_HTTP_ADDR", "WAFRED_ANALYSIS_HTTP_ADDR"];
         fn clear() {
             for key in KEYS {
                 unsafe { std::env::remove_var(key) };

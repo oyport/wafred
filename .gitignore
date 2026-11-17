@@ -83,7 +83,7 @@ Thumbs.db
 
 # ─── Local build-output binaries dropped at the repo root ─────────────────────
 # Leading slash anchors these to the repo root only, so a stray compiled binary
-# is ignored while source dirs (pingwaf-server/, pingap-core/, ...) and files
+# is ignored while source dirs (wafred-server/, pingap-core/, ...) and files
 # like wafred.toml / wafred.service are untouched.
 /wafred
 /pingap

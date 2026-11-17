@@ -109,7 +109,7 @@ const MODULE_NAMES = ['proxy', 'waf', 'cache', 'plugin', 'db', 'control', 'other
 
 describe('system API contract', () => {
   it('memory_used_percent is 0-100 and consumers must not rescale it', () => {
-    // 后端（pingwaf-system/src/memory.rs）按 0-100、1 位小数上报。
+    // 后端（wafred-system/src/memory.rs）按 0-100、1 位小数上报。
     expect(METRICS.memory.memory_used_percent).toBe(56.3)
     expect(METRICS.memory.memory_used_percent).toBeLessThanOrEqual(100)
     // 量纲断言：消费端（MetricCards / NodeSection）只允许经

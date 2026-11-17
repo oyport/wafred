@@ -1,19 +1,19 @@
 ---
 title: Security
-description: How to report a vulnerability privately, which versions receive security fixes, and the hardening steps to take before exposing PingWAF to the internet.
+description: How to report a vulnerability privately, which versions receive security fixes, and the hardening steps to take before exposing WAFred to the internet.
 minutes: 8
 ---
 
 ## Reporting a vulnerability
 
-PingWAF sits in the request path of the applications it protects, so a
+WAFred sits in the request path of the applications it protects, so a
 vulnerability in it matters as much as one in the sites behind it. Please
 report privately — never in a public issue, discussion or pull request.
 
 - **GitHub private vulnerability reporting (preferred):**
-  [Report a vulnerability](https://github.com/shuaiZend/PingWAF/security/advisories/new)
+  [Report a vulnerability](https://github.com/shuaiZend/WAFred/security/advisories/new)
   — private, tracked, and the fastest route to a fix.
-- **Email:** `security@pingwaf.com`, monitored by at least two maintainers. A
+- **Email:** `security@waf.red`, monitored by at least two maintainers. A
   PGP key is being published; until its fingerprint is listed here, send a
   plain-text summary first and we will reply with a key.
 
@@ -22,7 +22,7 @@ backend, reproduction steps and attack prerequisites, and redact tokens and
 passwords. We acknowledge within three business days, keep you updated weekly
 while a fix is developed, and coordinate disclosure after the fix ships (or at
 90 days, whichever comes first). The full policy is in
-[SECURITY.md](https://github.com/shuaiZend/PingWAF/blob/main/SECURITY.md).
+[SECURITY.md](https://github.com/shuaiZend/WAFred/blob/main/SECURITY.md).
 
 ## Supported versions
 
@@ -34,7 +34,7 @@ while a fix is developed, and coordinate disclosure after the fix ships (or at
 
 Only the current release line is guaranteed to receive security patches;
 security fixes ship in patch releases and are listed under `### Security` in
-the [changelog](https://github.com/shuaiZend/PingWAF/blob/main/CHANGELOG.md).
+the [changelog](https://github.com/shuaiZend/WAFred/blob/main/CHANGELOG.md).
 
 ## Hardening before exposure
 
@@ -42,15 +42,15 @@ The console ships with development-friendly defaults. Before exposing an
 instance to a network you do not control:
 
 1. **Credentials** — change the seeded administrator password, set
-   `PINGWAF_JWT_SECRET` and `PINGWAF_SECRET_KEY` to 32 random bytes each, close
-   self-service registration (`PINGWAF_ALLOW_REGISTRATION=false`), and move the
+   `WAFRED_JWT_SECRET` and `WAFRED_SECRET_KEY` to 32 random bytes each, close
+   self-service registration (`WAFRED_ALLOW_REGISTRATION=false`), and move the
    PostgreSQL password away from the default.
 2. **Network** — bind the console (`9080`) to loopback or a private interface
    and reach it through a VPN or reverse proxy; expose the gRPC port (`9090`)
    only to agent hosts; never expose PostgreSQL (`5432`).
 3. **TLS** — upload a real certificate for the console or terminate TLS in
    front of it; enable HTTPS and HSTS on every site; keep gRPC TLS on.
-4. **Secrets at rest** — `PINGWAF_SECRET_KEY` seals notification-channel
+4. **Secrets at rest** — `WAFRED_SECRET_KEY` seals notification-channel
    secrets, the AI provider key and backup-target credentials. Without it those
    fields are stored in clear text. Back the key up separately; there is no
    online rotation yet.
@@ -66,5 +66,5 @@ instance to a network you do not control:
 
 The complete checklist — with the exact environment variables, backup steps and
 rotation caveats — is in
-[SECURITY.md](https://github.com/shuaiZend/PingWAF/blob/main/SECURITY.md#hardening-checklist)
-and [docs/deployment.md](https://github.com/shuaiZend/PingWAF/blob/main/docs/deployment.md).
+[SECURITY.md](https://github.com/shuaiZend/WAFred/blob/main/SECURITY.md#hardening-checklist)
+and [docs/deployment.md](https://github.com/shuaiZend/WAFred/blob/main/docs/deployment.md).

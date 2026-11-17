@@ -372,7 +372,14 @@ by the edge agent, so the control plane refuses — with a `400` naming the
 offending agent and version — when the agents serving the site cannot execute
 what you are saving. This applies to **all five panels** that can carry a
 scope: path exceptions, IP rules, geo restrictions, basic auth and the OIDC
-configuration. For path exceptions, a `regex` match type requires every
+configuration. The original WAFred 1.0.0 agent predates these updates; an
+updated 1.0.0 agent reports `1.0.0+wafredpath1`. Update and reconnect agents
+that still report plain `1.0.0` before saving these scoped settings. The
+version numbers below describe the upstream capability history. An older agent
+that reconnects after scoped settings exist generates a warning; update it
+before letting it serve traffic.
+
+For path exceptions, a `regex` match type requires every
 serving agent to be **≥ 0.32.20** (`path scope is not supported by agent
 <name> (<version>); regex scope requires agent >= 0.32.20`), and saving any
 exception (its `skip_layers` is always non-empty) requires **≥ 0.32.21**
@@ -969,11 +976,11 @@ passkeys), then use the authenticator — Touch ID, Windows Hello or a hardware
 security key — on the login page instead of typing the password. Passkeys
 require a **secure context**: HTTPS under a hostname, or `localhost`. They do
 not work over plain `http://` or a bare IP, and behind a TLS-terminating proxy
-`PINGWAF_PASSKEY_ORIGIN` must name the public origin (see
+`WAFRED_PASSKEY_ORIGIN` must name the public origin (see
 [deployment.md](./deployment.md)). A lost device is not a lockout: sign in with
 the password, delete the old passkey on **Profile**, and register the new
 device. Administrators can turn the feature off deployment-wide with
-`PINGWAF_PASSKEY_ENABLED=false`.
+`WAFRED_PASSKEY_ENABLED=false`.
 
 ### Forced First-Sign-In Password Change
 

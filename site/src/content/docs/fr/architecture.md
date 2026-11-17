@@ -24,7 +24,7 @@ La console est compilée dans le binaire via `rust-embed` : aucun frontend sépa
 
 ## Contrat gRPC
 
-La source unique est `pingwaf-proto/proto/control_plane.proto`, avec sept RPC :
+La source unique est `wafred-proto/proto/control_plane.proto`, avec sept RPC :
 
 | RPC | Type | Usage |
 | --- | --- | --- |

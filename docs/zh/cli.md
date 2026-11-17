@@ -52,23 +52,23 @@ Web 控制台是 `:9080` 控制面的 HTTP 客户端。当控制面本身出问�
 ### 安全传参
 
 `--db-url`、`--api-key`、`--jwt-secret`、`--admin-password` 会出现在 `ps` 与 shell history 中，本机任何用户可见。
-优先使用同名环境变量（`PINGWAF_DB_URL`、`PINGWAF_API_KEY`、`PINGWAF_JWT_SECRET`、`PINGWAF_ADMIN_PASSWORD`）
-或权限 `0600` 的环境文件——二进制安装器正是为此把 `PINGWAF_SECRET_KEY` 写入
-`/etc/pingwaf/pingwaf.env`，systemd 通过 `EnvironmentFile=-/etc/pingwaf/pingwaf.env` 读取。
+优先使用同名环境变量（`WAFRED_DB_URL`、`WAFRED_API_KEY`、`WAFRED_JWT_SECRET`、`WAFRED_ADMIN_PASSWORD`）
+或权限 `0600` 的环境文件——二进制安装器正是为此把 `WAFRED_SECRET_KEY` 写入
+`/etc/wafred/wafred.env`，systemd 通过 `EnvironmentFile=-/etc/wafred/wafred.env` 读取。
 
 对其中两个高价值 secret，CLI 支持从文件读取（避免进入 `ps` 与 shell history）：
 
 | 参数 | 环境变量 | 读取内容 |
 | --- | --- | --- |
-| `--db-url-file` | `PINGWAF_DB_URL_FILE` | PostgreSQL 连接串（`server`、`all-in-one` 及所有运维子命令） |
-| `--api-key-file` | `PINGWAF_API_KEY_FILE` | Agent 注册 API key（`agent`、`all-in-one`） |
+| `--db-url-file` | `WAFRED_DB_URL_FILE` | PostgreSQL 连接串（`server`、`all-in-one` 及所有运维子命令） |
+| `--api-key-file` | `WAFRED_API_KEY_FILE` | Agent 注册 API key（`agent`、`all-in-one`） |
 
 文件内容会被 trim（去掉首尾空白与末尾换行）后整体作为取值；文件不可读或**为空**时以退出码 1 中止，而不是静默配置空 secret。
 同时给出内联值与文件时，**文件优先**；只给 `--db-url`/`--api-key` 内联值而未给对应文件参数时，会打印一条告警提示该值在进程列表中可见。
 
 脚本与 CI 建议把 secret 写入 `0600` 文件（或使用环境变量 / systemd `EnvironmentFile=`——二进制安装器正是为此把
-`PINGWAF_SECRET_KEY` 写入 `/etc/pingwaf/pingwaf.env`），再传 `--db-url-file` / `--api-key-file`。
-`--jwt-secret` 与 `--admin-password` 目前没有文件参数：用 `PINGWAF_JWT_SECRET` / `PINGWAF_ADMIN_PASSWORD`，
+`WAFRED_SECRET_KEY` 写入 `/etc/wafred/wafred.env`），再传 `--db-url-file` / `--api-key-file`。
+`--jwt-secret` 与 `--admin-password` 目前没有文件参数：用 `WAFRED_JWT_SECRET` / `WAFRED_ADMIN_PASSWORD`，
 并先跑安装器 `--dry-run` 检查解析后的计划（而不是把 secret 打进日志）。
 
 ### 配置优先级

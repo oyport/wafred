@@ -17,7 +17,7 @@ const render = () =>
 describe('console 404 page', () => {
   it('offers the official site in a new window with noopener', () => {
     const html = render()
-    expect(WEBSITE_URL).toBe('https://www.pingwaf.com')
+    expect(WEBSITE_URL).toBe('https://waf.red')
     expect(html).toContain(`href="${WEBSITE_URL}"`)
     expect(html).toContain('target="_blank"')
     expect(html).toContain('rel="noopener noreferrer"')
