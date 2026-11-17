@@ -1,40 +1,44 @@
 @import "tailwindcss";
 
 /* ============================================================
-   WAFred Design System — Cloudflare Kumo inspired
+   WAFred Design System
    Raw semantic tokens live in :root and are overridden per-theme.
    ============================================================ */
 :root {
   color-scheme: light;
 
   /* Background */
-  --color-bg-base: #ffffff;
+  --color-bg-base: #f6f7f9;
   --color-bg-elevated: #ffffff;
-  --color-bg-recessed: #f7f7f8;
-  --color-bg-brand: #d8324f;
-  --color-bg-brand-hover: #bb2640;
-  --color-bg-danger: #e54d2a;
+  --color-bg-recessed: #f1f3f5;
+  --color-bg-brand: #c62847;
+  --color-bg-brand-hover: #ad203b;
+  --color-bg-brand-soft: #fbe9ed;
+  --color-bg-danger: #b42339;
+  --color-bg-danger-hover: #981b30;
   --color-bg-success: #18794e;
-  --color-bg-warning: #ffb224;
-  --color-bg-overlay: rgba(0, 0, 0, 0.5);
+  --color-bg-warning: #ca8a04;
+  --color-bg-disabled: #ebeef2;
+  --color-bg-overlay: rgba(17, 20, 27, 0.55);
 
   /* Text */
-  --color-text-default: #1d1d1d;
-  --color-text-subtle: #666666;
-  --color-text-strong: #000000;
-  /* Brand-coloured text that must stay readable on the brand-tinted surfaces
-     (active nav item, `bg-brand-soft` chips). The plain brand orange is a
-     background colour — on white it is only ~2.6:1, so it never names text. */
-  --color-text-brand-strong: #9a3d00;
+  --color-text-default: #262b33;
+  --color-text-subtle: #59616e;
+  --color-text-strong: #10131a;
+  --color-text-brand-strong: #a81234;
   --color-text-inverse: #ffffff;
+  --color-text-on-brand: #ffffff;
+  --color-text-on-danger: #ffffff;
+  --color-text-disabled: #626b77;
   --color-text-link: #0051c3;
-  --color-text-danger: #b93a1c;
-  --color-text-success: #18794e;
+  --color-text-danger: #b42339;
+  --color-text-success: #146f45;
+  --color-text-warning: #8a5a08;
 
   /* Border */
-  --color-border-line: #e8e8e8;
-  --color-border-fill: #d9d9d9;
-  --color-border-focus: #0051c3;
+  --color-border-line: #dfe3e9;
+  --color-border-fill: #c9cfd8;
+  --color-border-focus: #bd2848;
 
   /* Spacing & Radius */
   --radius-sm: 4px;
@@ -56,31 +60,35 @@
 [data-theme="dark"] {
   color-scheme: dark;
 
-  --color-bg-base: #1d1d1d;
-  --color-bg-elevated: #2a2a2a;
-  --color-bg-recessed: #161616;
-  --color-bg-brand: #d8324f;
-  --color-bg-brand-hover: #f26f83;
-  --color-bg-danger: #ff6340;
-  --color-bg-success: #30a46c;
-  --color-bg-warning: #ffc53d;
+  --color-bg-base: #14171c;
+  --color-bg-elevated: #20242c;
+  --color-bg-recessed: #171b21;
+  --color-bg-brand: #c62847;
+  --color-bg-brand-hover: #d02e4b;
+  --color-bg-brand-soft: #3d2630;
+  --color-bg-danger: #b42339;
+  --color-bg-danger-hover: #c82b44;
+  --color-bg-success: #40b97a;
+  --color-bg-warning: #e0a72e;
+  --color-bg-disabled: #363b46;
   --color-bg-overlay: rgba(0, 0, 0, 0.7);
 
-  --color-text-default: #e8e8e8;
-  /* ≥5.5:1 on both #1d1d1d and #2a2a2a; the old #a0a0a0 dipped under 5:1 on
-     the elevated surface (UX-17). */
-  --color-text-subtle: #a8a8a8;
-  --color-text-strong: #ffffff;
-  /* Brand-coloured text for dark surfaces: ~9:1 on #1d1d1d / #2a2a2a. */
-  --color-text-brand-strong: #ffb066;
-  --color-text-inverse: #1d1d1d;
-  --color-text-link: #52a9ff;
-  --color-text-danger: #ff8a66;
-  --color-text-success: #30a46c;
+  --color-text-default: #e5e8ee;
+  --color-text-subtle: #aeb6c2;
+  --color-text-strong: #f7f8fa;
+  --color-text-brand-strong: #ff91a5;
+  --color-text-inverse: #14171c;
+  --color-text-on-brand: #ffffff;
+  --color-text-on-danger: #ffffff;
+  --color-text-disabled: #b0b8c3;
+  --color-text-link: #8abfff;
+  --color-text-danger: #ff9aa5;
+  --color-text-success: #6ad9a2;
+  --color-text-warning: #f3c66b;
 
-  --color-border-line: #3a3a3a;
-  --color-border-fill: #4a4a4a;
-  --color-border-focus: #52a9ff;
+  --color-border-line: #363d47;
+  --color-border-fill: #4b5562;
+  --color-border-focus: #ff8095;
 
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4);
@@ -99,22 +107,28 @@
   --color-recessed: var(--color-bg-recessed);
   --color-brand: var(--color-bg-brand);
   --color-brand-hover: var(--color-bg-brand-hover);
+  --color-brand-soft: var(--color-bg-brand-soft);
   --color-danger: var(--color-bg-danger);
+  --color-danger-hover: var(--color-bg-danger-hover);
   --color-success: var(--color-bg-success);
   --color-warning: var(--color-bg-warning);
+  --color-disabled: var(--color-bg-disabled);
   --color-overlay: var(--color-bg-overlay);
 
   /* Foregrounds */
   --color-fg: var(--color-text-default);
   --color-fg-subtle: var(--color-text-subtle);
   --color-fg-strong: var(--color-text-strong);
-  /* Readable brand text (text-fg-brand-strong): never use `text-brand` for
-     words — the orange is a surface colour. */
+  /* Foregrounds for tinted surfaces and filled actions are distinct. */
   --color-fg-brand-strong: var(--color-text-brand-strong);
   --color-fg-inverse: var(--color-text-inverse);
+  --color-on-brand: var(--color-text-on-brand);
+  --color-on-danger: var(--color-text-on-danger);
+  --color-fg-disabled: var(--color-text-disabled);
   --color-link: var(--color-text-link);
   --color-fg-danger: var(--color-text-danger);
   --color-fg-success: var(--color-text-success);
+  --color-fg-warning: var(--color-text-warning);
 
   /* Borders */
   --color-line: var(--color-border-line);
@@ -187,10 +201,10 @@ body {
 
 /* Utility: subtle brand tint used across surfaces */
 .bg-brand-soft {
-  background-color: color-mix(in srgb, var(--color-bg-brand) 12%, transparent);
+  background-color: var(--color-bg-brand-soft);
 }
 .text-brand {
-  color: var(--color-bg-brand);
+  color: var(--color-text-brand-strong);
 }
 .border-brand {
   border-color: var(--color-bg-brand);

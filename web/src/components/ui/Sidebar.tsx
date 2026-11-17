@@ -91,8 +91,7 @@ export function Sidebar({ collapsed, onNavigate }: SidebarProps) {
   const linkBase =
     'group relative flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors duration-150'
   const linkIdle = 'text-fg-subtle hover:bg-recessed hover:text-fg'
-  // Active state: the label uses the readable brand token (the orange itself is
-  // only ~2.6:1 on white) plus a 2px brand indicator bar on the leading edge.
+  // The active label uses the readable brand text on a soft red surface.
   const linkActive =
     'bg-brand-soft text-fg-brand-strong before:absolute before:left-0 before:top-1/2 before:h-5 before:w-0.5 before:-translate-y-1/2 before:rounded-full before:bg-brand before:content-[\'\']'
 
