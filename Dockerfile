@@ -33,7 +33,7 @@
 # image resolve step before any layer cache can help.
 # Node version is pinned in lockstep with ci.yml / release.yml; bump this
 # patch version when a Node security release ships.
-FROM mirror.gcr.io/library/node:26.12.1-alpine AS frontend-builder
+FROM mirror.gcr.io/library/node:26.13.1-alpine AS frontend-builder
 
 WORKDIR /app/web
 
@@ -49,8 +49,8 @@ COPY web/ ./
 RUN npm run build
 
 # ─── Stage 2: Rust Builder ───────────────────────────────────────────────────
-# 改进：版本从 1.98.0 升至 1.98.1，与 release.yml 的 dtolnay/rust-toolchain@1.98.1 对齐
-FROM mirror.gcr.io/library/rust:1.99.1-bookworm AS builder
+# Rust image tracks the stable toolchain used by the release workflow.
+FROM mirror.gcr.io/library/rust:1.100.0-bookworm AS builder
 ARG TARGETARCH
 
 # SYNC: keep this list in lockstep with ci.yml / release.yml
