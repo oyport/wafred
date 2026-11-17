@@ -5,7 +5,7 @@ Apache-2.0-licensed [PingWAF](https://github.com/shuaiZend/PingWAF) codebase.
 The original PingWAF release history is retained below for provenance; the
 older `pingap` history is retained as the proxy layer's inherited history.
 
-## [WAFred 1.0.2] - 2026-11-17
+## [WAFred 1.0.2] - 2026-11-18
 
 ### Added
 

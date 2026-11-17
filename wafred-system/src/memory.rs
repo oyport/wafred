@@ -311,10 +311,16 @@ pub fn memory_snapshot() -> MemorySnapshot {
         None => (0, 0),
     };
     let kind = sysinfo::MemoryRefreshKind::nothing().with_ram();
-    let mut sys = sysinfo::System::new_with_specifics(
-        sysinfo::RefreshKind::nothing().with_memory(kind),
-    );
-    sys.refresh_memory();
+    let (total_memory_bytes, used_memory_bytes) =
+        match sysinfo::System::new_with_specifics(
+            sysinfo::RefreshKind::nothing().with_memory(kind),
+        ) {
+            Ok(mut sys) => {
+                sys.refresh_memory();
+                (sys.total_memory(), sys.used_memory())
+            },
+            Err(_) => (0, 0),
+        };
     let container = cgroup::container_memory();
     // The `/proc` extras are parsed from the raw text rather than taken from
     // sysinfo: every number gets a fixture-tested parser, independent of the
@@ -328,8 +334,6 @@ pub fn memory_snapshot() -> MemorySnapshot {
     let vm_size_bytes = parse_vm_size(&status);
     let (page_faults_minor, page_faults_major) =
         parse_page_faults(&read_proc("/proc/self/stat"));
-    let total_memory_bytes = sys.total_memory();
-    let used_memory_bytes = sys.used_memory();
     let swap_used_bytes = meminfo.swap_used_bytes();
     let committed_as_bytes = meminfo.committed_as_bytes;
     let commit_limit_bytes = meminfo.commit_limit_bytes;

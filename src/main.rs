@@ -654,9 +654,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         return run_admin_node(args);
     }
 
-    let mut sys = System::new();
-    sys.refresh_memory();
-    pingap_cache::update_available_memory(sys.available_memory());
+    match System::new() {
+        Ok(mut sys) => {
+            sys.refresh_memory();
+            pingap_cache::update_available_memory(sys.available_memory());
+        },
+        Err(err) => eprintln!("Unable to sample available memory: {err}"),
+    }
 
     // Initialize configuration. With `--upstream` the whole config is built
     // from the command line and kept in memory, so no config file is needed.

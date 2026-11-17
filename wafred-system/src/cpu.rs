@@ -44,20 +44,24 @@ pub struct CpuLiveStats {
 
 /// Persistent sampler; the baseline is refreshed once at construction so the
 /// first snapshot has a delta to work with.
-static CPU_SAMPLER: LazyLock<Mutex<System>> = LazyLock::new(|| {
+static CPU_SAMPLER: LazyLock<Mutex<Option<System>>> =
+    LazyLock::new(|| Mutex::new(new_sampler()));
+
+fn new_sampler() -> Option<System> {
     let mut sys = System::new_with_specifics(
         RefreshKind::nothing()
             .with_cpu(CpuRefreshKind::everything())
             .with_memory(MemoryRefreshKind::nothing().with_ram()),
-    );
+    )
+    .ok()?;
     sys.refresh_cpu_specifics(CpuRefreshKind::everything());
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
         false,
         ProcessRefreshKind::everything(),
     );
-    Mutex::new(sys)
-});
+    Some(sys)
+}
 
 /// When the last real refresh completed (for the minimum-interval stretch).
 static LAST_REFRESH: LazyLock<Mutex<Instant>> =
@@ -100,6 +104,23 @@ pub fn cpu_snapshot() -> CpuLiveStats {
             return cached.clone();
         }
     }
+    if sys.is_none() {
+        *sys = new_sampler();
+        if sys.is_some() {
+            // A new baseline needs its own minimum interval before sampling.
+            mark_refreshed();
+        }
+    }
+    let Some(sys) = sys.as_mut() else {
+        return CpuLiveStats {
+            process_cpu_percent: 0.0,
+            host_cpu_percent: 0.0,
+            cores: std::thread::available_parallelism()
+                .map(|cores| cores.get())
+                .unwrap_or_default(),
+            collected_at_ms: now_ms(),
+        };
+    };
     stretch_to_minimum_interval();
     sys.refresh_cpu_specifics(CpuRefreshKind::everything());
     let pid = Pid::from_u32(std::process::id());
