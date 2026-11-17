@@ -103,7 +103,6 @@ pub mod m20240101_000094_site_path_restrictions;
 pub mod m20240101_000095_access_restriction_paths;
 pub mod m20240101_000095_site_oidc_auth_scope;
 pub mod m20240101_000096_allow_rule_mode_monitor;
-mod m20240101_000096_demo_account;
 pub mod m20240101_000097_path_exception_regex;
 pub mod m20240101_000098_rule_managed_rule_id;
 pub mod m20240101_000099_agent_peer_ip;
@@ -225,7 +224,6 @@ impl MigratorTrait for Migrator {
             Box::new(m20240101_000095_access_restriction_paths::Migration),
             Box::new(m20240101_000095_site_oidc_auth_scope::Migration),
             Box::new(m20240101_000096_allow_rule_mode_monitor::Migration),
-            Box::new(m20240101_000096_demo_account::Migration),
             Box::new(m20240101_000097_path_exception_regex::Migration),
             Box::new(m20240101_000098_rule_managed_rule_id::Migration),
             Box::new(m20240101_000099_agent_peer_ip::Migration),

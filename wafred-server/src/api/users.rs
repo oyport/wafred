@@ -68,15 +68,11 @@ pub fn routes() -> Router<AppState> {
 /// `GET /api/v1/users`
 async fn list(
     State(state): State<AppState>,
-    admin: AdminUser,
+    _admin: AdminUser,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Page<UserResponse>>, ApiError> {
     let pagination = query.pagination.normalise();
-    let mut users = user::Entity::find();
-    if admin.is_demo {
-        users = users.filter(user::Column::Id.eq(admin.id));
-    }
-    let paginator = users
+    let paginator = user::Entity::find()
         .order_by_asc(user::Column::CreatedAt)
         .paginate(&state.db, pagination.limit());
     let total = paginator.num_items().await?;
@@ -189,11 +185,6 @@ async fn update(
         .one(&state.db)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("user {id} not found")))?;
-    if account.is_demo {
-        return Err(ApiError::Forbidden(
-            "this account is managed by the deployment".to_string(),
-        ));
-    }
 
     // Self-service profile changes go through `/auth/me`; role and status
     // changes on the caller's own account could lock the operator out.

@@ -34,8 +34,6 @@ export interface User {
   email: string
   name: string | null
   role: UserRole | string
-  /** Private showcase account; the server rejects all persistent changes. */
-  is_demo?: boolean
   /** First sign-in gate: the account must replace its password. */
   must_change_password: boolean
   /** Disabled accounts cannot sign in (admin user list only). */
@@ -73,11 +71,6 @@ export interface AuthStatus {
   registration_open: boolean
   /** Whether the login form should offer a passkey. */
   passkey_enabled: boolean
-  /** Present only when the private demo deployment is enabled. */
-  demo_credentials?: {
-    email: string
-    password: string
-  }
 }
 
 /** `api::passkeys::PasskeySummary` */

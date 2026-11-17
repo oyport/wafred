@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::api::common::load_site_read;
 use crate::api::error::ApiError;
 use crate::api::sites::touch_site;
 use crate::api::state::AppState;
@@ -98,16 +97,6 @@ async fn list_versions(
                 .filter(config_version::Column::SiteId.eq(site_id))
         },
     };
-    if current.is_demo {
-        let owned = site::Entity::find()
-            .filter(site::Column::UserId.eq(current.id))
-            .all(&state.db)
-            .await?;
-        query = query.filter(
-            config_version::Column::SiteId
-                .is_in(owned.into_iter().map(|site| site.id)),
-        );
-    }
 
     let rows = query.all(&state.db).await?;
 
@@ -181,12 +170,6 @@ async fn show_version(
         .ok_or(ApiError::NotFound(format!(
             "version {version_id} not found"
         )))?;
-    if current.is_demo {
-        let site_id = row.site_id.ok_or_else(|| {
-            ApiError::NotFound(format!("version {version_id} not found"))
-        })?;
-        load_site_read(&state.db, site_id, &current).await?;
-    }
     // A historical snapshot may predate secret stripping. Do not expose it
     // merely because the version is old enough to contain the material.
     row.snapshot = sanitize_snapshot_for_output(&row.snapshot);

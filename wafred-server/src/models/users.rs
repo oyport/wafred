@@ -34,8 +34,6 @@ pub mod users {
         pub disabled: bool,
         /// First-login flag: the console forces a password change.
         pub must_change_password: bool,
-        /// Account managed by the private showcase configuration.
-        pub is_demo: bool,
         /// Bumped on credential-sensitive changes (password change, role
         /// change, disable). Tokens embed the version they were minted
         /// with; a mismatch invalidates them immediately.

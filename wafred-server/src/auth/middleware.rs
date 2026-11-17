@@ -32,7 +32,6 @@ pub struct AuthUser {
     pub role: String,
     /// The console forces a password (and name) change before any mutation.
     pub must_change_password: bool,
-    pub is_demo: bool,
 }
 
 impl AuthUser {
@@ -46,17 +45,16 @@ impl AuthUser {
             email: email.into(),
             role: role.into(),
             must_change_password: false,
-            is_demo: false,
         }
     }
 
     pub fn is_admin(&self) -> bool {
-        self.role == role::ADMIN && !self.is_demo
+        self.role == role::ADMIN
     }
 
     /// Fails with `403` unless the caller is an administrator.
     pub fn require_admin(&self) -> Result<(), AuthError> {
-        if self.is_admin() || self.is_demo {
+        if self.is_admin() {
             Ok(())
         } else {
             Err(AuthError::Forbidden(
@@ -274,51 +272,6 @@ pub async fn require_password_change(
     )
 }
 
-fn demo_method_allowed(method: &Method) -> bool {
-    method == Method::GET || method == Method::HEAD || method == Method::OPTIONS
-}
-
-pub const DEMO_READ_ONLY_MESSAGE: &str = "演示账号无法保存修改";
-
-fn demo_request_allowed(method: &Method, path: &str) -> bool {
-    let path = path.strip_prefix(crate::api::API_PREFIX).unwrap_or(path);
-    if demo_method_allowed(method) {
-        return true;
-    }
-    if method != Method::POST {
-        return false;
-    }
-    path == "/auth/refresh"
-        || path == "/ai/conversations"
-        || path
-            .strip_prefix("/ai/conversations/")
-            .and_then(|value| value.strip_suffix("/messages"))
-            .is_some_and(|id| Uuid::parse_str(id).is_ok())
-}
-
-/// Covers every API route, including self-service credential endpoints and
-/// future routes that may forget to enforce the auditor role themselves.
-pub async fn enforce_demo_read_only(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let path = request_path(&request);
-    let method = request.method().clone();
-    let (mut parts, body) = request.into_parts();
-    if let Ok(user) = AuthUser::from_request_parts(&mut parts, &state).await {
-        if user.is_demo && !demo_request_allowed(&method, &path) {
-            return error_response(
-                StatusCode::FORBIDDEN,
-                "demo_read_only",
-                DEMO_READ_ONLY_MESSAGE,
-            );
-        }
-        parts.extensions.insert(user);
-    }
-    next.run(Request::from_parts(parts, body)).await
-}
-
 /// Pulls the raw bearer token out of the request headers.
 pub fn bearer_token(parts: &Parts) -> Result<String, AuthError> {
     let header = parts
@@ -375,18 +328,12 @@ pub async fn authenticate_user(
             account.role
         )));
     }
-    if account.is_demo && account.role != role::AUDITOR {
-        return Err(AuthError::Forbidden(
-            "this account has an invalid role".to_string(),
-        ));
-    }
 
     Ok(AuthUser {
         id,
         email: account.email,
         role: account.role,
         must_change_password: account.must_change_password,
-        is_demo: account.is_demo,
     })
 }
 
@@ -452,61 +399,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn showcase_account_allows_reads_and_blocks_mutations() {
-        for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
-            assert!(demo_request_allowed(&method, "/api/v1/users"));
-        }
-        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE]
-        {
-            assert!(!demo_request_allowed(&method, "/api/v1/settings/defense"));
-        }
-        assert!(demo_request_allowed(&Method::POST, "/api/v1/auth/refresh"));
-        assert!(!demo_request_allowed(&Method::POST, "/api/v1/sites"));
-    }
-
-    #[tokio::test]
-    async fn showcase_middleware_blocks_self_service_writes() {
-        use axum::routing::{get, put};
-        use tower::ServiceExt;
-
-        let state = AppState::new(
-            sea_orm::DatabaseConnection::Disconnected,
-            crate::config::ServerConfig::default(),
-            crate::grpc::AgentRegistry::new(),
-        );
-        let app = axum::Router::new()
-            .route("/auth/password", put(|| async { StatusCode::NO_CONTENT }))
-            .route("/sites", get(|| async { StatusCode::OK }))
-            .layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                enforce_demo_read_only,
-            ))
-            .with_state(state);
-        let mut demo =
-            AuthUser::new(Uuid::new_v4(), "demo@example.com", role::AUDITOR);
-        demo.is_demo = true;
-
-        let write = Request::builder()
-            .method(Method::PUT)
-            .uri("/auth/password")
-            .extension(demo.clone())
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(
-            app.clone().oneshot(write).await.unwrap().status(),
-            StatusCode::FORBIDDEN
-        );
-
-        let read = Request::builder()
-            .method(Method::GET)
-            .uri("/sites")
-            .extension(demo)
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(app.oneshot(read).await.unwrap().status(), StatusCode::OK);
-    }
-
-    #[test]
     fn admin_check_rejects_viewers() {
         let viewer =
             AuthUser::new(Uuid::new_v4(), "v@example.com", role::VIEWER);
@@ -516,12 +408,6 @@ mod tests {
         let admin = AuthUser::new(Uuid::new_v4(), "a@example.com", role::ADMIN);
         assert!(admin.is_admin());
         assert!(admin.require_admin().is_ok());
-
-        let mut demo =
-            AuthUser::new(Uuid::new_v4(), "demo@example.com", role::AUDITOR);
-        demo.is_demo = true;
-        assert!(!demo.is_admin());
-        assert!(demo.require_admin().is_ok());
     }
 
     /// The path as the client sends it: the API prefix plus an inner route.

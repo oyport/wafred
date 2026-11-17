@@ -173,8 +173,8 @@ fn key_principal(
         // Admission above already requires `read` or `write`; a writer can
         // always read, so every accepted key is readable.
         can_read: true,
-        can_write: fleet_wide && !owner.is_demo,
-        is_admin: fleet_wide && !owner.is_demo,
+        can_write: fleet_wide,
+        is_admin: fleet_wide,
     })
 }
 
@@ -191,8 +191,8 @@ fn jwt_principal(user: &AuthUser) -> Result<McpPrincipal, McpAuthError> {
         label: user.email.clone(),
         key_id: None,
         can_read: true,
-        can_write: user.is_admin() && !user.is_demo,
-        is_admin: user.role == role::ADMIN && !user.is_demo,
+        can_write: user.is_admin(),
+        is_admin: user.is_admin(),
     })
 }
 
@@ -270,7 +270,6 @@ mod tests {
             role: role.to_string(),
             disabled: false,
             must_change_password: false,
-            is_demo: false,
             token_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -362,17 +361,6 @@ mod tests {
         assert!(viewer.can_read);
         assert!(!viewer.can_write);
         assert!(!viewer.is_admin);
-    }
-
-    #[test]
-    fn showcase_account_has_read_only_mcp_access() {
-        let mut demo =
-            AuthUser::new(Uuid::new_v4(), "demo@example.com", role::AUDITOR);
-        demo.is_demo = true;
-        let principal = jwt_principal(&demo).unwrap();
-        assert!(principal.can_read);
-        assert!(!principal.can_write);
-        assert!(!principal.is_admin);
     }
 
     /// D06: the storage error used to be the 401 body, table names included.

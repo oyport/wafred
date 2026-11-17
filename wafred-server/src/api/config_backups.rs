@@ -76,9 +76,6 @@ async fn list_targets(
     current: AuthUser,
 ) -> Result<Json<Vec<TargetView>>, ApiError> {
     current.require_admin().map_err(ApiError::from)?;
-    if current.is_demo {
-        return Ok(Json(Vec::new()));
-    }
     Ok(Json(config_backup::list_targets(&state.db).await?))
 }
 
@@ -175,9 +172,6 @@ async fn list_backups(
     current: AuthUser,
 ) -> Result<Json<Vec<BackupView>>, ApiError> {
     current.require_admin().map_err(ApiError::from)?;
-    if current.is_demo {
-        return Ok(Json(Vec::new()));
-    }
     Ok(Json(config_backup::list_backups(&state.db).await?))
 }
 
@@ -187,9 +181,6 @@ async fn create_backup(
     Json(payload): Json<CreateBackupRequest>,
 ) -> Result<Json<BackupView>, ApiError> {
     current.require_admin().map_err(ApiError::from)?;
-    if current.is_demo {
-        return Err(ApiError::NotFound("backup not found".to_string()));
-    }
     let scope = parse_scope(&payload.scope, payload.site_id)?;
     let backup = config_backup::create_backup_record(
         &state.db,
@@ -231,9 +222,6 @@ async fn download_backup(
     Path(backup_id): Path<Uuid>,
 ) -> Result<Response<Body>, ApiError> {
     current.require_admin().map_err(ApiError::from)?;
-    if current.is_demo {
-        return Err(ApiError::NotFound("backup not found".to_string()));
-    }
     let backup = config_backup::load_backup(&state.db, backup_id)
         .await
         .map_err(backup_error)?;

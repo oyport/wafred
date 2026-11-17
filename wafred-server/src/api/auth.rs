@@ -90,8 +90,6 @@ pub struct UserResponse {
     pub email: String,
     pub name: Option<String>,
     pub role: String,
-    /// Marks the private, read-only showcase account.
-    pub is_demo: bool,
     /// The console walks first-login accounts through a password change.
     pub must_change_password: bool,
     /// Disabled accounts cannot sign in; shown in the admin user list.
@@ -112,12 +110,7 @@ impl From<user::Model> for UserResponse {
             id: model.id,
             email: model.email,
             name: model.name,
-            role: if model.is_demo {
-                role::ADMIN.to_string()
-            } else {
-                model.role
-            },
-            is_demo: model.is_demo,
+            role: model.role,
             must_change_password: model.must_change_password,
             disabled: model.disabled,
             created_at: model.created_at,
@@ -187,16 +180,6 @@ pub struct AuthStatus {
     pub registration_open: bool,
     /// Whether the login form should offer a passkey.
     pub passkey_enabled: bool,
-    /// Public demo credentials, returned only by deployments with demo mode
-    /// enabled so the showcase login can fill them in with one click.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub demo_credentials: Option<DemoLoginCredentials>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct DemoLoginCredentials {
-    pub email: String,
-    pub password: String,
 }
 
 /// Routes contributed to `/api/v1`.
@@ -217,8 +200,7 @@ async fn status(
     let count = user::Entity::find().count(&state.db).await?;
     Ok(Json(AuthStatus {
         needs_setup: count == 0,
-        registration_open: !crate::demo::enabled()
-            && (state.config.allow_registration || count == 0),
+        registration_open: state.config.allow_registration || count == 0,
         // The runtime master switch (instance_settings KV) overrides the
         // static boot config, so the login form hides the passkey option as
         // soon as an operator turns it off - no restart needed.
@@ -227,8 +209,6 @@ async fn status(
             state.config.passkey_enabled,
         )
         .await?,
-        demo_credentials: crate::demo::login_hint()
-            .map(|(email, password)| DemoLoginCredentials { email, password }),
     }))
 }
 
@@ -278,15 +258,7 @@ async fn login(
     }
     if account.disabled {
         tracing::debug!(%email, "login failed: account disabled");
-        if account.is_demo {
-            return Err(ApiError::Unauthorized(
-                INVALID_CREDENTIALS.to_string(),
-            ));
-        }
         return Err(ApiError::Unauthorized("account is disabled".to_string()));
-    }
-    if account.is_demo && account.role != role::AUDITOR {
-        return Err(ApiError::Unauthorized(INVALID_CREDENTIALS.to_string()));
     }
 
     tracing::info!(%email, user_id = %account.id, role = %account.role, "user logged in");
@@ -323,11 +295,6 @@ async fn register(
     State(state): State<AppState>,
     AppJson(payload): AppJson<RegisterRequest>,
 ) -> Result<Response, ApiError> {
-    if crate::demo::enabled() {
-        return Err(ApiError::Forbidden(
-            "registration is disabled on this server".to_string(),
-        ));
-    }
     let email = normalise_email(&payload.email)?;
     validate_password(&payload.password)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
@@ -418,15 +385,7 @@ async fn refresh(
         })?;
 
     if account.disabled {
-        if account.is_demo {
-            return Err(ApiError::Unauthorized(
-                INVALID_CREDENTIALS.to_string(),
-            ));
-        }
         return Err(ApiError::Unauthorized("account is disabled".to_string()));
-    }
-    if account.is_demo && account.role != role::AUDITOR {
-        return Err(ApiError::Unauthorized(INVALID_CREDENTIALS.to_string()));
     }
     if !token_version_valid(claims.ver, &account) {
         return Err(ApiError::Unauthorized(
@@ -673,7 +632,6 @@ pub async fn create_user(
         role: Set(assigned_role.to_string()),
         disabled: Set(false),
         must_change_password: Set(false),
-        is_demo: Set(false),
         token_version: Set(0),
         created_at: Set(timestamp),
         updated_at: Set(timestamp),
@@ -748,7 +706,6 @@ mod tests {
             role: role::ADMIN.into(),
             disabled: false,
             must_change_password: false,
-            is_demo: false,
             token_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),

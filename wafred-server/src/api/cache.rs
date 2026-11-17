@@ -383,16 +383,7 @@ async fn list_by_query(
         load_site_read(&state.db, id, &current).await?;
         condition = condition.add(cache_rules::Column::SiteId.eq(id));
     }
-    if current.is_demo && requested.is_none() {
-        let owned = site::Entity::find()
-            .filter(site::Column::UserId.eq(current.id))
-            .all(&state.db)
-            .await?;
-        condition = condition.add(
-            cache_rules::Column::SiteId
-                .is_in(owned.into_iter().map(|site| site.id)),
-        );
-    } else if !current.is_admin() && requested.is_none() {
+    if !current.is_admin() && requested.is_none() {
         // `scope_site` already rejected this, but a non-admin listing every
         // rule must never fall through to the unfiltered query.
         return Err(ApiError::BadRequest(
