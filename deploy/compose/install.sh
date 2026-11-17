@@ -41,7 +41,7 @@ Options:
   --mirror-mode <mode>    host-path (default) or full-url
   --image-mirror <url>    OCI proxy prefix (default: --mirror in host-path mode)
   --ref <git-ref>          Git ref the compose file is downloaded from
-                           (default: v<tag> for a release tag, otherwise main)
+                           (default: matching release tag; main only for --tag main)
   --dir <path>             Directory to create/use (default: ./wafred)
   --admin-email <email>    Initial administrator e-mail
   --admin-password <pw>    Initial administrator password (default: wafred123)
@@ -93,7 +93,8 @@ random_hex() { # $1 bytes (default 32) -> lowercase hex
 }
 
 latest_release_tag() {
-    local url="https://api.github.com/repos/${REPO}/releases/latest" tag=""
+    local url tag=""
+    url="$(mirror_url "https://api.github.com/repos/${REPO}/releases/latest")"
     if command -v curl >/dev/null 2>&1; then
         tag="$(curl -fsSL --proto '=https' "$url" 2>/dev/null \
             | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
