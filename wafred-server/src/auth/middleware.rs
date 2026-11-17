@@ -4,7 +4,6 @@
 use axum::extract::{FromRef, FromRequestParts, OriginalUri, Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
-use axum::http::Method;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
