@@ -154,7 +154,7 @@ mod tests {
         RejectData,
         RejectMessage,
         MalformedEhlo,
-        InjectStartTlsReply,
+        InjectStartTls,
     }
 
     #[derive(Default)]
@@ -190,7 +190,7 @@ mod tests {
                                 .await
                                 .unwrap();
                         },
-                        Reply::InjectStartTlsReply => {
+                        Reply::InjectStartTls => {
                             writer
                                 .write_all(b"250-localhost\r\n250 STARTTLS\r\n")
                                 .await
@@ -374,8 +374,7 @@ mod tests {
 
     #[tokio::test]
     async fn extra_plaintext_after_starttls_is_not_delivered() {
-        let (result, exchange) =
-            run(Reply::InjectStartTlsReply, "starttls").await;
+        let (result, exchange) = run(Reply::InjectStartTls, "starttls").await;
         let error = result.expect_err("injected STARTTLS reply was accepted");
         assert!(
             error.contains("unexpected data after the STARTTLS reply"),
