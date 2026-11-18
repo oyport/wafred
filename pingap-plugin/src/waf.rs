@@ -6407,6 +6407,112 @@ pub(crate) mod tests {
         assert!(!restrictions.over_threshold(compiled, "192.0.2.1", 120));
     }
 
+    fn scheduled_path_restriction(
+        timezone: &str,
+        days: &[i32],
+        start: &str,
+        end: &str,
+    ) -> CompiledPathRestriction {
+        CompiledPathRestriction::build(&CachePathRestriction {
+            id: "schedule-test".to_string(),
+            path: "/admin".to_string(),
+            match_type: "prefix".to_string(),
+            action: "block".to_string(),
+            enabled: true,
+            schedule_enabled: true,
+            schedule_timezone: timezone.to_string(),
+            schedule_days: days.to_vec(),
+            schedule_start: start.to_string(),
+            schedule_end: end.to_string(),
+            ..Default::default()
+        })
+        .expect("test schedule should compile")
+    }
+
+    fn schedule_instant(value: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .expect("test instant should be RFC 3339")
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn path_schedule_uses_half_open_bounds_and_selected_weekdays() {
+        // 2026-11-16 is a Monday. The start is inclusive and the end exclusive.
+        let rule = scheduled_path_restriction("UTC", &[1], "09:00", "17:00");
+        assert!(!rule.active_now(schedule_instant("2026-11-16T08:59:59Z")));
+        assert!(rule.active_now(schedule_instant("2026-11-16T09:00:00Z")));
+        assert!(rule.active_now(schedule_instant("2026-11-16T16:59:59Z")));
+        assert!(!rule.active_now(schedule_instant("2026-11-16T17:00:00Z")));
+        assert!(!rule.active_now(schedule_instant("2026-11-15T09:00:00Z")));
+    }
+
+    #[test]
+    fn path_schedule_after_midnight_belongs_to_the_start_day() {
+        let rule = scheduled_path_restriction("UTC", &[1], "22:00", "02:00");
+        assert!(!rule.active_now(schedule_instant("2026-11-16T21:59:59Z")));
+        assert!(rule.active_now(schedule_instant("2026-11-16T22:00:00Z")));
+        assert!(rule.active_now(schedule_instant("2026-11-17T01:59:59Z")));
+        assert!(!rule.active_now(schedule_instant("2026-11-17T02:00:00Z")));
+        // Monday's early hours belong to Sunday, which was not selected.
+        assert!(!rule.active_now(schedule_instant("2026-11-16T01:00:00Z")));
+        assert!(!rule.active_now(schedule_instant("2026-11-17T22:00:00Z")));
+    }
+
+    #[test]
+    fn path_schedule_applies_the_shanghai_timezone_offset() {
+        let rule =
+            scheduled_path_restriction("Asia/Shanghai", &[1], "09:00", "17:00");
+        // Monday 09:00 in Shanghai is Monday 01:00 UTC.
+        assert!(!rule.active_now(schedule_instant("2026-11-16T00:59:59Z")));
+        assert!(rule.active_now(schedule_instant("2026-11-16T01:00:00Z")));
+        assert!(rule.active_now(schedule_instant("2026-11-16T08:59:59Z")));
+        assert!(!rule.active_now(schedule_instant("2026-11-16T09:00:00Z")));
+    }
+
+    #[test]
+    fn path_schedule_skips_the_missing_spring_forward_hour() {
+        // In New York on 2026-03-08, 01:59 EST is followed by 03:00 EDT.
+        let missing_hour = scheduled_path_restriction(
+            "America/New_York",
+            &[7],
+            "02:00",
+            "03:00",
+        );
+        assert!(
+            !missing_hour.active_now(schedule_instant("2026-03-08T06:59:59Z"))
+        );
+        assert!(
+            !missing_hour.active_now(schedule_instant("2026-03-08T07:00:00Z"))
+        );
+
+        let spanning = scheduled_path_restriction(
+            "America/New_York",
+            &[7],
+            "01:30",
+            "03:30",
+        );
+        assert!(spanning.active_now(schedule_instant("2026-03-08T06:59:59Z")));
+        assert!(spanning.active_now(schedule_instant("2026-03-08T07:00:00Z")));
+        assert!(!spanning.active_now(schedule_instant("2026-03-08T07:30:00Z")));
+    }
+
+    #[test]
+    fn path_schedule_covers_both_occurrences_of_the_fall_back_hour() {
+        // On 2026-11-01, New York observes 01:00 twice, first EDT then EST.
+        let rule = scheduled_path_restriction(
+            "America/New_York",
+            &[7],
+            "01:00",
+            "02:00",
+        );
+        assert!(!rule.active_now(schedule_instant("2026-11-01T04:59:59Z")));
+        assert!(rule.active_now(schedule_instant("2026-11-01T05:00:00Z")));
+        assert!(rule.active_now(schedule_instant("2026-11-01T05:59:59Z")));
+        assert!(rule.active_now(schedule_instant("2026-11-01T06:00:00Z")));
+        assert!(rule.active_now(schedule_instant("2026-11-01T06:59:59Z")));
+        assert!(!rule.active_now(schedule_instant("2026-11-01T07:00:00Z")));
+    }
+
     #[test]
     fn deferred_body_entry_limit_tracks_the_per_request_cap() {
         assert_eq!(deferred_body_max_entries(64 * 1024), 1024);
