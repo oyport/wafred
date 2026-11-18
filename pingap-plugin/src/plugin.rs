@@ -83,3 +83,29 @@ static PLUGIN_FACTORY: LazyLock<PluginFactory> =
 pub fn get_plugin_factory() -> &'static PluginFactory {
     &PLUGIN_FACTORY
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_constructors_register_security_plugins() {
+        let factory = get_plugin_factory();
+        let supported = factory.supported_plugins();
+        for category in
+            ["waf", "basic_auth", "oidc", "challenge", "compression"]
+        {
+            assert!(
+                supported.iter().any(|plugin| plugin == category),
+                "startup constructor did not register {category}"
+            );
+        }
+
+        let config: PluginConf = toml::from_str(
+            r#"category = "basic_auth"
+authorizations = ["dGVzdDpwYXNzd29yZA=="]"#,
+        )
+        .expect("valid basic authentication configuration");
+        assert!(factory.create(&config).is_ok());
+    }
+}

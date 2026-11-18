@@ -318,7 +318,7 @@ chrono = { version = "0.4.45", default-features = false, features = [
 chrono-tz = "0.10"
 cookie = "0.18.2"
 crc32fast = "1.5.1"
-ctor = "1.0.13"
+ctor = "1.0.14"
 derive_more = { version = "2.1.1", default-features = false, features = [
     "debug",
 ] }
