@@ -12,6 +12,11 @@ older `pingap` history is retained as the proxy layer's inherited history.
 - Updated the startup constructor dependency used to register WAF, authentication,
   and compression plugins.
 
+### Fixed
+
+- Updated the SMTP email transport to fix upstream message handling, response
+  parsing, and STARTTLS issues.
+
 ## [WAFred 1.0.2] - 2026-11-18
 
 ### Added

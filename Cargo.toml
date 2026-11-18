@@ -340,7 +340,7 @@ ring = "0.17"
 maxminddb = "0.32"
 # SMTP client for the notification system's e-mail channel. rustls keeps the
 # control plane free of OpenSSL, like every other TLS consumer in the tree.
-lettre = { version = "0.11", default-features = false, features = [
+lettre = { version = "0.11.24", default-features = false, features = [
     "builder",
     "smtp-transport",
     "tokio1",
