@@ -218,6 +218,7 @@ Compose variables you can set:
 | `WAFRED_HEARTBEAT_INTERVAL` | `15` | Agent heartbeat interval (seconds) |
 | `RUST_LOG` | `info,sqlx=warn` | Tracing log level filter |
 | `WAFRED_HTTP_PORT` / `WAFRED_HTTPS_PORT` | `80` / `443` | Host ports for site traffic |
+| `WAFRED_CUSTOM_PORT_START` / `WAFRED_CUSTOM_PORT_END` | `7000` / `7777` | Inclusive port pool for per-host HTTP/HTTPS bindings (778 ports) |
 | `WAFRED_ADMIN_PORT` / `WAFRED_GRPC_PORT` | `9080` / `9090` | Host ports for dashboard/API and gRPC |
 | `POSTGRES_PORT` | `5432` | Host port mapped to PostgreSQL |
 

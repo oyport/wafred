@@ -429,11 +429,11 @@ async fn restore_backup(
         restore_options(&current, scope),
     )
     .await?;
-    config_restore::apply_restore(&txn, plan).await?;
+    let restore_report = config_restore::apply_restore(&txn, plan).await?;
     txn.commit().await?;
 
     let mut post_warnings = Vec::new();
-    match scope {
+    let listener_restart = match scope {
         VersionScope::Site(site_id) => {
             if let Err(error) =
                 crate::api::sites::touch_site(&state, site_id).await
@@ -442,11 +442,37 @@ async fn restore_backup(
                     .push(format!("agent push preparation failed: {error}"));
             }
             notify_config_changed(&state, site_id, Some(&current.email)).await;
+            if restore_report.listener_bindings_changed {
+                let (sent, queued) = crate::api::sites::restart_site_agents(
+                    &state,
+                    site_id,
+                    "site backup restore changed listener bindings",
+                )
+                .await;
+                json!({ "required": true, "sent": sent, "queued": queued })
+            } else {
+                json!({ "required": false, "sent": 0, "queued": 0 })
+            }
         },
-        VersionScope::Global | VersionScope::Deployment => {
+        VersionScope::Global => {
             notify_all_config_changed(&state, Some(&current.email)).await;
+            json!({ "required": false, "sent": 0, "queued": 0 })
         },
-    }
+        VersionScope::Deployment => {
+            notify_all_config_changed(&state, Some(&current.email)).await;
+            if restore_report.listener_bindings_changed {
+                let (sent, queued) =
+                    crate::api::sites::restart_all_site_agents(
+                        &state,
+                        "deployment backup restore changed listener bindings",
+                    )
+                    .await;
+                json!({ "required": true, "sent": sent, "queued": queued })
+            } else {
+                json!({ "required": false, "sent": 0, "queued": 0 })
+            }
+        },
+    };
     if let Some(manager) = crate::notify::global() {
         manager.reload().await;
     }
@@ -482,6 +508,7 @@ async fn restore_backup(
         "restored": true,
         "pre_restore_backup_id": pre_restore.id,
         "new_version": new_version,
+        "listener_restart": listener_restart,
         "warnings": post_warnings,
     })))
 }

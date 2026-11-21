@@ -1250,6 +1250,10 @@ LimitNOFILE=65536
 ${agent_env}
 # Log level; the default keeps sqlx's per-statement log out of the way:
 Environment=RUST_LOG=info,sqlx=warn
+# Allocator startup defaults; override in wafred.env when load testing.
+Environment=MIMALLOC_ARENA_RESERVE=67108864
+Environment=MIMALLOC_ARENA_EAGER_COMMIT=0
+Environment=MIMALLOC_ALLOW_THP=0
 # Instance secrets (WAFRED_SECRET_KEY) live in a 0600 file; the leading dash
 # keeps the unit working when the file does not exist (e.g. an agent node).
 EnvironmentFile=-${CONFIG_DIR}/wafred.env

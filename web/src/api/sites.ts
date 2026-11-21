@@ -9,6 +9,7 @@ import type {
   Route,
   Site,
   SiteDetail,
+  SiteHostBindings,
   SiteListQuery,
   SslConfig,
   UpdatePoolRequest,
@@ -37,6 +38,14 @@ export const sitesApi = {
 
   update: (id: string, data: UpdateSiteRequest) =>
     apiClient.put<Site>(`/sites/${id}`, data),
+
+  getHostBindings: (id: string) =>
+    apiClient.get<SiteHostBindings>(`/sites/${id}/host-bindings`),
+
+  updateHostBindings: (
+    id: string,
+    data: { bindings: SiteHostBindings['bindings'] },
+  ) => apiClient.put<SiteHostBindings>(`/sites/${id}/host-bindings`, data),
 
   delete: (id: string) => apiClient.delete<void>(`/sites/${id}`),
 
@@ -98,6 +107,7 @@ export const siteKeys = {
   all: ['sites'] as const,
   list: (query?: SiteListQuery) => [...siteKeys.all, 'list', query ?? {}] as const,
   detail: (id: string) => [...siteKeys.all, 'detail', id] as const,
+  hostBindings: (id: string) => [...siteKeys.all, id, 'host-bindings'] as const,
   upstreams: (id: string) => [...siteKeys.all, id, 'upstreams'] as const,
   pools: (id: string) => [...siteKeys.all, id, 'pools'] as const,
   routes: (id: string) => [...siteKeys.all, id, 'routes'] as const,

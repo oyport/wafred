@@ -222,6 +222,15 @@ impl ControlPlaneClient {
         *h = handlers;
     }
 
+    /// Replace the callback used by a server-initiated process restart while
+    /// preserving the built-in purge and any config-reload handlers.
+    pub async fn set_restart_handler(
+        &self,
+        handler: impl Fn(bool) + Send + Sync + 'static,
+    ) {
+        self.command_handlers.write().await.on_restart = Some(Box::new(handler));
+    }
+
     /// Queue a log entry for shipping to the server (non-blocking).
     ///
     /// If the log buffer is full, the entry is dropped with a warning.

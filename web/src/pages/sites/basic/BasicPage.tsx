@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowClockwise, Plus } from '@phosphor-icons/react'
 import { PageHeader } from '@/components/PageHeader'
 import { Button } from '@/components/ui/Button'
@@ -13,6 +13,7 @@ import type { IpGroupResponse } from '@/api/types'
 import { FailoverPanel } from '../FailoverPanel'
 import { ProxyTrustCard } from './ProxyTrustCard'
 import { DownstreamTimeoutCard } from './DownstreamTimeoutCard'
+import { HostPortBindingsCard } from './HostPortBindingsCard'
 import { OriginVerifyCertCard } from './OriginVerifyCertCard'
 import { OriginPoolsSection } from './OriginPoolsSection'
 import { RoutesSection } from './RoutesSection'
@@ -27,6 +28,7 @@ import { RouteDialog, type RouteDialogRequest } from './RouteDialog'
 export function BasicPage() {
   const { t } = useTranslation()
   const canWrite = useCanWrite()
+  const queryClient = useQueryClient()
   const { siteId = '' } = useParams<{ siteId: string }>()
 
   const poolsQuery = useQuery({
@@ -82,6 +84,10 @@ export function BasicPage() {
     void poolsQuery.refetch()
     void upstreamsQuery.refetch()
     void routesQuery.refetch()
+    void siteQuery.refetch()
+    void queryClient.invalidateQueries({
+      queryKey: siteKeys.hostBindings(siteId),
+    })
   }
 
   const openCreateRoute = () => {
@@ -146,6 +152,7 @@ export function BasicPage() {
               site={siteQuery.data.site}
             />
           )}
+          <HostPortBindingsCard key={siteId} siteId={siteId} />
         </CardBody>
       </Card>
 

@@ -1253,7 +1253,7 @@ The same page also manages complete encrypted backups:
 3. **Upload backup file** to restore. Enter the same password and review the
    dry-run: before/after rows, additions, removals, changes, owner mappings
    and warnings. No secret values are shown. A deployment restore requires a
-   complete schema-2 snapshot; an invalid password, checksum or scope is
+   complete schema-2-or-newer snapshot; an invalid password, checksum or scope is
    refused.
 4. **Confirm full replacement** only after reviewing the impact. WAFred
    creates a fresh encrypted pre-restore backup and applies the change in one

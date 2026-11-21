@@ -55,6 +55,7 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:9080/healthz   # 期
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `WAFRED_ADMIN_PORT` / `WAFRED_GRPC_PORT` | `9080` / `9090` | Compose 发布的控制台/API 与 gRPC 主机端口；默认绑定所有网卡 |
+| `WAFRED_CUSTOM_PORT_START` / `WAFRED_CUSTOM_PORT_END` | `7000` / `7777` | 主机名自定义 HTTP/HTTPS 监听端口池，首尾均包含，共 778 个 TCP 端口；自定义范围起点需不低于 1024，且不能和宿主机 HTTP/HTTPS/API/gRPC 端口冲突；所有承载相关站点的 Agent 应使用相同范围并在防火墙/容器中开放 |
 | `WAFRED_ADMIN_PASSWORD` | `wafred123` | 初始管理员口令，首次登录强制修改；生产部署请显式设置随机值 |
 | `POSTGRES_PASSWORD` | `wafred`（开发回退） | PostgreSQL 口令；正式部署务必在 `.env` 设置随机值 |
 | `WAFRED_SECRET_KEY` | 安装器生成 | 静态加密主密钥：加密通知渠道口令、AI Provider Key、备份目标凭据。请保存在权限 `600` 的文件中并单独备份；无在线轮换，详见 [SECURITY.md](../../SECURITY.md#credentials-and-secrets) |
@@ -63,8 +64,28 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:9080/healthz   # 期
 | `WAFRED_CORS_ORIGINS` | 空 | 允许的跨域来源，逗号分隔 |
 | `WAFRED_TLS_ENABLED` | `true` | 控制台/API 使用 HTTPS（自签证书，可上传正式证书）；反代终止 TLS 时可设 `false` |
 | `WAFRED_PASSKEY_ENABLED` | `true` | 启用 Passkey 登录。Passkey 需要安全上下文：HTTPS 主机名或 `localhost`；反代后需设 `WAFRED_PASSKEY_ORIGIN` |
+| `MIMALLOC_ARENA_RESERVE` | `67108864`（镜像、Compose、systemd） | 初始内存区域预留大小为 64 MiB，并非堆内存上限；必须在进程启动前设置 |
+| `MIMALLOC_ARENA_EAGER_COMMIT` | `0`（镜像、Compose、systemd） | 按需提交内存页，减少空闲时内存占用 |
+| `MIMALLOC_ALLOW_THP` | `0`（镜像、Compose、systemd） | Linux 下禁用 WAFred 进程的透明大页，不改变宿主机全局设置 |
 
 其余变量（连接池、心跳、日志级别、Elasticsearch、限流等）见英文 [deployment.md → Configuration Reference](../deployment.md#configuration-reference)。
+
+### 空闲内存优化
+
+官方镜像、Compose、systemd 模板和二进制安装器统一使用上述三个分配器参数。内存仍可随业务增长；工作线程、缓存容量和已启用功能保持原有配置。内存页回收延迟继续按内存上限自适应。
+
+mimalloc 在 `main` 之前初始化，必须在启动前传入参数；运行中修改配置不能缩小已预留的区域。手动启动时使用：
+
+```bash
+export MIMALLOC_ARENA_RESERVE=67108864
+export MIMALLOC_ARENA_EAGER_COMMIT=0
+export MIMALLOC_ALLOW_THP=0
+wafred all-in-one
+```
+
+已有 systemd 安装可将参数写入 `/etc/wafred/wafred.env` 后重启；Compose 写入 `.env` 后重建应用容器。已有 `WAFRED_MALLOC_ARENA_RESERVE_MB`、`WAFRED_MALLOC_EAGER_COMMIT` 显式设置仍优先于运行时调优，应与启动参数保持一致。持续高负载场景可覆盖默认值，但需用实际流量比较吞吐、延迟和常驻内存后决定。
+
+核对内存时查看进程 RSS/PSS 和 `/proc/<pid>/smaps_rollup` 的 `AnonHugePages`，按相同请求、预热和空闲时间比较。VSZ 是虚拟地址空间；主机总内存还包括 PostgreSQL、Docker 等服务，且 PostgreSQL 多进程 RSS 直接相加会重复计算共享页。
 
 ## 6. TLS
 

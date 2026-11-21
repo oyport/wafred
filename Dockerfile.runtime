@@ -31,8 +31,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 4-16GB → 500ms, >16GB → 1000ms. Override with
 # WAFRED_MALLOC_PURGE_DELAY_MS
 # or MIMALLOC_PURGE_DELAY — see
-# src/allocator_tune.rs. No fixed ENV here on purpose: a pinned 1000ms
+# src/allocator_tune.rs. No fixed purge delay here: a pinned 1000ms
 # kept freed pages resident on small hosts and fed the OOM incidents.
+
+# Set these before mimalloc's load-time initialization. Reserve in smaller
+# chunks, commit on demand, and avoid THP inflating lightly used heaps.
+# This is not a heap limit; allocations can grow as traffic requires.
+ENV MIMALLOC_ARENA_RESERVE=67108864 \
+    MIMALLOC_ARENA_EAGER_COMMIT=0 \
+    MIMALLOC_ALLOW_THP=0
 
 COPY wafred /usr/local/bin/wafred
 COPY wafred.toml /etc/wafred/wafred.toml
@@ -42,7 +49,7 @@ COPY wafred.toml /etc/wafred/wafred.toml
 RUN setcap cap_net_bind_service=+ep /usr/local/bin/wafred \
     && getcap /usr/local/bin/wafred | grep -q cap_net_bind_service
 
-EXPOSE 80 443 9080 9090
+EXPOSE 80 443 7000-7777 9080 9090
 
 VOLUME ["/var/lib/wafred"]
 

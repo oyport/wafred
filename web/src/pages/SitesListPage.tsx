@@ -272,7 +272,15 @@ export function SitesListPage() {
     mutationFn: ({ id, data }: { id: string; data: UpdateSiteRequest }) =>
       sitesApi.update(id, data),
     onSuccess: (site) => {
-      toast.success(t('pages.sites.updated'), site.domain)
+      toast.success(
+        t('pages.sites.updated'),
+        site.listener_restart_required
+          ? t('pages.sites.updatedRestart', {
+              sent: site.restart_commands_sent ?? 0,
+              queued: site.restart_commands_queued ?? 0,
+            })
+          : site.domain,
+      )
       closeDialog()
       invalidate()
     },

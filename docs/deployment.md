@@ -126,6 +126,15 @@ consequences worth knowing:
   default falls back to `0.0.0.0` automatically instead of failing to start.
 - Host-side Compose ports can be changed with `WAFRED_HTTP_PORT` and
   `WAFRED_HTTPS_PORT`.
+- Hostnames can also bind dedicated HTTP/HTTPS ports in the default
+  `7000-7777` pool (778 TCP ports, inclusive). Compose publishes the pool
+  through to the container; change `WAFRED_CUSTOM_PORT_START` and
+  `WAFRED_CUSTOM_PORT_END` together in `.env` before startup to use another
+  contiguous range beginning at port 1024 or higher. Keep the range clear of
+  the host-side HTTP, HTTPS, admin and gRPC ports. Every agent that serves these sites must use the same
+  range and publish/map it through its host firewall or container runtime.
+  Each number can be shared by multiple hostnames using the same protocol,
+  but one number cannot serve HTTP and HTTPS at once.
 
 Images built from this repository grant that capability to the binary at build
 time (`setcap cap_net_bind_service=+ep /usr/local/bin/wafred`, asserted with
@@ -186,6 +195,7 @@ The systemd path solves the same problem a different way — the unit grants
 |----------|---------|-------------|
 | `WAFRED_TAG` | `latest` | WAFred image tag — pin a release in production |
 | `WAFRED_HTTP_PORT` / `WAFRED_HTTPS_PORT` | `80` / `443` | Host ports for proxied traffic |
+| `WAFRED_CUSTOM_PORT_START` / `WAFRED_CUSTOM_PORT_END` | `7000` / `7777` | Inclusive custom listener pool for per-host HTTP/HTTPS bindings |
 | `WAFRED_ADMIN_PORT` / `WAFRED_GRPC_PORT` | `9080` / `9090` | Host ports for the console/API and the agent gRPC endpoint |
 | `WAFRED_TLS_SANS` | empty | Comma-separated SANs for the self-signed console certificate |
 | `WAFRED_TLS_ENABLED` | `true` | Serve the console over HTTPS |
@@ -399,6 +409,9 @@ and therefore no file key:
 | `WAFRED_PASSKEY_ORIGIN` | derived from the request | Origin the dashboard is served from |
 | `WAFRED_PASSKEY_TRUST_FORWARDED_PROTO` | `false` | Believe `X-Forwarded-Proto` when deriving the origin |
 | `WAFRED_MALLOC_PURGE_DELAY_MS` | derived from memory ceiling | Allocator purge delay in **milliseconds** (mimalloc `mi_option_purge_delay`). Overrides the automatic bucketing (<1 GB → 0, 1-4 GB → 250, 4-16 GB → 500, >16 GB → 1000); `-1` disables purging. The standard `MIMALLOC_PURGE_DELAY` is honoured as a fallback |
+| `MIMALLOC_ARENA_RESERVE` | `67108864` (images, Compose, systemd) | Initial arena reservation size in bytes (64 MiB), not a heap limit; must be set before the process starts |
+| `MIMALLOC_ARENA_EAGER_COMMIT` | `0` (images, Compose, systemd) | Commit arena pages on demand to reduce idle memory usage |
+| `MIMALLOC_ALLOW_THP` | `0` (images, Compose, systemd) | Disable transparent huge pages for the WAFred process on Linux; leaves host-wide THP policy unchanged |
 
 > **Passkeys need a secure context.** WebAuthn only works over HTTPS under a
 > hostname (or `localhost`), never plain `http://` or a bare IP. Behind a
@@ -709,9 +722,34 @@ that share the box with PostgreSQL):
   purge); the standard `MIMALLOC_PURGE_DELAY` is honoured as a fallback. The
   effective value is logged at startup
   (`wafred: allocator retention purge_delay=...`).
-- **Set transparent hugepages to `madvise`** on the host kernel
-  (`/sys/kernel/mm/transparent_hugepage/enabled`); `always` lets the
-  hugepage backing inflate resident memory.
+- **Keep idle heaps small from process startup.** All runtime images,
+  Compose, the shipped systemd unit and the binary installer set
+  `MIMALLOC_ARENA_RESERVE=67108864`, `MIMALLOC_ARENA_EAGER_COMMIT=0` and
+  `MIMALLOC_ALLOW_THP=0`. These reserve smaller arenas, commit pages on demand
+  and disable transparent huge pages for this process on Linux. No host-wide
+  kernel setting changes are needed. The 64 MiB reservation is **not a heap
+  limit**: memory can grow as traffic and configuration require. Workers,
+  caches and enabled features retain their existing settings.
+
+  mimalloc initializes before `main`; changing runtime options cannot shrink
+  an arena already allocated. For a manually launched binary, export these
+  variables before starting it:
+
+  ```bash
+  export MIMALLOC_ARENA_RESERVE=67108864
+  export MIMALLOC_ARENA_EAGER_COMMIT=0
+  export MIMALLOC_ALLOW_THP=0
+  wafred all-in-one
+  ```
+
+  For existing systemd installations, place the variables in
+  `/etc/wafred/wafred.env` and restart the service. For Compose, use `.env`
+  and recreate the WAFred container. Explicit `WAFRED_MALLOC_ARENA_RESERVE_MB`
+  and `WAFRED_MALLOC_EAGER_COMMIT` overrides still take precedence for
+  runtime tuning; keep them consistent with the startup variables.
+  Large, sustained workloads may benefit from larger arenas or THP:
+  override these defaults and compare latency, throughput and RSS under
+  representative load before choosing a different policy.
 - **Swap is a buffer, not a substitute.** Configuring swap absorbs slow growth,
   but a sudden burst allocates faster than the kernel can swap out, so the OOM
   killer still fires first — keep the memory cap.
@@ -720,6 +758,11 @@ To observe actual memory usage, call `GET /api/v1/system/metrics` — the
 `memory` object carries the process RSS, the host totals and the cgroup
 figures the dashboard reads; see
 [System observation](./profiling.md#get-apiv1systemmetrics).
+On Linux, `/proc/<pid>/smaps_rollup` exposes RSS, PSS and `AnonHugePages` for
+verification. Compare the same workload after warm-up and an equal idle
+period; virtual address space (`VSZ`) is not resident RAM. PostgreSQL and
+Docker have separate memory costs; summing PostgreSQL process RSS also
+double-counts shared pages.
 
 ## SSL/TLS Configuration
 

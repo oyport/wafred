@@ -1,5 +1,25 @@
 # Changelog
 
+## [WAFred 1.0.4] - 2026-11-21
+
+### Added
+
+- Per-host HTTP and HTTPS listener bindings for primary and alternate site
+  hostnames, with a default custom port pool of `7000`–`7777` (778 ports).
+- Agent listener generation, HTTPS redirect port handling, version gating,
+  persisted binding configuration, and restart requests when a listener changes.
+- Compose port publishing and deployment documentation for configurable
+  `WAFRED_CUSTOM_PORT_START` / `WAFRED_CUSTOM_PORT_END` ranges.
+
+### Changed
+
+- Bumped the workspace release to `1.0.4` so the control plane can prevent
+  older Agents from silently ignoring custom listener assignments.
+- Reduced idle allocator overhead with consistent startup defaults across
+  runtime images, Compose and systemd: 64 MiB arena reservations, on-demand
+  commitment and process-local transparent huge pages disabled on Linux.
+  Heap growth, worker counts, cache capacities and enabled features are unchanged.
+
 This file now tracks **WAFred**, an independent project derived from the
 Apache-2.0-licensed [PingWAF](https://github.com/shuaiZend/PingWAF) codebase.
 The original PingWAF release history is retained below for provenance; the

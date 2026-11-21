@@ -531,6 +531,7 @@
       "count": "{{count}} サイト",
       "created": "作成日",
       "updated": "サイトが更新されました",
+      "updatedRestart": "ホスト名の変更により Agent の再起動を要求しました（送信 {{sent}}、キュー {{queued}}）",
       "deleted": "サイトが削除されました",
       "deleteTitle": "サイトを削除",
       "deleteDescription": "この操作は元に戻せません。このサイトのすべてのルールとログが permanently 削除されます。",
@@ -2858,6 +2859,19 @@
     "basic": {
       "title": "基本",
       "description": "オリジンプール・負荷分散・ルーティング・信頼プロキシ設定を管理します",
+      "hostBindings": {
+        "title": "ドメインのポート割り当て",
+        "description": "プライマリと代替ホスト名ごとに HTTP/HTTPS の待受ポートを設定します。ポート変更時は対象 Agent が再起動し、一時的に通信が中断することがあります。",
+        "rangeHint": "標準ポートは HTTP 80、HTTPS 443 です。カスタム範囲は {{min}}-{{max}}。カスタム HTTPS にはサイトの HTTPS 有効化が必要です。空欄にするとそのプロトコルを無効にします。",
+        "http": "HTTP ポート",
+        "https": "HTTPS ポート",
+        "disabled": "無効",
+        "invalidPort": "HTTP 80、HTTPS 443、または {{min}}-{{max}} の整数を指定し、少なくとも一方のプロトコルを有効にしてください。",
+        "protocolCollision": "同じ TCP ポートを HTTP と HTTPS の両方には設定できません。",
+        "restartHint": "割り当てを変更すると対象 Agent に制御された再起動を要求します。オフライン Agent は次回接続時に適用されます。フォアグラウンドで実行中の Agent は運用担当者が再起動してください。",
+        "saved": "ドメインのポート割り当てを保存しました",
+        "savedRestart": "保存しました。オンライン Agent {{sent}} 台に再起動を要求、{{queued}} 台はキューに追加しました"
+      },
       "addPool": "プールを追加",
       "editPool": "オリジンプールを編集",
       "poolCreateDescription": "オリジンプールは、負荷分散アルゴリズムと通信プロトコルを共有するオリジンノードのグループです。",

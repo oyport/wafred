@@ -107,6 +107,7 @@ mod m20240101_000096_demo_account;
 pub mod m20240101_000097_path_exception_regex;
 pub mod m20240101_000098_rule_managed_rule_id;
 pub mod m20240101_000099_agent_peer_ip;
+pub mod m20240101_000100_site_host_bindings;
 
 use sea_orm_migration::prelude::*;
 
@@ -229,6 +230,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20240101_000097_path_exception_regex::Migration),
             Box::new(m20240101_000098_rule_managed_rule_id::Migration),
             Box::new(m20240101_000099_agent_peer_ip::Migration),
+            Box::new(m20240101_000100_site_host_bindings::Migration),
         ]
     }
 }

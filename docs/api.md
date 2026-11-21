@@ -561,6 +561,42 @@ Create a new site. `upstream_address` is required: a site without an origin cann
 
 **Response (201):** Site object.
 
+### GET /sites/{site_id}/host-bindings
+
+Get the primary and alternate hostnames with their HTTP and HTTPS listener
+ports. Existing sites default to `80` and `443`. The deployment's custom
+range is returned as inclusive `allowed_port_start` / `allowed_port_end`.
+
+### PUT /sites/{site_id}/host-bindings
+
+Replace the full binding list. Every hostname currently configured on the site
+must appear exactly once. Set a protocol port to `null` to disable it; each
+hostname must retain at least one protocol. HTTP accepts `80` or a port in the
+configured custom range; HTTPS accepts `443` or a port in that range. A TCP
+port may be shared by multiple hostnames for the same protocol, but cannot
+serve both HTTP and HTTPS. The default custom range is `7000`–`7777`
+(inclusive, 778 ports); deployments can set `WAFRED_CUSTOM_PORT_START` and
+`WAFRED_CUSTOM_PORT_END` before starting the service. The range must start at
+1024 or higher and must not overlap reserved HTTP, HTTPS, admin or gRPC listeners.
+Custom HTTPS ports require HTTPS to be enabled on the site. If HTTPS redirects
+are enabled, every hostname must retain an HTTPS listener.
+
+**Request:**
+```json
+{
+  "bindings": [
+    { "hostname": "example.com", "http_port": 7000, "https_port": 7001 },
+    { "hostname": "api.example.com", "http_port": 7002, "https_port": 7003 }
+  ]
+}
+```
+
+Changing a binding saves the configuration and requests an Agent process
+restart because the listener set is fixed at startup. The response includes
+`restart_required`, `restart_commands_sent` and `restart_commands_queued`;
+managed Compose/systemd deployments restart the process through their service
+supervisor. Site write permission is required.
+
 ### GET /sites/{site_id}
 
 Get site details including upstreams and SSL config.
@@ -5253,7 +5289,7 @@ recorded — the restore itself still succeeded. The preview (from the upload
 or the `preview` endpoint) reports before/after counts, additions, removals,
 changes, owner mappings and warnings.
 
-A deployment restore requires a complete schema-2 snapshot. Missing tables are rejected, while an explicitly empty table means an empty configuration. Site ownership is restored when the original owner exists, otherwise the requesting administrator is used as the explicit default owner. Uploads claiming an unsupported algorithm, excessive KDF costs, an invalid scope, a wrong password or a mismatched checksum are refused.
+A deployment restore requires a complete schema-2-or-newer snapshot. Current exports use schema 3; schema 1/2 site snapshots remain readable and restore host bindings to the legacy `80`/`443` defaults. Missing tables in a current snapshot are rejected, while an explicitly empty table means an empty configuration. Site ownership is restored when the original owner exists, otherwise the requesting administrator is used as the explicit default owner. Uploads claiming an unsupported algorithm, excessive KDF costs, an invalid scope, a wrong password or a mismatched checksum are refused.
 
 **Agent capability gating.** A restore is also validated against the current
 fleet before it is applied: every path scope in the snapshot is checked

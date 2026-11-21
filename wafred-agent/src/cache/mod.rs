@@ -139,6 +139,10 @@ pub struct SiteRules {
     pub site_id: String,
     pub domain: String,
     pub alternate_domains: Vec<String>,
+    /// Per-host HTTP/HTTPS listener assignments. Missing values in old cache
+    /// files are reconstructed as the legacy 80/443 defaults.
+    #[serde(default)]
+    pub host_bindings: Vec<HostPortBinding>,
     /// Lifecycle status (`active`/`paused`/`pending`); caches written before
     /// the edge consumed it default to `active`.
     #[serde(default = "default_site_status")]
@@ -199,6 +203,13 @@ pub struct SiteRules {
     /// Explicit path restrictions, evaluated before any exception bypass.
     #[serde(default)]
     pub path_restrictions: Vec<PathRestrictionConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostPortBinding {
+    pub hostname: String,
+    pub http_port: Option<u16>,
+    pub https_port: Option<u16>,
 }
 
 /// Serializable mirror of the proto `PathException`.
@@ -1731,12 +1742,21 @@ impl RuleCache {
             .sites
             .get(&site_id)
             .map(|site| site.downstream_timeout_secs);
+        let previous_host_bindings = self
+            .inner
+            .load()
+            .sites
+            .get(&site_id)
+            .map(|site| site.host_bindings.clone());
         let mut converted = Self::convert_bundle(bundle);
         // A rule bundle does not carry site-level fields. Preserve the value
         // learned from the full SiteConfig instead of resetting it to 60 on
         // every incremental rule sync.
         if let Some(timeout) = previous_timeout {
             converted.downstream_timeout_secs = timeout;
+        }
+        if let Some(bindings) = previous_host_bindings {
+            converted.host_bindings = bindings;
         }
         let site_rules = Arc::new(converted);
         let domain = site_rules.domain.clone();
@@ -1944,6 +1964,29 @@ impl RuleCache {
                     site_rules.site_id = site.id.clone();
                     site_rules.alternate_domains =
                         site.alternate_domains.clone();
+                    site_rules.host_bindings = if site.host_bindings.is_empty() {
+                        std::iter::once(site.domain.as_str())
+                            .chain(site.alternate_domains.iter().map(String::as_str))
+                            .map(|hostname| HostPortBinding {
+                                hostname: hostname.to_string(),
+                                http_port: Some(80),
+                                https_port: Some(443),
+                            })
+                            .collect()
+                    } else {
+                        site.host_bindings
+                            .iter()
+                            .map(|binding| HostPortBinding {
+                                hostname: binding.hostname.clone(),
+                                http_port: u16::try_from(binding.http_port)
+                                    .ok()
+                                    .filter(|port| *port > 0),
+                                https_port: u16::try_from(binding.https_port)
+                                    .ok()
+                                    .filter(|port| *port > 0),
+                            })
+                            .collect()
+                    };
                     site_rules.status = site_status_str(site.status);
                     site_rules.downstream_timeout_secs =
                         if site.downstream_timeout_secs == 0 {
@@ -2924,6 +2967,7 @@ impl RuleCache {
             site_id: bundle.site_id.clone(),
             domain: String::new(), // Will be set from Site if available
             alternate_domains: Vec::new(),
+            host_bindings: Vec::new(),
             // Set from the owning `Site` in `update_from_site_config`.
             status: default_site_status(),
             downstream_timeout_secs: default_downstream_timeout_secs(),
@@ -4246,6 +4290,7 @@ mod tests {
                     site_id: "site-1".to_string(),
                     domain: "example.com".to_string(),
                     alternate_domains: Vec::new(),
+                    host_bindings: Vec::new(),
                     status: site_status::PAUSED.to_string(),
                     downstream_timeout_secs: 60,
                     waf_config: None,
@@ -4415,6 +4460,7 @@ mod tests {
                 site_id: "site-1".to_string(),
                 domain: DOMAIN.to_string(),
                 alternate_domains: Vec::new(),
+                host_bindings: Vec::new(),
                 status: site_status::ACTIVE.to_string(),
                 downstream_timeout_secs: 60,
                 waf_config: None,

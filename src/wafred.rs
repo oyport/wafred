@@ -17,7 +17,7 @@
 //! Handles the three operating modes: Server (control plane only),
 //! Agent (data plane only), and AllInOne (both in a single process).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,7 +51,7 @@ use pingora::server;
 use pingora::server::configuration::Opt;
 use pingora::services::background::background_service;
 use pingwaf_agent::cache::{
-    CachedRules, CustomErrorPage, HealthCheckConfig, OidcConfig,
+    CachedRules, CustomErrorPage, HealthCheckConfig, HostPortBinding, OidcConfig,
     ResponseReplaceConfig, RuleCache, SslConfig,
 };
 use pingwaf_agent::config::AgentConfig;
@@ -66,6 +66,20 @@ pub enum RunMode {
     Agent(Box<AgentConfig>),
     /// Both control plane and data plane in a single process
     AllInOne(Box<ServerConfig>, Box<AgentConfig>),
+}
+
+static AGENT_RESTART_NOTIFY: tokio::sync::Notify =
+    tokio::sync::Notify::const_new();
+
+async fn install_agent_restart_handler(
+    agent: &pingwaf_agent::WafredAgent,
+) {
+    agent
+        .set_restart_handler(|graceful| {
+            info!(graceful, "agent process restart requested by control plane");
+            AGENT_RESTART_NOTIFY.notify_one();
+        })
+        .await;
 }
 
 /// Convert CLI server options into a `ServerConfig`.
@@ -229,6 +243,14 @@ pub(crate) fn public_listen_addr(
             }
         }
     }
+    if ipv6_wildcard_bindable() {
+        format!("[::]:{port}")
+    } else {
+        format!("0.0.0.0:{port}")
+    }
+}
+
+fn public_listen_addr_for_port(port: u16) -> String {
     if ipv6_wildcard_bindable() {
         format!("[::]:{port}")
     } else {
@@ -422,9 +444,8 @@ fn site_posture_plugins(
         names.push(name);
     }
 
-    // The redirect plugin compares the request's TLS state against the
-    // desired one, so sharing a location between :80 and :443 is safe — only
-    // the plaintext listener redirects.
+    // The redirect plugin is attached to each HTTP host binding below; its
+    // target port is adjusted when the HTTPS binding is not the standard 443.
     if ssl.always_use_https {
         let name = format!("{site_id}_https");
         let mut conf = PluginConf::new();
@@ -433,6 +454,7 @@ fn site_posture_plugins(
             toml::Value::String("redirect".to_string()),
         );
         conf.insert("http_to_https".to_string(), toml::Value::Boolean(true));
+        conf.insert("https_port".to_string(), toml::Value::Integer(443));
         conf.insert("status".to_string(), toml::Value::Integer(301));
         plugins.insert(name.clone(), conf);
         names.push(name);
@@ -867,6 +889,70 @@ fn site_has_cache_policy(site: &pingwaf_agent::cache::SiteRules) -> bool {
         })
 }
 
+fn custom_listener_port_allowed(port: u16) -> bool {
+    let start = std::env::var("WAFRED_CUSTOM_PORT_START")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .unwrap_or(7000);
+    let end = std::env::var("WAFRED_CUSTOM_PORT_END")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .unwrap_or(7777);
+    if start >= 1024 && start <= end && (start..=end).contains(&port) {
+        true
+    } else {
+        warn!(
+            port,
+            start,
+            end,
+            "custom host listener is outside the agent's configured port range; binding skipped"
+        );
+        false
+    }
+}
+
+fn adjust_binding_redirect(
+    location: &mut LocationConf,
+    site_id: &str,
+    is_http: bool,
+    https_port: Option<u16>,
+    plugins: &mut HashMap<String, PluginConf>,
+) {
+    let base_name = format!("{site_id}_https");
+    let Some(names) = location.plugins.as_mut() else {
+        return;
+    };
+    let Some(index) = names.iter().position(|name| name == &base_name) else {
+        return;
+    };
+    if !is_http {
+        names.remove(index);
+        return;
+    }
+    let Some(port) = https_port else {
+        names.remove(index);
+        return;
+    };
+    if port == 443 {
+        return;
+    }
+    let custom_name = format!("{site_id}_https_to_{port}");
+    if !plugins.contains_key(&custom_name)
+        && let Some(mut conf) = plugins.get(&base_name).cloned()
+    {
+        conf.insert(
+            "https_port".to_string(),
+            toml::Value::Integer(i64::from(port)),
+        );
+        plugins.insert(custom_name.clone(), conf);
+    }
+    if plugins.contains_key(&custom_name) {
+        names[index] = custom_name;
+    } else {
+        names.remove(index);
+    }
+}
+
 fn cached_rules_to_pingap_config(
     cached: &CachedRules,
     cache_dir: &Path,
@@ -888,6 +974,8 @@ fn cached_rules_to_pingap_config(
     let mut locations: HashMap<String, LocationConf> = HashMap::new();
     let mut certificates: HashMap<String, CertificateConf> = HashMap::new();
     let mut location_names: Vec<String> = Vec::new();
+    let mut location_prototypes_by_site: HashMap<String, Vec<String>> =
+        HashMap::new();
     // PEM bundle of the CAs every mTLS-enabled site trusts. The listener
     // verifies client certificates as a whole, so the anchor is the union
     // across sites; pinning a certificate to its site is left to the WAF
@@ -1004,6 +1092,7 @@ fn cached_rules_to_pingap_config(
         if site.domain.is_empty() {
             continue;
         }
+        let mut site_location_names = Vec::new();
 
         // Only a site that actually serves HTTPS contributes a protocol to
         // the shared listener.
@@ -1205,6 +1294,7 @@ fn cached_rules_to_pingap_config(
                 },
             );
             location_names.push(loc_name);
+            site_location_names.push(format!("{site_id}_loc"));
         }
 
         for route in &site.routes {
@@ -1286,6 +1376,8 @@ fn cached_rules_to_pingap_config(
                 },
             );
             location_names.push(loc_name);
+            site_location_names
+                .push(format!("{site_id}_route_{}", route.id));
         }
 
         // Convert SSL certificate: an uploaded PEM is served as-is, while a
@@ -1328,6 +1420,9 @@ fn cached_rules_to_pingap_config(
             mtls_ca_bundle.push_str(ssl.mtls_client_ca.trim());
             mtls_ca_bundle.push('\n');
         }
+
+        location_prototypes_by_site
+            .insert(site_id.clone(), site_location_names);
     }
 
     // Host fallback pages: only when at least one enabled error page carries
@@ -1411,20 +1506,229 @@ fn cached_rules_to_pingap_config(
         return None;
     }
 
-    // TLS is a per-server switch in pingap: `global_certificates` turns it
-    // on for every address that server listens on, so 80 and 443 cannot
-    // share one server — a merged listener ran plaintext HTTP through TLS
-    // handshakes, which also broke ACME HTTP-01 validation on port 80.
-    //
-    // 443 is bound even before the first certificate exists: the listener
-    // comes up with an empty provider and handshakes fail until issuance
-    // completes, but the moment a certificate is issued or uploaded the
-    // provider serves it — no restart, no listener rebuild. Binding 443
-    // only once a certificate existed left fresh deployments with the port
-    // closed until the whole process restarted.
+    // TLS is a per-server switch in pingap, so each numeric port has one
+    // protocol. Host-specific locations are cloned onto their assigned port;
+    // the standard 80/443 listeners stay present for compatibility.
+    let has_unmatched_host_location =
+        locations.contains_key(UNMATCHED_HOST_LOCATION_NAME);
+    // Keep source locations available while custom-site prototypes are
+    // removed from the final location map. Each custom binding gets a clone
+    // with its own exact hostname match. Legacy sites avoid the extra copies.
+    let mut prototype_locations: HashMap<String, LocationConf> =
+        HashMap::new();
+    let mut legacy_default_sites = BTreeSet::new();
+    for (site_id, site) in &cached.sites {
+        let Some(prototypes) = location_prototypes_by_site.get(site_id) else {
+            continue;
+        };
+        let expected: BTreeSet<String> =
+            std::iter::once(site.domain.to_ascii_lowercase())
+                .chain(
+                    site.alternate_domains
+                        .iter()
+                        .map(|hostname| hostname.to_ascii_lowercase()),
+                )
+                .collect();
+        let default_bindings: Vec<HostPortBinding> =
+            std::iter::once(site.domain.as_str())
+                .chain(site.alternate_domains.iter().map(String::as_str))
+                .map(|hostname| HostPortBinding {
+                    hostname: hostname.to_string(),
+                    http_port: Some(80),
+                    https_port: Some(443),
+                })
+                .collect();
+        let bindings = if site.host_bindings.is_empty() {
+            &default_bindings
+        } else {
+            &site.host_bindings
+        };
+        let actual: BTreeSet<String> = bindings
+            .iter()
+            .map(|binding| binding.hostname.to_ascii_lowercase())
+            .collect();
+        if actual == expected
+            && bindings.iter().all(|binding| {
+                binding.http_port == Some(80)
+                    && binding.https_port == Some(443)
+            })
+        {
+            // Preserve the original location keys and one shared location per
+            // site when every hostname still uses the legacy listeners.
+            legacy_default_sites.insert(site_id.clone());
+        } else {
+            for name in prototypes {
+                if let Some(location) = locations.get(name).cloned() {
+                    prototype_locations.insert(name.clone(), location);
+                }
+                locations.remove(name);
+            }
+        }
+    }
+
+    let mut http_locations: BTreeMap<u16, Vec<String>> =
+        BTreeMap::from([(80, Vec::new())]);
+    let mut https_locations: BTreeMap<u16, Vec<String>> =
+        BTreeMap::from([(443, Vec::new())]);
+    for (site_id, site) in &cached.sites {
+        let Some(prototypes) = location_prototypes_by_site.get(site_id) else {
+            continue;
+        };
+        let default_bindings: Vec<HostPortBinding> =
+            std::iter::once(site.domain.as_str())
+                .chain(site.alternate_domains.iter().map(String::as_str))
+                .map(|hostname| HostPortBinding {
+                    hostname: hostname.to_string(),
+                    http_port: Some(80),
+                    https_port: Some(443),
+                })
+                .collect();
+        let bindings = if site.host_bindings.is_empty() {
+            &default_bindings
+        } else {
+            &site.host_bindings
+        };
+        if legacy_default_sites.contains(site_id) {
+            http_locations
+                .get_mut(&80)
+                .expect("standard HTTP listener")
+                .extend(prototypes.iter().cloned());
+            let redirect_name = format!("{site_id}_https");
+            let has_redirect = prototypes.iter().any(|prototype| {
+                locations.get(prototype).is_some_and(|location| {
+                    location.plugins.as_ref().is_some_and(|names| {
+                        names.iter().any(|name| name == &redirect_name)
+                    })
+                })
+            });
+            if has_redirect {
+                // The HTTP location redirects, while its TLS counterpart must
+                // run the same WAF/route chain without redirecting again.
+                for (binding_index, binding) in bindings.iter().enumerate() {
+                    for prototype in prototypes {
+                        let Some(mut location) = locations.get(prototype).cloned()
+                        else {
+                            continue;
+                        };
+                        location.host = Some(binding.hostname.clone());
+                        if location
+                            .site_hosts
+                            .as_ref()
+                            .is_some_and(|hosts| !hosts.is_empty())
+                        {
+                            location.site_hosts = Some(vec![
+                                binding.hostname.trim().to_ascii_lowercase(),
+                            ]);
+                        }
+                        adjust_binding_redirect(
+                            &mut location,
+                            site_id,
+                            false,
+                            binding.https_port,
+                            &mut plugins,
+                        );
+                        let name = format!(
+                            "{prototype}_binding_{binding_index}_https"
+                        );
+                        locations.insert(name.clone(), location);
+                        https_locations
+                            .get_mut(&443)
+                            .expect("standard TLS listener")
+                            .push(name);
+                    }
+                }
+            } else {
+                https_locations
+                    .get_mut(&443)
+                    .expect("standard TLS listener")
+                    .extend(prototypes.iter().cloned());
+            }
+            continue;
+        }
+        for (binding_index, binding) in bindings.iter().enumerate() {
+            for (is_http, port) in [
+                (true, binding.http_port),
+                (false, binding.https_port),
+            ] {
+                let Some(port) = port else {
+                    continue;
+                };
+                let standard_port = if is_http { 80 } else { 443 };
+                if port != standard_port && !custom_listener_port_allowed(port)
+                {
+                    continue;
+                }
+                let listener_locations = if is_http {
+                    http_locations.entry(port).or_default()
+                } else {
+                    https_locations.entry(port).or_default()
+                };
+                for prototype in prototypes {
+                    let Some(mut location) =
+                        prototype_locations.get(prototype).cloned()
+                    else {
+                        continue;
+                    };
+                    let listener_suffix = if is_http { "http" } else { "https" };
+                    let name = format!(
+                        "{prototype}_binding_{binding_index}_{listener_suffix}"
+                    );
+                    location.host = Some(binding.hostname.clone());
+                    if location
+                        .site_hosts
+                        .as_ref()
+                        .is_some_and(|hosts| !hosts.is_empty())
+                    {
+                        location.site_hosts = Some(vec![
+                            binding.hostname.trim().to_ascii_lowercase(),
+                        ]);
+                    }
+                    adjust_binding_redirect(
+                        &mut location,
+                        site_id,
+                        is_http,
+                        binding.https_port,
+                        &mut plugins,
+                    );
+                    locations.insert(name.clone(), location);
+                    listener_locations.push(name);
+                }
+            }
+        }
+    }
+    if has_unmatched_host_location {
+        for names in http_locations.values_mut() {
+            names.push(UNMATCHED_HOST_LOCATION_NAME.to_string());
+        }
+        for names in https_locations.values_mut() {
+            names.push(UNMATCHED_HOST_LOCATION_NAME.to_string());
+        }
+    }
+
+    // A corrupt/out-of-band configuration must not attempt to bind the same
+    // TCP socket as both TLS and plaintext HTTP.
+    let protocol_conflicts: Vec<u16> = http_locations
+        .keys()
+        .filter(|port| https_locations.contains_key(port))
+        .copied()
+        .filter(|port| *port != 80 && *port != 443)
+        .collect();
+    for port in protocol_conflicts {
+        warn!(port, "HTTP/HTTPS port conflict; custom listener omitted");
+        http_locations.remove(&port);
+        https_locations.remove(&port);
+    }
+
+    location_names.clear();
+    for names in http_locations.values().chain(https_locations.values()) {
+        location_names.extend(names.iter().cloned());
+    }
+    location_names.sort();
+    location_names.dedup();
+
     if certificates.is_empty() {
         warn!(
-            "data plane: no certificates yet — TLS handshakes on 443 will \
+            "data plane: no certificates yet — TLS handshakes on HTTPS listeners will \
              fail until one is issued or uploaded"
         );
     }
@@ -1439,38 +1743,56 @@ fn cached_rules_to_pingap_config(
         443,
     );
     let mut servers: HashMap<String, PingapServerConf> = HashMap::new();
-    servers.insert(
-        "wafred".to_string(),
-        PingapServerConf {
-            ipv6_only: all_addrs_ipv6(&public_http_addr).then_some(false),
-            addr: public_http_addr,
-            locations: Some(location_names.clone()),
-            global_certificates: Some(false),
-            ..Default::default()
-        },
-    );
-    servers.insert(
-        "wafred_tls".to_string(),
-        PingapServerConf {
-            ipv6_only: all_addrs_ipv6(&public_https_addr).then_some(false),
-            addr: public_https_addr,
-            locations: Some(location_names),
-            global_certificates: Some(true),
-            client_ca_pem: (!mtls_ca_bundle.is_empty())
-                .then_some(mtls_ca_bundle),
-            // Without these the listener stayed on pingap's default
-            // (`enabled_h2 = false`), which is why no site ever negotiated
-            // HTTP/2. A deployment with no HTTPS site leaves both unset:
-            // writing `false/false` would trip pingap-config's
-            // "at least one protocol" validation and the listener would not
-            // start at all.
-            enabled_h2: (listener_http1 || listener_http2)
-                .then_some(listener_http2),
-            http1_enabled: (listener_http1 || listener_http2)
-                .then_some(listener_http1 || !listener_http2),
-            ..Default::default()
-        },
-    );
+    for (port, names) in http_locations {
+        let addr = if port == 80 {
+            public_http_addr.clone()
+        } else {
+            public_listen_addr_for_port(port)
+        };
+        let name = if port == 80 {
+            "wafred".to_string()
+        } else {
+            format!("wafred_http_{port}")
+        };
+        servers.insert(
+            name,
+            PingapServerConf {
+                ipv6_only: all_addrs_ipv6(&addr).then_some(false),
+                addr,
+                locations: Some(names),
+                global_certificates: Some(false),
+                ..Default::default()
+            },
+        );
+    }
+    for (port, names) in https_locations {
+        let addr = if port == 443 {
+            public_https_addr.clone()
+        } else {
+            public_listen_addr_for_port(port)
+        };
+        let name = if port == 443 {
+            "wafred_tls".to_string()
+        } else {
+            format!("wafred_tls_{port}")
+        };
+        servers.insert(
+            name,
+            PingapServerConf {
+                ipv6_only: all_addrs_ipv6(&addr).then_some(false),
+                addr,
+                locations: Some(names),
+                global_certificates: Some(true),
+                client_ca_pem: (!mtls_ca_bundle.is_empty())
+                    .then_some(mtls_ca_bundle.clone()),
+                enabled_h2: (listener_http1 || listener_http2)
+                    .then_some(listener_http2),
+                http1_enabled: (listener_http1 || listener_http2)
+                    .then_some(listener_http1 || !listener_http2),
+                ..Default::default()
+            },
+        );
+    }
 
     // A generated site must not accept an unbounded request body by default.
     // Explicit per-location caps from the control plane still win.
@@ -2169,6 +2491,7 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
                 "starting WAFred in Agent mode (data plane only)"
             );
             let agent = pingwaf_agent::start_agent(*config).await?;
+            install_agent_restart_handler(&agent).await;
             let upgrade = pingwaf_agent::upgrade::spawn(Arc::clone(&agent));
             info!("WAFred agent is running, starting data plane proxy");
 
@@ -2180,8 +2503,13 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
                 }
             });
 
-            // Wait for shutdown signal
-            shutdown_signal().await;
+            // Wait for an operator signal or a control-plane restart request.
+            tokio::select! {
+                _ = shutdown_signal() => {},
+                _ = AGENT_RESTART_NOTIFY.notified() => {
+                    info!("restarting agent process to apply listener changes");
+                },
+            }
             upgrade.abort();
             agent.shutdown().await;
             proxy_handle.abort();
@@ -2227,7 +2555,10 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
             // Start the agent in the background first.
             // It will retry connecting to the server until it comes up.
             let agent = match pingwaf_agent::start_agent(*agent_config).await {
-                Ok(agent) => Some(agent),
+                Ok(agent) => {
+                    install_agent_restart_handler(&agent).await;
+                    Some(agent)
+                },
                 Err(e) => {
                     error!(error = %e, "failed to start agent, continuing with server only");
                     None
@@ -2247,7 +2578,14 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
             };
 
             // Run the server (blocks until shutdown signal)
-            let result = pingwaf_server::start_server(*server_config).await;
+            let server = pingwaf_server::start_server(*server_config);
+            let result = tokio::select! {
+                result = server => result,
+                _ = AGENT_RESTART_NOTIFY.notified() => {
+                    info!("restarting all-in-one process to apply listener changes");
+                    Ok(())
+                },
+            };
 
             // Gracefully shut down the agent
             if let Some(agent) = agent {
