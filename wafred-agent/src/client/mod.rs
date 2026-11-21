@@ -228,7 +228,8 @@ impl ControlPlaneClient {
         &self,
         handler: impl Fn(bool) + Send + Sync + 'static,
     ) {
-        self.command_handlers.write().await.on_restart = Some(Box::new(handler));
+        self.command_handlers.write().await.on_restart =
+            Some(Box::new(handler));
     }
 
     /// Queue a log entry for shipping to the server (non-blocking).

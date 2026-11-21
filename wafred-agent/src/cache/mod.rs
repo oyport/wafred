@@ -1964,9 +1964,14 @@ impl RuleCache {
                     site_rules.site_id = site.id.clone();
                     site_rules.alternate_domains =
                         site.alternate_domains.clone();
-                    site_rules.host_bindings = if site.host_bindings.is_empty() {
+                    site_rules.host_bindings = if site.host_bindings.is_empty()
+                    {
                         std::iter::once(site.domain.as_str())
-                            .chain(site.alternate_domains.iter().map(String::as_str))
+                            .chain(
+                                site.alternate_domains
+                                    .iter()
+                                    .map(String::as_str),
+                            )
                             .map(|hostname| HostPortBinding {
                                 hostname: hostname.to_string(),
                                 http_port: Some(80),

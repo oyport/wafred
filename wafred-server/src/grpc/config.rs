@@ -14,12 +14,12 @@ use pingwaf_proto::control_plane::{
     AiBotPolicy, AiCrawlConfig, BasicAuthConfig, BasicAuthCredential,
     BotProtectionConfig, CacheRule, CacheTypeCategory, CacheTypePolicy,
     ChallengeConfig, CustomErrorPage, FailoverMode, GeoConfig,
-    GlobalCacheSettings, HealthCheckConfig, IpAccessRule, LogSettings,
-    OidcAccessRule, OidcConfig, OidcHeaderClaim, PathException, PathMatchType,
-    PathRestriction, RateLimitRule, ResponseReplaceConfig, ResponseReplaceRule,
-    HostPortBinding, RewriteOperation, RewriteRule, RouteConfig, RuleBundle,
-    RuleOverride, Site, SiteCacheSettings, SiteConfig, SitePolicy, SslConfig,
-    UpstreamConfig, UpstreamPeer, WafConfig, WafRule,
+    GlobalCacheSettings, HealthCheckConfig, HostPortBinding, IpAccessRule,
+    LogSettings, OidcAccessRule, OidcConfig, OidcHeaderClaim, PathException,
+    PathMatchType, PathRestriction, RateLimitRule, ResponseReplaceConfig,
+    ResponseReplaceRule, RewriteOperation, RewriteRule, RouteConfig,
+    RuleBundle, RuleOverride, Site, SiteCacheSettings, SiteConfig, SitePolicy,
+    SslConfig, UpstreamConfig, UpstreamPeer, WafConfig, WafRule,
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -43,10 +43,10 @@ use crate::models::{
     challenge_settings, characteristic, client_cert_status, defense_settings,
     error_pages, geo_rules, ip_access_rules, ip_group_sites, ip_groups, mode,
     mtls_client_certificate, oidc_provider, path_exceptions, path_restrictions,
-    rate_limit_rules, rewrite_rules, rule, rule_groups, site,
-    site_host_bindings, site_basic_auth, site_certificates, site_oidc,
-    site_oidc as site_oidc_model, site_routes,
-    site_ssl, site_status, site_upstream_pools, site_upstreams, waf_settings,
+    rate_limit_rules, rewrite_rules, rule, rule_groups, site, site_basic_auth,
+    site_certificates, site_host_bindings, site_oidc,
+    site_oidc as site_oidc_model, site_routes, site_ssl, site_status,
+    site_upstream_pools, site_upstreams, waf_settings,
 };
 use crate::pki::mtls::normalise_fingerprint;
 
@@ -2205,11 +2205,7 @@ pub async fn build_site_config(
                 .remove(&row.id)
                 .unwrap_or_else(|| {
                     std::iter::once(row.domain.as_str())
-                        .chain(
-                            row.alternate_domains
-                                .iter()
-                                .map(String::as_str),
-                        )
+                        .chain(row.alternate_domains.iter().map(String::as_str))
                         .map(|hostname| HostPortBinding {
                             hostname: hostname.to_string(),
                             http_port: 80,

@@ -510,9 +510,8 @@ pub fn normalise_tables(
                 {
                     hostnames.push(domain.to_string());
                 }
-                if let Some(alternates) = site
-                    .get("alternate_domains")
-                    .and_then(Value::as_array)
+                if let Some(alternates) =
+                    site.get("alternate_domains").and_then(Value::as_array)
                 {
                     hostnames.extend(
                         alternates
