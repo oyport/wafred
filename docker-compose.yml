@@ -58,6 +58,7 @@ services:
       # without touching the compose file; container-side ports stay fixed.
       - "${WAFRED_HTTP_PORT:-80}:80"       # HTTP traffic (proxied)
       - "${WAFRED_HTTPS_PORT:-443}:443"    # HTTPS traffic (proxied)
+      - "${WAFRED_CUSTOM_PORT_START:-7000}-${WAFRED_CUSTOM_PORT_END:-7777}:${WAFRED_CUSTOM_PORT_START:-7000}-${WAFRED_CUSTOM_PORT_END:-7777}/tcp" # Per-host custom HTTP/HTTPS listeners
       - "${WAFRED_ADMIN_PORT:-9080}:9080"  # Admin dashboard + REST API
       - "${WAFRED_GRPC_PORT:-9090}:9090"   # gRPC control plane (agents connect here)
     environment:
@@ -72,6 +73,8 @@ services:
       - WAFRED_JWT_SECRET=${WAFRED_JWT_SECRET:-change-me-in-production-use-32-chars}
       - WAFRED_ADMIN_ADDR=0.0.0.0:9080
       - WAFRED_GRPC_ADDR=0.0.0.0:9090
+      - WAFRED_CUSTOM_PORT_START=${WAFRED_CUSTOM_PORT_START:-7000}
+      - WAFRED_CUSTOM_PORT_END=${WAFRED_CUSTOM_PORT_END:-7777}
       - WAFRED_ADMIN_EMAIL=${WAFRED_ADMIN_EMAIL:-admin@wafred.local}
       - WAFRED_ADMIN_PASSWORD=${WAFRED_ADMIN_PASSWORD:-wafred123}
       - WAFRED_ALLOW_REGISTRATION=${WAFRED_ALLOW_REGISTRATION:-false}
@@ -85,17 +88,14 @@ services:
       # production; never set this on a real deployment.
       - PINGAP_ACME_STAGING=${PINGAP_ACME_STAGING:-}
       - RUST_LOG=${RUST_LOG:-info,sqlx=warn}
-      # ── Allocator reservation (must be in the environment, not the code) ──
-      # mimalloc reserves a 1 GiB arena by default on 64-bit and, on a Linux
-      # overcommit kernel, commits that whole reservation up front — the
-      # `[anon:mimalloc]` mapping with Size 1 GiB / Rss 93 MB in the
-      # 2026-11-06 `smaps`. 67108864 bytes = 64 MiB, sized for the 768 MiB
-      # ceiling above; raise it together with WAFRED_MEM_LIMIT (e.g. 256 MiB
-      # for 2 GiB, 512 MiB for 8 GiB — see src/allocator_tune.rs).
-      # These are parsed by mimalloc before `main`, which is exactly why they
-      # belong here: mi_option_set cannot shrink an arena that already exists.
+      # Allocator startup defaults, matching all runtime images and systemd.
+      # These must exist before main: runtime tuning cannot shrink an arena
+      # already reserved by mimalloc's initialization. 64 MiB is a reservation
+      # size, not a heap limit. Commit on demand and disable process-local THP
+      # to keep lightly used heaps small without changing host kernel policy.
       - MIMALLOC_ARENA_RESERVE=${MIMALLOC_ARENA_RESERVE:-67108864}
       - MIMALLOC_ARENA_EAGER_COMMIT=${MIMALLOC_ARENA_EAGER_COMMIT:-0}
+      - MIMALLOC_ALLOW_THP=${MIMALLOC_ALLOW_THP:-0}
       # Elasticsearch (optional — uncomment to enable log shipping)
       # - WAFRED_ES_ENABLED=true
       # - WAFRED_ES_URLS=http://elasticsearch:9200

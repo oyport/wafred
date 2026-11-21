@@ -526,6 +526,7 @@
       "count": "{{count}} sites",
       "created": "Created",
       "updated": "Site updated",
+      "updatedRestart": "Hostname changes required an Agent restart ({{sent}} sent, {{queued}} queued).",
       "deleted": "Site deleted",
       "deleteTitle": "Delete site",
       "deleteDescription": "This action cannot be undone. All rules and logs for this site will be permanently removed.",
@@ -2859,6 +2860,19 @@
     "basic": {
       "title": "Basic",
       "description": "Manage origin pools, load balancing, route dispatch and trusted proxy settings.",
+      "hostBindings": {
+        "title": "Domain port bindings",
+        "description": "Set HTTP and HTTPS listener ports for the primary and alternate hostnames. A port change restarts Agents serving this site and may briefly interrupt traffic.",
+        "rangeHint": "Standard ports are HTTP 80 and HTTPS 443; custom ports use {{min}}-{{max}}. Custom HTTPS ports require HTTPS enabled for this site. Leave a field blank to disable that protocol.",
+        "http": "HTTP port",
+        "https": "HTTPS port",
+        "disabled": "Disabled",
+        "invalidPort": "Use HTTP 80, HTTPS 443, or an integer in {{min}}-{{max}}, and enable at least one protocol.",
+        "protocolCollision": "A TCP port cannot be configured for both HTTP and HTTPS.",
+        "restartHint": "A changed binding sends a controlled restart to the relevant Agents; offline Agents apply it when they reconnect. An Agent started in the foreground must be restarted by its operator.",
+        "saved": "Domain port bindings saved",
+        "savedRestart": "Saved; restart requested for {{sent}} online Agent(s), {{queued}} queued"
+      },
       "addPool": "Add pool",
       "editPool": "Edit origin pool",
       "poolCreateDescription": "An origin pool is a set of origin nodes sharing one load-balancing algorithm and origin protocol.",

@@ -10,11 +10,12 @@ use chrono::{DateTime, Utc};
 use sea_orm::sea_query::{Expr, Func};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait,
-    DatabaseConnection, DbErr, EntityTrait, FromQueryResult, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    DatabaseConnection, DbErr, EntityTrait, FromQueryResult,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::api::capabilities;
@@ -33,11 +34,12 @@ use crate::api::validation::{
 use crate::auth::AuthUser;
 use crate::grpc::notify_config_changed;
 use crate::models::{
-    acme_challenge, bot_protection, cache_rules, certificate_links,
+    acme_challenge, agent, bot_protection, cache_rules, certificate_links,
     challenge_settings, geo_rules, ip_access_rules, ip_group_sites, ip_groups,
     mtls, path_exceptions, rate_limit_rules, rewrite_rules, route_match_type,
     rule, rule_groups, site, site_ai_bot_policies, site_ai_crawl_settings,
-    site_basic_auth, site_certificates, site_oidc, site_routes, site_ssl,
+    site_basic_auth, site_certificates, site_host_bindings, site_oidc,
+    site_routes, site_ssl,
     site_status, site_upstream_pools, site_upstreams, tls_version,
     trusted_header, visitor_site_grant, waf_settings, ResponseReplaceConfig,
     ResponseReplaceRule,
@@ -49,6 +51,63 @@ use crate::models::{
 /// human-readable message are unchanged. Only the hostname-conflict paths carry
 /// it — every other validation failure keeps the default `bad_request` code.
 const DOMAIN_CONFLICT_CODE: &str = "site.domain_conflict";
+
+const DEFAULT_CUSTOM_PORT_START: u16 = 7000;
+const DEFAULT_CUSTOM_PORT_END: u16 = 7777;
+pub(crate) const HOST_BINDING_ADVISORY_LOCK_KEY: i64 = 70007777;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HostBindingResponse {
+    pub hostname: String,
+    pub http_port: Option<u16>,
+    pub https_port: Option<u16>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HostBindingsResponse {
+    pub allowed_port_start: u16,
+    pub allowed_port_end: u16,
+    pub bindings: Vec<HostBindingResponse>,
+    /// Listener addresses are fixed when the Agent process starts. A changed
+    /// binding triggers a controlled restart of every Agent that serves this
+    /// site so new ports are actually opened.
+    pub restart_required: bool,
+    pub restart_commands_sent: usize,
+    pub restart_commands_queued: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HostBindingInput {
+    pub hostname: String,
+    pub http_port: Option<u16>,
+    pub https_port: Option<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateHostBindingsRequest {
+    pub bindings: Vec<HostBindingInput>,
+}
+
+fn custom_listener_port_set(
+    bindings: &[HostBindingResponse],
+) -> BTreeSet<(bool, u16)> {
+    bindings
+        .iter()
+        .flat_map(|binding| {
+            binding
+                .http_port
+                .filter(|port| *port != 80)
+                .map(|port| (true, port))
+                .into_iter()
+                .chain(
+                    binding
+                        .https_port
+                        .filter(|port| *port != 443)
+                        .map(|port| (false, port)),
+                )
+        })
+        .collect()
+}
 
 /// Tags a hostname conflict with [`DOMAIN_CONFLICT_CODE`].
 ///
@@ -127,6 +186,15 @@ pub struct SiteResponse {
     pub user_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SiteUpdateResponse {
+    #[serde(flatten)]
+    pub site: SiteResponse,
+    pub listener_restart_required: bool,
+    pub restart_commands_sent: usize,
+    pub restart_commands_queued: usize,
 }
 
 impl From<site::Model> for SiteResponse {
@@ -1118,11 +1186,605 @@ fn default_true() -> bool {
     true
 }
 
+fn configured_custom_port_range() -> Result<(u16, u16), ApiError> {
+    fn read_port(key: &str, default: u16) -> Result<u16, ApiError> {
+        match std::env::var(key) {
+            Ok(value) => value.trim().parse::<u16>().map_err(|_| {
+                ApiError::Internal(format!(
+                    "{key} must be a TCP port from 1 to 65535"
+                ))
+            }),
+            Err(std::env::VarError::NotPresent) => Ok(default),
+            Err(error) => Err(ApiError::Internal(format!(
+                "could not read {key}: {error}"
+            ))),
+        }
+    }
+
+    let start = read_port("WAFRED_CUSTOM_PORT_START", DEFAULT_CUSTOM_PORT_START)?;
+    let end = read_port("WAFRED_CUSTOM_PORT_END", DEFAULT_CUSTOM_PORT_END)?;
+    let mut reserved_ports = vec![80, 443];
+    reserved_ports.extend(configured_addr_ports(
+        "WAFRED_LISTEN_HTTP_ADDR",
+        Some("WAFRED_ANALYSIS_HTTP_ADDR"),
+        80,
+    ));
+    reserved_ports.extend(configured_addr_ports(
+        "WAFRED_LISTEN_HTTPS_ADDR",
+        Some("WAFRED_ANALYSIS_HTTPS_ADDR"),
+        443,
+    ));
+    reserved_ports.extend(configured_addr_ports(
+        "WAFRED_ADMIN_ADDR",
+        None,
+        9080,
+    ));
+    reserved_ports.extend(configured_addr_ports(
+        "WAFRED_GRPC_ADDR",
+        None,
+        9090,
+    ));
+    if start < 1024
+        || start > end
+        || reserved_ports
+            .into_iter()
+            .any(|port| (start..=end).contains(&port))
+    {
+        return Err(ApiError::Internal(
+            "custom port range is invalid or overlaps a reserved listener"
+                .to_string(),
+        ));
+    }
+    Ok((start, end))
+}
+
+fn configured_addr_ports(
+    key: &str,
+    legacy_key: Option<&str>,
+    default: u16,
+) -> Vec<u16> {
+    for key in [Some(key), legacy_key].into_iter().flatten() {
+        if let Ok(value) = std::env::var(key) {
+            let ports = value
+                .split(',')
+                .filter_map(|address| {
+                    address
+                        .trim()
+                        .rsplit(':')
+                        .next()?
+                        .parse::<u16>()
+                        .ok()
+                })
+                .collect::<Vec<_>>();
+            if !ports.is_empty() {
+                return ports;
+            }
+        }
+    }
+    vec![default]
+}
+
+async fn lock_host_bindings<C: ConnectionTrait>(
+    db: &C,
+) -> Result<(), ApiError> {
+    db.query_one(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "SELECT pg_advisory_xact_lock({HOST_BINDING_ADVISORY_LOCK_KEY})"
+        ),
+    ))
+    .await?;
+    Ok(())
+}
+
+fn validate_host_binding_port(
+    port: Option<u16>,
+    standard: u16,
+    protocol: &str,
+    range: (u16, u16),
+) -> Result<Option<u16>, ApiError> {
+    let Some(port) = port else {
+        return Ok(None);
+    };
+    if port == standard || (range.0..=range.1).contains(&port) {
+        return Ok(Some(port));
+    }
+    Err(ApiError::BadRequest(format!(
+        "{protocol} port must be {standard} or within {}-{}",
+        range.0, range.1
+    )))
+}
+
+async fn insert_default_host_bindings<C>(
+    db: &C,
+    site_id: Uuid,
+    hostnames: &[String],
+) -> Result<(), ApiError>
+where
+    C: ConnectionTrait,
+{
+    let rows = hostnames
+        .iter()
+        .map(|hostname| site_host_bindings::ActiveModel {
+            site_id: Set(site_id),
+            hostname: Set(hostname.clone()),
+            http_port: Set(Some(80)),
+            https_port: Set(Some(443)),
+        })
+        .collect::<Vec<_>>();
+    if !rows.is_empty() {
+        site_host_bindings::Entity::insert_many(rows).exec(db).await?;
+    }
+    Ok(())
+}
+
+async fn reconcile_site_host_bindings<C>(
+    db: &C,
+    site_id: Uuid,
+    hostnames: &[String],
+) -> Result<bool, ApiError>
+where
+    C: ConnectionTrait,
+{
+    let existing = site_host_bindings::Entity::find()
+        .filter(site_host_bindings::Column::SiteId.eq(site_id))
+        .all(db)
+        .await?;
+    let previous_custom_ports: BTreeSet<(bool, i32)> = existing
+        .iter()
+        .flat_map(|binding| {
+            binding
+                .http_port
+                .filter(|port| *port != 80)
+                .map(|port| (true, port))
+                .into_iter()
+                .chain(
+                    binding
+                        .https_port
+                        .filter(|port| *port != 443)
+                        .map(|port| (false, port)),
+                )
+        })
+        .collect();
+    let mut by_hostname: HashMap<String, site_host_bindings::Model> =
+        existing
+            .into_iter()
+            .map(|row| (row.hostname.clone(), row))
+            .collect();
+    let desired = hostnames
+        .iter()
+        .map(|hostname| {
+            let existing = by_hostname.remove(hostname);
+            (
+                hostname.clone(),
+                existing
+                    .as_ref()
+                    .map_or(Some(80), |binding| binding.http_port),
+                existing
+                    .as_ref()
+                    .map_or(Some(443), |binding| binding.https_port),
+            )
+        })
+        .collect::<Vec<_>>();
+    let desired_custom_ports: BTreeSet<(bool, i32)> = desired
+        .iter()
+        .flat_map(|(_, http_port, https_port)| {
+            http_port
+                .filter(|port| *port != 80)
+                .map(|port| (true, port))
+                .into_iter()
+                .chain(
+                    https_port
+                        .filter(|port| *port != 443)
+                        .map(|port| (false, port)),
+                )
+        })
+        .collect();
+    let listeners_changed = previous_custom_ports != desired_custom_ports;
+    let rows = desired
+        .into_iter()
+        .map(|(hostname, http_port, https_port)| {
+            site_host_bindings::ActiveModel {
+                site_id: Set(site_id),
+                hostname: Set(hostname),
+                http_port: Set(http_port),
+                https_port: Set(https_port),
+            }
+        })
+        .collect::<Vec<_>>();
+    site_host_bindings::Entity::delete_many()
+        .filter(site_host_bindings::Column::SiteId.eq(site_id))
+        .exec(db)
+        .await?;
+    if !rows.is_empty() {
+        site_host_bindings::Entity::insert_many(rows).exec(db).await?;
+    }
+    Ok(listeners_changed)
+}
+
+async fn site_agent_ids_from<C: ConnectionTrait>(
+    db: &C,
+    site_id: Uuid,
+) -> Result<Vec<Uuid>, DbErr> {
+    let rows = agent::Entity::find().all(db).await?;
+    let mut ids = Vec::new();
+    for row in rows {
+        let visible = crate::grpc::agent_visible_site_ids(db, &row).await?;
+        if visible.contains(&site_id) {
+            ids.push(row.id);
+        }
+    }
+    Ok(ids)
+}
+
+pub(crate) async fn site_agent_ids(
+    state: &AppState,
+    site_id: Uuid,
+) -> Result<Vec<Uuid>, ApiError> {
+    Ok(site_agent_ids_from(&state.db, site_id).await?)
+}
+
+pub(crate) async fn restart_agent_ids(
+    state: &AppState,
+    agent_ids: &[Uuid],
+    reason: &str,
+) -> (usize, usize) {
+    let request = crate::api::agents::CommandRequest {
+        command: "restart".to_string(),
+        site_id: None,
+        ip_addresses: Vec::new(),
+        urls: Vec::new(),
+        tags: Vec::new(),
+        duration_seconds: None,
+        reason: Some(reason.to_string()),
+        graceful: true,
+    };
+    let mut sent = 0;
+    let mut queued = 0;
+    for agent_id in agent_ids.iter().copied().collect::<BTreeSet<_>>() {
+        let command = match crate::api::agents::build_command(&request, None) {
+            Ok(command) => command,
+            Err(error) => {
+                tracing::error!(%agent_id, %error, "could not build listener restart command");
+                continue;
+            },
+        };
+        if state.agents.send_command(&agent_id, command).await {
+            sent += 1;
+        } else {
+            // The registry retains restart requests for offline Agents. They
+            // receive the new SiteConfig during registration before the
+            // queued command is delivered on their heartbeat stream.
+            queued += 1;
+        }
+    }
+    (sent, queued)
+}
+
+pub(crate) async fn restart_site_agents(
+    state: &AppState,
+    site_id: Uuid,
+    reason: &str,
+) -> (usize, usize) {
+    match site_agent_ids(state, site_id).await {
+        Ok(agent_ids) => restart_agent_ids(state, &agent_ids, reason).await,
+        Err(error) => {
+            tracing::warn!(%site_id, %error, "could not resolve agents for listener restart");
+            (0, 0)
+        },
+    }
+}
+
+pub(crate) async fn restart_all_site_agents(
+    state: &AppState,
+    reason: &str,
+) -> (usize, usize) {
+    let rows = match agent::Entity::find().all(&state.db).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "could not list agents for listener restart");
+            return (0, 0);
+        },
+    };
+    let mut ids = Vec::new();
+    for row in rows {
+        match crate::grpc::agent_visible_site_ids(&state.db, &row).await {
+            Ok(visible) if !visible.is_empty() => ids.push(row.id),
+            Ok(_) => {},
+            Err(error) => {
+                tracing::warn!(agent_id = %row.id, %error, "could not resolve sites for listener restart");
+            },
+        }
+    }
+    restart_agent_ids(state, &ids, reason).await
+}
+
+/// `GET /api/v1/sites/{site_id}/host-bindings`
+async fn show_host_bindings(
+    State(state): State<AppState>,
+    current: AuthUser,
+    Path(site_id): Path<String>,
+) -> Result<Json<HostBindingsResponse>, ApiError> {
+    let id = parse_uuid(&site_id, "site id")?;
+    let model = load_site_read(&state.db, id, &current).await?;
+    let (allowed_port_start, allowed_port_end) = configured_custom_port_range()?;
+    let rows = site_host_bindings::Entity::find()
+        .filter(site_host_bindings::Column::SiteId.eq(id))
+        .order_by_asc(site_host_bindings::Column::Hostname)
+        .all(&state.db)
+        .await?;
+    let bindings = if rows.is_empty() {
+        std::iter::once(model.domain.as_str())
+            .chain(model.alternate_domains.iter().map(String::as_str))
+            .map(|hostname| HostBindingResponse {
+                hostname: hostname.to_string(),
+                http_port: Some(80),
+                https_port: Some(443),
+            })
+            .collect()
+    } else {
+        rows.into_iter()
+            .map(|row| HostBindingResponse {
+                hostname: row.hostname,
+                http_port: row
+                    .http_port
+                    .and_then(|port| u16::try_from(port).ok()),
+                https_port: row
+                    .https_port
+                    .and_then(|port| u16::try_from(port).ok()),
+            })
+            .collect()
+    };
+    Ok(Json(HostBindingsResponse {
+        allowed_port_start,
+        allowed_port_end,
+        bindings,
+        restart_required: false,
+        restart_commands_sent: 0,
+        restart_commands_queued: 0,
+    }))
+}
+
+/// `PUT /api/v1/sites/{site_id}/host-bindings`
+async fn update_host_bindings(
+    State(state): State<AppState>,
+    current: AuthUser,
+    Path(site_id): Path<String>,
+    AppJson(payload): AppJson<UpdateHostBindingsRequest>,
+) -> Result<Json<HostBindingsResponse>, ApiError> {
+    let id = parse_uuid(&site_id, "site id")?;
+    let model = load_site_write(&state.db, id, &current).await?;
+    let range = configured_custom_port_range()?;
+    let allowed_port_start = range.0;
+    let allowed_port_end = range.1;
+
+    let expected: BTreeSet<String> = std::iter::once(model.domain.clone())
+        .chain(model.alternate_domains.iter().cloned())
+        .collect();
+    let mut seen = BTreeSet::new();
+    let mut bindings = Vec::with_capacity(payload.bindings.len());
+    let mut http_ports = HashSet::new();
+    let mut https_ports = HashSet::new();
+    for input in payload.bindings {
+        let hostname = normalise_domain(&input.hostname)?;
+        if !seen.insert(hostname.clone()) {
+            return Err(ApiError::BadRequest(format!(
+                "hostname '{hostname}' appears more than once"
+            )));
+        }
+        if !expected.contains(&hostname) {
+            return Err(ApiError::BadRequest(format!(
+                "hostname '{hostname}' is not configured on this site"
+            )));
+        }
+        let http_port = validate_host_binding_port(
+            input.http_port,
+            80,
+            "HTTP",
+            range,
+        )?;
+        let https_port = validate_host_binding_port(
+            input.https_port,
+            443,
+            "HTTPS",
+            range,
+        )?;
+        if http_port.is_none() && https_port.is_none() {
+            return Err(ApiError::BadRequest(format!(
+                "hostname '{hostname}' must have at least one listener"
+            )));
+        }
+        if let Some(port) = http_port {
+            http_ports.insert(port);
+        }
+        if let Some(port) = https_port {
+            https_ports.insert(port);
+        }
+        bindings.push(HostBindingResponse {
+            hostname,
+            http_port,
+            https_port,
+        });
+    }
+    if seen != expected {
+        let missing = expected
+            .difference(&seen)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ApiError::BadRequest(format!(
+            "every configured hostname needs a port binding; missing: {missing}"
+        )));
+    }
+    bindings.sort_by(|left, right| left.hostname.cmp(&right.hostname));
+    if http_ports.iter().any(|port| https_ports.contains(port)) {
+        return Err(ApiError::Conflict(
+            "one TCP port cannot be assigned to both HTTP and HTTPS".into(),
+        ));
+    }
+
+    let uses_non_default_binding = bindings.iter().any(|binding| {
+        binding.http_port != Some(80) || binding.https_port != Some(443)
+    });
+    if uses_non_default_binding {
+        let below = capabilities::site_agents_below(
+            &state.db,
+            id,
+            capabilities::MIN_AGENT_HOST_PORT_BINDINGS,
+        )
+        .await?;
+        if let Some((name, version)) = below.first() {
+            return Err(ApiError::BadRequest(format!(
+                "non-default host port bindings require agent >= {}; agent '{name}' reports version '{version}'",
+                capabilities::MIN_AGENT_HOST_PORT_BINDINGS
+            )));
+        }
+    }
+
+    // Serialize port-protocol checks across concurrent edits. Sharing a port
+    // within one protocol is intentional; using the same TCP port for HTTP and
+    // HTTPS would make the listener protocol ambiguous.
+    let txn = state.db.begin().await?;
+    lock_host_bindings(&txn).await?;
+    let locked_model = site::Entity::find_by_id(id)
+        .one(&txn)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("site {id} not found")))?;
+    let locked_expected: BTreeSet<String> =
+        std::iter::once(locked_model.domain)
+            .chain(locked_model.alternate_domains)
+            .collect();
+    if locked_expected != expected {
+        return Err(ApiError::BadRequest(
+            "site hostnames changed while saving; reload the page and retry".into(),
+        ));
+    }
+    let ssl = site_ssl::Entity::find()
+        .filter(site_ssl::Column::SiteId.eq(id))
+        .one(&txn)
+        .await?;
+    let https_enabled = ssl.as_ref().is_some_and(|ssl| ssl.https_enabled);
+    let force_https = ssl
+        .as_ref()
+        .is_some_and(|ssl| ssl.https_enabled && ssl.always_use_https);
+    if !https_enabled
+        && bindings.iter().any(|binding| {
+            binding.https_port.is_some_and(|port| port != 443)
+        })
+    {
+        return Err(ApiError::BadRequest(
+            "enable HTTPS before assigning a custom HTTPS listener port".into(),
+        ));
+    }
+    if force_https {
+        if let Some(binding) = bindings
+            .iter()
+            .find(|binding| binding.https_port.is_none())
+        {
+            return Err(ApiError::BadRequest(format!(
+                "HTTPS redirect is enabled; hostname '{}' must have an HTTPS listener",
+                binding.hostname
+            )));
+        }
+    }
+    let mut previous_bindings: Vec<HostBindingResponse> =
+        site_host_bindings::Entity::find()
+            .filter(site_host_bindings::Column::SiteId.eq(id))
+            .all(&txn)
+            .await?
+            .into_iter()
+            .map(|row| HostBindingResponse {
+                hostname: row.hostname,
+                http_port: row
+                    .http_port
+                    .and_then(|port| u16::try_from(port).ok()),
+                https_port: row
+                    .https_port
+                    .and_then(|port| u16::try_from(port).ok()),
+            })
+            .collect();
+    previous_bindings.sort_by(|left, right| left.hostname.cmp(&right.hostname));
+    let bindings_changed = previous_bindings != bindings;
+    let listeners_changed = custom_listener_port_set(&previous_bindings)
+        != custom_listener_port_set(&bindings);
+    let desired_http: Vec<i32> = http_ports.iter().copied().map(i32::from).collect();
+    let desired_https: Vec<i32> =
+        https_ports.iter().copied().map(i32::from).collect();
+    if !desired_http.is_empty() {
+        let rows = site_host_bindings::Entity::find()
+            .filter(site_host_bindings::Column::SiteId.ne(id))
+            .filter(site_host_bindings::Column::HttpsPort.is_in(desired_http))
+            .all(&txn)
+            .await?;
+        if let Some(conflict) = rows.first() {
+            return Err(ApiError::Conflict(format!(
+                "port {} is already an HTTPS listener on another site",
+                conflict.https_port.unwrap_or_default()
+            )));
+        }
+    }
+    if !desired_https.is_empty() {
+        let rows = site_host_bindings::Entity::find()
+            .filter(site_host_bindings::Column::SiteId.ne(id))
+            .filter(site_host_bindings::Column::HttpPort.is_in(desired_https))
+            .all(&txn)
+            .await?;
+        if let Some(conflict) = rows.first() {
+            return Err(ApiError::Conflict(format!(
+                "port {} is already an HTTP listener on another site",
+                conflict.http_port.unwrap_or_default()
+            )));
+        }
+    }
+
+    site_host_bindings::Entity::delete_many()
+        .filter(site_host_bindings::Column::SiteId.eq(id))
+        .exec(&txn)
+        .await?;
+    let rows = bindings
+        .iter()
+        .map(|binding| site_host_bindings::ActiveModel {
+            site_id: Set(id),
+            hostname: Set(binding.hostname.clone()),
+            http_port: Set(binding.http_port.map(i32::from)),
+            https_port: Set(binding.https_port.map(i32::from)),
+        })
+        .collect::<Vec<_>>();
+    site_host_bindings::Entity::insert_many(rows).exec(&txn).await?;
+    txn.commit().await?;
+
+    if bindings_changed {
+        notify_config_changed(&state, id, Some(&current.email)).await;
+    }
+    let (restart_commands_sent, restart_commands_queued) = if listeners_changed {
+        restart_site_agents(
+            &state,
+            id,
+            "site host port listeners changed; restarting to rebind sockets",
+        )
+        .await
+    } else {
+        (0, 0)
+    };
+    Ok(Json(HostBindingsResponse {
+        allowed_port_start,
+        allowed_port_end,
+        bindings,
+        restart_required: listeners_changed,
+        restart_commands_sent,
+        restart_commands_queued,
+    }))
+}
+
 /// Routes contributed to `/api/v1`.
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/sites", get(list).post(create))
         .route("/sites/{site_id}", get(show).put(update).delete(remove))
+        .route(
+            "/sites/{site_id}/host-bindings",
+            get(show_host_bindings).put(update_host_bindings),
+        )
         .route(
             "/sites/{site_id}/upstreams",
             get(list_upstreams).post(create_upstream),
@@ -1313,6 +1975,8 @@ pub(crate) async fn create_site_for_user(
     // The unique index and the conflicts trigger on `sites` are the backstop.
     .await
     .map_err(map_site_domain_conflict)?;
+
+    insert_default_host_bindings(db, id, &all_domains).await?;
 
     // Every site starts with a default origin pool; the first origin node
     // goes into it.
@@ -1704,6 +2368,8 @@ async fn clone_site(
         .await
         .map_err(map_site_domain_conflict)?;
 
+    insert_default_host_bindings(&txn, new_id, &all_domains).await?;
+
     // Upstream pools first: nodes and routes reference them by id, so the
     // clone needs its own pool ids and a mapping from the source's.
     let mut pool_ids: HashMap<Uuid, Uuid> = HashMap::new();
@@ -2092,11 +2758,14 @@ async fn update(
     current: AuthUser,
     Path(site_id): Path<String>,
     AppJson(payload): AppJson<UpdateSiteRequest>,
-) -> Result<Json<SiteResponse>, ApiError> {
+) -> Result<Json<SiteUpdateResponse>, ApiError> {
     let id = parse_uuid(&site_id, "site id")?;
     let model = load_site_write(&state.db, id, &current).await?;
     let previous_domain = model.domain.clone();
     let previous_alternates = model.alternate_domains.clone();
+    let reconcile_hostnames =
+        payload.domain.as_ref().is_some_and(|domain| !domain.trim().is_empty())
+            || payload.alternate_domains.is_some();
 
     let mut active: site::ActiveModel = model.into();
     if let Some(name) = non_empty(&payload.name) {
@@ -2224,16 +2893,45 @@ async fn update(
     }
     active.updated_at = Set(Utc::now());
 
+    let txn = state.db.begin().await?;
+    if reconcile_hostnames {
+        lock_host_bindings(&txn).await?;
+    }
     let updated = active
-        .update(&state.db)
+        .update(&txn)
         .await
         // Same backstop as create: the uniqueness check above is a pre-check,
         // the DB constraint decides under concurrency.
         .map_err(map_site_domain_conflict)?;
+    let listeners_changed = if reconcile_hostnames {
+        let hostnames = std::iter::once(updated.domain.as_str())
+            .chain(updated.alternate_domains.iter().map(String::as_str))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        reconcile_site_host_bindings(&txn, id, &hostnames).await?
+    } else {
+        false
+    };
+    txn.commit().await?;
     tracing::info!(%id, "site updated");
     notify_config_changed(&state, id, Some(&current.email)).await;
+    let (restart_commands_sent, restart_commands_queued) = if listeners_changed {
+        restart_site_agents(
+            &state,
+            id,
+            "site hostnames changed the custom listener set",
+        )
+        .await
+    } else {
+        (0, 0)
+    };
 
-    Ok(Json(updated.into()))
+    Ok(Json(SiteUpdateResponse {
+        site: updated.into(),
+        listener_restart_required: listeners_changed,
+        restart_commands_sent,
+        restart_commands_queued,
+    }))
 }
 
 /// `DELETE /api/v1/sites/{site_id}`
@@ -2246,10 +2944,34 @@ async fn remove(
     // Verify ownership first so that the ON DELETE CASCADE rules never run for a
     // site the caller must not see.
     load_site_write(&state.db, id, &current).await?;
-    site::Entity::delete_by_id(id).exec(&state.db).await?;
+    let txn = state.db.begin().await?;
+    lock_host_bindings(&txn).await?;
+    let bindings = site_host_bindings::Entity::find()
+        .filter(site_host_bindings::Column::SiteId.eq(id))
+        .all(&txn)
+        .await?;
+    let removed_custom_listener = bindings.iter().any(|binding| {
+        binding.http_port.is_some_and(|port| port != 80)
+            || binding.https_port.is_some_and(|port| port != 443)
+    });
+    let affected_agents = if removed_custom_listener {
+        site_agent_ids_from(&txn, id).await?
+    } else {
+        Vec::new()
+    };
+    site::Entity::delete_by_id(id).exec(&txn).await?;
+    txn.commit().await?;
 
     tracing::info!(%id, owner = %current.id, "site deleted");
     notify_config_changed(&state, id, Some(&current.email)).await;
+    if removed_custom_listener {
+        restart_agent_ids(
+            &state,
+            &affected_agents,
+            "site deleted; removing its custom listener set",
+        )
+        .await;
+    }
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -2968,7 +3690,32 @@ async fn upsert_ssl(
     // `site_ssl` row twice; a failure between the two writes must not leave a
     // half-applied posture behind, so both go through one transaction.
     let txn = state.db.begin().await?;
+    lock_host_bindings(&txn).await?;
     let posture = save_tls_posture(&txn, &site, &tls).await?;
+
+    let host_bindings = site_host_bindings::Entity::find()
+        .filter(site_host_bindings::Column::SiteId.eq(id))
+        .all(&txn)
+        .await?;
+    if !posture.https_enabled
+        && host_bindings.iter().any(|binding| {
+            binding.https_port.is_some_and(|port| port != 443)
+        })
+    {
+        return Err(ApiError::BadRequest(
+            "custom HTTPS listener ports must be removed before disabling HTTPS".into(),
+        ));
+    }
+    if posture.https_enabled && posture.always_use_https {
+        if let Some(binding) =
+            host_bindings.iter().find(|binding| binding.https_port.is_none())
+        {
+            return Err(ApiError::BadRequest(format!(
+                "HTTPS redirect is enabled; hostname '{}' must have an HTTPS listener",
+                binding.hostname
+            )));
+        }
+    }
 
     let existing = site_ssl::Entity::find()
         .filter(site_ssl::Column::SiteId.eq(id))
@@ -3059,10 +3806,25 @@ async fn delete_ssl(
     let id = parse_uuid(&site_id, "site id")?;
     load_site_write(&state.db, id, &current).await?;
 
+    let txn = state.db.begin().await?;
+    lock_host_bindings(&txn).await?;
+    let host_bindings = site_host_bindings::Entity::find()
+        .filter(site_host_bindings::Column::SiteId.eq(id))
+        .all(&txn)
+        .await?;
+    if host_bindings.iter().any(|binding| {
+        binding.https_port.is_some_and(|port| port != 443)
+    }) {
+        return Err(ApiError::BadRequest(
+            "custom HTTPS listener ports must be removed before deleting HTTPS configuration".into(),
+        ));
+    }
+
     site_ssl::Entity::delete_many()
         .filter(site_ssl::Column::SiteId.eq(id))
-        .exec(&state.db)
+        .exec(&txn)
         .await?;
+    txn.commit().await?;
 
     tracing::info!(site_id = %id, "SSL configuration removed");
     touch_site(&state, id).await?;

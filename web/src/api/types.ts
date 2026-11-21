@@ -113,6 +113,23 @@ export interface UpdateProfileRequest {
 
 export type SiteStatus = 'active' | 'paused' | 'pending'
 
+export interface SiteHostBinding {
+  hostname: string
+  /** `null` disables HTTP for this hostname. */
+  http_port: number | null
+  /** `null` disables HTTPS for this hostname. */
+  https_port: number | null
+}
+
+export interface SiteHostBindings {
+  allowed_port_start: number
+  allowed_port_end: number
+  bindings: SiteHostBinding[]
+  restart_required: boolean
+  restart_commands_sent: number
+  restart_commands_queued: number
+}
+
 /** `api::sites::SiteResponse` */
 export interface Site {
   id: string
@@ -121,6 +138,10 @@ export interface Site {
   domain: string
   /** Extra hostnames served by the same site configuration. */
   alternate_domains: string[]
+  /** Present on site updates when hostname edits require rebinding listeners. */
+  listener_restart_required?: boolean
+  restart_commands_sent?: number
+  restart_commands_queued?: number
   status: SiteStatus | string
   plan: string
   /** Disk budget, in MiB, the agents may use for this site's cache. */

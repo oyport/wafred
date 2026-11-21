@@ -195,16 +195,40 @@ async fn rollback_version(
         config_history::rollback(&state.db, version_id, Some(&current.email))
             .await?;
 
-    match outcome.scope {
+    let listener_restart = match outcome.scope {
         VersionScope::Site(site_id) => {
             touch_site(&state, site_id).await?;
             notify_config_changed(&state, site_id, Some(&current.email)).await;
+            if outcome.listener_bindings_changed {
+                let (sent, queued) = crate::api::sites::restart_site_agents(
+                    &state,
+                    site_id,
+                    "configuration rollback changed site listener bindings",
+                )
+                .await;
+                serde_json::json!({ "required": true, "sent": sent, "queued": queued })
+            } else {
+                serde_json::json!({ "required": false, "sent": 0, "queued": 0 })
+            }
         },
         VersionScope::Global | VersionScope::Deployment => {
             // The restored settings ride in every bundle.
             notify_all_config_changed(&state, Some(&current.email)).await;
+            if outcome.listener_bindings_changed
+                && outcome.scope == VersionScope::Deployment
+            {
+                let (sent, queued) =
+                    crate::api::sites::restart_all_site_agents(
+                        &state,
+                        "deployment rollback changed site listener bindings",
+                    )
+                    .await;
+                serde_json::json!({ "required": true, "sent": sent, "queued": queued })
+            } else {
+                serde_json::json!({ "required": false, "sent": 0, "queued": 0 })
+            }
         },
-    }
+    };
 
     tracing::info!(
         actor = %current.email,
@@ -216,6 +240,7 @@ async fn rollback_version(
     Ok(Json(serde_json::json!({
         "restored_version": outcome.restored_version,
         "new_version": outcome.new_version,
+        "listener_restart": listener_restart,
         "scope": match outcome.scope {
             VersionScope::Site(site_id) => site_id.to_string(),
             VersionScope::Global => "global".to_string(),

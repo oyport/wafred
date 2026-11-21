@@ -14,8 +14,9 @@ use uuid::Uuid;
 
 use crate::api::capabilities::{
     attached_scope_requirements, path_exception_requirements,
-    site_agents_below, ScopeRequirement,
+    site_agents_below, ScopeRequirement, MIN_AGENT_HOST_PORT_BINDINGS,
 };
+use crate::api::sites::HOST_BINDING_ADVISORY_LOCK_KEY;
 use crate::api::error::ApiError;
 use crate::api::validation::{
     check_path_exception_fields, check_rule_fields, RuleRowFix,
@@ -110,6 +111,7 @@ pub struct RestorePlan {
     pub scope: VersionScope,
     pub tables: Vec<PreparedTable>,
     pub prune_site_ids: Vec<Uuid>,
+    pub prune_sites: bool,
     pub owner_changes: Vec<Value>,
     pub warnings: Vec<String>,
 }
@@ -118,6 +120,30 @@ pub struct RestorePlan {
 pub struct RestoreReport {
     pub rows_by_table: BTreeMap<String, usize>,
     pub warnings: Vec<String>,
+    pub listener_bindings_changed: bool,
+}
+
+/// Return the custom TCP listeners represented by a set of host-binding rows.
+/// Standard 80/443 listeners are always present and do not require an Agent
+/// restart when a hostname is reassigned to them.
+fn custom_listener_ports(rows: &[Value]) -> BTreeSet<(bool, u16)> {
+    rows.iter()
+        .flat_map(|row| {
+            let http = row
+                .get("http_port")
+                .and_then(Value::as_u64)
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port != 80)
+                .map(|port| (true, port));
+            let https = row
+                .get("https_port")
+                .and_then(Value::as_u64)
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port != 443)
+                .map(|port| (false, port));
+            http.into_iter().chain(https)
+        })
+        .collect()
 }
 
 fn quote_ident(identifier: &str) -> String {
@@ -466,6 +492,9 @@ async fn validate_references<C: ConnectionTrait>(
         for row in &prepared.rows {
             let mut refs = Vec::new();
             match prepared.spec.name {
+                "site_host_bindings" => {
+                    refs.push(("site_id", "sites"));
+                },
                 "site_oidc" => refs.push(("provider_id", "oidc_providers")),
                 "visitor_site_grants" => {
                     refs.push(("visitor_id", "site_visitors"));
@@ -682,8 +711,302 @@ fn row_scope_requirements(table: &str, row: &Value) -> Vec<ScopeRequirement> {
             let match_type = json_key(row, "match_type").unwrap_or_default();
             attached_scope_requirements(path, &match_type)
         },
+        "site_host_bindings" => {
+            let http_port = row.get("http_port").and_then(Value::as_u64);
+            let https_port = row.get("https_port").and_then(Value::as_u64);
+            if http_port == Some(80) && https_port == Some(443) {
+                Vec::new()
+            } else {
+                vec![ScopeRequirement {
+                    min: MIN_AGENT_HOST_PORT_BINDINGS,
+                    label: "non-default host port bindings",
+                }]
+            }
+        },
         _ => Vec::new(),
     }
+}
+
+fn restore_custom_port_range() -> Result<(u16, u16), DbErr> {
+    fn read_port(key: &str, default: u16) -> Result<u16, DbErr> {
+        match std::env::var(key) {
+            Ok(value) => value.trim().parse::<u16>().map_err(|_| {
+                DbErr::Custom(format!("{key} must be a TCP port from 1 to 65535"))
+            }),
+            Err(std::env::VarError::NotPresent) => Ok(default),
+            Err(error) => Err(DbErr::Custom(format!(
+                "could not read {key}: {error}"
+            ))),
+        }
+    }
+    fn addr_ports(
+        key: &str,
+        legacy_key: Option<&str>,
+        default: u16,
+    ) -> Vec<u16> {
+        for key in [Some(key), legacy_key].into_iter().flatten() {
+            if let Ok(value) = std::env::var(key) {
+                let ports = value
+                    .split(',')
+                    .filter_map(|address| {
+                        address
+                            .trim()
+                            .rsplit(':')
+                            .next()?
+                            .parse::<u16>()
+                            .ok()
+                    })
+                    .collect::<Vec<_>>();
+                if !ports.is_empty() {
+                    return ports;
+                }
+            }
+        }
+        vec![default]
+    }
+
+    let start = read_port("WAFRED_CUSTOM_PORT_START", 7000)?;
+    let end = read_port("WAFRED_CUSTOM_PORT_END", 7777)?;
+    let mut reserved_ports = vec![80, 443];
+    reserved_ports.extend(addr_ports(
+        "WAFRED_LISTEN_HTTP_ADDR",
+        Some("WAFRED_ANALYSIS_HTTP_ADDR"),
+        80,
+    ));
+    reserved_ports.extend(addr_ports(
+        "WAFRED_LISTEN_HTTPS_ADDR",
+        Some("WAFRED_ANALYSIS_HTTPS_ADDR"),
+        443,
+    ));
+    reserved_ports.extend(addr_ports("WAFRED_ADMIN_ADDR", None, 9080));
+    reserved_ports.extend(addr_ports("WAFRED_GRPC_ADDR", None, 9090));
+    if start < 1024
+        || start > end
+        || reserved_ports
+            .into_iter()
+            .any(|port| (start..=end).contains(&port))
+    {
+        return Err(DbErr::Custom(
+            "custom port range is invalid or overlaps a reserved listener".into(),
+        ));
+    }
+    Ok((start, end))
+}
+
+fn restore_port(row: &Value, field: &str) -> Result<Option<u16>, DbErr> {
+    match row.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|port| u16::try_from(port).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                DbErr::Custom(format!(
+                    "site_host_bindings.{field} must be null or a TCP port from 1 to 65535"
+                ))
+            }),
+    }
+}
+
+/// Validate the effective binding set before a restore transaction writes it.
+/// Site restores are checked against other live sites; deployment restores
+/// already carry all snapshot sites and include retained sites when pruning is
+/// disabled.
+async fn validate_restored_host_bindings<C: ConnectionTrait>(
+    db: &C,
+    scope: VersionScope,
+    tables: &[PreparedTable],
+    prune_sites: bool,
+) -> Result<(), DbErr> {
+    if scope == VersionScope::Global {
+        return Ok(());
+    }
+    let bindings_spec = spec_for("site_host_bindings")
+        .ok_or_else(|| DbErr::Custom("site_host_bindings is not catalogued".into()))?;
+    let mut bindings = tables
+        .iter()
+        .find(|table| table.spec.name == "site_host_bindings")
+        .map(|table| table.rows.clone())
+        .unwrap_or_default();
+    if let VersionScope::Site(site_id) = scope {
+        bindings.extend(
+            query_rows(db, bindings_spec, None)
+                .await?
+                .into_iter()
+                .filter(|row| uuid_field(row, "site_id") != Some(site_id)),
+        );
+    }
+
+    let sites_spec = spec_for("sites")
+        .ok_or_else(|| DbErr::Custom("sites is not catalogued".into()))?;
+    let mut roots: BTreeMap<Uuid, Value> = if scope == VersionScope::Deployment
+        && prune_sites
+    {
+        BTreeMap::new()
+    } else {
+        query_rows(db, sites_spec, None)
+            .await?
+            .into_iter()
+            .filter_map(|row| uuid_field(&row, "id").map(|id| (id, row)))
+            .collect()
+    };
+    if let Some(restored_sites) = tables
+        .iter()
+        .find(|table| table.spec.name == "sites")
+    {
+        for row in &restored_sites.rows {
+            if let Some(id) = uuid_field(row, "id") {
+                roots.insert(id, row.clone());
+            }
+        }
+    }
+
+    let mut ssl_rows: Vec<Value> = query_rows(
+        db,
+        spec_for("site_ssl")
+            .ok_or_else(|| DbErr::Custom("site_ssl is not catalogued".into()))?,
+        None,
+    )
+    .await?;
+    if let Some(restored_ssl) =
+        tables.iter().find(|table| table.spec.name == "site_ssl")
+    {
+        if let VersionScope::Site(site_id) = scope {
+            ssl_rows.retain(|row| uuid_field(row, "site_id") != Some(site_id));
+            ssl_rows.extend(restored_ssl.rows.iter().cloned());
+        } else {
+            ssl_rows = restored_ssl.rows.clone();
+        }
+    }
+    let https_enabled_sites: BTreeSet<Uuid> = ssl_rows
+        .iter()
+        .filter(|row| {
+            row.get("https_enabled").and_then(Value::as_bool) == Some(true)
+        })
+        .filter_map(|row| uuid_field(row, "site_id"))
+        .collect();
+    let force_https_sites: BTreeSet<Uuid> = ssl_rows
+        .iter()
+        .filter(|row| {
+            row.get("https_enabled").and_then(Value::as_bool) == Some(true)
+                && row.get("always_use_https").and_then(Value::as_bool)
+                    == Some(true)
+        })
+        .filter_map(|row| uuid_field(row, "site_id"))
+        .collect();
+
+    let range = restore_custom_port_range()?;
+    let mut actual_hosts: BTreeMap<Uuid, BTreeSet<String>> = BTreeMap::new();
+    let mut seen_hosts = BTreeSet::new();
+    let mut http_ports = BTreeSet::new();
+    let mut https_ports = BTreeSet::new();
+    for row in &bindings {
+        let site_id = uuid_field(row, "site_id").ok_or_else(|| {
+            DbErr::Custom("site_host_bindings row has an invalid site_id".into())
+        })?;
+        let hostname = row
+            .get("hostname")
+            .and_then(Value::as_str)
+            .map(|hostname| hostname.trim().to_ascii_lowercase())
+            .filter(|hostname| !hostname.is_empty())
+            .ok_or_else(|| {
+                DbErr::Custom("site_host_bindings row has an invalid hostname".into())
+            })?;
+        let root = roots.get(&site_id).ok_or_else(|| {
+            DbErr::Custom(format!(
+                "site_host_bindings refers to unknown site {site_id}"
+            ))
+        })?;
+        let mut expected = BTreeSet::new();
+        if let Some(domain) = root.get("domain").and_then(Value::as_str) {
+            expected.insert(domain.trim().to_ascii_lowercase());
+        }
+        if let Some(alternates) = root
+            .get("alternate_domains")
+            .and_then(Value::as_array)
+        {
+            expected.extend(
+                alternates
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|domain| domain.trim().to_ascii_lowercase()),
+            );
+        }
+        if !expected.contains(&hostname) {
+            return Err(DbErr::Custom(format!(
+                "hostname {hostname} is not configured on site {site_id}"
+            )));
+        }
+        if !seen_hosts.insert((site_id, hostname.clone())) {
+            return Err(DbErr::Custom(format!(
+                "duplicate site host binding for {hostname}"
+            )));
+        }
+        let http_port = restore_port(row, "http_port")?;
+        let https_port = restore_port(row, "https_port")?;
+        if http_port.is_none() && https_port.is_none() {
+            return Err(DbErr::Custom(format!(
+                "hostname {hostname} must have at least one listener"
+            )));
+        }
+        if http_port.is_some_and(|port| {
+            port != 80 && !(range.0..=range.1).contains(&port)
+        }) || https_port.is_some_and(|port| {
+            port != 443 && !(range.0..=range.1).contains(&port)
+        }) {
+            return Err(DbErr::Custom(format!(
+                "hostname {hostname} uses a port outside the configured custom port range"
+            )));
+        }
+        if https_port.is_some_and(|port| port != 443)
+            && !https_enabled_sites.contains(&site_id)
+        {
+            return Err(DbErr::Custom(format!(
+                "HTTPS must be enabled before hostname {hostname} can use a custom HTTPS port"
+            )));
+        }
+        if force_https_sites.contains(&site_id) && https_port.is_none() {
+            return Err(DbErr::Custom(format!(
+                "HTTPS redirect is enabled; hostname {hostname} must have an HTTPS listener"
+            )));
+        }
+        if let Some(port) = http_port {
+            http_ports.insert(port);
+        }
+        if let Some(port) = https_port {
+            https_ports.insert(port);
+        }
+        actual_hosts.entry(site_id).or_default().insert(hostname);
+    }
+    if http_ports.iter().any(|port| https_ports.contains(port)) {
+        return Err(DbErr::Custom(
+            "one TCP port cannot be assigned to both HTTP and HTTPS".into(),
+        ));
+    }
+
+    for (site_id, root) in roots {
+        let mut expected = BTreeSet::new();
+        if let Some(domain) = root.get("domain").and_then(Value::as_str) {
+            expected.insert(domain.trim().to_ascii_lowercase());
+        }
+        if let Some(alternates) = root
+            .get("alternate_domains")
+            .and_then(Value::as_array)
+        {
+            expected.extend(
+                alternates
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|domain| domain.trim().to_ascii_lowercase()),
+            );
+        }
+        if actual_hosts.get(&site_id) != Some(&expected) {
+            return Err(DbErr::Custom(format!(
+                "site {site_id} host bindings do not match its configured hostnames"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The rejection message for a restore blocked by an under-capable agent.
@@ -1033,6 +1356,13 @@ async fn prepare_restore_inner<C: ConnectionTrait>(
         });
     }
 
+    validate_restored_host_bindings(
+        db,
+        scope,
+        &prepared,
+        options.prune_sites,
+    )
+    .await?;
     validate_references(db, &prepared).await?;
 
     let mut prune_site_ids = Vec::new();
@@ -1058,6 +1388,7 @@ async fn prepare_restore_inner<C: ConnectionTrait>(
         scope,
         tables: prepared,
         prune_site_ids,
+        prune_sites: options.prune_sites,
         owner_changes,
         warnings,
     })
@@ -1207,6 +1538,35 @@ pub async fn apply_restore(
     plan: RestorePlan,
 ) -> Result<RestoreReport, DbErr> {
     let site_id = plan.scope.column_value();
+    if plan.scope != VersionScope::Global {
+        // Use the same transaction-level lock as the host-binding API so a
+        // restore cannot race a concurrent port assignment. Revalidate under
+        // the lock because the preview/plan may have been prepared earlier.
+        txn.query_one(Statement::from_string(
+            txn.get_database_backend(),
+            format!(
+                "SELECT pg_advisory_xact_lock({HOST_BINDING_ADVISORY_LOCK_KEY})"
+            ),
+        ))
+        .await?;
+        validate_restored_host_bindings(
+            txn,
+            plan.scope,
+            &plan.tables,
+            plan.prune_sites,
+        )
+        .await?;
+    }
+    let listener_bindings_changed = if let Some(prepared) = plan
+        .tables
+        .iter()
+        .find(|table| table.spec.name == "site_host_bindings")
+    {
+        let current = query_rows(txn, prepared.spec, site_id).await?;
+        custom_listener_ports(&current) != custom_listener_ports(&prepared.rows)
+    } else {
+        false
+    };
     let mut by_layer = plan.tables.iter().collect::<Vec<_>>();
     by_layer.sort_by_key(|prepared| std::cmp::Reverse(prepared.spec.layer));
     for prepared in by_layer {
@@ -1224,6 +1584,7 @@ pub async fn apply_restore(
     let mut report = RestoreReport {
         rows_by_table: BTreeMap::new(),
         warnings: plan.warnings.clone(),
+        listener_bindings_changed,
     };
     let mut by_layer = plan.tables.iter().collect::<Vec<_>>();
     by_layer.sort_by_key(|prepared| prepared.spec.layer);

@@ -113,6 +113,45 @@ pub mod sites {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+/// Per-host listener ports. A hostname may be exposed over either protocol,
+/// and an empty port disables that protocol for the host.
+pub mod site_host_bindings {
+    use super::*;
+
+    #[derive(
+        Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize,
+    )]
+    #[sea_orm(table_name = "site_host_bindings")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub site_id: Uuid,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub hostname: String,
+        pub http_port: Option<i32>,
+        pub https_port: Option<i32>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {
+        #[sea_orm(
+            belongs_to = "super::sites::Entity",
+            from = "Column::SiteId",
+            to = "super::sites::Column::Id",
+            on_update = "Cascade",
+            on_delete = "Cascade"
+        )]
+        Site,
+    }
+
+    impl Related<super::sites::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::Site.def()
+        }
+    }
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 /// `site_upstreams` — origin servers the agents load balance across.
 pub mod site_upstreams {
     use super::*;

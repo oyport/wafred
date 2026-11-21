@@ -1099,6 +1099,16 @@ message Site {
   // Per-site downstream read/write timeout in seconds. 0 means the sender
   // predates the field; the agent must fall back to 60.
   uint32 downstream_timeout_secs = 11;
+  // Per-host listener ports. A value of 0 disables that protocol for this
+  // hostname. Older agents ignore this field and therefore must not receive
+  // custom bindings from a control plane that supports them.
+  repeated HostPortBinding host_bindings = 12;
+}
+
+message HostPortBinding {
+  string hostname = 1;
+  uint32 http_port = 2;
+  uint32 https_port = 3;
 }
 
 enum SiteStatusEnum {

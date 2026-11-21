@@ -17,9 +17,9 @@ use pingwaf_proto::control_plane::{
     GlobalCacheSettings, HealthCheckConfig, IpAccessRule, LogSettings,
     OidcAccessRule, OidcConfig, OidcHeaderClaim, PathException, PathMatchType,
     PathRestriction, RateLimitRule, ResponseReplaceConfig, ResponseReplaceRule,
-    RewriteOperation, RewriteRule, RouteConfig, RuleBundle, RuleOverride, Site,
-    SiteCacheSettings, SiteConfig, SitePolicy, SslConfig, UpstreamConfig,
-    UpstreamPeer, WafConfig, WafRule,
+    HostPortBinding, RewriteOperation, RewriteRule, RouteConfig, RuleBundle,
+    RuleOverride, Site, SiteCacheSettings, SiteConfig, SitePolicy, SslConfig,
+    UpstreamConfig, UpstreamPeer, WafConfig, WafRule,
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -43,8 +43,9 @@ use crate::models::{
     challenge_settings, characteristic, client_cert_status, defense_settings,
     error_pages, geo_rules, ip_access_rules, ip_group_sites, ip_groups, mode,
     mtls_client_certificate, oidc_provider, path_exceptions, path_restrictions,
-    rate_limit_rules, rewrite_rules, rule, rule_groups, site, site_basic_auth,
-    site_certificates, site_oidc, site_oidc as site_oidc_model, site_routes,
+    rate_limit_rules, rewrite_rules, rule, rule_groups, site,
+    site_host_bindings, site_basic_auth, site_certificates, site_oidc,
+    site_oidc as site_oidc_model, site_routes,
     site_ssl, site_status, site_upstream_pools, site_upstreams, waf_settings,
 };
 use crate::pki::mtls::normalise_fingerprint;
@@ -2149,6 +2150,31 @@ pub async fn build_site_config(
             .collect()
     };
 
+    // Load every hostname's listener assignment in one query so the full
+    // config push stays independent of the site count.
+    let site_ids: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
+    let mut host_bindings_by_site: HashMap<Uuid, Vec<HostPortBinding>> =
+        HashMap::new();
+    if !site_ids.is_empty() {
+        for binding in site_host_bindings::Entity::find()
+            .filter(site_host_bindings::Column::SiteId.is_in(site_ids))
+            .order_by_asc(site_host_bindings::Column::Hostname)
+            .all(db)
+            .await?
+        {
+            host_bindings_by_site
+                .entry(binding.site_id)
+                .or_default()
+                .push(HostPortBinding {
+                    hostname: binding.hostname,
+                    http_port: binding.http_port.unwrap_or_default().max(0)
+                        as u32,
+                    https_port: binding.https_port.unwrap_or_default().max(0)
+                        as u32,
+                });
+        }
+    }
+
     let mut sites = Vec::with_capacity(rows.len());
     let mut updated_at = Utc.timestamp_opt(0, 0).unwrap();
     for row in &rows {
@@ -2175,6 +2201,22 @@ pub async fn build_site_config(
                 &row.trusted_proxy_group_ids,
                 &group_ranges,
             ),
+            host_bindings: host_bindings_by_site
+                .remove(&row.id)
+                .unwrap_or_else(|| {
+                    std::iter::once(row.domain.as_str())
+                        .chain(
+                            row.alternate_domains
+                                .iter()
+                                .map(String::as_str),
+                        )
+                        .map(|hostname| HostPortBinding {
+                            hostname: hostname.to_string(),
+                            http_port: 80,
+                            https_port: 443,
+                        })
+                        .collect()
+                }),
         });
     }
 

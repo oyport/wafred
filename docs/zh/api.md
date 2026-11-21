@@ -10,6 +10,18 @@
 >
 > 所有端点的基址：`https://<host>:9080/api/v1`。
 
+## Host Port Bindings（站点域名端口绑定）
+
+站点主域名和备用域名可以分别配置 HTTP/HTTPS 入口端口。读取需要站点读权限，更新需要
+站点写权限；具体请求字段和响应示例见英文版 [Host Port Bindings](../api.md#host-port-bindings)。
+
+- `GET /sites/{site_id}/host-bindings` 返回域名绑定和当前可用的自定义端口范围。
+- `PUT /sites/{site_id}/host-bindings` 整体替换绑定；必须覆盖该站点当前的每个主机名。
+- HTTP 使用 `80` 或自定义端口，HTTPS 使用 `443` 或自定义端口；空值关闭对应协议。
+- 自定义 HTTPS 端口要求站点已开启 HTTPS；启用强制 HTTPS 跳转时，每个主机名都必须保留 HTTPS 绑定。
+- 默认自定义端口段为 `7000–7777`，首尾均包含，共 **778** 个端口；同协议可共享端口，HTTP 和 HTTPS 不可共用同一个 TCP 端口。
+- 修改绑定会请求 Agent 重启以重新创建监听器。Compose/systemd 由服务管理器拉起进程；前台手动运行的 Agent 退出后需要手动重启。
+
 ## Path Restrictions（路径限制）
 
 站点路径限制优先于路径例外。读取需要站点读权限，创建、修改和删除需要站点写权限；每个站点最多 64 条。规则按 `priority` 从小到大执行。

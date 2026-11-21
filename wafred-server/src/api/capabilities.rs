@@ -56,6 +56,10 @@ pub const MIN_AGENT_CANONICAL_SCOPES: &str = "0.32.21";
 /// v0.32.16).
 pub const MIN_AGENT_REGEX_SCOPES: &str = "0.32.20";
 
+/// Minimum WAFred agent version that partitions site hostnames onto the
+/// configured HTTP/HTTPS listeners.
+pub const MIN_AGENT_HOST_PORT_BINDINGS: &str = "1.0.4";
+
 /// Feature label used in rejection messages for an attached path scope.
 pub const PATH_SCOPE_LABEL: &str = "path scope";
 

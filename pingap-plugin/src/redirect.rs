@@ -45,6 +45,8 @@ pub struct Redirect {
     // Whether to redirect HTTP requests to HTTPS
     // true = force HTTPS, false = force HTTP
     http_to_https: bool,
+    // Target HTTPS port; zero is treated as the standard port 443.
+    https_port: Option<u16>,
     // HTTP status code for the redirect response
     status: StatusCode,
     // Plugin execution step (must be Request)
@@ -88,10 +90,22 @@ impl Redirect {
             308 => StatusCode::PERMANENT_REDIRECT,
             _ => StatusCode::TEMPORARY_REDIRECT,
         };
+        let http_to_https = get_bool_conf(params, "http_to_https");
+        let configured_https_port = get_int_conf(params, "https_port");
+        let https_port = if http_to_https {
+            Some(if (1..=u16::MAX as i64).contains(&configured_https_port) {
+                configured_https_port as u16
+            } else {
+                443
+            })
+        } else {
+            None
+        };
         Ok(Self {
             hash_value,
             prefix,
-            http_to_https: get_bool_conf(params, "http_to_https"),
+            http_to_https,
+            https_port,
             status,
             plugin_step: PluginStep::Request,
         })
@@ -156,6 +170,13 @@ impl Plugin for Redirect {
         // Extract host from request headers
         // Fallback to empty string if not found
         let host = get_host(session.req_header()).unwrap_or_default();
+        let host = if self.http_to_https {
+            host.parse::<http::uri::Authority>()
+                .map(|authority| authority.host().to_string())
+                .unwrap_or(host)
+        } else {
+            host
+        };
 
         // Determine target schema based on configuration
         let schema = if self.http_to_https { "https" } else { "http" };
@@ -177,8 +198,12 @@ impl Plugin for Redirect {
         // - Original host
         // - Configured prefix
         // - Original URI (path + query parameters)
+        let authority = match self.https_port {
+            Some(port) if port != 443 => format!("{host}:{port}"),
+            _ => host,
+        };
         let location = format!(
-            "Location: {schema}://{host}{prefix}{}",
+            "Location: {schema}://{authority}{prefix}{}",
             session.req_header().uri
         );
 

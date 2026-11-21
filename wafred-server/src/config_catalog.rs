@@ -11,7 +11,7 @@ use sea_orm::{ConnectionTrait, DbErr, Statement, Value as DbValue};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-pub const SNAPSHOT_SCHEMA: i64 = 2;
+pub const SNAPSHOT_SCHEMA: i64 = 3;
 pub const INSTANCE_SETTING_KEYS: [&str; 3] =
     ["notification_settings", "login_security", "passkey_enabled"];
 
@@ -134,6 +134,15 @@ pub static SITE_TABLES: &[TableSpec] = &[
     site("cache_rules", 3, "id"),
     site("site_upstream_pools", 3, "id"),
     site("site_upstreams", 4, "id"),
+    TableSpec {
+        name: "site_host_bindings",
+        scopes: SD,
+        filter: Filter::SiteId,
+        layer: 3,
+        key: None,
+        order: "hostname",
+        secrets: &[],
+    },
     site("site_routes", 4, "id"),
     TableSpec {
         secrets: &["key_pem", "acme_dns_config"],
@@ -485,6 +494,58 @@ pub fn normalise_tables(
                 .or_insert_with(|| Value::Array(vec![site.clone()]));
         }
     }
+    if scope != VersionScope::Global && schema < 3 {
+        // Schema 1/2 snapshots predate per-host listener bindings. Recreate
+        // their historical 80/443 behaviour so restoring an old snapshot
+        // cannot leave newer live custom ports attached to older hostnames.
+        let site_rows = rows_for(schema, &tables, "sites")?.unwrap_or_default();
+        let bindings = site_rows
+            .iter()
+            .flat_map(|site| {
+                let Some(site_id) = site.get("id").cloned() else {
+                    return Vec::new();
+                };
+                let mut hostnames = Vec::new();
+                if let Some(domain) = site.get("domain").and_then(Value::as_str)
+                {
+                    hostnames.push(domain.to_string());
+                }
+                if let Some(alternates) = site
+                    .get("alternate_domains")
+                    .and_then(Value::as_array)
+                {
+                    hostnames.extend(
+                        alternates
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string),
+                    );
+                }
+                hostnames
+                    .into_iter()
+                    .map(move |hostname| {
+                        json!({
+                            "site_id": site_id.clone(),
+                            "hostname": hostname,
+                            "http_port": 80,
+                            "https_port": 443,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        tables
+            .entry("site_host_bindings".to_string())
+            .or_insert_with(|| Value::Array(bindings));
+    }
+    if scope != VersionScope::Global
+        && schema >= 3
+        && !tables.contains_key("site_host_bindings")
+    {
+        return Err(DbErr::Custom(
+            "snapshot is missing the site_host_bindings table".into(),
+        ));
+    }
     let allowed: BTreeSet<_> = tables_for(scope)
         .into_iter()
         .map(|table| table.name)
@@ -534,17 +595,17 @@ mod tests {
 
     #[test]
     fn catalogue_covers_the_confirmed_configuration() {
-        assert_eq!(SITE_TABLES.len(), 26);
+        assert_eq!(SITE_TABLES.len(), 27);
         // log_retention_settings moved from deployment-only to global: the
         // static-asset access-log filter rides inside every rule bundle.
         assert_eq!(GLOBAL_TABLES.len(), 5);
         assert_eq!(DEPLOYMENT_ONLY_TABLES.len(), 9);
-        assert_eq!(tables_for(VersionScope::Deployment).len(), 40);
+        assert_eq!(tables_for(VersionScope::Deployment).len(), 41);
         let names: BTreeSet<_> = tables_for(VersionScope::Deployment)
             .into_iter()
             .map(|table| table.name)
             .collect();
-        assert_eq!(names.len(), 40, "table names must be unique");
+        assert_eq!(names.len(), 41, "table names must be unique");
     }
 
     #[test]

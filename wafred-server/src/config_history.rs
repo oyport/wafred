@@ -29,6 +29,7 @@ pub struct RollbackOutcome {
     pub scope: VersionScope,
     pub new_version: Option<i64>,
     pub pre_rollback_version: Option<i64>,
+    pub listener_bindings_changed: bool,
 }
 
 /// Captures one scope. `include_secrets` is only for an encrypted backup; the
@@ -269,7 +270,7 @@ pub async fn rollback(
         RestoreOptions::default(),
     )
     .await?;
-    config_restore::apply_restore(&txn, plan).await?;
+    let restore_report = config_restore::apply_restore(&txn, plan).await?;
     txn.commit().await?;
 
     tracing::info!(
@@ -301,6 +302,7 @@ pub async fn rollback(
         scope,
         new_version,
         pre_rollback_version,
+        listener_bindings_changed: restore_report.listener_bindings_changed,
     })
 }
 
@@ -351,6 +353,6 @@ mod tests {
         assert_eq!(VersionScope::Site(id).column_value(), Some(id));
         assert_eq!(VersionScope::Global.column_value(), None);
         assert_eq!(VersionScope::Deployment.as_str(), "deployment");
-        assert_eq!(crate::config_catalog::SNAPSHOT_SCHEMA, 2);
+        assert_eq!(crate::config_catalog::SNAPSHOT_SCHEMA, 3);
     }
 }

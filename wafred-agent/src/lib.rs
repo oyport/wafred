@@ -212,6 +212,16 @@ impl WafredAgent {
         &self.client
     }
 
+    /// Set the process-level restart action used for server-initiated
+    /// restarts. The callback runs on the gRPC command loop and should signal
+    /// the embedding application's shutdown path instead of blocking it.
+    pub async fn set_restart_handler(
+        &self,
+        handler: impl Fn(bool) + Send + Sync + 'static,
+    ) {
+        self.client.set_restart_handler(handler).await;
+    }
+
     /// Get the global agent instance (if started).
     pub fn instance() -> Option<Arc<Self>> {
         AGENT_INSTANCE.load_full()

@@ -23,6 +23,10 @@ Restart=always
 RestartSec=5
 LimitNOFILE=65536
 Environment=RUST_LOG=info,sqlx=warn
+# Allocator startup defaults; override in wafred.env when load testing.
+Environment=MIMALLOC_ARENA_RESERVE=67108864
+Environment=MIMALLOC_ARENA_EAGER_COMMIT=0
+Environment=MIMALLOC_ALLOW_THP=0
 # Instance secrets (WAFRED_SECRET_KEY) live in a 0600 file written by
 # install.sh; the leading dash keeps the unit working when it does not exist.
 EnvironmentFile=-/etc/wafred/wafred.env

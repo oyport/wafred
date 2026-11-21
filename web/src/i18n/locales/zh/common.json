@@ -526,6 +526,7 @@
       "count": "{{count}} 个站点",
       "created": "已创建",
       "updated": "站点已更新",
+      "updatedRestart": "域名变更影响自定义监听端口，已请求重启 Agent（已发送 {{sent}}，离线排队 {{queued}}）",
       "deleted": "站点已删除",
       "deleteTitle": "删除站点",
       "deleteDescription": "此操作不可撤销。该站点的所有规则和日志将被永久删除。",
@@ -2859,6 +2860,19 @@
     "basic": {
       "title": "基础",
       "description": "管理源站池、负载均衡、路由分发与反向代理信任",
+      "hostBindings": {
+        "title": "域名端口绑定",
+        "description": "为主域名和备用域名分别设置 HTTP、HTTPS 监听端口。端口映射变更会重启承载本站点的 Agent，期间可能短暂中断流量。",
+        "rangeHint": "标准端口为 HTTP 80、HTTPS 443；自定义端口范围为 {{min}}-{{max}}。自定义 HTTPS 端口要求站点已启用 HTTPS；留空表示关闭该协议。",
+        "http": "HTTP 端口",
+        "https": "HTTPS 端口",
+        "disabled": "关闭",
+        "invalidPort": "请使用 HTTP 80、HTTPS 443 或 {{min}}-{{max}} 范围内的整数，并至少启用一个协议。",
+        "protocolCollision": "同一个 TCP 端口不能同时配置为 HTTP 和 HTTPS。",
+        "restartHint": "保存实际变更时会向相关 Agent 发送受控重启；离线 Agent 会在下次连接时应用配置。前台手动运行的 Agent 需要由运维人员重新启动。",
+        "saved": "域名端口绑定已保存",
+        "savedRestart": "已保存并发送 Agent 重启请求（在线 {{sent}} 个，离线排队 {{queued}} 个）"
+      },
       "addPool": "添加源站池",
       "editPool": "编辑源站池",
       "poolCreateDescription": "源站池是一组共享负载均衡与回源协议的源站节点。",
