@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Card, CardBody, CardHeader } from '@/components/ui/Card'
@@ -31,7 +31,7 @@ export function HostPortBindingsCard({ siteId }: { siteId: string }) {
   const toast = useToast()
   const queryClient = useQueryClient()
   const canWrite = useCanWrite()
-  const [draft, setDraft] = useState<DraftBinding[]>([])
+  const [edited, setEdited] = useState<{ siteId: string; bindings: DraftBinding[] } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const query = useQuery({
     queryKey: siteKeys.hostBindings(siteId),
@@ -39,14 +39,11 @@ export function HostPortBindingsCard({ siteId }: { siteId: string }) {
     enabled: Boolean(siteId),
   })
 
-  useEffect(() => {
-    if (query.data) setDraft(toDraft(query.data.bindings))
-  }, [query.data])
-
   const savedDraft = useMemo(
     () => toDraft(query.data?.bindings ?? []),
     [query.data],
   )
+  const draft = edited?.siteId === siteId ? edited.bindings : savedDraft
   const dirty = Boolean(query.data) &&
     JSON.stringify(draft) !== JSON.stringify(savedDraft)
   useRegisterUnsaved(dirty)
@@ -95,7 +92,8 @@ export function HostPortBindingsCard({ siteId }: { siteId: string }) {
         })),
       }),
     onSuccess: (result) => {
-      setDraft(toDraft(result.bindings))
+      queryClient.setQueryData(siteKeys.hostBindings(siteId), result)
+      setEdited(null)
       setError(null)
       toast.success(
         result.restart_required
@@ -117,13 +115,14 @@ export function HostPortBindingsCard({ siteId }: { siteId: string }) {
     protocol: 'http_port' | 'https_port',
     value: string,
   ) => {
-    setDraft((current) =>
-      current.map((binding) =>
+    setEdited((current) => ({
+      siteId,
+      bindings: (current?.siteId === siteId ? current.bindings : savedDraft).map((binding) =>
         binding.hostname === hostname
           ? { ...binding, [protocol]: value }
           : binding,
       ),
-    )
+    }))
     setError(null)
   }
 
