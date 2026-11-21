@@ -6668,6 +6668,7 @@ ml_threshold = 0.75
     /// everything else is empty/disabled.
     fn site_rules(waf: Option<CacheWafConfig>) -> CacheSiteRules {
         CacheSiteRules {
+            host_bindings: vec![],
             site_id: "site-1".into(),
             domain: "example.com".into(),
             alternate_domains: Vec::new(),
@@ -7607,6 +7608,7 @@ inspect_body = true"###,
             .rule_cache
             .update_from_site_config(&proto::SiteConfig {
                 sites: vec![proto::Site {
+                    host_bindings: vec![],
                     id: "site-1".to_string(),
                     name: "example".to_string(),
                     domain: "example.com".to_string(),
@@ -7676,6 +7678,7 @@ inspect_body = true"###,
             .rule_cache
             .update_from_site_config(&proto::SiteConfig {
                 sites: vec![proto::Site {
+                    host_bindings: vec![],
                     id: "site-1".to_string(),
                     name: "example".to_string(),
                     domain: "example.com".to_string(),
@@ -7767,6 +7770,7 @@ inspect_body = true"###,
             .rule_cache
             .update_from_site_config(&proto::SiteConfig {
                 sites: vec![proto::Site {
+                    host_bindings: vec![],
                     id: "site-1".to_string(),
                     name: "example".to_string(),
                     domain: "example.com".to_string(),
@@ -7928,6 +7932,7 @@ inspect_body = true"###,
             .rule_cache
             .update_from_site_config(&proto::SiteConfig {
                 sites: vec![proto::Site {
+                    host_bindings: vec![],
                     id: "site-1".to_string(),
                     name: "example".to_string(),
                     domain: "example.com".to_string(),
@@ -7990,6 +7995,7 @@ inspect_body = true"###,
             .rule_cache
             .update_from_site_config(&proto::SiteConfig {
                 sites: vec![proto::Site {
+                    host_bindings: vec![],
                     id: "site-1".to_string(),
                     name: "example".to_string(),
                     domain: "example.com".to_string(),
@@ -8278,6 +8284,7 @@ inspect_body = true"###,
             .rule_cache
             .update_from_site_config(&proto::SiteConfig {
                 sites: vec![proto::Site {
+                    host_bindings: vec![],
                     id: "site-1".to_string(),
                     name: "example".to_string(),
                     domain: "example.com".to_string(),
@@ -8577,6 +8584,7 @@ inspect_body = true"###,
             .rule_cache
             .update_from_site_config(&proto::SiteConfig {
                 sites: vec![proto::Site {
+                    host_bindings: vec![],
                     id: "site-1".to_string(),
                     name: "example".to_string(),
                     domain: "example.com".to_string(),
@@ -8788,6 +8796,7 @@ inspect_body = true"###,
             .rule_cache
             .update_from_site_config(&proto::SiteConfig {
                 sites: vec![proto::Site {
+                    host_bindings: vec![],
                     id: "site-1".to_string(),
                     name: "example".to_string(),
                     domain: "example.com".to_string(),
@@ -9162,6 +9171,7 @@ inspect_body = true"###,
             .rule_cache
             .update_from_site_config(&proto::SiteConfig {
                 sites: vec![proto::Site {
+                    host_bindings: vec![],
                     id: "site-1".to_string(),
                     name: "example".to_string(),
                     domain: "example.com".to_string(),
@@ -9229,6 +9239,7 @@ inspect_body = true"###,
             .rule_cache
             .update_from_site_config(&proto::SiteConfig {
                 sites: vec![proto::Site {
+                    host_bindings: vec![],
                     id: "site-1".to_string(),
                     name: "example".to_string(),
                     domain: "example.com".to_string(),
@@ -9666,6 +9677,7 @@ inspect_body = true"###,
             .rule_cache
             .update_from_site_config(&proto::SiteConfig {
                 sites: vec![proto::Site {
+                    host_bindings: vec![],
                     id: "site-1".to_string(),
                     name: "example".to_string(),
                     domain: "example.com".to_string(),
@@ -9986,6 +9998,7 @@ inspect_body = true"###,
             .rule_cache
             .update_from_site_config(&proto::SiteConfig {
                 sites: vec![proto::Site {
+                    host_bindings: vec![],
                     id: "site-1".to_string(),
                     name: "example".to_string(),
                     domain: "example.com".to_string(),
@@ -10247,6 +10260,7 @@ inspect_body = true"###,
             .rule_cache
             .update_from_site_config(&proto::SiteConfig {
                 sites: vec![proto::Site {
+                    host_bindings: vec![],
                     id: "site-1".to_string(),
                     name: "example".to_string(),
                     domain: "example.com".to_string(),
@@ -10458,6 +10472,7 @@ inspect_body = true"###,
             .rule_cache
             .update_from_site_config(&proto::SiteConfig {
                 sites: vec![proto::Site {
+                    host_bindings: vec![],
                     id: "site-1".to_string(),
                     name: "example".to_string(),
                     domain: "*.example.com".to_string(),
@@ -11430,6 +11445,7 @@ inspect_body = true"###,
             .rule_cache
             .update_from_site_config(&proto::SiteConfig {
                 sites: vec![proto::Site {
+                    host_bindings: vec![],
                     id: "site-1".to_string(),
                     name: "example".to_string(),
                     domain: "example.com".to_string(),

@@ -1656,6 +1656,7 @@ cookie_secret = "test-secret"
             .update_from_site_config(&proto::SiteConfig {
                 sites: vec![
                     proto::Site {
+                        host_bindings: vec![],
                         id: "site-1".to_string(),
                         name: "example".to_string(),
                         domain: "example.com".to_string(),
@@ -1675,6 +1676,7 @@ cookie_secret = "test-secret"
                         downstream_timeout_secs: 60,
                     },
                     proto::Site {
+                        host_bindings: vec![],
                         id: "site-2".to_string(),
                         name: "bare".to_string(),
                         domain: "bare.example.com".to_string(),

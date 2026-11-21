@@ -943,6 +943,7 @@ template = '{"error":"rate_limit_exceeded","request_id":"{{ request_id }}"}'
                 .rule_cache
                 .update_from_site_config(&proto::SiteConfig {
                     sites: vec![proto::Site {
+                        host_bindings: vec![],
                         id: "site-1".to_string(),
                         name: "example".to_string(),
                         domain: "example.com".to_string(),
@@ -1015,6 +1016,7 @@ template = '{"error":"rate_limit_exceeded","request_id":"{{ request_id }}"}'
                 .rule_cache
                 .update_from_site_config(&proto::SiteConfig {
                     sites: vec![proto::Site {
+                        host_bindings: vec![],
                         id: "site-1".to_string(),
                         name: "example".to_string(),
                         domain: "example.com".to_string(),

@@ -2092,6 +2092,7 @@ rules = '[{"id":"zeros","direction":"request","operations":[{"type":"regex_repla
         ) -> proto::SiteConfig {
             proto::SiteConfig {
                 sites: vec![proto::Site {
+                    host_bindings: vec![],
                     id: "site-1".to_string(),
                     name: "example".to_string(),
                     domain: "example.com".to_string(),

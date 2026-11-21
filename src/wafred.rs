@@ -2814,6 +2814,7 @@ mod tests {
 
     fn site_rules(site_id: &str, domain: &str) -> SiteRules {
         SiteRules {
+            host_bindings: vec![],
             site_id: site_id.to_string(),
             domain: domain.to_string(),
             alternate_domains: vec![],

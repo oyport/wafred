@@ -4043,6 +4043,7 @@ mod tests {
                 .unwrap();
 
         let site = |id: &str, domain: &str| proto::Site {
+            host_bindings: vec![],
             id: id.to_string(),
             name: id.to_string(),
             domain: domain.to_string(),
@@ -4106,6 +4107,7 @@ mod tests {
         cache
             .update_from_site_config(&proto::SiteConfig {
                 sites: vec![proto::Site {
+                    host_bindings: vec![],
                     id: "site-1".to_string(),
                     name: "example".to_string(),
                     domain: "example.com".to_string(),
@@ -4209,6 +4211,7 @@ mod tests {
             },
         ];
         let site = |id: &str, domain: &str| proto::Site {
+            host_bindings: vec![],
             id: id.to_string(),
             name: id.to_string(),
             domain: domain.to_string(),
@@ -4549,6 +4552,7 @@ mod tests {
     #[test]
     fn proto_conversion_carries_status_and_new_fields() {
         let site = proto::Site {
+            host_bindings: vec![],
             id: "site-1".to_string(),
             name: "Example".to_string(),
             domain: "example.com".to_string(),
@@ -4590,6 +4594,7 @@ mod tests {
     #[test]
     fn optional_mtls_does_not_require_a_client_certificate() {
         let site = proto::Site {
+            host_bindings: vec![],
             id: "site-1".to_string(),
             name: "Example".to_string(),
             domain: "example.com".to_string(),
