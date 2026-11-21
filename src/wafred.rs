@@ -51,8 +51,8 @@ use pingora::server;
 use pingora::server::configuration::Opt;
 use pingora::services::background::background_service;
 use pingwaf_agent::cache::{
-    CachedRules, CustomErrorPage, HealthCheckConfig, HostPortBinding, OidcConfig,
-    ResponseReplaceConfig, RuleCache, SslConfig,
+    CachedRules, CustomErrorPage, HealthCheckConfig, HostPortBinding,
+    OidcConfig, ResponseReplaceConfig, RuleCache, SslConfig,
 };
 use pingwaf_agent::config::AgentConfig;
 use pingwaf_server::ServerConfig;
@@ -71,9 +71,7 @@ pub enum RunMode {
 static AGENT_RESTART_NOTIFY: tokio::sync::Notify =
     tokio::sync::Notify::const_new();
 
-async fn install_agent_restart_handler(
-    agent: &pingwaf_agent::WafredAgent,
-) {
+async fn install_agent_restart_handler(agent: &pingwaf_agent::WafredAgent) {
     agent
         .set_restart_handler(|graceful| {
             info!(graceful, "agent process restart requested by control plane");
@@ -1376,8 +1374,7 @@ fn cached_rules_to_pingap_config(
                 },
             );
             location_names.push(loc_name);
-            site_location_names
-                .push(format!("{site_id}_route_{}", route.id));
+            site_location_names.push(format!("{site_id}_route_{}", route.id));
         }
 
         // Convert SSL certificate: an uploaded PEM is served as-is, while a
@@ -1514,8 +1511,7 @@ fn cached_rules_to_pingap_config(
     // Keep source locations available while custom-site prototypes are
     // removed from the final location map. Each custom binding gets a clone
     // with its own exact hostname match. Legacy sites avoid the extra copies.
-    let mut prototype_locations: HashMap<String, LocationConf> =
-        HashMap::new();
+    let mut prototype_locations: HashMap<String, LocationConf> = HashMap::new();
     let mut legacy_default_sites = BTreeSet::new();
     for (site_id, site) in &cached.sites {
         let Some(prototypes) = location_prototypes_by_site.get(site_id) else {
@@ -1549,8 +1545,7 @@ fn cached_rules_to_pingap_config(
             .collect();
         if actual == expected
             && bindings.iter().all(|binding| {
-                binding.http_port == Some(80)
-                    && binding.https_port == Some(443)
+                binding.http_port == Some(80) && binding.https_port == Some(443)
             })
         {
             // Preserve the original location keys and one shared location per
@@ -1606,7 +1601,8 @@ fn cached_rules_to_pingap_config(
                 // run the same WAF/route chain without redirecting again.
                 for (binding_index, binding) in bindings.iter().enumerate() {
                     for prototype in prototypes {
-                        let Some(mut location) = locations.get(prototype).cloned()
+                        let Some(mut location) =
+                            locations.get(prototype).cloned()
                         else {
                             continue;
                         };
@@ -1646,10 +1642,9 @@ fn cached_rules_to_pingap_config(
             continue;
         }
         for (binding_index, binding) in bindings.iter().enumerate() {
-            for (is_http, port) in [
-                (true, binding.http_port),
-                (false, binding.https_port),
-            ] {
+            for (is_http, port) in
+                [(true, binding.http_port), (false, binding.https_port)]
+            {
                 let Some(port) = port else {
                     continue;
                 };
@@ -1669,7 +1664,8 @@ fn cached_rules_to_pingap_config(
                     else {
                         continue;
                     };
-                    let listener_suffix = if is_http { "http" } else { "https" };
+                    let listener_suffix =
+                        if is_http { "http" } else { "https" };
                     let name = format!(
                         "{prototype}_binding_{binding_index}_{listener_suffix}"
                     );

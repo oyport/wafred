@@ -16,8 +16,8 @@ use crate::api::capabilities::{
     attached_scope_requirements, path_exception_requirements,
     site_agents_below, ScopeRequirement, MIN_AGENT_HOST_PORT_BINDINGS,
 };
-use crate::api::sites::HOST_BINDING_ADVISORY_LOCK_KEY;
 use crate::api::error::ApiError;
+use crate::api::sites::HOST_BINDING_ADVISORY_LOCK_KEY;
 use crate::api::validation::{
     check_path_exception_fields, check_rule_fields, RuleRowFix,
 };
@@ -731,12 +731,14 @@ fn restore_custom_port_range() -> Result<(u16, u16), DbErr> {
     fn read_port(key: &str, default: u16) -> Result<u16, DbErr> {
         match std::env::var(key) {
             Ok(value) => value.trim().parse::<u16>().map_err(|_| {
-                DbErr::Custom(format!("{key} must be a TCP port from 1 to 65535"))
+                DbErr::Custom(format!(
+                    "{key} must be a TCP port from 1 to 65535"
+                ))
             }),
             Err(std::env::VarError::NotPresent) => Ok(default),
-            Err(error) => Err(DbErr::Custom(format!(
-                "could not read {key}: {error}"
-            ))),
+            Err(error) => {
+                Err(DbErr::Custom(format!("could not read {key}: {error}")))
+            },
         }
     }
     fn addr_ports(
@@ -749,12 +751,7 @@ fn restore_custom_port_range() -> Result<(u16, u16), DbErr> {
                 let ports = value
                     .split(',')
                     .filter_map(|address| {
-                        address
-                            .trim()
-                            .rsplit(':')
-                            .next()?
-                            .parse::<u16>()
-                            .ok()
+                        address.trim().rsplit(':').next()?.parse::<u16>().ok()
                     })
                     .collect::<Vec<_>>();
                 if !ports.is_empty() {
@@ -787,7 +784,8 @@ fn restore_custom_port_range() -> Result<(u16, u16), DbErr> {
             .any(|port| (start..=end).contains(&port))
     {
         return Err(DbErr::Custom(
-            "custom port range is invalid or overlaps a reserved listener".into(),
+            "custom port range is invalid or overlaps a reserved listener"
+                .into(),
         ));
     }
     Ok((start, end))
@@ -821,8 +819,9 @@ async fn validate_restored_host_bindings<C: ConnectionTrait>(
     if scope == VersionScope::Global {
         return Ok(());
     }
-    let bindings_spec = spec_for("site_host_bindings")
-        .ok_or_else(|| DbErr::Custom("site_host_bindings is not catalogued".into()))?;
+    let bindings_spec = spec_for("site_host_bindings").ok_or_else(|| {
+        DbErr::Custom("site_host_bindings is not catalogued".into())
+    })?;
     let mut bindings = tables
         .iter()
         .find(|table| table.spec.name == "site_host_bindings")
@@ -839,20 +838,18 @@ async fn validate_restored_host_bindings<C: ConnectionTrait>(
 
     let sites_spec = spec_for("sites")
         .ok_or_else(|| DbErr::Custom("sites is not catalogued".into()))?;
-    let mut roots: BTreeMap<Uuid, Value> = if scope == VersionScope::Deployment
-        && prune_sites
-    {
-        BTreeMap::new()
-    } else {
-        query_rows(db, sites_spec, None)
-            .await?
-            .into_iter()
-            .filter_map(|row| uuid_field(&row, "id").map(|id| (id, row)))
-            .collect()
-    };
-    if let Some(restored_sites) = tables
-        .iter()
-        .find(|table| table.spec.name == "sites")
+    let mut roots: BTreeMap<Uuid, Value> =
+        if scope == VersionScope::Deployment && prune_sites {
+            BTreeMap::new()
+        } else {
+            query_rows(db, sites_spec, None)
+                .await?
+                .into_iter()
+                .filter_map(|row| uuid_field(&row, "id").map(|id| (id, row)))
+                .collect()
+        };
+    if let Some(restored_sites) =
+        tables.iter().find(|table| table.spec.name == "sites")
     {
         for row in &restored_sites.rows {
             if let Some(id) = uuid_field(row, "id") {
@@ -863,8 +860,9 @@ async fn validate_restored_host_bindings<C: ConnectionTrait>(
 
     let mut ssl_rows: Vec<Value> = query_rows(
         db,
-        spec_for("site_ssl")
-            .ok_or_else(|| DbErr::Custom("site_ssl is not catalogued".into()))?,
+        spec_for("site_ssl").ok_or_else(|| {
+            DbErr::Custom("site_ssl is not catalogued".into())
+        })?,
         None,
     )
     .await?;
@@ -902,7 +900,9 @@ async fn validate_restored_host_bindings<C: ConnectionTrait>(
     let mut https_ports = BTreeSet::new();
     for row in &bindings {
         let site_id = uuid_field(row, "site_id").ok_or_else(|| {
-            DbErr::Custom("site_host_bindings row has an invalid site_id".into())
+            DbErr::Custom(
+                "site_host_bindings row has an invalid site_id".into(),
+            )
         })?;
         let hostname = row
             .get("hostname")
@@ -910,7 +910,9 @@ async fn validate_restored_host_bindings<C: ConnectionTrait>(
             .map(|hostname| hostname.trim().to_ascii_lowercase())
             .filter(|hostname| !hostname.is_empty())
             .ok_or_else(|| {
-                DbErr::Custom("site_host_bindings row has an invalid hostname".into())
+                DbErr::Custom(
+                    "site_host_bindings row has an invalid hostname".into(),
+                )
             })?;
         let root = roots.get(&site_id).ok_or_else(|| {
             DbErr::Custom(format!(
@@ -921,9 +923,8 @@ async fn validate_restored_host_bindings<C: ConnectionTrait>(
         if let Some(domain) = root.get("domain").and_then(Value::as_str) {
             expected.insert(domain.trim().to_ascii_lowercase());
         }
-        if let Some(alternates) = root
-            .get("alternate_domains")
-            .and_then(Value::as_array)
+        if let Some(alternates) =
+            root.get("alternate_domains").and_then(Value::as_array)
         {
             expected.extend(
                 alternates
@@ -989,9 +990,8 @@ async fn validate_restored_host_bindings<C: ConnectionTrait>(
         if let Some(domain) = root.get("domain").and_then(Value::as_str) {
             expected.insert(domain.trim().to_ascii_lowercase());
         }
-        if let Some(alternates) = root
-            .get("alternate_domains")
-            .and_then(Value::as_array)
+        if let Some(alternates) =
+            root.get("alternate_domains").and_then(Value::as_array)
         {
             expected.extend(
                 alternates
@@ -1356,13 +1356,8 @@ async fn prepare_restore_inner<C: ConnectionTrait>(
         });
     }
 
-    validate_restored_host_bindings(
-        db,
-        scope,
-        &prepared,
-        options.prune_sites,
-    )
-    .await?;
+    validate_restored_host_bindings(db, scope, &prepared, options.prune_sites)
+        .await?;
     validate_references(db, &prepared).await?;
 
     let mut prune_site_ids = Vec::new();
