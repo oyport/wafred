@@ -2132,11 +2132,11 @@ pub(crate) const CLONE_COPIED_TABLES: &[&str] = &[
     "visitor_site_grants",
 ];
 
-/// Nothing site-scoped is skipped any more. The list stays so a future
-/// decision to exclude a table has one obvious place to record it, and the
-/// coverage test keeps both lists in sync with `config_catalog::SITE_TABLES`.
+/// Source hostname bindings are not copied: a clone has different domains,
+/// so `clone_site` creates default 80/443 bindings for its own hostnames.
+/// Keep this list in sync with `config_catalog::SITE_TABLES`.
 #[cfg(test)]
-pub(crate) const CLONE_INTENTIONALLY_SKIPPED: &[&str] = &[];
+pub(crate) const CLONE_INTENTIONALLY_SKIPPED: &[&str] = &["site_host_bindings"];
 
 /// Copies the source site's WAF rule groups and custom rules onto the clone
 /// inside the caller's transaction (C4/L2-001). Groups are inserted first so
