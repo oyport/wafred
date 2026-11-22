@@ -23,11 +23,11 @@ const features = {
   metrics: {
     eyebrow: "Measured effectiveness",
     title: "Numbers from a public corpus",
-    lead: "33 877 blazehttp samples replayed byte for byte against a release build — strict calibre: only 403 block pages and 503 challenge pages count.",
+    lead: "WAFred 1.0.4 candidate replayed all 33,877 blazehttp requests; blocks and challenges count as interceptions across all 658 malicious samples.",
     items: [
-      { value: "96.6%", label: "Attack interception", note: "Effective · 638 decidable samples" },
-      { value: "0.06%", label: "False positives", note: "19 of 33 219 benign samples" },
-      { value: "1–2 ms", label: "Static-tier p95", note: "loopback replay / release build" },
+      { value: "96.05%", label: "Attack interception · Strict + body", note: "632/658 attacks in the full corpus" },
+      { value: "0.057%", label: "False positives", note: "19 of 33,219 benign samples" },
+      { value: "48 ms", label: "Corpus replay p95", note: "VM, proxy and mock origin included" },
     ],
     link: { label: "Read the full test report", path: "/docs/waf-test-report/" },
   },

@@ -1,23 +1,30 @@
 /**
  * Cross-vendor benchmark rows for the WAF test report page.
  *
- * PingWAF figures come from `results/0.32.4/metrics.json` (33 877 samples,
- * this repository's own replay). The other rows are quoted from the blazehttp
- * project README (33 669 samples), which is why the page shows a source note
- * next to the charts. Labels are product names and stay in English across
- * locales; only the prose around them is translated.
+ * WAFred figures come from the corrected 2026-11-22 full-corpus replay
+ * (33 877 samples). PingWAF P13 rows are the prior version's final run on the
+ * same nominal corpus, with earlier body framing. Other products are
+ * historical values quoted from the blazehttp project README; they were not
+ * retested in this run. Labels stay in English across locales; page copy
+ * explains sources and denominator differences.
  */
 export interface BenchRow {
   label: string;
   /** Percent, 0-100. */
   value: number;
-  /** PingWAF rows carry the site accent colour. */
+  /** Current WAFred rows carry the site accent colour. */
   accent?: boolean;
 }
 
 export const INTERCEPTION_ROWS: BenchRow[] = [
-  { label: "PingWAF Strict+body", value: 93.8, accent: true },
-  { label: "PingWAF Normal", value: 60.2, accent: true },
+  { label: "WAFred Strict+body", value: 96.05, accent: true },
+  { label: "PingWAF prior P13 Strict+body", value: 93.8 },
+  { label: "WAFred Strict", value: 76.14, accent: true },
+  { label: "PingWAF prior P13 Strict", value: 76.0 },
+  { label: "WAFred Normal+body", value: 75.08, accent: true },
+  { label: "PingWAF prior P13 Normal+body", value: 71.9 },
+  { label: "WAFred Normal", value: 60.33, accent: true },
+  { label: "PingWAF prior P13 Normal", value: 60.2 },
   { label: "SafeLine strict", value: 76.17 },
   { label: "SafeLine balanced", value: 71.65 },
   { label: "ModSecurity PL4", value: 94.61 },
@@ -26,8 +33,14 @@ export const INTERCEPTION_ROWS: BenchRow[] = [
 ];
 
 export const FALSE_POSITIVE_ROWS: BenchRow[] = [
-  { label: "PingWAF Strict+body", value: 0.06, accent: true },
-  { label: "PingWAF Normal", value: 0.01, accent: true },
+  { label: "WAFred Strict+body", value: 0.057, accent: true },
+  { label: "PingWAF prior P13 Strict+body", value: 0.063 },
+  { label: "WAFred Strict", value: 0.012, accent: true },
+  { label: "PingWAF prior P13 Strict", value: 0.015 },
+  { label: "WAFred Normal+body", value: 0.036, accent: true },
+  { label: "PingWAF prior P13 Normal+body", value: 0.042 },
+  { label: "WAFred Normal", value: 0.012, accent: true },
+  { label: "PingWAF prior P13 Normal", value: 0.015 },
   { label: "SafeLine strict", value: 0.22 },
   { label: "SafeLine balanced", value: 0.07 },
   { label: "ModSecurity PL4", value: 52.46 },

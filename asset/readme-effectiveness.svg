@@ -1,22 +1,79 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="400" viewBox="0 0 1000 400" role="img" aria-labelledby="title desc">
-  <title id="title">Historical PingWAF source-project benchmark</title>
-  <desc id="desc">A comparison of the PingWAF 0.32.4 source baseline and other products on the blazehttp corpus. WAFred has not rerun this benchmark.</desc>
-  <defs><pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0H0V40" fill="none" stroke="#171717" stroke-width="1"/></pattern></defs>
-  <rect width="1000" height="400" fill="#101010"/><rect width="1000" height="400" fill="url(#grid)"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="650" viewBox="0 0 1000 650" role="img" aria-labelledby="title desc">
+  <title id="title">WAFred 1.0.4 compared with prior PingWAF results and firewall references</title>
+  <desc id="desc">Current corrected WAFred measurements for four policy tiers, paired with the earlier PingWAF P13 results and historical SafeLine, ModSecurity and Cloudflare references.</desc>
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0H0V40" fill="none" stroke="#171717" stroke-width="1"/></pattern>
+  </defs>
+  <rect width="1000" height="650" fill="#101010"/>
+  <rect width="1000" height="650" fill="url(#grid)"/>
   <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
-    <text x="30" y="40" fill="#e8e8e8" font-size="15" font-weight="700">Historical source baseline · blazehttp corpus</text>
-    <text x="30" y="61" fill="#8d8d8d" font-size="10">PingWAF 0.32.4 · WAFred has not re-run this benchmark</text>
-    <g font-size="11" fill="#8d8d8d">
-      <text x="30" y="115" fill="#ffb9c5" font-weight="700">PingWAF source</text><text x="30" y="163">ModSecurity PL4</text><text x="30" y="211">SafeLine strict</text><text x="30" y="259">ModSecurity PL1</text><text x="30" y="307">Cloudflare free</text>
+    <text x="30" y="34" fill="#e8e8e8" font-size="15" font-weight="700">WAFred 1.0.4 · prior PingWAF run · firewall references</text>
+    <text x="30" y="53" fill="#8d8d8d" font-size="10">Interception rate · current WAFred uses corrected body framing · same nominal corpus: 658 attacks</text>
+    <g font-size="10.5" fill="#c8c8c8">
+      <text x="30" y="90" fill="#ffb9c5" font-weight="700">WAFred Strict + body</text>
+      <text x="30" y="126" fill="#d3ad64">PingWAF prior P13 Strict + body</text>
+      <text x="30" y="162" fill="#ffb9c5" font-weight="700">WAFred Strict</text>
+      <text x="30" y="198" fill="#d3ad64">PingWAF prior P13 Strict</text>
+      <text x="30" y="234" fill="#ffb9c5" font-weight="700">WAFred Normal + body</text>
+      <text x="30" y="270" fill="#d3ad64">PingWAF prior P13 Normal + body</text>
+      <text x="30" y="306" fill="#ffb9c5" font-weight="700">WAFred Normal</text>
+      <text x="30" y="342" fill="#d3ad64">PingWAF prior P13 Normal</text>
+      <text x="30" y="378">ModSecurity PL4</text>
+      <text x="30" y="414">SafeLine free · strict</text>
+      <text x="30" y="450">SafeLine free · balanced</text>
+      <text x="30" y="486">ModSecurity PL1</text>
+      <text x="30" y="522">Cloudflare free</text>
     </g>
-    <g fill="#252525"><rect x="220" y="96" width="620" height="20" rx="4"/><rect x="220" y="144" width="620" height="20" rx="4"/><rect x="220" y="192" width="620" height="20" rx="4"/><rect x="220" y="240" width="620" height="20" rx="4"/><rect x="220" y="288" width="620" height="20" rx="4"/></g>
+    <g fill="#252525">
+      <rect x="270" y="76" width="620" height="19" rx="4"/>
+      <rect x="270" y="112" width="620" height="19" rx="4"/>
+      <rect x="270" y="148" width="620" height="19" rx="4"/>
+      <rect x="270" y="184" width="620" height="19" rx="4"/>
+      <rect x="270" y="220" width="620" height="19" rx="4"/>
+      <rect x="270" y="256" width="620" height="19" rx="4"/>
+      <rect x="270" y="292" width="620" height="19" rx="4"/>
+      <rect x="270" y="328" width="620" height="19" rx="4"/>
+      <rect x="270" y="364" width="620" height="19" rx="4"/>
+      <rect x="270" y="400" width="620" height="19" rx="4"/>
+      <rect x="270" y="436" width="620" height="19" rx="4"/>
+      <rect x="270" y="472" width="620" height="19" rx="4"/>
+      <rect x="270" y="508" width="620" height="19" rx="4"/>
+    </g>
     <g>
-      <rect x="220" y="96" width="581.6" height="20" rx="4" fill="#d8324f"/><rect x="801.6" y="96" width="17.36" height="20" fill="#d8324f" fill-opacity=".55"/>
-      <rect x="220" y="144" width="586.6" height="20" rx="4" fill="#707070"/><rect x="220" y="192" width="472.3" height="20" rx="4" fill="#707070"/><rect x="220" y="240" width="432.4" height="20" rx="4" fill="#707070"/><rect x="220" y="288" width="66.3" height="20" rx="4" fill="#707070"/>
+      <rect x="270" y="76" width="595.5" height="19" rx="4" fill="#d8324f"/>
+      <rect x="270" y="112" width="581.6" height="19" rx="4" fill="#a7833a"/>
+      <rect x="270" y="148" width="472.1" height="19" rx="4" fill="#d8324f"/>
+      <rect x="270" y="184" width="471.2" height="19" rx="4" fill="#a7833a"/>
+      <rect x="270" y="220" width="465.5" height="19" rx="4" fill="#d8324f"/>
+      <rect x="270" y="256" width="445.8" height="19" rx="4" fill="#a7833a"/>
+      <rect x="270" y="292" width="374.0" height="19" rx="4" fill="#d8324f"/>
+      <rect x="270" y="328" width="373.2" height="19" rx="4" fill="#a7833a"/>
+      <rect x="270" y="364" width="586.6" height="19" rx="4" fill="#707070"/>
+      <rect x="270" y="400" width="472.3" height="19" rx="4" fill="#707070"/>
+      <rect x="270" y="436" width="444.2" height="19" rx="4" fill="#707070"/>
+      <rect x="270" y="472" width="432.4" height="19" rx="4" fill="#707070"/>
+      <rect x="270" y="508" width="66.3" height="19" rx="4" fill="#707070"/>
     </g>
-    <g fill="#e8e8e8" font-size="11" font-weight="700"><text x="832" y="111">93.8%</text><text x="816" y="159">94.61%</text><text x="702" y="207">76.17%</text><text x="662" y="255">69.74%</text><text x="296" y="303">10.70%</text></g>
-    <text x="220" y="333" fill="#8d8d8d" font-size="9">0%</text><text x="815" y="333" fill="#8d8d8d" font-size="9">100%</text>
-    <text x="30" y="365" fill="#c6b7bd" font-size="10">Source data: PingWAF 0.32.4 · 658 malicious samples · 0.06% benign affected · 96.6% effective interception</text>
-    <text x="30" y="384" fill="#8d8d8d" font-size="9">Historical reference only. These figures are not a WAFred release measurement.</text>
+    <g font-size="10.5" font-weight="700">
+      <text x="870" y="90" fill="#ffb9c5">96.05%</text>
+      <text x="854" y="126" fill="#d3ad64">93.8%</text>
+      <text x="746" y="162" fill="#ffb9c5">76.14%</text>
+      <text x="745" y="198" fill="#d3ad64">76.0%</text>
+      <text x="739" y="234" fill="#ffb9c5">75.08%</text>
+      <text x="720" y="270" fill="#d3ad64">71.9%</text>
+      <text x="648" y="306" fill="#ffb9c5">60.33%</text>
+      <text x="647" y="342" fill="#d3ad64">60.2%</text>
+      <text x="861" y="378" fill="#e8e8e8">94.61%</text>
+      <text x="746" y="414" fill="#e8e8e8">76.17%</text>
+      <text x="718" y="450" fill="#e8e8e8">71.65%</text>
+      <text x="706" y="486" fill="#e8e8e8">69.74%</text>
+      <text x="342" y="522" fill="#e8e8e8">10.70%</text>
+    </g>
+    <text x="270" y="544" fill="#8d8d8d" font-size="9">0%</text>
+    <text x="885" y="544" fill="#8d8d8d" font-size="9">100%</text>
+    <text x="30" y="566" fill="#c6b7bd" font-size="9.5">WAFred Strict + body: 632/658 intercepted · 19/33,219 benign affected (0.057%).</text>
+    <text x="30" y="586" fill="#d3ad64" font-size="9">Prior PingWAF P13 Strict + body: 617/658 (93.8%) · 21 benign affected (0.063%).</text>
+    <text x="30" y="606" fill="#8d8d8d" font-size="9">Prior replay framing differed and had 15 framing-related HTTP 500s; current WAFred uses corrected framing.</text>
+    <text x="30" y="626" fill="#8d8d8d" font-size="9">Other firewall values are historical; corpus and network paths differ. p95 is not directly comparable.</text>
   </g>
 </svg>

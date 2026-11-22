@@ -107,40 +107,42 @@
 
 ---
 
-## 📊 PingWAF 历史基准数据
+## 📊 WAFred 1.0.4 基准测试结果
 
-<img src="./asset/readme-effectiveness.svg" alt="PingWAF 0.32.4 在 blazehttp 语料上的历史来源基线：全量口径拦截率 93.8%（有效口径 96.6%，误报 0.06%）；WAFred 尚未重测" width="1000">
+<img src="./asset/readme-effectiveness.svg" alt="WAFred 1.0.4 在 33,877 条 blazehttp 语料上的结果，与早期 PingWAF P13 和其他防火墙历史数据对比" width="1000">
 
-下列数据由 PingWAF 0.32.4 在 WAFred 独立开发前测得。WAFred 尚未重新运行这套基准，因此这些数字是**来源项目的历史基线**，不代表 WAFred 当前版本的实测结果。
+本地重建的 WAFred 1.0.4 测试候选版本已回放公开的 [blazehttp](https://github.com/chaitin/blazehttp) 全量语料（33,877 条 HTTP 请求：恶意 658 / 正常 33,219）。拦截数包括 WAF 拦截与质询；正常流量受影响也统计这两类响应。
 
-基于公开的 [blazehttp](https://github.com/chaitin/blazehttp) 样本库（33 877 条原始 HTTP 报文：恶意 658 / 正常 33 219），对 release 构建逐字节回放。拦截数按 WAF 判决面统计——403 拦截页与 503 质询页；"正常流量受影响"同样计入两者，质询不会被藏进"拦截"数字里。
+| 档位 | 攻击拦截 | 正常流量受影响 | 语料回放 p50 / p95 |
+|---|---:|---:|---:|
+| Normal | 397/658（60.33%） | 4/33,219（0.012%） | 43 / 48 ms |
+| Normal + 请求体检测 | 494/658（75.08%） | 12/33,219（0.036%） | 43 / 48 ms |
+| Strict | 501/658（76.14%；491 拦截、10 质询） | 4/33,219（0.012%） | 43 / 48 ms |
+| Strict + 请求体检测 | **632/658（96.05%；622 拦截、10 质询）** | **19/33,219（0.057%）** | 43 / 48 ms |
 
-在反向代理侧 WAF 真正能够判决的请求范围内，**Strict + 请求体检测的拦截率为 96.6%（616/638）**，正常流量受影响 **0.06%（19/33 219）**，准确率 **99.82%**。658 条恶意样本中有 20 条从未到达任何检测面，未计入该口径：19 条是不带 `Content-Length` / `Transfer-Encoding` 的 `POST`/`PUT`（按 RFC 7230 请求体为空），1 条把载荷藏在 URL fragment 里，HTTP 解析器在构造请求行前就已剥离。任何反代侧 WAF 对这 20 条都只能放行——把它们算作漏报会低估检出能力。
+### 与其他防火墙的历史数据对比
 
-| 档位 | 攻击拦截率（全量口径） | 正常流量受影响 | p95 |
-| --- | --- | --- | --- |
-| Normal（默认，不检测请求体） | 60.2% | 0.01% | 1 ms |
-| Normal + 请求体检测 | 71.9% | 0.04% | 1 ms |
-| Strict | 76.0% | 0.01% | 1 ms |
-| Strict + 请求体检测 | **93.8%** | **0.06%** | 2 ms |
+| 产品 / 模式 | 恶意样本 | 拦截数 | 正常样本 | 受影响数 | 报告 p95 |
+|---|---:|---:|---:|---:|---:|
+| WAFred Normal | 658 | 397（60.33%） | 33,219 | 4（0.012%） | 48 ms* |
+| WAFred Normal + body | 658 | 494（75.08%） | 33,219 | 12（0.036%） | 48 ms* |
+| WAFred Strict | 658 | 501（76.14%） | 33,219 | 4（0.012%） | 48 ms* |
+| WAFred Strict + body | 658 | **632（96.05%）** | 33,219 | **19（0.057%）** | 48 ms* |
+| PingWAF 早期 P13 · Normal | 658 | 396（60.2%） | 33,219 | 5（0.015%） | 5 ms‡ |
+| PingWAF 早期 P13 · Normal + body | 658 | 473（71.9%） | 33,219 | 14（0.042%） | ~3 s‡ |
+| PingWAF 早期 P13 · Strict | 658 | 500（76.0%） | 33,219 | 5（0.015%） | 4 ms‡ |
+| PingWAF 早期 P13 · Strict + body | 658 | 617（93.8%） | 33,219 | 21（0.063%） | ~3 s‡ |
+| SafeLine 免费版 · strict | 575 | 438（76.17%） | 33,094 | 73（0.22%） | 64.34 ms† |
+| SafeLine 免费版 · balanced | 575 | 412（71.65%） | 33,094 | 23（0.07%） | 70.05 ms† |
+| ModSecurity PL4 | 575 | 544（94.61%） | 33,094 | 17,362（52.46%） | 28.89 ms† |
+| ModSecurity PL1 | 575 | 401（69.74%） | 33,094 | 5,819（17.58%） | 31.15 ms† |
+| Cloudflare 免费版 | 570 | 61（10.70%） | 32,780 | 23（0.07%） | 288.96 ms† |
 
-全量口径（93.8%，617/658）保留用于与其他测量直接对照；有效口径见上。
+WAFred 行是 2026-11-22 修正 framing 后的本地实测。PingWAF 早期 P13 行来自同一名义语料上的旧版本测试，但当时回放器未正确描述部分请求体，并产生 15 个 framing 相关 HTTP 500；本轮使用修正后的请求 framing。两组数据用于呈现版本测试结果，不构成严格控制变量的前后对照。SafeLine、ModSecurity、Cloudflare 数值来自 [blazehttp 基准](https://github.com/chaitin/blazehttp)的历史记录，本轮未重测。*WAFred p95 包含测试虚拟机、代理和模拟源站；†其他 p95 使用不同链路，不可直接比较。‡PingWAF p95 来自较早的回放环境，body 档长尾包含客户端上传耗时。
 
-### 跨厂商对比
+已修正回放器：为带请求体但未声明 framing 的样本补充准确 `Content-Length`，并截去单个合法长度之外的多余尾字节。此改动消除了由语料 framing 错误造成的 15 个 HTTP 500。测试候选版本还补充了有界表单/ multipart 请求体解析和 Base64 路径分段扫描。gzip 套件中，不检查请求体时拦截 0/8 条攻击；Normal + body 拦截 7/8；Strict + body 拦截 8/8。
 
-| 产品 / 模式 | 恶意样本 | 拦截率 | 正常样本 | 误报率 | 准确率 |
-|---|---|---|---|---|---|
-| **PingWAF 0.32.4 · Strict + body** | 658 | **93.8%**（617） | 33 219 | **0.06%**（19） | **99.82%** |
-| **PingWAF 0.32.4 · Normal** | 658 | **60.2%**（396） | 33 219 | **0.01%**（4） | **99.21%** |
-| SafeLine free · strict | 575 | 76.17%（438） | 33 094 | 0.22%（73） | 99.38% |
-| SafeLine free · balanced | 575 | 71.65%（412） | 33 094 | 0.07%（23） | 99.45% |
-| ModSecurity PL4 | 575 | 94.61%（544） | 33 094 | 52.46%（17 362） | 48.34% |
-| ModSecurity PL1 | 575 | 69.74%（401） | 33 094 | 17.58%（5 819） | 82.20% |
-| Cloudflare free | 570 | 10.70%（61） | 32 780 | 0.07%（23） | 98.40% |
-
-PingWAF 两行为来源项目自行回放（有效口径 96.6%，见上），WAFred 尚未独立复测；其余各行引自 blazehttp 项目 README，未在本地重跑。两边样本集接近但不相同（33 877 vs 33 669；恶意样本 658 vs 570–575），且第三方延迟含公网往返，而 PingWAF 的 p95 是环回判决延迟——只比检出与误报，不比毫秒。
-
-每个数字都可复现：套件定义、回放工具与原始指标在 [`tools/waf-bench/`](./tools/waf-bench)。方法论见**[测试方案](./docs/zh/waf-test-plan.md)**，结论、分类表、与 Cloudflare / 雷池 / ModSecurity 的横向对比（引自 blazehttp 评测）与已知限制见**[测试效果报告](./docs/zh/waf-test-report.md)**。
+另一次 256 并发、3 分钟 Strict + body 稳态测试完成 931,266 个 2 KiB POST，吞吐 5,172 RPS、错误为 0。512 并发时，部署进程软文件句柄上限 1,024 导致 30 个 GET 和 68 个 POST 返回 502；隔离实例提高到 65,536 后均未再出现 502。语料 p95 包含代理链路开销，不是 WAF 单独处理时延。完整方法、HTTPS、漏报分析和归档信息见**[WAFred 1.0.4 完整测试报告](./docs/wafred-baseline-test-report-2026-11-22.md)**；[基准附录](./docs/waf-benchmark-report.md)并列早期 PingWAF P13 与本轮 WAFred 结果。
 
 ## 🧱 技术栈
 
@@ -275,8 +277,9 @@ WAFRED_CONFIG=/etc/wafred/wafred.toml wafred all-in-one   # 等价写法
 | [docs/user-guide.md](./docs/user-guide.md) | 控制台使用、站点、规则与策略 |
 | [docs/zh/http-lifecycle.md](./docs/zh/http-lifecycle.md) | 请求生命周期：各项功能在流水线中的执行阶段（WAF 检查顺序、缓存、错误页）与调试方法 |
 | [docs/zh/waf-test-plan.md](./docs/zh/waf-test-plan.md) | WAF 测试方案——分层模型、blazehttp 用例选取、口径与验收门槛 |
-| [docs/zh/waf-test-report.md](./docs/zh/waf-test-report.md) | WAF 实测效果报告（0.32.4）——拦截率、误报、归因与限制 |
-| [docs/waf-benchmark-report.md](./docs/waf-benchmark-report.md) | 逐轮基准数据附录（P0 → P14 迭代史） |
+| [docs/zh/waf-test-report.md](./docs/zh/waf-test-report.md) | WAFred 1.0.4 实测效果——拦截率、误报、性能与限制 |
+| [docs/wafred-baseline-test-report-2026-11-22.md](./docs/wafred-baseline-test-report-2026-11-22.md) | WAFred 1.0.4 完整测试报告与原始结果校验值 |
+| [docs/waf-benchmark-report.md](./docs/waf-benchmark-report.md) | WAFred 1.0.4 当前档位结果与早期 PingWAF 测试背景 |
 | [docs/api.md](./docs/api.md) | REST API 参考（`https://<host>:9080/api/v1`） |
 | [docs/README.md](./docs/README.md) | 完整文档索引 |
 | [CONTRIBUTING.md](./CONTRIBUTING.md) | 如何参与贡献 |

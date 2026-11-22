@@ -23,11 +23,11 @@ const features = {
   metrics: {
     eyebrow: "実測効果",
     title: "公開コーパスの実測数値",
-    lead: "33 877 件の blazehttp サンプルを raw socket でバイト単位に release ビルドへリプレイ — 厳格基準：403 ブロックページと 503 チャレンジページのみを検知に数えます。",
+    lead: "WAFred 1.0.4候補版でblazehttpの全33,877件を再生しました。658件の悪意あるサンプルに対するブロックとチャレンジを検知数に含めます。",
     items: [
-      { value: "96.6%", label: "攻撃検知率", note: "有効基準 · 判定可能な 638 件" },
-      { value: "0.06%", label: "誤検知率", note: "正常サンプル 33 219 件中 19 件" },
-      { value: "1–2 ms", label: "静的ティア p95", note: "loopback リプレイ / release ビルド" },
+      { value: "96.05%", label: "攻撃検知率 · Strict + body", note: "Strict + body · 全658件中632件" },
+      { value: "0.057%", label: "誤検知率", note: "正常サンプル33,219件中19件" },
+      { value: "48 ms", label: "リプレイ p95", note: "VM・プロキシ・模擬オリジンを含む" },
     ],
     link: { label: "完全なテストレポートを読む", path: "/docs/waf-test-report/" },
   },

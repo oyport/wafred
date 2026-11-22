@@ -41,7 +41,7 @@ const showBenchChart = slug === "waf-test-report";
       <div class="bench-charts">
         <WafBenchChart
           title="Interception — public corpus"
-          caption="Full-corpus calibre: share of malicious samples intercepted. PingWAF 0.32.4 source baseline: 33 877 samples (not re-run on WAFred); other products quoted from the blazehttp README (33 669)."
+          caption="WAFred is a corrected local replay of 33,877 samples. Other products are historical values from the blazehttp README (33,669 samples), not retested here; dataset and latency environments differ."
           max={INTERCEPTION_MAX}
           rows={INTERCEPTION_ROWS}
         />
