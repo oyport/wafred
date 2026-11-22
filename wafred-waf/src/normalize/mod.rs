@@ -241,6 +241,27 @@ pub fn normalize_request<'a>(
         decoded: decoded_path_raw,
         field: true,
     });
+    // Some routers expose a base64-encoded token as a standalone path
+    // segment (`/YWxlcnQuY2FsbC...`). The full path starts with `/`, which
+    // makes it fail the whole-value base64 decoder even though the segment
+    // itself is a valid transport value. Add only printable, bounded
+    // segments; the ordinary detector still decides whether they are
+    // malicious.
+    for segment in normalized_path.split('/').filter(|s| !s.is_empty()) {
+        if segment.len() < 12 || segment.len() > B64_MAX_VALUE_LEN {
+            continue;
+        }
+        if let Some(decoded) = b64_decode_value(segment) {
+            let decoded =
+                decode_value(&decoded, max_decode_layers, decode_escapes);
+            decoded_values.push(DecodedValue {
+                source: ValueSource::Path,
+                name: Cow::Borrowed(""),
+                decoded: Cow::Owned(decoded.into_owned()),
+                field: true,
+            });
+        }
+    }
 
     // Build the decoded URI in one allocation; `parse_query` appends the
     // `?k=v&…` suffix while it parses, so no intermediate Vec of pairs and no
@@ -326,12 +347,24 @@ pub fn normalize_request<'a>(
             .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
             .map(|(_, v)| v.as_str())
             .unwrap_or_default();
-        if contains_ci(content_type, "multipart/form-data") {
+        let declared_multipart =
+            contains_ci(content_type, "multipart/form-data");
+        let sniffed_multipart_boundary = if declared_multipart {
+            None
+        } else {
+            sniff_multipart_boundary(text)
+        };
+        if declared_multipart || sniffed_multipart_boundary.is_some() {
             // Boundaries are case-sensitive, so the parser takes the original
-            // header value rather than the lower-cased copy. Textual parts
-            // become typed fields; without that the whole body stayed one
-            // `field: false` blob and a single SQLi/XSS hit only scored 2.
-            if let Some(boundary) = multipart_boundary(content_type) {
+            // header value rather than the lower-cased copy. If the corpus or
+            // client omitted Content-Type, infer only a boundary-shaped body
+            // with a form-data disposition and a matching closing delimiter.
+            // Textual parts become typed fields; without that the whole body
+            // stayed one `field: false` blob and a single SQLi/XSS hit only
+            // scored 2.
+            if let Some(boundary) =
+                multipart_boundary(content_type).or(sniffed_multipart_boundary)
+            {
                 let delimiter = format!("--{boundary}");
                 let mut parts = text.split(&delimiter);
                 for part in parts.by_ref().take(MAX_MULTIPART_PARTS) {
@@ -405,6 +438,7 @@ pub fn normalize_request<'a>(
                 field: false,
             });
         } else if contains_ci(content_type, "application/x-www-form-urlencoded")
+            || looks_like_form_body(text)
         {
             parse_form_body(
                 text,
@@ -780,6 +814,80 @@ fn multipart_boundary(content_type: &str) -> Option<String> {
         let value = value.trim().trim_matches('"');
         (!value.is_empty()).then(|| value.to_string())
     })
+}
+
+/// Infer URL-encoded form syntax only when the body has a clear `key=value`
+/// shape. Some replay corpora and clients omit Content-Type; scanning those
+/// bytes as one weak blob lets a single SQLi/XSS/RCE field stay below the
+/// anomaly threshold. This bounded sniff rejects prose, JSON, XML, and
+/// multipart bodies, which have their own parsers.
+fn looks_like_form_body(text: &str) -> bool {
+    let text = text.trim_matches(['\r', '\n']);
+    if text.is_empty()
+        || text.len() > MAX_SCAN_BODY_BYTES
+        || text.contains('\r')
+        || text.contains('\n')
+        || text.starts_with("--")
+        || looks_like_json(text)
+        || text.starts_with('<')
+    {
+        return false;
+    }
+
+    let mut fields = 0usize;
+    for pair in text.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let Some((key, _)) = pair.split_once('=') else {
+            return false;
+        };
+        if key.is_empty()
+            || key.len() > 256
+            || !key.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'_' | b'-' | b'.' | b'[' | b']' | b'%' | b'+'
+                    )
+            })
+        {
+            return false;
+        }
+        fields += 1;
+        if fields >= MAX_FORM_PARAMS {
+            return true;
+        }
+    }
+    fields > 0
+}
+
+/// Detect a boundary-framed multipart form even when its Content-Type header
+/// is absent. The inferred form must begin with a short ASCII boundary, carry
+/// a form-data disposition, and end with that same boundary; arbitrary text
+/// containing a `Content-Disposition` string is not enough.
+fn sniff_multipart_boundary(text: &str) -> Option<String> {
+    let line_end = text.find('\n')?;
+    let first_line = text[..line_end]
+        .strip_suffix('\r')
+        .unwrap_or(&text[..line_end]);
+    let boundary = first_line.strip_prefix("--")?;
+    if boundary.is_empty()
+        || boundary.len() > 70
+        || !boundary.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return None;
+    }
+    let delimiter = format!("--{boundary}");
+    let closing = format!("{delimiter}--");
+    let lower = text.to_ascii_lowercase();
+    let trimmed = text.trim_end_matches(['\r', '\n']);
+    if !lower.contains("content-disposition: form-data; name=")
+        || !trimmed.ends_with(&closing)
+    {
+        return None;
+    }
+    Some(boundary.to_string())
 }
 
 /// The `name` attribute of a part's `Content-Disposition` header.
@@ -1529,6 +1637,68 @@ mod tests {
             .find(|v| v.name == "p")
             .expect("param p");
         assert_eq!(v.decoded, "../../etc/passwd");
+    }
+
+    #[test]
+    fn body_without_content_type_sniffs_urlencoded_fields() {
+        let body =
+            b"appno= 1 union SELECT 42894*41146,1&editor=cn&site=web\r\n\r\n";
+        let req = normalize_request("POST", "/", "", &[], Some(body), 3, true);
+        let field = req
+            .decoded_values
+            .iter()
+            .find(|value| {
+                value.source == ValueSource::Body && value.name == "appno"
+            })
+            .expect("sniffed form field");
+        assert!(field.field);
+        assert!(field.decoded.contains("union SELECT 42894*41146"));
+    }
+
+    #[test]
+    fn body_without_content_type_sniffs_multipart_fields() {
+        let body = concat!(
+            "--8341955aac0088cd5d9220b6d1b185ffa5f69a4f789eaa2623ba65ca777c\r\n",
+            "Content-Disposition: form-data; name=\"payload\"\r\n\r\n",
+            "%22%3E%3Csvg+onmouseover%3D%22confirm%26%230000000040document.domain%29\r\n",
+            "--8341955aac0088cd5d9220b6d1b185ffa5f69a4f789eaa2623ba65ca777c--\r\n",
+        );
+        let req = normalize_request(
+            "POST",
+            "/",
+            "",
+            &[],
+            Some(body.as_bytes()),
+            3,
+            true,
+        );
+        let field = req
+            .decoded_values
+            .iter()
+            .find(|value| {
+                value.source == ValueSource::Body && value.name == "payload"
+            })
+            .expect("sniffed multipart field");
+        assert!(field.field);
+        assert!(field.decoded.contains("<svg"));
+    }
+
+    #[test]
+    fn base64_path_segment_is_added_as_a_scannable_value() {
+        let req = normalize_request(
+            "GET",
+            "/YWxlcnQuY2FsbCglMjAsICJYU1MiKTs",
+            "",
+            &[],
+            None,
+            3,
+            true,
+        );
+        assert!(req.decoded_values.iter().any(|value| {
+            value.source == ValueSource::Path
+                && value.field
+                && value.decoded.contains("alert.call(")
+        }));
     }
 
     #[test]

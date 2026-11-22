@@ -48,9 +48,9 @@ const intro = {
       note: "Flujos bidireccionales, sin reiniciar procesos.",
     },
     {
-      value: "96.6%",
-      label: "Intercepción de ataques (criterio efectivo)",
-      note: "638 muestras maliciosas decidibles; 0.06 % de benignas afectadas.",
+      value: "96.05%",
+      label: "Intercepción · Strict + body",
+      note: "632/658 ataques en el corpus completo; 19/33.219 benignas afectadas (0,057%).",
     },
   ],
   architecture: {

@@ -4433,6 +4433,49 @@ mod tests {
     }
 
     #[test]
+    fn strict_scans_untyped_form_bodies_and_base64_path_segments() {
+        let e = strict_engine();
+
+        let mut form = req("POST", "/admin", "");
+        form.body = Some(bytes::Bytes::from(
+            b"appno= 1 union SELECT 42894*41146,1&editor=cn&site=web".to_vec(),
+        ));
+        let verdict = e.inspect(&form);
+        assert_eq!(
+            verdict.action,
+            WafAction::Block,
+            "untyped form body: {}",
+            verdict.details
+        );
+
+        let mut encoded_form = req("POST", "/", "");
+        encoded_form.body = Some(bytes::Bytes::from(
+            b"field=cHJvbXB0LmNhbGwobnVsbCwxKQ".to_vec(),
+        ));
+        let verdict = e.inspect(&encoded_form);
+        assert_eq!(
+            verdict.action,
+            WafAction::Block,
+            "base64 JavaScript form field: {}",
+            verdict.details
+        );
+
+        let verdict =
+            e.inspect(&req("GET", "/YWxlcnQuY2FsbCglMjAsICJYU1MiKTs", ""));
+        assert_eq!(
+            verdict.action,
+            WafAction::Block,
+            "base64 JavaScript path segment: {}",
+            verdict.details
+        );
+
+        let mut benign = req("POST", "/profile", "");
+        benign.body =
+            Some(bytes::Bytes::from(b"username=alice&remember=true".to_vec()));
+        assert_ne!(e.inspect(&benign).action, WafAction::Block);
+    }
+
+    #[test]
     fn cmd_git_lua_xstream_needles_block() {
         // P12 needle widening: tight `||` DNS chain, pipe into a filesystem
         // write, git client option injection, Lua os-library escape, and

@@ -34,9 +34,10 @@ centrally-controlled Web Application Firewall built on
 | [e2e-test-plan.md](./e2e-test-plan.md) | Product-level E2E plan — scenarios, environments, case design, execution tiers, defect flow, regression set, gates (incl. UI/UE and accessibility), metrics |
 | [quality-patrol.md](./quality-patrol.md) | Quality patrol — two cadence-driven agents (E2E + design review): triggers, check dimensions, defect record format, reporting and the human review loop |
 | [waf-test-plan.md](./waf-test-plan.md) | WAF test plan — layered model, blazehttp suite selection and organisation, matrix, calibres, acceptance gates |
-| [waf-test-report.md](./waf-test-report.md) | Results-only effectiveness report for users — interception, false positives, cross-vendor comparison |
-| [waf-test-report-internal.md](./waf-test-report-internal.md) | Maintainer companion — denominators, per-sample attribution, regression evidence, limits, open work |
-| [waf-benchmark-report.md](./waf-benchmark-report.md) | Per-round benchmark appendix — P0 → P14 iteration history, per-category tables, semantic-gate rationale |
+| [waf-test-report.md](./waf-test-report.md) | Current WAFred 1.0.4 effectiveness and performance results |
+| [wafred-baseline-test-report-2026-11-22.md](./wafred-baseline-test-report-2026-11-22.md) | Full current lab report — topology, metrics, anomalies, limitations and checksums |
+| [waf-test-report-internal.md](./waf-test-report-internal.md) | Current WAFred 1.0.4 internal triage, miss attribution, HTTPS and capacity notes |
+| [waf-benchmark-report.md](./waf-benchmark-report.md) | Current WAFred 1.0.4 matrix, peer comparison and earlier-version test background |
 | [waf-engine-review.md](./waf-engine-review.md) | Engine review and design record — why each detector exists and which failure it was built for |
 
 Harness: [`tools/waf-bench/`](../tools/waf-bench) — suite manifest, replayer, summariser, verdict diff.

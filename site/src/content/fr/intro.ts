@@ -48,9 +48,9 @@ const intro = {
       note: "Flux bidirectionnels, sans redémarrage.",
     },
     {
-      value: "96.6%",
-      label: "Interception des attaques (critère effectif)",
-      note: "638 échantillons malveillants décidables ; 0.06 % de bénins affectés.",
+      value: "96.05%",
+      label: "Interception · Strict + body",
+      note: "632/658 attaques sur le corpus complet ; 19/33 219 bénins affectés (0,057 %).",
     },
   ],
   architecture: {

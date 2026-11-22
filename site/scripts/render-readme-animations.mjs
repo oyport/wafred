@@ -50,7 +50,7 @@ const THEME = {
 
 const SCENES = {
   architecture: { width: 1000, height: 560 },
-  effectiveness: { width: 1000, height: 400 },
+  effectiveness: { width: 1000, height: 690 },
 };
 
 function loadPlaywright() {
@@ -303,9 +303,17 @@ ${baseCss(width, height)}
 /* --------------------------------------------------------------- effectiveness */
 
 const BARS = [
-  { label: "PingWAF 0.32.4 baseline", value: 93.8, accent: true, effective: 96.6 },
+  { label: "WAFred Strict + body", value: 96.05, accent: true },
+  { label: "PingWAF prior P13 Strict + body", value: 93.8 },
+  { label: "WAFred Strict", value: 76.14, accent: true },
+  { label: "PingWAF prior P13 Strict", value: 76.0 },
+  { label: "WAFred Normal + body", value: 75.08, accent: true },
+  { label: "PingWAF prior P13 Normal + body", value: 71.9 },
+  { label: "WAFred Normal", value: 60.33, accent: true },
+  { label: "PingWAF prior P13 Normal", value: 60.2 },
   { label: "ModSecurity PL4", value: 94.61 },
   { label: "SafeLine strict", value: 76.17 },
+  { label: "SafeLine balanced", value: 71.65 },
   { label: "ModSecurity PL1", value: 69.74 },
   { label: "Cloudflare free", value: 10.7, note: "10.70" },
 ];
@@ -315,28 +323,17 @@ function effectivenessHtml() {
   const track = 620;
   const rows = BARS.map((bar, index) => {
     const left = 250;
-    const top = 92 + index * 52;
+    const top = 72 + index * 42;
     const w = (bar.value / 100).toFixed(4);
     const delay = (index * 0.28).toFixed(2);
-    const extend = bar.effective ? ((bar.effective - bar.value) / 100) * track : 0;
-    const valueLeft = (bar.value / 100) * track + extend + 10;
-    const text = bar.note ?? String(bar.value);
+    const valueLeft = (bar.value / 100) * track + 10;
+    const text = bar.value.toFixed(2);
     return `
     <div class="row" style="top:${top}px">
       <span class="row__label${bar.accent ? " row__label--accent" : ""}">${bar.label}</span>
       <div class="bar" style="left:${left}px;width:${track}px">
         <div class="bar__fill${bar.accent ? " bar__fill--accent" : ""}" style="--w:${w};animation-delay:${delay}s"></div>
-        ${
-          bar.accent
-            ? `<div class="bar__extend" style="left:${(bar.value / 100) * track}px;width:${extend}px;animation-delay:${delay}s"></div>`
-            : ""
-        }
         <span class="bar__value${bar.accent ? " bar__value--accent" : ""}" style="left:${valueLeft}px;animation-delay:${delay}s">${text}%</span>
-        ${
-          bar.accent
-            ? `<span class="bar__note" style="left:${valueLeft + 48}px;animation-delay:${delay}s">96.6% eff.</span>`
-            : ""
-        }
       </div>
     </div>`;
   }).join("");
@@ -363,13 +360,6 @@ ${baseCss(width, height)}
     animation: grow 8s cubic-bezier(0.22, 0.8, 0.24, 1) infinite;
   }
   .bar__fill--accent { background: linear-gradient(90deg, ${THEME.brand}, #ff8296); }
-  .bar__extend {
-    position: absolute; top: 10px; height: 18px;
-    border-radius: 4px;
-    background: repeating-linear-gradient(45deg, rgba(216, 50, 79, 0.55) 0 4px, rgba(216, 50, 79, 0.18) 4px 8px);
-    opacity: 0;
-    animation: extend 8s ease-out infinite;
-  }
   .bar__value {
     position: absolute; top: 12px;
     white-space: nowrap;
@@ -378,37 +368,31 @@ ${baseCss(width, height)}
     animation: reveal 8s ease-out infinite;
   }
   .bar__value--accent { color: ${THEME.brand}; font-weight: 700; }
-  .bar__note {
-    position: absolute; top: 13px;
-    white-space: nowrap;
-    font-size: 9.5px; color: ${THEME.brand}; opacity: 0;
-    animation: reveal 8s ease-out infinite;
-  }
   @keyframes grow {
     0% { transform: scaleX(0); }
     24% { transform: scaleX(var(--w)); }
     100% { transform: scaleX(var(--w)); }
   }
-  @keyframes extend {
-    0%, 26% { opacity: 0; }
-    34%, 100% { opacity: 1; }
-  }
   @keyframes reveal {
     0%, 14% { opacity: 0; }
     22%, 100% { opacity: 1; }
   }
-  .foot {
-    position: absolute; left: 30px; bottom: 26px;
-    font-size: 10px; color: ${THEME.muted};
+  .foot, .foot2, .foot3 {
+    position: absolute; left: 30px; right: 30px;
+    font-size: 9px; color: ${THEME.muted}; white-space: nowrap;
   }
-  .foot b { color: ${THEME.text}; font-weight: 600; }
+  .foot { top: 624px; color: #c6b7bd; }
+  .foot2 { top: 642px; }
+  .foot3 { top: 660px; }
 </style></head><body><div class="stage">
   <div class="head">
-    <h1 class="head__title">Interception · blazehttp corpus</h1>
-    <p class="head__sub">same corpus as the table below · 658 malicious samples · strict + body inspection</p>
+    <h1 class="head__title">WAFred 1.0.4 · prior PingWAF test · firewall references</h1>
+    <p class="head__sub">Interception rate · current WAFred: corrected replay · prior PingWAF: P13 corpus run</p>
   </div>
   ${rows}
-  <p class="foot"><b>PingWAF source baseline</b> · 0.06 % benign affected · 99.82 % accuracy · effective interception <b>96.6 %</b> (616/638)</p>
+  <p class="foot">WAFred Strict + body: 632/658 attacks intercepted · 19/33,219 benign requests affected (0.057%).</p>
+  <p class="foot2">Prior PingWAF P13 Strict + body: 617/658 (93.8%), 21 benign affected; its replay framing differs.</p>
+  <p class="foot3">Other products are historical references. Corpus denominators and network paths differ; p95 is not directly comparable.</p>
 </div></body></html>`;
 }
 

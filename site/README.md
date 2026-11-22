@@ -148,7 +148,7 @@ The repository READMEs use static SVG artwork:
 | Asset | Size | Scene |
 | --- | --- | --- |
 | `asset/readme-architecture.svg` | 1000×560 | `architecture` — requests, edge agents, control plane and origin |
-| `asset/readme-effectiveness.svg` | 1000×400 | `effectiveness` — clearly labelled PingWAF source-project benchmark baseline |
+| `asset/readme-effectiveness.svg` | 1000×540 | `effectiveness` — current WAFred full-corpus results beside historical SafeLine, ModSecurity and Cloudflare references |
 
 The optional animation script renders preview WebP files that are not embedded
 in the READMEs:

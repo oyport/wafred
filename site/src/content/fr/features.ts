@@ -23,11 +23,11 @@ const features = {
   metrics: {
     eyebrow: "Efficacité mesurée",
     title: "Des chiffres issus d'un corpus public",
-    lead: "33 877 échantillons blazehttp rejoués octet par octet sur un build release — calibre strict : seules comptent les pages de blocage 403 et les défis 503.",
+    lead: "La version candidate de WAFred 1.0.4 a rejoué les 33 877 requêtes blazehttp ; blocages et défis comptent parmi les 658 échantillons malveillants.",
     items: [
-      { value: "96.6%", label: "Interception des attaques", note: "Critère effectif · 638 échantillons décidables" },
-      { value: "0.06%", label: "Faux positifs", note: "19 sur 33 219 échantillons bénins" },
-      { value: "1–2 ms", label: "p95 du tier statique", note: "replay en loopback / build release" },
+      { value: "96.05%", label: "Interception · Strict + body", note: "Strict + body · 632/658 sur le corpus complet" },
+      { value: "0.057%", label: "Faux positifs", note: "19 sur 33 219 échantillons bénins" },
+      { value: "48 ms", label: "p95 du replay", note: "VM, proxy et origine simulée inclus" },
     ],
     link: { label: "Lire le rapport de tests complet", path: "/docs/waf-test-report/" },
   },

@@ -1796,6 +1796,26 @@ fn builtin_patterns() -> Vec<SignaturePattern> {
             needle,
         });
     };
+    // A method-call form of a JavaScript dialog function is a stronger
+    // executable-code indicator than a bare `alert()`/`prompt()` token. Keep
+    // it in Strict, where operators have explicitly accepted more coverage,
+    // and mark it critical so a single decoded field or path segment blocks.
+    push_strict(
+        "XSS-022",
+        AttackCategory::Xss,
+        5,
+        StackSet::GENERIC,
+        "alert.call invocation",
+        "alert.call(",
+    );
+    push_strict(
+        "XSS-023",
+        AttackCategory::Xss,
+        5,
+        StackSet::GENERIC,
+        "prompt.call invocation",
+        "prompt.call(",
+    );
     push_strict(
         "CI-101",
         AttackCategory::CommandInjection,

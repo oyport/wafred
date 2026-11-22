@@ -2,8 +2,11 @@
 """Replay blazehttp HTTP testcases against a running reverse proxy/WAF.
 
 Reads raw HTTP request files (*.black = expected blocked, *.white = expected
-passed), sends each one verbatim over a TCP socket, and classifies the
-response:
+passed), sends each one over a TCP socket, and classifies the response. When a
+fixture contains a body but no HTTP/1.1 framing header, the replayer adds a
+Content-Length for those body bytes. Without that repair the server correctly
+interprets the request as bodyless and a body-inspection test silently tests
+only the headers:
 
   blocked         403 (block page) or 503 (challenge page) — a WAF verdict
   passed          2xx/3xx — reached the origin
@@ -91,7 +94,19 @@ def classify(raw: bytes) -> str:
 
 
 def prepare(raw: bytes, xff: str | None, host_rewrite: str | None) -> bytes:
-    """Force Connection: close and optionally inject XFF / rewrite Host."""
+    """Frame fixture bodies and optionally rewrite connection/host/XFF.
+
+    BlazeHTTP corpus fixtures often omit both Content-Length and
+    Transfer-Encoding even when bytes follow the header terminator. On an
+    HTTP/1.1 connection those bytes are not a request body: the server treats
+    the request as bodyless, and the apparent body is left unread. Add a
+    byte-accurate Content-Length only when a body exists and the fixture has
+    no framing header. The corpus runner sends one request per TCP connection,
+    so bytes beyond one valid Content-Length are dropped: they are not part of
+    that request body and cannot represent a second request in this harness.
+    Ambiguous or malformed framing (multiple lengths, invalid lengths, or
+    Transfer-Encoding) is preserved for protocol-layer testing.
+    """
     sep = raw.find(b"\r\n\r\n")
     seplen = 4
     if sep < 0:
@@ -119,6 +134,28 @@ def prepare(raw: bytes, xff: str | None, host_rewrite: str | None) -> bytes:
         head = replace_line(head, b"host:", b"Host: " + host_rewrite.encode())
     if xff:
         head = replace_line(head, b"x-forwarded-for:", b"X-Forwarded-For: " + xff.encode())
+    lines = head.split(b"\r\n")
+    has_transfer_encoding = any(
+        line.lower().startswith(b"transfer-encoding:") for line in lines
+    )
+    content_length_lines = [
+        line for line in lines if line.lower().startswith(b"content-length:")
+    ]
+    if rest and not has_transfer_encoding:
+        if not content_length_lines:
+            head += b"\r\nContent-Length: " + str(len(rest)).encode("ascii")
+        elif len(content_length_lines) == 1:
+            match = re.fullmatch(
+                rb"content-length:\s*([0-9]+)\s*",
+                content_length_lines[0],
+                flags=re.IGNORECASE,
+            )
+            if match:
+                try:
+                    declared_length = int(match.group(1))
+                except ValueError:
+                    declared_length = len(rest)
+                rest = rest[:declared_length]
     return head + b"\r\n\r\n" + rest
 
 
