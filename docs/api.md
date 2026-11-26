@@ -457,7 +457,7 @@ Build metadata.
 ```json
 {
   "name": "wafred-server",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "api": "/api/v1",
   "registration_open": true
 }
@@ -1906,7 +1906,7 @@ List registered agents.
       "private_ip": "10.0.1.5",
       "peer_ip": "203.0.113.7",
       "peer_ip_seen_at": "2024-01-01T12:00:00Z",
-      "version": "1.0.4",
+      "version": "1.0.5",
       "os_info": "Linux 6.1.0",
       "cpu_cores": 4,
       "memory_bytes": 8589934592,
@@ -1993,7 +1993,7 @@ revoked agent is rejected even with a well-formed signature.
 **Response (200):**
 ```json
 {
-  "version": "1.0.4",
+  "version": "1.0.5",
   "sha256": "9f2c…",
   "size": 48219136,
   "url": "/api/v1/agent-upgrade/artifact"
@@ -6298,7 +6298,7 @@ is the fleet" in one call.
       "connections": 128,
       "rps": null,
       "sites": 1,
-      "version": "1.0.4",
+      "version": "1.0.5",
       "last_seen": "2024-01-01T12:00:00Z"
     }
   ],

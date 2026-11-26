@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [WAFred 1.0.5] - 2026-11-27
+
 ### Security and stability
 
 - Integrated upstream fixes for request-body truncation handling, WAF rule
