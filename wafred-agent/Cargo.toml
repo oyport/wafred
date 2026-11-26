@@ -17,6 +17,7 @@ tls-rustls = ["pingap-upstream/tls-rustls"]
 
 [dependencies]
 pingwaf-proto = { path = "../wafred-proto" }
+wafred-tunnel = { workspace = true }
 # Self-accounting for configuration sync; atomics only, no allocator hook.
 pingwaf-profiler = { path = "../wafred-profiler" }
 pingap-cache = { workspace = true }
@@ -46,6 +47,7 @@ arc-swap = { workspace = true }
 # channel cannot serve a file, and `sha2`/`hex` are already used elsewhere.
 reqwest = { workspace = true }
 sha2 = { workspace = true }
+toml = { workspace = true }
 # CRC32 of the persisted sites snapshot, checked against metadata.json on load
 # so a torn or corrupted snapshot is detected instead of silently parsed.
 crc32fast = { workspace = true }

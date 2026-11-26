@@ -247,7 +247,7 @@ impl VisitorAuth {
         now: i64,
     ) -> Option<VisitorSession> {
         let cookie = get_cookie_value(session.req_header(), SESSION_COOKIE)?;
-        let parsed = self.unseal::<VisitorSession>(cookie)?;
+        let parsed = self.unseal::<VisitorSession>(&cookie)?;
         if parsed.exp <= now {
             return None;
         }

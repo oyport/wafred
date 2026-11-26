@@ -60,6 +60,9 @@ jobs:
     permissions:
       contents: write # create the release
     steps:
+      # Full history is required: the Full Changelog link below resolves the
+      # previous tag with `git describe --tags`, which needs tags in the clone
+      # (actions/checkout defaults to --depth=1 and fetches no tags).
       - name: Checkout
         uses: actions/checkout@v7
         with:
@@ -263,6 +266,70 @@ jobs:
           tar -czf "$ASSET.tar.gz" "$ASSET"
           # `shasum` is a Perl script that is absent on minimal images;
           # `sha256sum` is the GNU coreutils one that is always present.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ASSET.tar.xz" > "$ASSET.tar.xz.sha256"
+            sha256sum "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256"
+          else
+            shasum -a 256 "$ASSET.tar.xz" > "$ASSET.tar.xz.sha256"
+            shasum -a 256 "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256"
+          fi
+          ls -lh "$ASSET.tar.xz" "$ASSET.tar.gz" \
+                 "$ASSET.tar.xz.sha256" "$ASSET.tar.gz.sha256"
+
+      # The agent-only build: the same data plane with the control plane
+      # compiled out (`edge`). Its own archive is what `install.sh --mode agent`
+      # downloads; keeping it in this job means both binaries share the cargo
+      # cache (the `edge` feature changes no dependency).
+      - name: Build and package wafred-agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --bin wafred-agent ${{ matrix.features }},edge --target ${{ matrix.target }}
+          ls -lh "target/${{ matrix.target }}/release/wafred-agent"
+
+          ASSET="wafred-agent-${{ matrix.plat }}-${{ matrix.arch }}"
+          rm -rf "$ASSET" "$ASSET.tar.xz" "$ASSET.tar.gz" \
+                 "$ASSET.tar.xz.sha256" "$ASSET.tar.gz.sha256"
+          mkdir -p "$ASSET"
+          cp "target/${{ matrix.target }}/release/wafred-agent" "$ASSET/wafred-agent"
+          cp LICENSE README.md "$ASSET/"
+          cp wafred.toml "$ASSET/" 2>/dev/null || true
+          # Deliberately no wafred.service: that unit runs `wafred
+          # all-in-one`. install.sh writes the agent's own unit; shipping the
+          # all-in-one one here would be a trap for a manual install.
+          chmod +x "$ASSET/wafred-agent"
+          tar -cJf "$ASSET.tar.xz" "$ASSET"
+          tar -czf "$ASSET.tar.gz" "$ASSET"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ASSET.tar.xz" > "$ASSET.tar.xz.sha256"
+            sha256sum "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256"
+          else
+            shasum -a 256 "$ASSET.tar.xz" > "$ASSET.tar.xz.sha256"
+            shasum -a 256 "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256"
+          fi
+          ls -lh "$ASSET.tar.xz" "$ASSET.tar.gz" \
+                 "$ASSET.tar.xz.sha256" "$ASSET.tar.gz.sha256"
+
+      # The tunnel connector: the only piece installed inside a private
+      # network, and the only one that needs neither the data plane nor the
+      # control plane. `install.sh --mode tunnel` downloads this archive.
+      - name: Build and package wafred-tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p wafred-tunnel --bin wafred-tunnel --target ${{ matrix.target }}
+          ls -lh "target/${{ matrix.target }}/release/wafred-tunnel"
+
+          ASSET="wafred-tunnel-${{ matrix.plat }}-${{ matrix.arch }}"
+          rm -rf "$ASSET" "$ASSET.tar.xz" "$ASSET.tar.gz" \
+                 "$ASSET.tar.xz.sha256" "$ASSET.tar.gz.sha256"
+          mkdir -p "$ASSET"
+          cp "target/${{ matrix.target }}/release/wafred-tunnel" "$ASSET/wafred-tunnel"
+          cp LICENSE "$ASSET/"
+          cp wafred-tunnel/README.md "$ASSET/" 2>/dev/null || true
+          chmod +x "$ASSET/wafred-tunnel"
+          tar -cJf "$ASSET.tar.xz" "$ASSET"
+          tar -czf "$ASSET.tar.gz" "$ASSET"
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$ASSET.tar.xz" > "$ASSET.tar.xz.sha256"
             sha256sum "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256"

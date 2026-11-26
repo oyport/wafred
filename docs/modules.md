@@ -3,8 +3,8 @@
 > WAFred's workspace contains the upstream `pingap-*` crates below **plus**
 > seven WAF-specific crates. The two are listed separately in
 > [docs/README.md](README.md#-crate-documentation): `pingwaf-proto`,
-> `pingwaf-server`, `pingwaf-agent`, `pingwaf-waf`, `pingwaf-challenge`,
-> `pingwaf-profiler` and `pingwaf-system`.
+> `pingwaf-server`, `wafred-agent`, `pingwaf-waf`, `pingwaf-challenge`,
+> `pingwaf-profiler`, `pingwaf-system` and `wafred-tunnel`.
 
 ## Trust boundaries
 
@@ -29,7 +29,7 @@ stored secrets. It is reachable only by:
   only a `write` key whose owner is an administrator is fleet-wide — see
   [api.md → MCP server](api.md#mcp-server).
 
-### Data plane / agent (`pingwaf-agent`)
+### Data plane / agent (`wafred-agent`)
 
 Holds only what it serves: the bundle for its own sites (including those sites'
 TLS private keys and OIDC secrets), its agent token, and a `0600` local rule
@@ -38,6 +38,28 @@ pushes logs/events/metrics and receives configuration over the authenticated
 gRPC stream (TLS with the control-plane CA by default). Disconnected behaviour
 is explicit: fail-open (keep serving the last bundle) or fail-closed (refuse
 hosts without a synced bundle), configurable per site and globally.
+
+The data plane also ships as its own binary, `wafred-agent`
+(`src/edge_main.rs`, `--features edge`): the same agent and proxy with the
+control-plane modules and the dashboard-embedding admin plugin compiled out.
+`install.sh --mode agent` installs it; it never links `pingwaf-server`.
+
+### Tunnel connector (`wafred-tunnel`)
+
+The connector runs **inside** the private network and holds the credential for
+one tunnel plus the list of targets it may dial. It has no database access and
+no control-plane read surface: it pairs once (`PairTunnel`), then holds a
+`TunnelControl` stream for policy and pushes nothing but heartbeats.
+
+The edge half of the same crate (`server`/`registry`, always compiled into the
+agent) accepts those sessions. It never sees the connector's credential: the
+control plane mints a **short-lived Ed25519 session token**, the connector
+presents it, and the edge verifies it against the public key that arrived in
+the rule bundle. A compromised edge therefore learns a token that expires
+(one hour by default) and is bound to one tunnel. The edge opens a data stream
+only for a target one of its own sites references. The two halves share one
+wire protocol (`protocol.rs`) so a change to a frame cannot land on one side
+only.
 
 ### PostgreSQL
 
@@ -162,4 +184,6 @@ graph TD
     upstream --> util
 
     webhook --> core
+
+    tunnel --> proto
 ```

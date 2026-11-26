@@ -21,6 +21,13 @@ import { SkeletonCard } from '@/components/ui/Skeleton'
 import { useToast } from '@/components/ui/Toast'
 import { ErrorState } from '@/components/ErrorState'
 import { challengeApi, challengeKeys, defaultChallengeConfig } from '@/api/challenge'
+import {
+  MAX_DIFFICULTY,
+  MAX_LIMIT_PER_MIN,
+  MIN_DIFFICULTY,
+  MIN_LIMIT_PER_MIN,
+  validatePow,
+} from '@/lib/challengePow'
 import { rateLimitApi, rateLimitKeys } from '@/api/rateLimiting'
 import { useCanWrite } from '@/hooks'
 import { cn } from '@/lib/utils'
@@ -296,6 +303,10 @@ function ChallengeConfigCard({ siteId }: { siteId: string }) {
         exempt_paths: payload.exempt_paths,
         browser_integrity_check: payload.browser_integrity_check,
         tls_fingerprint_check: payload.tls_fingerprint_check,
+        base_difficulty: payload.base_difficulty,
+        max_difficulty: payload.max_difficulty,
+        issue_limit_per_min: payload.issue_limit_per_min,
+        verify_limit_per_min: payload.verify_limit_per_min,
       }),
     onSuccess: (saved) => {
       setConfig(saved)
@@ -321,6 +332,7 @@ function ChallengeConfigCard({ siteId }: { siteId: string }) {
   }
 
   const exemptPathsIssue = config ? validateExemptPaths(config.exempt_paths) : null
+  const powIssue = config ? validatePow(config) : null
 
   return (
     <div>
@@ -346,7 +358,12 @@ function ChallengeConfigCard({ siteId }: { siteId: string }) {
                     <Button
                       size="sm"
                       variant="primary"
-                      disabled={!dirty || save.isPending || exemptPathsIssue !== null}
+                      disabled={
+                        !dirty ||
+                        save.isPending ||
+                        exemptPathsIssue !== null ||
+                        powIssue !== null
+                      }
                       loading={save.isPending}
                       onClick={() => config && save.mutate(config)}
                     >
@@ -409,6 +426,60 @@ function ChallengeConfigCard({ siteId }: { siteId: string }) {
                   onChange={(e) => patch({ rate_threshold: Number(e.target.value) })}
                 />
               </div>
+            </CardBody>
+          </Card>
+
+          <Card>
+            <CardHeader
+              title={t('pages.cc.pow')}
+              description={t('pages.cc.powHint')}
+            />
+            <CardBody className="flex flex-col gap-5">
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <Input
+                  type="number"
+                  label={t('pages.cc.baseDifficulty')}
+                  value={config.base_difficulty}
+                  min={MIN_DIFFICULTY}
+                  max={MAX_DIFFICULTY}
+                  disabled={!canWrite || !config.enabled}
+                  hint={t('pages.cc.baseDifficultyHint')}
+                  onChange={(e) => patch({ base_difficulty: Number(e.target.value) })}
+                />
+                <Input
+                  type="number"
+                  label={t('pages.cc.maxDifficulty')}
+                  value={config.max_difficulty}
+                  min={MIN_DIFFICULTY}
+                  max={MAX_DIFFICULTY}
+                  disabled={!canWrite || !config.enabled}
+                  hint={t('pages.cc.maxDifficultyHint')}
+                  onChange={(e) => patch({ max_difficulty: Number(e.target.value) })}
+                />
+                <Input
+                  type="number"
+                  label={t('pages.cc.issueLimit')}
+                  value={config.issue_limit_per_min}
+                  min={MIN_LIMIT_PER_MIN}
+                  max={MAX_LIMIT_PER_MIN}
+                  disabled={!canWrite || !config.enabled}
+                  hint={t('pages.cc.issueLimitHint')}
+                  onChange={(e) => patch({ issue_limit_per_min: Number(e.target.value) })}
+                />
+                <Input
+                  type="number"
+                  label={t('pages.cc.verifyLimit')}
+                  value={config.verify_limit_per_min}
+                  min={MIN_LIMIT_PER_MIN}
+                  max={MAX_LIMIT_PER_MIN}
+                  disabled={!canWrite || !config.enabled}
+                  hint={t('pages.cc.verifyLimitHint')}
+                  onChange={(e) => patch({ verify_limit_per_min: Number(e.target.value) })}
+                />
+              </div>
+              {powIssue && (
+                <p className="text-xs text-fg-danger">{t(`pages.cc.pow_${powIssue}`)}</p>
+              )}
             </CardBody>
           </Card>
 

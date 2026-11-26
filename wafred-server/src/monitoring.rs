@@ -220,7 +220,9 @@ async fn sweep_visitor_states(
     Ok(challenges + ceremonies)
 }
 
-/// Scans all agents marked as online and demotes those with stale heartbeats.
+/// Scans all agents not yet marked offline and demotes those with stale
+/// heartbeats. A degraded agent that went silent is just as gone as an online
+/// one.
 async fn check_stale_agents(
     db: &DatabaseConnection,
     registry: &AgentRegistry,
@@ -233,9 +235,9 @@ async fn check_stale_agents(
         - chrono::Duration::from_std(stale_threshold)
             .unwrap_or(chrono::Duration::seconds(90));
 
-    // Find agents currently marked online whose last heartbeat is older than cutoff
+    // Find agents not marked offline whose last heartbeat is older than cutoff
     let stale_agents = agent::Entity::find()
-        .filter(agent::Column::Status.eq(agent_status::ONLINE))
+        .filter(agent::Column::Status.ne(agent_status::OFFLINE))
         .filter(agent::Column::LastHeartbeat.lt(cutoff))
         .all(db)
         .await?;

@@ -15,6 +15,7 @@ const features = {
       { id: "cc-bot", label: "CC 与 Bot" },
       { id: "access-control", label: "访问控制" },
       { id: "traffic-caching", label: "流量与缓存" },
+      { id: "tunnel", label: "隧道" },
       { id: "tls", label: "TLS" },
       { id: "observability", label: "可观测性" },
       { id: "operations", label: "运维" },
@@ -104,6 +105,25 @@ const features = {
         id: "caching",
         caption: "缓存规则、TTL 与站点级配额。",
         alt: "WAFred 控制台中的边缘缓存配置",
+      },
+    },
+    {
+      id: "tunnel",
+      icon: "network",
+      kicker: "接入",
+      title: "让没有公网入口的服务也能被保护",
+      lead: "内网里的连接器主动向边缘拨号，NAT 之后的 NAS、内网应用或管理页同样由同一套 WAF 保护——源站无需开放入站端口，也不需要公网 IP。",
+      points: [
+        "连接器只发起出站连接；公网侧由边缘终止，并把回环桥接地址交给源站池。",
+        "边缘永远看不到连接器凭据：它只校验短期 Ed25519 会话令牌，并固定边缘证书。",
+        "完全没有直接出网的主机，可经 SOCKS5 代理同时访问控制面与边缘。",
+        "控制台一站式完成：创建、配对、绑定源站池、轮换、吊销、禁用与删除。",
+      ],
+      note: "出站连接器 → 边缘监听 → 回环桥接",
+      scene: {
+        id: "agents",
+        caption: "隧道与边缘节点在同一页管理：配对、会话与限制。",
+        alt: "PingWAF 控制台中的隧道标签页",
       },
     },
     {

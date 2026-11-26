@@ -165,6 +165,40 @@ fn js_string(value: &str) -> String {
         .replace("</", "<\\/")
 }
 
+const SCRIPTS_START: &str = "<!-- WAFRED_SCRIPTS_START -->";
+const SCRIPTS_END: &str = "<!-- WAFRED_SCRIPTS_END -->";
+
+/// DOM ids the compiled challenge script dereferences directly. A custom
+/// template (rendered by the control plane's error-page editor) must keep all
+/// of them; the challenge logic itself is never templated.
+pub const REQUIRED_DOM_IDS: [&str; 7] = [
+    "countdown",
+    "title",
+    "subtitle",
+    "status",
+    "spinnerWrap",
+    "progressBar",
+    "progressFill",
+];
+
+fn extract_scripts(default_html: &str) -> Option<&str> {
+    let start = default_html.find(SCRIPTS_START)? + SCRIPTS_START.len();
+    let rest = &default_html[start..];
+    let end = rest.find(SCRIPTS_END)?;
+    Some(&rest[..end])
+}
+
+/// The compiled challenge script blocks, for injection into a custom page.
+///
+/// The custom page is presentation only: this exact block carries the
+/// fingerprint, proof-of-work, verification and redirect logic. It is
+/// generated from the built-in page so there is one source of truth.
+pub fn challenge_scripts(params: &ChallengePageParams) -> String {
+    extract_scripts(&generate_js_challenge_html(params))
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Generate the JS challenge HTML page (5-second shield).
 /// The page is self-contained with inline CSS and JS — no external dependencies.
 pub fn generate_js_challenge_html(params: &ChallengePageParams) -> String {
@@ -177,7 +211,7 @@ pub fn generate_js_challenge_html(params: &ChallengePageParams) -> String {
     let original_url = js_string(&params.original_url);
     let brand_name = &params.brand_name;
 
-    format!(
+    let default_html = format!(
         r##"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -258,6 +292,7 @@ h1{{font-size:20px;font-weight:600;margin-bottom:12px;color:var(--text)}}
   </div>
 </div>
 
+<!-- WAFRED_SCRIPTS_START -->
 <script>
 {fingerprint_js}
 </script>
@@ -419,6 +454,7 @@ h1{{font-size:20px;font-weight:600;margin-bottom:12px;color:var(--text)}}
   }}
 }})();
 </script>
+<!-- WAFRED_SCRIPTS_END -->
 <noscript>
 <style>.container{{border-color:var(--error)}}</style>
 <div class="container" style="margin-top:16px">
@@ -428,7 +464,8 @@ h1{{font-size:20px;font-weight:600;margin-bottom:12px;color:var(--text)}}
 </noscript>
 </body>
 </html>"##
-    )
+    );
+    default_html
 }
 
 /// Generate the managed challenge HTML page.
@@ -539,6 +576,34 @@ mod tests {
             "the client-controlled URL must not close the challenge script"
         );
         assert!(html.contains("computeProofOfWork"));
+    }
+
+    #[test]
+    fn default_page_exposes_the_script_markers() {
+        let html = generate_js_challenge_html(&ChallengePageParams::default());
+        assert!(html.contains(SCRIPTS_START));
+        assert!(html.contains(SCRIPTS_END));
+        assert!(extract_scripts(&html)
+            .is_some_and(|scripts| scripts.contains("computeProofOfWork")));
+    }
+
+    #[test]
+    fn challenge_scripts_contains_the_compiled_proof_of_work() {
+        let scripts = challenge_scripts(&ChallengePageParams::default());
+        assert!(scripts.contains("<script>"));
+        assert!(scripts.contains("computeProofOfWork"));
+        assert!(scripts.contains("__pingwaf_fingerprint"));
+    }
+
+    #[test]
+    fn default_page_has_every_required_id() {
+        let html = generate_js_challenge_html(&ChallengePageParams::default());
+        for id in REQUIRED_DOM_IDS {
+            assert!(
+                html.contains(&format!("id=\"{id}\"")),
+                "default page is missing id={id}"
+            );
+        }
     }
 
     #[test]

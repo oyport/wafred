@@ -27,7 +27,7 @@ A login returns `access_token`, `refresh_token`, `token_type: Bearer`, `expires_
 | Rules | `GET|POST /sites/{id}/rules`, `GET|PUT|DELETE /sites/{id}/rules/{rule_id}`, `POST /sites/{id}/waf/defaults` |
 | WAF | `GET|PUT /sites/{id}/waf/settings`, `GET /sites/{id}/waf/posture`, `GET /managed-rules` |
 | Logs | `GET /logs/security`, `GET /logs/access`, `GET /logs/access/{id}`, `DELETE /logs/purge` |
-| Agents | `GET /agents`, `POST /agents/enroll`, `POST /agents/{id}/commands` |
+| Agents | `GET /agents`, `POST /agents/enroll`, `PUT /agents/{id}/sites`, `POST /agents/{id}/commands` |
 | Config versions | `GET /config-versions`, `GET /config-versions/{id}`, `POST /config-versions/{id}/rollback`, `POST /config-versions/prune` |
 | System | `GET /system/metrics`, `/system/profile`, `/system/nodes`, `/system/status` |
 
@@ -56,9 +56,9 @@ Operators can whitelist request paths that skip selected protection layers (`waf
 | `POST /sites/{id}/path-exceptions` | Create: `path` (starts with `/`, ≤512; a pattern for `regex`), `match_type` (`prefix`/`exact`/`wildcard`/`regex` — unanchored, case-sensitive Rust regex), `skip_layers`, `note`, `log_hits`, `enabled` |
 | `GET|PUT|DELETE /sites/{id}/path-exceptions/{id}` | Read / partial update / delete (`204`) |
 
-## Error page scopes
+## Custom page scopes
 
-Custom error pages (`GET|POST /error-pages`, administrators) carry a `scope`:
+Custom pages (`GET|POST /error-pages`, administrators; the API path keeps the historical name) carry a `scope`:
 
 - **`site`** (default) — replaces error responses of matched sites; status
   codes 400–599; templates render the full context (`request_id`,
@@ -71,6 +71,13 @@ Custom error pages (`GET|POST /error-pages`, administrators) carry a `scope`:
   and it never overrides a matched site's own locations. Its template gets
   only `{{ host }}` (HTML-escaped) and `{{ request_id }}`; responses carry
   `Cache-Control: no-store`.
+- **`challenge`** — the JS / managed / interactive challenge page; fixed
+  status 503 and `text/html`. Presentation only: the compiled challenge
+  scripts are injected with `{{ challenge_scripts | safe }}`; the template
+  must keep the `countdown`, `title`, `subtitle`, `status`, `spinnerWrap`,
+  `progressBar` and `progressFill` ids and must not contain `<script>`. This
+  scope is separate from the site and unmatched-host 503 error pages; editing
+  it does not change them.
 
 ## Site clones copy everything
 

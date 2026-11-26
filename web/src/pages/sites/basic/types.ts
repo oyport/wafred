@@ -95,6 +95,8 @@ export interface PoolFormState {
   sni: string
   verifyCert: VerifyCertMode
   addressFamily: AddressFamilyOption
+  /** Tunnel connector bound to this pool; '' = direct origins. */
+  tunnelId: string
   healthCheckEnabled: boolean
   /** Kept as strings: raw input, validated on submit. */
   healthCheckPath: string
@@ -112,6 +114,7 @@ export const emptyPoolForm = (): PoolFormState => ({
   sni: '',
   verifyCert: 'inherit',
   addressFamily: 'auto',
+  tunnelId: '',
   healthCheckEnabled: false,
   healthCheckPath: '/healthz',
   healthCheckInterval: '10',
@@ -130,6 +133,7 @@ export function poolFormFromPool(pool: UpstreamPool): PoolFormState {
     sni: pool.sni ?? '',
     verifyCert: verifyCertMode(pool.verify_cert),
     addressFamily: addressFamilyValue(pool.address_family),
+    tunnelId: pool.tunnel_id ?? '',
     healthCheckEnabled: pool.health_check_enabled,
     healthCheckPath: pool.health_check_path || '/healthz',
     healthCheckInterval: String(pool.health_check_interval_seconds),

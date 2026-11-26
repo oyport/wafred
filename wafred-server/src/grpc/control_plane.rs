@@ -5,17 +5,21 @@
 //! and every other RPC verifies that token before touching the database.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use pingwaf_proto::control_plane::{
     control_plane_server::ControlPlane as ControlPlaneTrait, AgentHeartbeat,
     BlockedIp, CertEventAck, CertEventEntry, GetSiteConfigRequest, HostSample,
-    LogAck, LogEntry, Metric, MetricAck, MetricBatch, RegisterAgentRequest,
-    RegisterAgentResponse, RuleBundle, ServerCommand, SiteConfig, SiteStatus,
-    SyncRulesRequest, UpstreamHealth, VisitorChallengeRequest,
+    LogAck, LogEntry, Metric, MetricAck, MetricBatch, PairTunnelRequest,
+    PairTunnelResponse, PublishCertificateRequest, PublishCertificateResponse,
+    RegisterAgentRequest, RegisterAgentResponse, RuleBundle, ServerCommand,
+    SiteConfig, SiteStatus, SyncRulesRequest, TunnelConnectorCommand,
+    TunnelConnectorMessage, UpstreamHealth, VisitorChallengeRequest,
     VisitorChallengeResponse, VisitorChangePasswordRequest,
     VisitorChangePasswordResponse, VisitorGrantsRequest, VisitorGrantsResponse,
     VisitorLoginRequest, VisitorLoginResponse, VisitorLogoutRequest,
@@ -28,7 +32,7 @@ use pingwaf_proto::control_plane::{
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait,
-    QueryFilter, QuerySelect, Set, UpdateMany,
+    QueryFilter, QuerySelect, Set, TransactionTrait, UpdateMany,
 };
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
@@ -51,13 +55,14 @@ use crate::grpc::config::{
     build_rule_bundle, build_site_config, from_timestamp,
 };
 use crate::grpc::registry::{
-    AgentRegistry, HeartbeatMetrics, COMMAND_CHANNEL_CAPACITY,
+    AgentRegistry, ConfigDrift, HeartbeatMetrics, COMMAND_CHANNEL_CAPACITY,
 };
 use crate::models::{
-    access_log, action, agent, agent_blocked_ip, agent_metric, agent_status,
-    api_key, certificate_events, certificate_links, geo_rules, host_sample,
-    ip_access_rules, path_exceptions, security_event, site, site_basic_auth,
-    site_certificates, site_oidc,
+    access_log, action, agent, agent_blocked_ip, agent_metric, agent_sites,
+    agent_status, api_key, certificate_events, certificate_links, geo_rules,
+    host_sample, ip_access_rules, path_exceptions, security_event, site,
+    site_basic_auth, site_certificates, site_oidc, tunnel_connector,
+    tunnel_session, tunnel_status,
 };
 
 /// Stream type returned by the server-streaming RPCs.
@@ -230,6 +235,35 @@ impl ControlPlaneService {
         &self,
         row: &agent::Model,
     ) -> Result<Vec<site::Model>, Status> {
+        if row.site_scope == "selected" {
+            let Some(key_id) = row.api_key_id else {
+                return Ok(Vec::new());
+            };
+            let key = api_key::Entity::find_by_id(key_id)
+                .one(&self.db)
+                .await
+                .map_err(db_status)?
+                .ok_or_else(|| {
+                    Status::unauthenticated("API key was revoked")
+                })?;
+            let assigned: Vec<Uuid> = agent_sites::Entity::find()
+                .filter(agent_sites::Column::AgentId.eq(row.id))
+                .all(&self.db)
+                .await
+                .map_err(db_status)?
+                .into_iter()
+                .map(|assignment| assignment.site_id)
+                .collect();
+            if assigned.is_empty() {
+                return Ok(Vec::new());
+            }
+            return site::Entity::find()
+                .filter(site::Column::Id.is_in(assigned))
+                .filter(site::Column::UserId.eq(key.user_id))
+                .all(&self.db)
+                .await
+                .map_err(db_status);
+        }
         if let Some(site_id) = row.site_id {
             let owned = site::Entity::find_by_id(site_id)
                 .one(&self.db)
@@ -393,9 +427,11 @@ impl ControlPlaneService {
     ) -> Result<SiteConfig, Status> {
         let sites = self.visible_sites(row).await?;
         let ids: Vec<Uuid> = sites.iter().map(|site| site.id).collect();
-        build_site_config(&self.db, Some(&ids))
+        let mut config = build_site_config(&self.db, Some(&ids))
             .await
-            .map_err(db_status)
+            .map_err(db_status)?;
+        crate::grpc::scope_acme_for_agent(&mut config, row.id, row.acme_issuer);
+        Ok(config)
     }
 }
 
@@ -462,12 +498,22 @@ impl ControlPlaneTrait for ControlPlaneService {
         // unbound agent serves all of the owner's sites; a future manual
         // binding API can narrow the scope explicitly.
         let site_id = None;
+        // The embedded all-in-one issuer reaches the control plane over
+        // loopback; a remote agent starts as a consumer and must be marked
+        // explicitly. The flag is set only on insert: a re-registration must
+        // not undo an operator's choice.
+        let acme_issuer = peer_ip
+            .as_deref()
+            .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback());
 
         let row = match existing {
             Some(row) => {
                 let agent_id = row.id;
                 let mut active: agent::ActiveModel = row.into();
-                active.site_id = Set(site_id);
+                // A re-registration must not clear an operator's site scope
+                // or legacy single-site binding; only a brand-new row starts
+                // with `all` / no binding.
                 active.version = Set(optional(&payload.version));
                 active.os_info = Set(optional(&payload.os_info));
                 active.cpu_cores = Set(positive_i32(payload.cpu_cores as i64));
@@ -497,6 +543,8 @@ impl ControlPlaneTrait for ControlPlaneService {
                 let created = agent::ActiveModel {
                     id: Set(agent_id),
                     site_id: Set(site_id),
+                    site_scope: Set("all".to_string()),
+                    acme_issuer: Set(acme_issuer),
                     hostname: Set(payload.hostname.clone()),
                     // The label is the operator's: a registering agent never
                     // supplies or clears it.
@@ -509,6 +557,7 @@ impl ControlPlaneTrait for ControlPlaneService {
                     total_memory_bytes: Set(total_memory),
                     // Usage starts unknown: the first heartbeat fills it.
                     used_memory_bytes: Set(None),
+                    process_rss_bytes: Set(None),
                     status: Set(status),
                     api_key_id: Set(Some(key.id)),
                     config_hash: Set(None),
@@ -520,6 +569,13 @@ impl ControlPlaneTrait for ControlPlaneService {
                     private_ip: Set(optional(&payload.private_ip)),
                     peer_ip: Set(peer_ip.clone()),
                     peer_ip_seen_at: Set(peer_ip.as_ref().map(|_| now)),
+                    // Filled in by the first heartbeat that carries the
+                    // tunnel listener state; the ingress address is the
+                    // operator's and starts unset.
+                    tunnel_ingress_addr: Set(None),
+                    tunnel_listener_addr: Set(None),
+                    tunnel_cert_sha256: Set(None),
+                    tunnel_listener_error: Set(None),
                 }
                 .insert(&self.db)
                 .await
@@ -536,7 +592,13 @@ impl ControlPlaneTrait for ControlPlaneService {
         )
         .map_err(|err| Status::internal(err.to_string()))?;
 
+        // Order matters: a change committed while the configuration is being
+        // built queues its own push, which must survive to be replayed.
+        self.agents.begin_registration(row.id).await;
         let initial_config = self.site_config_for(&row).await?;
+        self.agents
+            .note_initial_config(row.id, &initial_config.config_hash)
+            .await;
         // DR-04: the config above is pushed regardless — this only makes a
         // version/capability mismatch visible to the operator.
         self.warn_scope_capability_gaps(&row).await;
@@ -619,6 +681,7 @@ impl ControlPlaneTrait for ControlPlaneService {
                 persist_peer_ip(&db, agent_id, &peer).await;
             }
             persist_heartbeat(&db, agent_id, &first, &registry).await;
+            reconcile_agent_config(&db, &registry, agent_id, &first).await;
             persist_host_samples(&db, agent_id, &first.host_samples).await;
             persist_blocked_ips(
                 &db,
@@ -628,6 +691,7 @@ impl ControlPlaneTrait for ControlPlaneService {
             )
             .await;
             record_upstream_health(&db, agent_id, &first.upstream_health).await;
+            persist_tunnel_state(&db, agent_id, &first).await;
             while let Some(mut message) = match inbound.message().await {
                 Ok(Some(message)) => Some(message),
                 Ok(None) => None,
@@ -647,6 +711,8 @@ impl ControlPlaneTrait for ControlPlaneService {
                     .record_heartbeat(agent_id, heartbeat_metrics(&message))
                     .await;
                 persist_heartbeat(&db, agent_id, &message, &registry).await;
+                reconcile_agent_config(&db, &registry, agent_id, &message)
+                    .await;
                 persist_host_samples(&db, agent_id, &message.host_samples)
                     .await;
                 persist_blocked_ips(
@@ -658,6 +724,7 @@ impl ControlPlaneTrait for ControlPlaneService {
                 .await;
                 record_upstream_health(&db, agent_id, &message.upstream_health)
                     .await;
+                persist_tunnel_state(&db, agent_id, &message).await;
             }
             mark_offline(&db, agent_id).await;
             registry.disconnect(&agent_id, generation).await;
@@ -669,6 +736,290 @@ impl ControlPlaneTrait for ControlPlaneService {
             Box::pin(ReceiverStream::new(receiver).map(Ok))
                 as Self::HeartbeatStream,
         ))
+    }
+
+    type TunnelControlStream = BoxedStream<TunnelConnectorCommand>;
+
+    async fn pair_tunnel(
+        &self,
+        request: Request<PairTunnelRequest>,
+    ) -> Result<Response<PairTunnelResponse>, Status> {
+        // Unauthenticated by design — the one-time token is the credential —
+        // so the peer is rate limited exactly like agent registration.
+        if let Some(addr) = request.remote_addr() {
+            if let Err(retry_after) =
+                crate::api::rate_limit::consume_agent_registration(addr.ip())
+            {
+                return Err(Status::resource_exhausted(format!(
+                    "too many pairing attempts; retry in {retry_after} seconds"
+                )));
+            }
+        }
+        let payload = request.into_inner();
+        let token = payload.pairing_token.trim();
+        if token.is_empty() {
+            return Err(Status::invalid_argument("pairing_token is required"));
+        }
+        let settings = crate::tunnel_policy::load_settings(&self.db)
+            .await
+            .map_err(db_status)?;
+        if !settings.enabled {
+            return Err(Status::failed_precondition(
+                "tunnel connectors are disabled on this deployment",
+            ));
+        }
+        let hash = crate::tunnel_policy::digest_hex(token);
+        let row = tunnel_connector::Entity::find()
+            .filter(tunnel_connector::Column::PairingTokenHash.eq(hash))
+            .one(&self.db)
+            .await
+            .map_err(db_status)?;
+        let Some(row) = row else {
+            // Same reply whether the token never existed or was already
+            // redeemed: a prober learns nothing either way.
+            return Err(Status::unauthenticated(INVALID_CREDENTIALS));
+        };
+        let now = Utc::now();
+        if row
+            .pairing_token_expires_at
+            .map(|expires| expires <= now)
+            .unwrap_or(true)
+        {
+            return Err(Status::unauthenticated(
+                "the pairing token has expired; mint a new one in the console",
+            ));
+        }
+        if row.status == tunnel_status::DISABLED {
+            return Err(Status::permission_denied("this tunnel is disabled"));
+        }
+
+        let credential = crate::tunnel_policy::generate_secret();
+        let tunnel_id = row.id;
+        let name = row.name.clone();
+        let mut active: tunnel_connector::ActiveModel = row.into();
+        active.credential_sha256 =
+            Set(Some(crate::tunnel_policy::digest_hex(&credential)));
+        active.credential_issued_at = Set(Some(now));
+        active.pairing_token_hash = Set(None);
+        active.pairing_token_expires_at = Set(None);
+        active.status = Set(tunnel_status::ACTIVE.to_string());
+        active.version = Set(optional(&payload.version));
+        active.hostname = Set(optional(&payload.hostname));
+        active.os_info = Set(optional(&payload.os_info));
+        active.last_seen_at = Set(Some(now));
+        active.updated_at = Set(now);
+        active.update(&self.db).await.map_err(db_status)?;
+
+        tracing::info!(
+            %tunnel_id,
+            hostname = %payload.hostname,
+            version = %payload.version,
+            "tunnel connector paired"
+        );
+
+        // A connector that is already running still holds a control stream
+        // opened with the previous credential (or with none). It must be told
+        // to go: otherwise the console shows it online while the edges — which
+        // are about to receive the new digest — refuse its data plane.
+        crate::grpc::notify_tunnel_connectors(
+            &self.db,
+            tunnel_id,
+            Some(
+                "the tunnel was paired again; run the new pairing command"
+                    .to_string(),
+            ),
+        )
+        .await;
+        // The new credential digest has to reach the edges now: until they
+        // hold it, the connector's session is refused.
+        crate::grpc::push_config_to_all(&self.db, &self.agents).await;
+
+        let ingress = crate::tunnel_policy::ingress_endpoints(&self.db)
+            .await
+            .map_err(db_status)?;
+        let targets =
+            crate::tunnel_policy::targets_for_tunnel(&self.db, tunnel_id)
+                .await
+                .map_err(db_status)?;
+        // A token is minted with the pairing so the connector can open edge
+        // sessions immediately; the control stream refreshes it from then on.
+        let (session_token, session_token_expires_at) =
+            crate::tunnel_token::mint(
+                &tunnel_id.to_string(),
+                settings.session_token_ttl_seconds.max(60) as u64,
+            )
+            .map_err(|err| {
+                tracing::error!(%tunnel_id, error = %err, "cannot mint a tunnel session token");
+                Status::internal(INTERNAL_MESSAGE)
+            })?;
+        Ok(Response::new(PairTunnelResponse {
+            tunnel_id: tunnel_id.to_string(),
+            name,
+            credential,
+            ingress,
+            targets,
+            settings: Some(pingwaf_proto::control_plane::TunnelSettings {
+                max_streams: settings.max_streams_per_session.max(1) as u32,
+                idle_timeout_secs: settings.idle_timeout_seconds.max(10) as u32,
+                heartbeat_secs: settings.heartbeat_seconds.max(5) as u32,
+                session_token_ttl_secs: settings
+                    .session_token_ttl_seconds
+                    .max(60) as u32,
+            }),
+            session_token,
+            session_token_expires_at,
+        }))
+    }
+
+    async fn tunnel_control(
+        &self,
+        request: Request<Streaming<TunnelConnectorMessage>>,
+    ) -> Result<Response<Self::TunnelControlStream>, Status> {
+        use pingwaf_proto::control_plane::tunnel_connector_message;
+
+        let mut inbound = request.into_inner();
+        let first = inbound.next().await.ok_or_else(|| {
+            Status::invalid_argument("the connector sent no hello")
+        })??;
+        let Some(tunnel_connector_message::Kind::Hello(hello)) = first.kind
+        else {
+            return Err(Status::invalid_argument(
+                "the first tunnel message must be a hello",
+            ));
+        };
+        let tunnel_id = Uuid::parse_str(hello.tunnel_id.trim())
+            .map_err(|_| Status::invalid_argument("tunnel_id is not a UUID"))?;
+        let row = tunnel_connector::Entity::find_by_id(tunnel_id)
+            .one(&self.db)
+            .await
+            .map_err(db_status)?;
+        let Some(row) = row else {
+            return Err(Status::unauthenticated(INVALID_CREDENTIALS));
+        };
+        let expected = row.credential_sha256.clone().unwrap_or_default();
+        if !wafred_tunnel::protocol::credential_matches(
+            &hello.credential,
+            &expected,
+        ) {
+            tracing::warn!(%tunnel_id, "tunnel control stream refused: bad credential");
+            return Err(Status::unauthenticated(INVALID_CREDENTIALS));
+        }
+        let settings = crate::tunnel_policy::load_settings(&self.db)
+            .await
+            .map_err(db_status)?;
+        if !settings.enabled || row.status == tunnel_status::DISABLED {
+            return Err(Status::permission_denied("this tunnel is disabled"));
+        }
+
+        let now = Utc::now();
+        let mut active: tunnel_connector::ActiveModel = row.into();
+        active.last_seen_at = Set(Some(now));
+        active.version = Set(optional(&hello.version));
+        active.hostname = Set(optional(&hello.hostname));
+        active.os_info = Set(optional(&hello.os_info));
+        active.updated_at = Set(now);
+        active.update(&self.db).await.map_err(db_status)?;
+
+        let (generation, mut commands) =
+            crate::grpc::TUNNEL_CONNECTORS.register(tunnel_id).await;
+        let (tx, rx) =
+            mpsc::channel::<Result<TunnelConnectorCommand, Status>>(16);
+        // The policy the connector needs first: without it there is nothing to
+        // dial.
+        match crate::tunnel_policy::connector_config(&self.db, tunnel_id).await
+        {
+            Ok(Some(config)) => {
+                let _ = tx
+                    .send(Ok(TunnelConnectorCommand {
+                        kind: Some(
+                            pingwaf_proto::control_plane::tunnel_connector_command::Kind::Config(
+                                config,
+                            ),
+                        ),
+                    }))
+                    .await;
+            },
+            Ok(None) => {
+                let _ = tx
+                    .send(Ok(TunnelConnectorCommand {
+                        kind: Some(
+                            pingwaf_proto::control_plane::tunnel_connector_command::Kind::Revoked(
+                                pingwaf_proto::control_plane::TunnelConnectorRevoked {
+                                    message: "the tunnel was deleted".to_string(),
+                                },
+                            ),
+                        ),
+                    }))
+                    .await;
+            },
+            Err(err) => {
+                tracing::warn!(%tunnel_id, error = %err, "cannot build the tunnel policy");
+            },
+        }
+        tracing::info!(%tunnel_id, hostname = %hello.hostname, "tunnel connector connected");
+
+        // A connector that goes away without closing the stream (host power
+        // loss, NAT expiry) must not keep the row "connected" forever: the
+        // heartbeat cadence bounds how long silence is plausible.
+        let liveness =
+            Duration::from_secs((settings.heartbeat_seconds.max(5) as u64) * 3);
+        let db = self.db.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    command = commands.recv() => {
+                        match command {
+                            Some(command) => {
+                                if tx.send(Ok(command)).await.is_err() {
+                                    break;
+                                }
+                            },
+                            None => break,
+                        }
+                    },
+                    message = tokio::time::timeout(liveness, inbound.next()) => {
+                        let message = match message {
+                            Ok(message) => message,
+                            Err(_) => {
+                                tracing::warn!(
+                                    %tunnel_id,
+                                    timeout_secs = liveness.as_secs(),
+                                    "tunnel connector went silent, closing its control stream"
+                                );
+                                break;
+                            },
+                        };
+                        match message {
+                            Some(Ok(message)) => {
+                                // Heartbeats keep the row fresh; nothing else
+                                // is expected on this stream.
+                                if let Some(
+                                    tunnel_connector_message::Kind::Heartbeat(heartbeat),
+                                ) = message.kind
+                                {
+                                    let _ = heartbeat;
+                                    let _ = tunnel_connector::Entity::update_many()
+                                        .col_expr(
+                                            tunnel_connector::Column::LastSeenAt,
+                                            Expr::value(Utc::now()),
+                                        )
+                                        .filter(tunnel_connector::Column::Id.eq(tunnel_id))
+                                        .exec(&db)
+                                        .await;
+                                }
+                            },
+                            _ => break,
+                        }
+                    },
+                }
+            }
+            crate::grpc::TUNNEL_CONNECTORS
+                .unregister(tunnel_id, generation)
+                .await;
+            tracing::info!(%tunnel_id, "tunnel connector disconnected");
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
     type SyncRulesStream = BoxedStream<RuleBundle>;
@@ -772,15 +1123,23 @@ impl ControlPlaneTrait for ControlPlaneService {
         request: Request<Streaming<LogEntry>>,
     ) -> Result<Response<LogAck>, Status> {
         let agent = self.authorize(&Self::metadata_token(&request)).await?;
+        // Kept for the periodic re-authorization below (DR32-08): the token
+        // must be re-verified on the metadata once per refresh window.
+        let agent_token = Self::metadata_token(&request);
         let authenticated_id = agent.id;
-        // The sites this agent serves, resolved once per stream: every entry's
-        // `site_id` is checked against it below (D10).
-        let visible_sites: Vec<Uuid> = self
-            .visible_sites(&agent)
-            .await?
-            .iter()
-            .map(|row| row.id)
-            .collect();
+        // The sites this agent serves, snapshot at connect and refreshed
+        // every [`SITE_VISIBILITY_REFRESH`] inside the loop below (D10 +
+        // DR32-08): a revoked key or an unbound site must stop the flow even
+        // on a stream that stays up for hours.
+        let mut visibility = SiteVisibility::new(
+            self.visible_sites(&agent)
+                .await?
+                .iter()
+                .map(|row| row.id)
+                .collect(),
+        );
+        let mut next_visibility_refresh =
+            tokio::time::Instant::now() + SITE_VISIBILITY_REFRESH;
         let mut inbound = request.into_inner();
         let batch_size = self.config.log_batch_size.max(1);
 
@@ -810,6 +1169,45 @@ impl ControlPlaneTrait for ControlPlaneService {
             // or one bad entry fails the whole batch forever (2026-11-13).
             sanitize_log_entry(&mut message);
             let now = Utc::now();
+            // DR32-08: periodic re-check of authentication and site bindings,
+            // once per `SITE_VISIBILITY_REFRESH` — never per entry. An auth
+            // failure (agent deleted, key revoked) ends the stream; entries
+            // received so far are still flushed below.
+            if tokio::time::Instant::now() >= next_visibility_refresh {
+                next_visibility_refresh =
+                    tokio::time::Instant::now() + SITE_VISIBILITY_REFRESH;
+                match self.authorize(&agent_token).await {
+                    Ok(agent) => match self.visible_sites(&agent).await {
+                        Ok(sites) => {
+                            let sites: Vec<Uuid> =
+                                sites.into_iter().map(|row| row.id).collect();
+                            if visibility.refresh(sites) {
+                                tracing::info!(
+                                    agent_id = %authenticated_id,
+                                    sites = visibility.sites.len(),
+                                    "log stream site visibility refreshed"
+                                );
+                            }
+                        },
+                        Err(err) => {
+                            tracing::warn!(
+                                agent_id = %authenticated_id,
+                                error = %err,
+                                "log stream ended: site visibility refresh failed"
+                            );
+                            break;
+                        },
+                    },
+                    Err(err) => {
+                        tracing::info!(
+                            agent_id = %authenticated_id,
+                            error = %err,
+                            "log stream ended: agent is no longer authorised"
+                        );
+                        break;
+                    },
+                }
+            }
             if !message.agent_id.is_empty()
                 && message.agent_id != authenticated_id.to_string()
             {
@@ -822,11 +1220,13 @@ impl ControlPlaneTrait for ControlPlaneService {
                 );
                 continue;
             }
-            if !site_stamp_is_visible(&message.site_id, &visible_sites) {
-                // The agent may only write history for the sites it serves.
-                // The entry is dropped rather than answered with an error: a
-                // misbehaving edge would otherwise retry the whole batch
-                // forever, and the batch also carries legitimate entries.
+            if !visibility.allows(&message.site_id) {
+                // The agent may only write history for the sites it serves
+                // (D10), against the snapshot refreshed every refresh window
+                // (DR32-08). The entry is dropped rather than answered with
+                // an error: a misbehaving edge would otherwise retry the
+                // whole batch forever, and the batch also carries legitimate
+                // entries.
                 dropped += 1;
                 tracing::warn!(
                     site_id = %message.site_id,
@@ -951,16 +1351,25 @@ impl ControlPlaneTrait for ControlPlaneService {
         request: Request<Streaming<CertEventEntry>>,
     ) -> Result<Response<CertEventAck>, Status> {
         let agent = self.authorize(&Self::metadata_token(&request)).await?;
+        // Kept for the periodic re-authorization below, same as `ship_logs`.
+        let agent_token = Self::metadata_token(&request);
         let authenticated_id = agent.id;
         // Same tenancy check as `ship_logs`: a certificate event drives a
         // state transition on the site's certificate, so a foreign `site_id`
-        // here would let an edge fail another tenant's renewal (D10).
-        let visible_sites: Vec<Uuid> = self
-            .visible_sites(&agent)
-            .await?
-            .iter()
-            .map(|row| row.id)
-            .collect();
+        // here would let an edge fail another tenant's renewal (D10). The
+        // snapshot is refreshed on the same cadence: a revoked key or an
+        // unbound site must stop the flow even on a connection that lives for
+        // days (review of 0.32.33, H3 — the same defect as DR32-08, fixed here
+        // because the two streams had identical shapes).
+        let mut visibility = SiteVisibility::new(
+            self.visible_sites(&agent)
+                .await?
+                .iter()
+                .map(|row| row.id)
+                .collect(),
+        );
+        let mut next_visibility_refresh =
+            tokio::time::Instant::now() + SITE_VISIBILITY_REFRESH;
         let mut inbound = request.into_inner();
         let batch_size = self.config.log_batch_size.max(1);
         let mut received: u64 = 0;
@@ -986,6 +1395,43 @@ impl ControlPlaneTrait for ControlPlaneService {
                 },
             };
             sanitize_cert_event(&mut message);
+            // Periodic re-authorization and visibility refresh; entries
+            // received so far are still flushed by the batch tail below.
+            if tokio::time::Instant::now() >= next_visibility_refresh {
+                next_visibility_refresh =
+                    tokio::time::Instant::now() + SITE_VISIBILITY_REFRESH;
+                match self.authorize(&agent_token).await {
+                    Ok(agent) => match self.visible_sites(&agent).await {
+                        Ok(sites) => {
+                            let sites: Vec<Uuid> =
+                                sites.into_iter().map(|row| row.id).collect();
+                            if visibility.refresh(sites) {
+                                tracing::info!(
+                                    agent_id = %authenticated_id,
+                                    sites = visibility.sites.len(),
+                                    "certificate event stream visibility refreshed"
+                                );
+                            }
+                        },
+                        Err(err) => {
+                            tracing::warn!(
+                                agent_id = %authenticated_id,
+                                error = %err,
+                                "certificate event stream ended: visibility refresh failed"
+                            );
+                            break;
+                        },
+                    },
+                    Err(err) => {
+                        tracing::info!(
+                            agent_id = %authenticated_id,
+                            error = %err,
+                            "certificate event stream ended: agent no longer authorized"
+                        );
+                        break;
+                    },
+                }
+            }
             let now = Utc::now();
             if !message.agent_id.is_empty()
                 && message.agent_id != authenticated_id.to_string()
@@ -997,17 +1443,33 @@ impl ControlPlaneTrait for ControlPlaneService {
                 );
                 continue;
             }
-            if !site_stamp_is_visible(&message.site_id, &visible_sites) {
+            if !visibility
+                .allows_cert_event(&message.site_id, &message.certificate_id)
+            {
                 // Dropped, not rejected: see `ship_logs`. The alert and the
                 // certificate state transition below both act on the site, so
-                // the check has to happen before either.
+                // the check has to happen before either. An empty stamp is a
+                // global ACME event (environment/account/authorization lines)
+                // and is accepted; only a non-empty foreign site is dropped.
+                // An empty site that names a certificate is not global: it
+                // would let an agent fail another tenant's certificate by id,
+                // so it is dropped too.
                 dropped += 1;
-                tracing::warn!(
-                    site_id = %message.site_id,
-                    agent_id = %authenticated_id,
-                    dropped,
-                    "certificate event stamped with a site this agent does not serve"
-                );
+                if message.site_id.is_empty() {
+                    tracing::warn!(
+                        certificate_id = %message.certificate_id,
+                        agent_id = %authenticated_id,
+                        dropped,
+                        "certificate event without a site stamp names a certificate; dropped"
+                    );
+                } else {
+                    tracing::warn!(
+                        site_id = %message.site_id,
+                        agent_id = %authenticated_id,
+                        dropped,
+                        "certificate event stamped with a site this agent does not serve"
+                    );
+                }
                 continue;
             }
             received += 1;
@@ -1190,9 +1652,15 @@ impl ControlPlaneTrait for ControlPlaneService {
                     "agent is not allowed to read this site",
                 ));
             }
-            build_site_config(&self.db, Some(&[id]))
+            let mut config = build_site_config(&self.db, Some(&[id]))
                 .await
-                .map_err(db_status)?
+                .map_err(db_status)?;
+            crate::grpc::scope_acme_for_agent(
+                &mut config,
+                row.id,
+                row.acme_issuer,
+            );
+            config
         };
 
         tracing::debug!(
@@ -1212,6 +1680,97 @@ impl ControlPlaneTrait for ControlPlaneService {
         }
 
         Ok(Response::new(config))
+    }
+
+    /// `PublishCertificate` — a designated issuer reports the material it
+    /// just issued.
+    ///
+    /// The caller must be an issuer and serve the site; the certificate row
+    /// must be ACME-managed, match the submitted hostname set and (when it
+    /// names one) be designated to this agent. The PEM/key pair and its
+    /// validity are checked before the row is promoted and the site config is
+    /// fanned out to every assigned agent.
+    async fn publish_certificate(
+        &self,
+        request: Request<PublishCertificateRequest>,
+    ) -> Result<Response<PublishCertificateResponse>, Status> {
+        let payload = request.into_inner();
+        let row = self.authorize(&payload.agent_token).await?;
+        if !row.acme_issuer {
+            return Err(Status::permission_denied(
+                "this agent is not an ACME issuer",
+            ));
+        }
+        let site_id = Uuid::parse_str(payload.site_id.trim())
+            .map_err(|_| Status::invalid_argument("site_id is not a UUID"))?;
+        let visible = self.visible_sites(&row).await?;
+        if !visible.iter().any(|site| site.id == site_id) {
+            return Err(Status::permission_denied(
+                "agent does not serve this site",
+            ));
+        }
+        const MAX_PEM_BYTES: usize = 1024 * 1024;
+        if payload.cert_pem.trim().is_empty()
+            || payload.key_pem.trim().is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "cert_pem and key_pem are required",
+            ));
+        }
+        if payload.cert_pem.len() > MAX_PEM_BYTES
+            || payload.key_pem.len() > MAX_PEM_BYTES
+        {
+            return Err(Status::invalid_argument(
+                "certificate material is too large",
+            ));
+        }
+
+        match crate::acme_state_sync::import_certificate(
+            &self.db,
+            site_id,
+            &payload.domains,
+            &payload.cert_pem,
+            &payload.key_pem,
+            Some(row.id),
+        )
+        .await
+        {
+            Ok(crate::acme_state_sync::ImportOutcome::Updated) => {
+                tracing::info!(
+                    agent_id = %row.id,
+                    %site_id,
+                    "certificate published by agent"
+                );
+                crate::grpc::notify_config_changed_for(
+                    &self.db,
+                    &self.agents,
+                    site_id,
+                    Some("agent-publish"),
+                )
+                .await;
+                Ok(Response::new(PublishCertificateResponse {
+                    accepted: true,
+                    message: "certificate published".to_string(),
+                }))
+            },
+            Ok(crate::acme_state_sync::ImportOutcome::Unchanged) => {
+                Ok(Response::new(PublishCertificateResponse {
+                    accepted: true,
+                    message: "certificate already current".to_string(),
+                }))
+            },
+            Ok(crate::acme_state_sync::ImportOutcome::Skipped(reason)) => {
+                let status = if reason.contains("designated") {
+                    Status::permission_denied(reason)
+                } else {
+                    Status::invalid_argument(reason)
+                };
+                Err(status)
+            },
+            Err(err) => Err(Status::internal(format!(
+                "could not store the published certificate: {err}"
+            ))),
+        }
     }
 
     // ── Visitor authentication ─────────────────────────────────────────
@@ -1344,10 +1903,13 @@ fn heartbeat_metrics(message: &AgentHeartbeat) -> HeartbeatMetrics {
         memory_bytes: message.memory_usage_bytes,
         connections: message.active_connections,
         rps: message.requests_per_second,
+        // Normalize at the boundary: a live process never has RSS 0, so 0 means
+        // "not reported". Filtering here keeps the in-memory view and the DB
+        // writer (which also drops 0) consistent — Some(0) never reaches the UI.
+        process_rss_bytes: message.process_rss_bytes.filter(|bytes| *bytes > 0),
     }
 }
 
-/// Persists the runtime counters of one heartbeat.
 /// What a dual-stack listener reports for an IPv4 peer is `::ffff:a.b.c.d`;
 /// operators type `a.b.c.d` into firewalls, so collapse the mapped form.
 fn canonical_peer_ip(ip: std::net::IpAddr) -> String {
@@ -1378,6 +1940,58 @@ async fn persist_peer_ip(db: &DatabaseConnection, agent_id: Uuid, peer: &str) {
     }
 }
 
+/// Acts on what a heartbeat says about the agent's configuration: records
+/// (and logs, on change) a reload the data plane could not apply, and pushes
+/// the configuration again when the agent stays on a hash other than the one
+/// last issued to it.
+async fn reconcile_agent_config(
+    db: &DatabaseConnection,
+    registry: &AgentRegistry,
+    agent_id: Uuid,
+    message: &AgentHeartbeat,
+) {
+    let apply_error = message.config_apply_error.trim();
+    if registry.record_apply_error(agent_id, apply_error).await {
+        if apply_error.is_empty() {
+            tracing::info!(
+                %agent_id,
+                config_hash = %message.config_hash,
+                "agent data plane applied its configuration again"
+            );
+        } else {
+            tracing::warn!(
+                %agent_id,
+                config_hash = %message.config_hash,
+                error = %apply_error,
+                "agent data plane could not apply its configuration; it keeps serving the previous one and retries"
+            );
+        }
+    }
+
+    let ConfigDrift::Repush { expected } = registry
+        .observe_config_hash(
+            agent_id,
+            message.config_hash.trim(),
+            Instant::now(),
+        )
+        .await
+    else {
+        return;
+    };
+    tracing::warn!(
+        %agent_id,
+        reported = %message.config_hash,
+        expected = expected.as_deref().unwrap_or(""),
+        "agent is not on the configuration last issued to it; pushing it again"
+    );
+    if let Err(err) =
+        crate::grpc::repush_agent_config(db, registry, agent_id).await
+    {
+        tracing::warn!(%agent_id, error = %err, "failed to rebuild the configuration for a re-push");
+    }
+}
+
+/// Persists the runtime counters of one heartbeat.
 async fn persist_heartbeat(
     db: &DatabaseConnection,
     agent_id: Uuid,
@@ -1393,6 +2007,20 @@ async fn persist_heartbeat(
     // `last_heartbeat` against Utc::now(), so trusting the reported timestamp
     // would let a skewed client clock mark healthy agents offline.
     let health = agent_status::from_proto_health(message.health);
+
+    // Lost access logs and security events are a gap in the audit trail the
+    // agent alone used to know about: say so here each time the count grows.
+    let newly_dropped = registry
+        .record_log_drops(agent_id, message.logs_dropped_total)
+        .await;
+    if newly_dropped > 0 {
+        tracing::warn!(
+            %agent_id,
+            dropped = newly_dropped,
+            total = message.logs_dropped_total,
+            "agent discarded log entries before they could be stored"
+        );
+    }
 
     // Rule-cache disk health: absent on older agents (treat as healthy).
     // A false means the edge could not load any usable snapshot and runs on
@@ -1431,6 +2059,11 @@ async fn persist_heartbeat(
         // is the unambiguous copy (migration 000064).
         active.memory_bytes = Set(Some(used));
         active.used_memory_bytes = Set(Some(used));
+    }
+    // Tri-state: an agent that predates the field (None) keeps whatever the
+    // row last held — NotSet means no update, not a clear.
+    if let Some(rss) = message.process_rss_bytes.filter(|b| *b > 0) {
+        active.process_rss_bytes = Set(Some(rss.min(i64::MAX as u64) as i64));
     }
     // Sync timestamps come from the agent's own clock, but they only feed
     // the dashboard's "last synced" display, so a skewed clock cannot make
@@ -2063,6 +2696,9 @@ async fn persist_host_samples(
             process_count: Set(i32::try_from(sample.process_count).ok()),
             tcp_connections: Set(i32::try_from(sample.tcp_connections).ok()),
             uptime_secs: Set(sample_i64(sample.uptime_secs)),
+            process_rss_bytes: Set(sample
+                .process_rss_bytes
+                .and_then(sample_i64)),
             created_at: Set(now),
             ..Default::default()
         })
@@ -2487,11 +3123,49 @@ async fn mark_offline(db: &DatabaseConnection, agent_id: Uuid) {
     {
         tracing::warn!(%agent_id, error = %err, "could not mark agent offline");
     }
+    // Its tunnel listener is gone with the process: clearing the reported
+    // address and fingerprint stops `ingress_endpoints` from handing
+    // connectors a pin they can no longer reach. The operator's ingress
+    // address is kept — it is configuration, not a report.
+    let _ = agent::Entity::update_many()
+        .col_expr(
+            agent::Column::TunnelListenerAddr,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            agent::Column::TunnelCertSha256,
+            Expr::value(Option::<String>::None),
+        )
+        .filter(agent::Column::Id.eq(agent_id))
+        .exec(db)
+        .await;
+    // Its tunnel sessions ended with the stream; the heartbeat that reported
+    // them is not coming back, so the report is cleared here instead of
+    // lingering as connected on the tunnel page.
+    if let Err(err) = tunnel_session::Entity::delete_many()
+        .filter(tunnel_session::Column::AgentId.eq(agent_id))
+        .exec(db)
+        .await
+    {
+        tracing::warn!(%agent_id, error = %err, "could not clear the tunnel sessions of a disconnected agent");
+    }
 }
 
 /// Soft byte budget for one in-flight log batch. The row-count limit alone
 /// lets a handful of large bodies pin far more memory than intended.
 const LOG_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
+/// DR32-08: how often an established `ship_logs` stream re-checks that its
+/// agent is still authenticated and which sites it may still log for. A log
+/// stream can live for hours; without the refresh, a revoked API key or an
+/// unbound site keeps flowing until the connection happens to drop. 60s
+/// matches `SAMPLE_PERSIST_INTERVAL_SECS`: one authorize + one site query per
+/// stream per minute is negligible next to the write batch flushed in the
+/// same window, while a revocation takes effect in under a minute. The check
+/// is deliberately periodic, never per entry — a per-message DB query would
+/// multiply the ingest load by the batch size.
+const SITE_VISIBILITY_REFRESH: std::time::Duration =
+    std::time::Duration::from_secs(60);
 /// `insert_many` builds one SQL statement per call; cap the row count so a
 /// large batch does not produce an oversized parameter buffer.
 const LOG_INSERT_CHUNK: usize = 64;
@@ -2614,6 +3288,26 @@ async fn flush_cert_events(
     Ok(())
 }
 
+/// AS number for a shipped entry: the agent's own resolution when it sent
+/// one, otherwise the control plane's local MaxMind ASN database.
+///
+/// The `lookup` parameter is the seam that makes the fallback testable — the
+/// production callers pass [`crate::asn::lookup_ip`], tests pass a fake. The
+/// lookup is in-process in both cases: the database is a local file read once,
+/// so no request ever performs a network call.
+fn effective_asn(
+    entry: &LogEntry,
+    lookup: impl FnOnce(IpAddr) -> Option<u32>,
+) -> Option<u32> {
+    // The edge resolves the ASN itself when its GeoIP data carries one; a
+    // control-plane lookup is only the fallback, never an override.
+    if entry.asn != 0 {
+        return Some(entry.asn);
+    }
+    let ip: IpAddr = entry.client_ip.trim().parse().ok()?;
+    lookup(ip).filter(|asn| *asn != 0)
+}
+
 /// Maps a shipped log entry onto the `access_logs` row.
 fn access_log_row(
     entry: &LogEntry,
@@ -2656,6 +3350,11 @@ fn access_log_row(
         user_agent: Set(optional(&entry.user_agent)),
         referer: Set(optional(&entry.referer)),
         country_code: Set(truncate(&entry.country_code, MAX_COUNTRY)),
+        // Autonomous system of the client address: the agent's own value, or
+        // the control plane's ASN database when the agent could not resolve
+        // it. `None` (no database, a miss, or a private/reserved address) is
+        // stored as NULL, so the ASN ranking never counts a bogus AS0.
+        asn: Set(effective_asn(entry, crate::asn::lookup_ip).map(i64::from)),
         tls_version: Set(truncate(&entry.tls_version, MAX_TLS_VERSION)),
         // Who made the request, when the site authenticated them. `optional`
         // maps an empty string to NULL: the column means "no identity", and a
@@ -2985,7 +3684,9 @@ fn access_log_document(
         ja3_hash: optional(&entry.ja3_hash),
         country_code: optional(&entry.country_code),
         city: optional(&entry.city),
-        asn: positive_u32(entry.asn),
+        // Same value the PostgreSQL row stores, so the two stores never
+        // disagree about the network a request came from.
+        asn: effective_asn(entry, crate::asn::lookup_ip),
 
         user_agent: optional(&entry.user_agent),
         referer: optional(&entry.referer),
@@ -3038,7 +3739,7 @@ fn security_event_document(
         user_agent: optional(&entry.user_agent),
         user_identity: optional(&entry.user_identity),
         country_code: optional(&entry.country_code),
-        asn: positive_u32(entry.asn),
+        asn: effective_asn(entry, crate::asn::lookup_ip),
 
         request_headers: headers_json(&entry.request_headers),
         request_body,
@@ -3120,6 +3821,108 @@ fn positive_u32(value: u32) -> Option<u32> {
 ///
 /// `NotFound` is deliberately not logged at `error` level: a missing row is a
 /// routine race (an agent deleted between two statements), not an incident.
+/// Records what an agent reports about its tunnel listener and sessions.
+///
+/// The session list is a *report*, not a source of truth: the rows for this
+/// agent are replaced on every heartbeat, so a session that ended disappears
+/// instead of lingering as a permanently-connected ghost. The listener columns
+/// are the ones the tunnel page reads before offering an ingress.
+async fn persist_tunnel_state(
+    db: &DatabaseConnection,
+    agent_id: Uuid,
+    heartbeat: &AgentHeartbeat,
+) {
+    let listener = heartbeat.tunnel_listener.as_ref();
+    let (addr, fingerprint, listener_error) = match listener {
+        Some(listener) if listener.active => (
+            optional(&listener.addr),
+            optional(&listener.cert_sha256),
+            None,
+        ),
+        // A configured listener that failed to bind reports why; an agent with
+        // no listener at all reports nothing. Either way it is not an ingress
+        // right now, and `tunnel_ingress_addr` (the operator's) is untouched.
+        Some(listener) => (
+            None,
+            optional(&listener.cert_sha256),
+            optional(&listener.last_error),
+        ),
+        None => (None, None, None),
+    };
+    // A rotated certificate changes what connectors must pin. Read the old
+    // value first (one indexed lookup per heartbeat) so the change can be
+    // pushed instead of waiting for a connector to reconnect on its own.
+    let previous_fingerprint = agent::Entity::find_by_id(agent_id)
+        .one(db)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| row.tunnel_cert_sha256);
+    let mut active: agent::ActiveModel = agent::ActiveModel {
+        id: Set(agent_id),
+        ..Default::default()
+    };
+    active.tunnel_listener_addr = Set(addr);
+    active.tunnel_cert_sha256 = Set(fingerprint.clone());
+    active.tunnel_listener_error = Set(listener_error);
+    if let Err(err) = active.update(db).await {
+        tracing::warn!(%agent_id, error = %err, "cannot record the tunnel listener state");
+    } else if fingerprint.is_some() && fingerprint != previous_fingerprint {
+        tracing::info!(
+            %agent_id,
+            "tunnel certificate fingerprint changed, pushing it to the connectors"
+        );
+        crate::grpc::notify_all_tunnel_connectors(db).await;
+    }
+
+    // The report is a snapshot, not a delta: replace it atomically so a reader
+    // never sees the agent with zero sessions between the delete and the
+    // inserts (the tunnel page would flash "no sessions" on every heartbeat).
+    let now = Utc::now();
+    let reports: Vec<(Uuid, tunnel_session::ActiveModel)> = heartbeat
+        .tunnel_sessions
+        .iter()
+        .filter_map(|report| {
+            let tunnel_id = Uuid::parse_str(report.tunnel_id.trim()).ok()?;
+            let session = tunnel_session::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                tunnel_id: Set(tunnel_id),
+                agent_id: Set(agent_id),
+                connected_at: Set(from_timestamp(report.connected_at.as_ref())),
+                last_seen_at: Set(now),
+                version: Set(optional(&report.connector_version)),
+                hostname: Set(optional(&report.hostname)),
+                streams_active: Set(
+                    report.streams_active.min(i32::MAX as u32) as i32
+                ),
+                rtt_ms: Set(report.rtt_ms.min(i32::MAX as u32) as i32),
+            };
+            Some((tunnel_id, session))
+        })
+        .collect();
+    let replaced = db
+        .transaction::<_, (), sea_orm::DbErr>(|txn| {
+            Box::pin(async move {
+                tunnel_session::Entity::delete_many()
+                    .filter(tunnel_session::Column::AgentId.eq(agent_id))
+                    .exec(txn)
+                    .await?;
+                for (tunnel_id, session) in reports {
+                    if let Err(err) = session.insert(txn).await {
+                        // A single bad row must not roll back the whole
+                        // report: the other tunnels' sessions are still true.
+                        tracing::warn!(%agent_id, %tunnel_id, error = %err, "cannot record a tunnel session");
+                    }
+                }
+                Ok(())
+            })
+        })
+        .await;
+    if let Err(err) = replaced {
+        tracing::warn!(%agent_id, error = %err, "cannot record the tunnel session report");
+    }
+}
+
 fn db_status(err: sea_orm::DbErr) -> Status {
     match err {
         sea_orm::DbErr::RecordNotFound(detail) => {
@@ -3153,6 +3956,50 @@ fn site_stamp_is_visible(stamped: &str, visible: &[Uuid]) -> bool {
     match parse_optional_uuid(stamped) {
         Some(id) => visible.contains(&id),
         None => false,
+    }
+}
+
+/// Snapshot of the sites an established log stream accepts (DR32-08), plus
+/// the periodic refresh that keeps a revoked key or an unbound site from
+/// flowing for the life of the stream. Pure logic, so the refresh semantics
+/// are testable without a database or `tokio::time`.
+struct SiteVisibility {
+    sites: Vec<Uuid>,
+}
+
+impl SiteVisibility {
+    fn new(sites: Vec<Uuid>) -> Self {
+        Self { sites }
+    }
+
+    /// Replaces the snapshot; returns `true` when the set actually changed
+    /// (so the caller can log one line per real change, not per refresh).
+    fn refresh(&mut self, sites: Vec<Uuid>) -> bool {
+        let changed = sites.len() != self.sites.len()
+            || !sites.iter().all(|id| self.sites.contains(id));
+        if changed {
+            self.sites = sites;
+        }
+        changed
+    }
+
+    /// D10 check for one entry's `site_id` stamp against the snapshot.
+    fn allows(&self, stamped: &str) -> bool {
+        site_stamp_is_visible(stamped, &self.sites)
+    }
+
+    /// Certificate events may be global: the ACME environment/account/
+    /// authorization lines carry no site, and the `certificate_events.site_id`
+    /// column is nullable for exactly that reason. Only a non-empty foreign
+    /// stamp is dropped. An empty stamp that still names a certificate is not
+    /// global — it could fail another tenant's certificate by id — so it is
+    /// rejected. The heartbeat/log/security paths keep using [`Self::allows`],
+    /// which rejects an empty stamp.
+    fn allows_cert_event(&self, site_id: &str, certificate_id: &str) -> bool {
+        if site_id.is_empty() {
+            return certificate_id.is_empty();
+        }
+        self.allows(site_id)
     }
 }
 
@@ -3278,6 +4125,52 @@ mod tests {
         assert!(!site_stamp_is_visible("   ", &[site]));
         assert!(!site_stamp_is_visible("not-a-uuid", &[site]));
         assert!(!site_stamp_is_visible(&Uuid::new_v4().to_string(), &[site]));
+    }
+
+    /// Global certificate events (no `site_id`) must be accepted: the ACME
+    /// environment/account/authorization lines have no site, and the column is
+    /// nullable. Dropping them also logged the misleading "site this agent
+    /// does not serve" warning with an empty `site_id`.
+    #[test]
+    fn an_empty_certificate_stamp_is_global_not_foreign() {
+        let site = Uuid::new_v4();
+        let visibility = SiteVisibility::new(vec![site]);
+        // Global ACME lines: no site and no certificate binding.
+        assert!(visibility.allows_cert_event("", ""));
+        // A site-scoped event follows the same visibility rule as the rest.
+        assert!(visibility.allows_cert_event(&site.to_string(), "cert"));
+        assert!(
+            !visibility.allows_cert_event(&Uuid::new_v4().to_string(), "cert")
+        );
+        // An empty site with a certificate id could target another tenant.
+        assert!(!visibility.allows_cert_event("", "cert"));
+    }
+
+    /// DR32-08: after a visibility refresh, a site the agent was unbound from
+    /// is no longer accepted and a newly bound one is; an unchanged set
+    /// reports no change so the periodic refresh logs one line per real
+    /// change only, and an empty refresh (agent unbound everywhere, or the
+    /// key's owner lost the sites) rejects everything.
+    #[test]
+    fn visibility_refresh_updates_the_accepted_site_set() {
+        let old_site = Uuid::new_v4();
+        let mut visibility = SiteVisibility::new(vec![old_site]);
+        assert!(visibility.allows(&old_site.to_string()));
+
+        let new_site = Uuid::new_v4();
+        // Rebound: old site drops out, new site flows.
+        assert!(visibility.refresh(vec![new_site]));
+        assert!(!visibility.allows(&old_site.to_string()));
+        assert!(visibility.allows(&new_site.to_string()));
+
+        // Same set again: no change reported.
+        assert!(!visibility.refresh(vec![new_site]));
+        assert!(visibility.allows(&new_site.to_string()));
+
+        // Agent unbound everywhere: nothing is accepted any more.
+        assert!(visibility.refresh(Vec::new()));
+        assert!(!visibility.allows(&new_site.to_string()));
+        assert!(!visibility.allows(""));
     }
 
     /// D03: an `acme_failed` event from the edge turns the certificate row
@@ -3513,6 +4406,73 @@ mod tests {
             .expect("event");
         assert!(event.action.is_set());
         assert_eq!(event.score.unwrap(), Some(42));
+    }
+
+    /// The AS number stored for a row: the agent's own value wins, and the
+    /// control plane's ASN database is consulted only when the agent sent 0.
+    /// A miss, an unparsable address and a database that answers 0 all end as
+    /// NULL rather than a guessed network.
+    #[test]
+    fn the_asn_falls_back_to_the_control_plane_database() {
+        let mut entry = LogEntry {
+            client_ip: "8.8.8.8".into(),
+            ..Default::default()
+        };
+
+        // Agent could not resolve it: the database answers.
+        assert_eq!(
+            Some(64_500),
+            effective_asn(&entry, |ip| {
+                assert_eq!("8.8.8.8", ip.to_string());
+                Some(64_500)
+            })
+        );
+
+        // No database / a miss: NULL, never AS0.
+        assert_eq!(None, effective_asn(&entry, |_| None));
+        assert_eq!(None, effective_asn(&entry, |_| Some(0)));
+
+        // The agent's own resolution wins and the database is not consulted.
+        entry.asn = 15_169;
+        assert_eq!(
+            Some(15_169),
+            effective_asn(&entry, |_| panic!("must not consult the database"))
+        );
+
+        // An address that cannot be parsed is not looked up at all.
+        entry.asn = 0;
+        entry.client_ip = "not-an-ip".into();
+        assert_eq!(
+            None,
+            effective_asn(&entry, |_| panic!("must not look up garbage"))
+        );
+        entry.client_ip = "  ".into();
+        assert_eq!(
+            None,
+            effective_asn(&entry, |_| panic!(
+                "must not look up an empty address"
+            ))
+        );
+    }
+
+    /// The row and the Elasticsearch documents all carry the enriched value,
+    /// so the two stores cannot disagree about the network.
+    #[test]
+    fn the_enriched_asn_reaches_the_stored_row() {
+        // 1.2.3.4 is outside the ASN test fixture's prefix, so this holds
+        // whether or not another test has the fixture installed.
+        let entry = LogEntry {
+            client_ip: "1.2.3.4".into(),
+            ..Default::default()
+        };
+        // No database in the test process: the column stays NULL.
+        let row = access_log_row(&entry, None, None, Utc::now());
+        assert_eq!(None, row.asn.unwrap());
+
+        let mut resolved = entry.clone();
+        resolved.asn = 13_335;
+        let row = access_log_row(&resolved, None, None, Utc::now());
+        assert_eq!(Some(13_335), row.asn.unwrap());
     }
 
     /// The identity is stored on both tables, an absent one stays NULL, and an

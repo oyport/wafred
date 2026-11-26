@@ -37,7 +37,7 @@ const quickstart = {
       {
         label: "PostgreSQL",
         value: "14+ (16 recommended)",
-        note: "Required by the control plane for sites, rules and versions.",
+        note: "Required by the control plane for sites, rules and versions. Native package names follow the distribution (postgresql-16 on Ubuntu 24.04, postgresql-18 on 26.04) — check with apt-cache search --names-only '^postgresql-[0-9]+$'.",
       },
       {
         label: "Ports",
@@ -67,15 +67,15 @@ const quickstart = {
         },
         {
           title: "Start the stack",
-          body: "Set JWT_SECRET and ADMIN_PASSWORD first if this host is reachable by anyone else.",
+          body: "Set JWT_SECRET and ADMIN_PASSWORD first if this host is reachable by anyone else. Without sudo — and outside the docker group — compose fails with permission denied … docker.sock; members of the docker group can drop the sudo.",
           code: {
             lang: "bash",
-            code: "export JWT_SECRET=\"$(openssl rand -hex 32)\"\nexport ADMIN_PASSWORD=\"$(openssl rand -hex 16)\"\ndocker compose up -d",
+            code: "export JWT_SECRET=\"$(openssl rand -hex 32)\"\nexport ADMIN_PASSWORD=\"$(openssl rand -hex 16)\"\n# drop sudo if your user is in the docker group\nsudo docker compose up -d",
           },
         },
         {
           title: "Open the dashboard",
-          body: "The console is served over HTTPS with a certificate generated on first boot, so the browser warns until you trust it or upload your own under Settings.",
+          body: "The console is served over HTTPS with a certificate generated on first boot, so the browser warns until you trust it or upload your own under Settings. On a fresh database sign-in succeeds, but every write answers 403 password_change_required until the seeded password is changed — in the console under Settings → Account, or via PUT /api/v1/auth/password (fields current_password / new_password; returns 204 and revokes the current token, so sign in again).",
           code: {
             lang: "bash",
             code: "curl --connect-timeout 2 --max-time 3 http://localhost:9080/healthz\n# {\"status\":\"ok\",\"database\":\"up\"}",
@@ -142,7 +142,7 @@ const quickstart = {
   },
   credentials: {
     title: "First sign-in",
-    lead: "The control plane seeds an administrator on first boot. The dashboard forces a password change before it is usable.",
+    lead: "The control plane seeds an administrator on first boot. The dashboard forces a password change before it is usable — via Settings → Account, or PUT /api/v1/auth/password (fields current_password / new_password; returns 204 and revokes the current token, so sign in again). Until then every write answers 403 password_change_required.",
     rows: [
       { label: "Dashboard", value: "https://localhost:9080" },
       { label: "Email", value: "admin@wafred.local" },
@@ -200,6 +200,10 @@ const quickstart = {
       {
         q: "The browser refuses the dashboard certificate",
         a: "The console is HTTPS with a self-signed certificate. Trust the downloaded certificate, or upload your own under Settings → Control plane HTTPS. Set WAFRED_TLS_SANS to the hostname you use.",
+      },
+      {
+        q: "Compose fails with \"failed to bind host port 127.0.0.1:5432/tcp: address already in use\"",
+        a: "A local PostgreSQL already owns 5432. Point the compose stack at another host port with POSTGRES_PORT=55432 — or pass --db-port 55432 to deploy/compose/install.sh, which picks a free port from 55432 up automatically — and start again.",
       },
       {
         q: "An agent never appears in the fleet",

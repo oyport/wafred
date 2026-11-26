@@ -41,10 +41,12 @@ pub struct WafredCli {
 #[derive(Subcommand, Debug)]
 pub enum WafredCommand {
     /// Run the control plane server only (REST API + gRPC + dashboard)
+    #[cfg(not(feature = "edge"))]
     Server(ServerOpts),
     /// Run the data plane agent only (connects to a remote control plane)
     Agent(AgentOpts),
     /// Run both control plane and data plane in a single process
+    #[cfg(not(feature = "edge"))]
     AllInOne(AllInOneOpts),
     /// Dashboard user administration
     User {
@@ -136,6 +138,7 @@ pub struct CommonOpts {
 }
 
 /// Control plane server options.
+#[cfg(not(feature = "edge"))]
 #[derive(Parser, Debug, Clone)]
 #[command(args_override_self = true)]
 pub struct ServerOpts {
@@ -236,6 +239,12 @@ pub struct AgentOpts {
     )]
     pub fail_open: bool,
 
+    /// Address the tunnel listener binds (`0.0.0.0:9443`); empty disables it.
+    /// A connector reaches this address out of the private network, so it is
+    /// only enabled on an edge that is meant to be a tunnel ingress.
+    #[arg(long, env = "WAFRED_TUNNEL_ADDR", default_value = "")]
+    pub tunnel_addr: String,
+
     /// Heartbeat interval in seconds
     #[arg(long, env = "WAFRED_HEARTBEAT_INTERVAL", default_value = "30")]
     pub heartbeat_interval_secs: u64,
@@ -277,6 +286,7 @@ pub struct AgentOpts {
 }
 
 /// All-in-one mode options (server + agent in one process).
+#[cfg(not(feature = "edge"))]
 #[derive(Parser, Debug, Clone)]
 #[command(args_override_self = true)]
 pub struct AllInOneOpts {
@@ -347,6 +357,12 @@ pub struct AllInOneOpts {
         action = clap::ArgAction::Set
     )]
     pub fail_open: bool,
+
+    /// Address the tunnel listener binds (`0.0.0.0:9443`); empty disables it.
+    /// A connector reaches this address out of the private network, so it is
+    /// only enabled on an edge that is meant to be a tunnel ingress.
+    #[arg(long, env = "WAFRED_TUNNEL_ADDR", default_value = "")]
+    pub tunnel_addr: String,
 
     /// Heartbeat interval in seconds
     #[arg(long, env = "WAFRED_HEARTBEAT_INTERVAL", default_value = "30")]
@@ -533,9 +549,12 @@ pub enum OnOff {
 /// The run modes: the subcommands that start a long-running process.
 ///
 /// Test-only: production mode detection comes from clap via [`is_mode`], and
-/// the parity test keeps this list honest.
-#[cfg(test)]
+/// the parity test keeps this list honest. The agent-only build exposes just
+/// `agent`, so its list shrinks with the CLI.
+#[cfg(all(test, not(feature = "edge")))]
 pub const RUN_MODES: [&str; 3] = ["server", "agent", "all-in-one"];
+#[cfg(all(test, feature = "edge"))]
+pub const RUN_MODES: [&str; 1] = ["agent"];
 
 /// The maintenance commands: they run against the database and exit.
 #[cfg(test)]
@@ -613,6 +632,7 @@ fn apply_db_file(db: &mut DbOpts) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(feature = "edge"))]
 fn apply_common_file(common: &mut CommonOpts) -> Result<(), String> {
     if let Some(path) = common.db_url_file.as_deref() {
         common.db_url = load_secret_file(path, "--db-url-file")?;
@@ -767,12 +787,96 @@ pub fn parse_wafred_cli() -> WafredCli {
     cli
 }
 
+/// Parse the command line of the agent-only `wafred-agent` binary.
+///
+/// Two spellings are accepted:
+///
+/// * `wafred-agent agent --server-url ...` — the same invocation as
+///   `wafred agent`, which matters because a self-upgrade replaces the file
+///   with the control plane's all-in-one build while the unit's `ExecStart`
+///   keeps saying `... agent`.
+/// * `wafred-agent --server-url ...` — the redundant subcommand omitted.
+///
+/// `--config` layering, `--api-key-file`, `--version` and the inline-secret
+/// warnings are shared with [`parse_pingwaf_cli`].
+#[cfg(feature = "edge")]
+pub fn parse_agent_cli() -> AgentOpts {
+    parse_agent_args(std::env::args().collect())
+}
+
+#[cfg(feature = "edge")]
+fn parse_agent_args(args: Vec<String>) -> AgentOpts {
+    if wants_version(&args) {
+        print_version(&args);
+    }
+
+    let mut argv = args.clone();
+    // `--help` and a bare flag list are parsed as `agent ...`, so clap prints
+    // the agent's own help instead of the top-level command's.
+    if argv.get(1).map(String::as_str) != Some("agent") {
+        argv.insert(1, "agent".to_string());
+    }
+
+    // The file's arguments go next to the subcommand so the command line,
+    // parsed after them, still wins (same contract as `wafred agent`).
+    match crate::config_file::injections("agent", &argv) {
+        Ok(extra) => {
+            argv.splice(2..2, extra);
+        },
+        Err(err) => {
+            eprintln!("wafred-agent: {err}");
+            std::process::exit(1);
+        },
+    }
+
+    let mut cli = PingWafCli::parse_from(argv);
+    if let Err(err) = apply_secret_files(&mut cli.command) {
+        eprintln!("wafred-agent: {err}");
+        std::process::exit(1);
+    }
+    for warning in inline_secret_warnings(&args) {
+        eprintln!("warning: {warning}");
+    }
+    match cli.command {
+        PingWafCommand::Agent(opts) => opts,
+        _ => {
+            // Only reachable if the injected `agent` was overridden by
+            // something clap accepted as a different subcommand; the agent
+            // build must not silently start another role.
+            eprintln!(
+                "wafred-agent only runs the data plane agent (agent mode)"
+            );
+            std::process::exit(2);
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> WafredCommand {
         WafredCli::try_parse_from(args).unwrap().command
+    }
+
+    /// The agent-only binary is invoked both ways: by the installer/unit
+    /// (`wafred-agent agent ...`, which is also what a self-upgraded
+    /// all-in-one binary understands) and directly (`wafred-agent ...`).
+    #[cfg(feature = "edge")]
+    #[test]
+    fn the_agent_binary_accepts_both_spellings() {
+        let opts = parse_agent_args(vec![
+            "wafred-agent".to_string(),
+            "--server-url=http://control-plane:9090".to_string(),
+        ]);
+        assert_eq!(opts.server_url, "http://control-plane:9090");
+
+        let opts = parse_agent_args(vec![
+            "wafred-agent".to_string(),
+            "agent".to_string(),
+            "--server-url=http://control-plane-2:9090".to_string(),
+        ]);
+        assert_eq!(opts.server_url, "http://control-plane-2:9090");
     }
 
     #[test]
@@ -800,6 +904,7 @@ mod tests {
         assert!(!opts.fail_open);
     }
 
+    #[cfg(not(feature = "edge"))]
     #[test]
     fn the_last_spelling_of_an_argument_wins() {
         // The configuration file is layered in as earlier arguments, so an
@@ -980,6 +1085,7 @@ mod tests {
         file
     }
 
+    #[cfg(not(feature = "edge"))]
     #[test]
     fn db_url_file_is_trimmed_and_wins_over_the_inline_value() {
         let file = secret_file("postgres://file:pw@db:5432/wafred\n\n");
@@ -1037,6 +1143,7 @@ mod tests {
         assert_eq!(opts.db_url, "postgres://file:pw@db:5432/wafred");
     }
 
+    #[cfg(not(feature = "edge"))]
     #[test]
     fn empty_or_missing_secret_files_are_refused() {
         let empty = secret_file("  \n");

@@ -51,6 +51,36 @@ pub enum Expression {
     Not(Box<Expression>),
 }
 
+impl Expression {
+    /// Names of the referenced fields that no request provides.
+    ///
+    /// Parsing accepts them so the data plane keeps loading rules stored
+    /// before the control plane checked, but such a comparison is constant:
+    /// false, or true under a negated operator. Writers should reject them.
+    pub fn unknown_fields(&self) -> Vec<&str> {
+        let mut names = Vec::new();
+        self.collect_unknown_fields(&mut names);
+        names
+    }
+
+    fn collect_unknown_fields<'a>(&'a self, names: &mut Vec<&'a str>) {
+        match self {
+            Expression::Field { field, .. } => {
+                if let FieldKind::Unknown(name) = &field.kind {
+                    if !names.contains(&name.as_str()) {
+                        names.push(name);
+                    }
+                }
+            },
+            Expression::And(left, right) | Expression::Or(left, right) => {
+                left.collect_unknown_fields(names);
+                right.collect_unknown_fields(names);
+            },
+            Expression::Not(inner) => inner.collect_unknown_fields(names),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
     pub kind: FieldKind,
@@ -1104,5 +1134,24 @@ mod tests {
         let dense = vec!["http.host eq \"x\""; MAX_EXPRESSION_TOKENS / 3 + 1]
             .join(" or ");
         assert!(parse_expression(&dense).is_err());
+    }
+
+    #[test]
+    fn reports_the_fields_no_request_provides() {
+        let known = parse_expression(
+            r#"http.request.uri.path contains "/a" and http.referer contains "x" and http.request.headers["x-a"] eq "1""#,
+        )
+        .unwrap();
+        assert!(known.unknown_fields().is_empty());
+
+        // Each name once, in order of appearance, through every node kind.
+        let unknown = parse_expression(
+            r#"http.response.status eq "404" or not (http.request.path eq "/" and http.response.status ne "200")"#,
+        )
+        .unwrap();
+        assert_eq!(
+            unknown.unknown_fields(),
+            vec!["http.response.status", "http.request.path"]
+        );
     }
 }

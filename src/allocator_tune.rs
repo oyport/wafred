@@ -124,6 +124,37 @@ pub fn eager_commit_for(total: Option<u64>) -> bool {
     total.is_some_and(|bytes| bytes / MIB >= 4096)
 }
 
+/// Whether the first arena will keep mimalloc's 1 GiB default even though the
+/// adaptive policy wants a smaller reserve, and the operator has not pinned the
+/// standard environment variable that mimalloc reads before that arena exists.
+///
+/// `mi_option_set` runs too late for the first arena, so the only thing that can
+/// change it is `MIMALLOC_ARENA_RESERVE` in the process environment. The
+/// `WAFRED_MALLOC_ARENA_RESERVE_MB` spelling is also too late here; the
+/// warning tells the operator to pin the standard variable instead.
+fn startup_arena_env_missing(
+    total: Option<u64>,
+    reserve_env_set: bool,
+) -> bool {
+    !reserve_env_set && arena_reserve_for(total) < 1024 * MIB
+}
+
+/// Whether the command line asks for help or the version. Those paths exit
+/// before any workload, so the allocator diagnostics (and the tuning they
+/// describe) are noise there.
+fn informational_flag_requested() -> bool {
+    informational_flag_in(std::env::args_os().skip(1))
+}
+
+fn informational_flag_in<I>(args: I) -> bool
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    args.into_iter().any(|arg| {
+        matches!(arg.to_str(), Some("--help" | "-h" | "--version" | "-V"))
+    })
+}
+
 /// Convert a byte count to the KiB unit mimalloc stores size options in
 /// (`mi_option_get_size` multiplies by `MI_KiB`). Skipping this conversion
 /// would reserve 1024x the intended amount.
@@ -278,6 +309,14 @@ fn source_label(sources: [&'static str; 3]) -> String {
 /// Applies the retention and reservation policy once per process. Safe to call
 /// from both entry points (all-in-one and the pingap-compatible one).
 pub fn apply() {
+    // `--help` / `--version` exit before the process does any work; printing
+    // allocator diagnostics before the answer is noise for scripts and
+    // operators. Check before `ONCE` so a later real call can still apply the
+    // policy in the same process.
+    if informational_flag_requested() {
+        return;
+    }
+
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let total = pingwaf_system::total_bytes();
@@ -330,6 +369,11 @@ pub fn apply() {
         let arena_mib = kib_to_mib(arena_effective);
         let reserve_os_mib = kib_to_mib(reserve_os_effective);
         let total_mib = total.map_or(0, |bytes| bytes / MIB);
+        // Only the standard mimalloc variable is read before the first arena;
+        // the WAFRED_* spelling is applied by this module, which is too late
+        // for an arena that already exists.
+        let reserve_env_set = std::env::var_os("MIMALLOC_ARENA_RESERVE")
+            .is_some_and(|value| !value.is_empty());
 
         // Startup diagnostics: stderr is the only reliable channel this early
         // (tracing may not be initialised yet). `eager_commit` here is the
@@ -340,7 +384,7 @@ pub fn apply() {
              (total={total_mib}MiB, source={source})"
         );
 
-        if total.is_none_or(|bytes| bytes < 2 * 1024 * MIB) {
+        if startup_arena_env_missing(total, reserve_env_set) {
             eprintln!(
                 "wafred: allocator WARN memory ceiling {total_mib}MiB is below the 2 GiB \
                  minimum; pin MIMALLOC_ARENA_RESERVE in the process environment (e.g. \
@@ -556,5 +600,44 @@ mod tests {
             ]),
             "env:WAFRED_MALLOC_PURGE_DELAY_MS+env:WAFRED_MALLOC_ARENA_RESERVE_MB"
         );
+    }
+    #[test]
+    fn startup_env_warning_covers_the_default_reserve_range() {
+        assert!(startup_arena_env_missing(None, false));
+        assert!(startup_arena_env_missing(Some(894 * MIB), false));
+        assert!(startup_arena_env_missing(Some(2 * 1024 * MIB), false));
+        assert!(startup_arena_env_missing(Some(8 * 1024 * MIB), false));
+        // Above 16 GiB the adaptive reserve is the 1 GiB default, so there is
+        // nothing to warn about. (16 GiB itself still gets 512 MiB.)
+        assert!(startup_arena_env_missing(Some(16 * 1024 * MIB), false));
+        assert!(!startup_arena_env_missing(Some(17 * 1024 * MIB), false));
+        assert!(!startup_arena_env_missing(Some(32 * 1024 * MIB), false));
+    }
+
+    #[test]
+    fn startup_env_warning_is_suppressed_by_the_standard_env() {
+        assert!(!startup_arena_env_missing(Some(894 * MIB), true));
+        assert!(!startup_arena_env_missing(Some(2 * 1024 * MIB), true));
+        assert!(!startup_arena_env_missing(Some(8 * 1024 * MIB), true));
+    }
+
+    #[test]
+    fn informational_flags_are_recognized() {
+        let args = |items: &[&str]| {
+            items
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        assert!(informational_flag_in(args(&["--version"])));
+        assert!(informational_flag_in(args(&["agent", "-V"])));
+        assert!(informational_flag_in(args(&["--help"])));
+        assert!(informational_flag_in(args(&["-h"])));
+        assert!(!informational_flag_in(args(&[
+            "agent",
+            "--server-url",
+            "http://127.0.0.1:9090",
+        ])));
+        assert!(!informational_flag_in(Vec::<std::ffi::OsString>::new()));
     }
 }

@@ -38,9 +38,10 @@ fn default_scope() -> String {
 }
 
 /// Valid scopes, in the spelling the API accepts.
-const VALID_SCOPES: [&str; 2] = [
+const VALID_SCOPES: [&str; 3] = [
     crate::models::error_pages::SCOPE_SITE,
     crate::models::error_pages::SCOPE_UNMATCHED_HOST,
+    crate::models::error_pages::SCOPE_CHALLENGE,
 ];
 
 /// Status codes an `unmatched_host` page may use.
@@ -108,6 +109,11 @@ fn validate_status_code(scope: &str, code: i32) -> Result<(), ApiError> {
              'unmatched_host' (allowed: 404, 421, 503)"
         )));
     }
+    if scope == crate::models::error_pages::SCOPE_CHALLENGE && code != 503 {
+        return Err(ApiError::BadRequest(
+            "status_code must be 503 for scope 'challenge'".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -120,6 +126,20 @@ fn validate_scope(scope: &str) -> Result<(), ApiError> {
             VALID_SCOPES.map(|s| format!("'{s}'")).join(", ")
         )))
     }
+}
+
+fn validate_content_type(
+    scope: &str,
+    content_type: &str,
+) -> Result<(), ApiError> {
+    if scope == crate::models::error_pages::SCOPE_CHALLENGE
+        && content_type != "text/html"
+    {
+        return Err(ApiError::BadRequest(
+            "challenge pages must use content_type text/html".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Whether another row already occupies `(scope, status_code)`.
@@ -172,6 +192,7 @@ async fn create(
 
     validate_scope(&payload.scope)?;
     validate_status_code(&payload.scope, payload.status_code)?;
+    validate_content_type(&payload.scope, &payload.content_type)?;
     if payload.name.trim().is_empty() || payload.name.len() > 200 {
         return Err(ApiError::BadRequest(
             "name must be 1-200 characters".to_string(),
@@ -228,6 +249,11 @@ async fn update(
     let effective_scope =
         payload.scope.clone().unwrap_or_else(|| row.scope.clone());
     let effective_status = payload.status_code.unwrap_or(row.status_code);
+    let effective_content_type = payload
+        .content_type
+        .clone()
+        .unwrap_or_else(|| row.content_type.clone());
+    validate_content_type(&effective_scope, &effective_content_type)?;
     let mut active: error_pages::ActiveModel = row.into();
 
     if let Some(scope) = &payload.scope {
@@ -321,6 +347,34 @@ mod tests {
     use super::*;
     use crate::models::error_pages::{SCOPE_SITE, SCOPE_UNMATCHED_HOST};
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn challenge_scope_requires_html() {
+        assert!(validate_content_type(
+            crate::models::error_pages::SCOPE_CHALLENGE,
+            "text/html"
+        )
+        .is_ok());
+        assert!(validate_content_type(
+            crate::models::error_pages::SCOPE_CHALLENGE,
+            "application/json"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn challenge_scope_only_accepts_503() {
+        assert!(validate_status_code(
+            crate::models::error_pages::SCOPE_CHALLENGE,
+            503
+        )
+        .is_ok());
+        assert!(validate_status_code(
+            crate::models::error_pages::SCOPE_CHALLENGE,
+            502
+        )
+        .is_err());
+    }
 
     #[test]
     fn error_page_scope_validation_accepts_known_values() {

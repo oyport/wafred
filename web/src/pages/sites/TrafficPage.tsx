@@ -3,10 +3,10 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  AreaChart,
   Area,
   BarChart,
   Bar,
+  ComposedChart,
   PieChart,
   Pie,
   Cell,
@@ -23,6 +23,7 @@ import {
   ChartLine,
   ArrowClockwise,
   Globe,
+  Buildings,
   Users,
   ShieldSlash,
   Timer,
@@ -33,7 +34,11 @@ import {
   Desktop,
 } from '@phosphor-icons/react'
 import { PageHeader } from '@/components/PageHeader'
-import { TopIpsTable, TopRulesTable } from '@/components/waf/TopRankingTables'
+import {
+  TopAsnsTable,
+  TopIpsTable,
+  TopRulesTable,
+} from '@/components/waf/TopRankingTables'
 import { Card, CardBody, CardHeader } from '@/components/ui/Card'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { useToast } from '@/components/ui/Toast'
@@ -44,12 +49,18 @@ import { Table, type Column } from '@/components/ui/Table'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { SkeletonStat } from '@/components/ui/Skeleton'
 import { ErrorState } from '@/components/ErrorState'
-import { trafficApi, trafficKeys, RANGE_HOURS, TRAFFIC_STEP, groupStatusCodes } from '@/api/traffic'
+import { trafficApi, trafficKeys, RANGE_HOURS, groupStatusCodes } from '@/api/traffic'
 import { aiCrawlApi, aiCrawlKeys } from '@/api/aiCrawl'
 import { analyticsApi, analyticsKeys } from '@/api/analytics'
 import { DonutChart } from '@/components/charts/DonutChart'
+import { GlobeChart } from '@/components/charts/GlobeChart'
+import { CountryTrafficList } from '@/components/charts/CountryTrafficList'
 import { geoApi, geoKeys } from '@/api/geo'
-import { WorldMapChart } from '@/components/charts/WorldMapChart'
+import {
+  countryTrafficRows,
+  mergeTrafficSeries,
+  requestBucketMs,
+} from '@/lib/trafficSeries'
 import { buildLogsDrillDownUrl } from '@/lib/logDrillDown'
 import { withBlockedBotPolicy } from '@/lib/aiBots'
 import { cn } from '@/lib/utils'
@@ -66,10 +77,14 @@ import {
 import {
   TRAFFIC_RANGES,
   type AiCrawlerRow,
+  type GeoCountryStat,
   type TrafficRange,
 } from '@/api/types'
 
 const PIE_COLORS = ['#18794e', '#0051c3', '#ffb224', '#e54d2a']
+
+/** Stable empty array so the geo memos keep their identity while loading. */
+const NO_GEO_STATS: GeoCountryStat[] = []
 
 const tooltipStyle = {
   background: 'var(--color-bg-elevated)',
@@ -94,13 +109,19 @@ export function TrafficPanels({ siteId }: { siteId?: string }) {
   const scoped = siteId !== undefined
 
   // Top IPs and top rules double as entry points into the matching log rows.
-  // The window travels with the link — see `buildLogsDrillDownUrl`.
-  const drillDown = (tab: 'access' | 'security', q: string) => {
+  // The window travels with the link — see `buildLogsDrillDownUrl`. `hours`
+  // defaults to the selected range but is overridden by widgets whose data
+  // covers a different window (the site-scoped geo stats are fixed at 24 h).
+  const drillDown = (
+    tab: 'access' | 'security',
+    q: string,
+    hours: number = RANGE_HOURS[range],
+  ) => {
     navigate(
       buildLogsDrillDownUrl({
         tab,
         q,
-        hours: RANGE_HOURS[range],
+        hours,
         siteId: siteId || null,
       }),
     )
@@ -129,7 +150,11 @@ export function TrafficPanels({ siteId }: { siteId?: string }) {
     enabled: scoped ? Boolean(siteId) : true,
     refetchInterval: 60_000,
   })
-  const geoStats = geoStatsQuery.data ?? []
+  const geoStats = geoStatsQuery.data ?? NO_GEO_STATS
+  // The site-scoped endpoint always covers the trailing 24 h; the fleet-wide
+  // one follows the range selector.
+  const geoHours = scoped ? 24 : RANGE_HOURS[range]
+  const countryRows = useMemo(() => countryTrafficRows(geoStats), [geoStats])
 
   // Live visitors (trailing 5 minutes) and the client-type breakdown, both
   // scoped to the site when `siteId` is set and fleet-wide otherwise.
@@ -155,21 +180,28 @@ export function TrafficPanels({ siteId }: { siteId?: string }) {
         requests: b.requests,
         passed: Math.max(0, b.requests - b.blocked),
         blocked: b.blocked,
-        latency: b.avg_latency_ms,
+        // The latency chart plots the three percentiles side by side: a mean
+        // hides the tail users actually feel, and p50 alone hides the spikes.
+        p50: b.p50_latency_ms,
+        p90: b.p90_latency_ms,
+        p99: b.p99_latency_ms,
       })),
     [data, spanMs],
   )
 
-  // Egress per bucket, converted to a bit rate so the axis reads as Mbps/Kbps.
+  // Requests and egress arrive as two differently-bucketed series; the merge
+  // puts them on one grid (egress bytes summed into the request buckets and
+  // converted to a mean bit rate) so a single composed chart can plot both.
   const egress = data?.egress
-  const egressData = useMemo(() => {
-    const step = egress?.step_seconds ?? TRAFFIC_STEP[range]
-    return (egress?.buckets ?? []).map((b) => ({
-      label: formatBucket(b.bucket, spanMs),
-      bps: (b.bytes * 8) / step,
-    }))
-  }, [egress, spanMs, range])
-
+  const bucketMs = requestBucketMs(RANGE_HOURS[range])
+  const mergedData = useMemo(
+    () =>
+      mergeTrafficSeries(data?.series ?? [], egress, bucketMs).map((point) => ({
+        ...point,
+        label: formatBucket(point.bucket, spanMs),
+      })),
+    [data, egress, bucketMs, spanMs],
+  )
   const avgBitrate =
     egress && spanMs > 0 ? (egress.total_bytes * 8) / (spanMs / 1000) : 0
 
@@ -385,14 +417,14 @@ export function TrafficPanels({ siteId }: { siteId?: string }) {
         />
       ) : (
         <div className="flex flex-col gap-6">
-          {/* Requests over time */}
+          {/* Requests + bandwidth over time, on one aligned bucket grid */}
           <Card>
             <CardHeader
-              title={t('pages.traffic.requestsOverTime')}
-              description={t('pages.traffic.requestsOverTimeHint')}
+              title={t('pages.traffic.requestsAndBandwidth')}
+              description={t('pages.traffic.requestsAndBandwidthHint')}
             />
             <CardBody>
-              {seriesData.length === 0 ? (
+              {mergedData.length === 0 ? (
                 <EmptyState
                   className="border-0 py-10"
                   icon={<ChartLine weight="duotone" className="h-8 w-8" />}
@@ -471,16 +503,23 @@ export function TrafficPanels({ siteId }: { siteId?: string }) {
                       </p>
                     </div>
                   </div>
-                  <div className="h-56 w-full">
+                  <div className="h-80 w-full">
                     <ResponsiveContainer width="100%" height="100%">
-                      <AreaChart data={egressData} margin={{ top: 8, right: 8, left: -8, bottom: 0 }}>
+                      <ComposedChart
+                        data={mergedData}
+                        margin={{ top: 8, right: 4, left: -16, bottom: 0 }}
+                      >
                         <defs>
-                          <linearGradient id="trafficEgress" x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="0%" stopColor="#2f6fed" stopOpacity={0.35} />
+                          <linearGradient id="trafficBandwidth" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor="#2f6fed" stopOpacity={0.25} />
                             <stop offset="100%" stopColor="#2f6fed" stopOpacity={0} />
                           </linearGradient>
                         </defs>
-                        <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border-line)" vertical={false} />
+                        <CartesianGrid
+                          strokeDasharray="3 3"
+                          stroke="var(--color-border-line)"
+                          vertical={false}
+                        />
                         <XAxis
                           dataKey="label"
                           tick={{ fontSize: 11, fill: 'var(--color-text-subtle)' }}
@@ -488,26 +527,70 @@ export function TrafficPanels({ siteId }: { siteId?: string }) {
                           axisLine={{ stroke: 'var(--color-border-line)' }}
                           minTickGap={24}
                         />
+                        {/* Left: request counts. Right: bit rate — the same
+                            chart, two units, one shared time axis. */}
                         <YAxis
+                          yAxisId="requests"
                           tick={{ fontSize: 11, fill: 'var(--color-text-subtle)' }}
                           tickLine={false}
                           axisLine={false}
-                          width={64}
-                          tickFormatter={(v: number) => formatBitrate(v)}
+                          tickFormatter={(value: number) => formatCompactNumber(value)}
+                        />
+                        <YAxis
+                          yAxisId="bitrate"
+                          orientation="right"
+                          width={68}
+                          tick={{ fontSize: 11, fill: 'var(--color-text-subtle)' }}
+                          tickLine={false}
+                          axisLine={false}
+                          tickFormatter={(value: number) => formatBitrate(value)}
                         />
                         <Tooltip
                           contentStyle={tooltipStyle}
-                          formatter={(v) => formatBitrate(Number(v ?? 0))}
+                          formatter={(value, name) =>
+                            name === t('pages.traffic.bandwidth')
+                              ? formatBitrate(Number(value ?? 0))
+                              : formatNumber(Number(value ?? 0))
+                          }
+                        />
+                        <Legend wrapperStyle={{ fontSize: 12 }} iconType="circle" />
+                        <Bar
+                          yAxisId="requests"
+                          dataKey="requests"
+                          name={t('pages.traffic.requests')}
+                          fill="#f6821f"
+                          fillOpacity={0.85}
+                          radius={[2, 2, 0, 0]}
+                          maxBarSize={22}
+                        />
+                        <Line
+                          yAxisId="requests"
+                          type="monotone"
+                          dataKey="passed"
+                          name={t('pages.traffic.passed')}
+                          stroke="#18794e"
+                          strokeWidth={2}
+                          dot={false}
+                        />
+                        <Line
+                          yAxisId="requests"
+                          type="monotone"
+                          dataKey="blocked"
+                          name={t('pages.traffic.blocked')}
+                          stroke="#e54d2a"
+                          strokeWidth={2}
+                          dot={false}
                         />
                         <Area
+                          yAxisId="bitrate"
                           type="monotone"
                           dataKey="bps"
                           name={t('pages.traffic.bandwidth')}
                           stroke="#2f6fed"
                           strokeWidth={2}
-                          fill="url(#trafficEgress)"
+                          fill="url(#trafficBandwidth)"
                         />
-                      </AreaChart>
+                      </ComposedChart>
                     </ResponsiveContainer>
                   </div>
                 </>
@@ -515,37 +598,73 @@ export function TrafficPanels({ siteId }: { siteId?: string }) {
             </CardBody>
           </Card>
 
-          {/* Geographic distribution */}
-          <Card>
-            <CardHeader
-              title={t('pages.traffic.geoMap.title')}
-              description={
-                scoped
-                  ? t('pages.traffic.geoMap.hintSite')
-                  : t('pages.traffic.geoMap.hint')
-              }
-              action={<Globe weight="duotone" className="h-4 w-4 text-fg-subtle" />}
-            />
-            <CardBody>
-              {geoStatsQuery.isPending && !geoStatsQuery.data ? (
-                <div className="h-64 animate-pulse rounded-lg bg-recessed" />
-              ) : geoStatsQuery.isError ? (
-                <ErrorState
-                  error={geoStatsQuery.error}
-                  onRetry={() => geoStatsQuery.refetch()}
-                  retrying={geoStatsQuery.isFetching}
+          {/* Geographic distribution (2/3) beside the ASN ranking (1/3): the
+              globe is the widest single visual on the page, and the network
+              table is the natural companion — which continent/network the
+              requests come from, side by side. */}
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+            <Card className="lg:col-span-2">
+              <CardHeader
+                title={t('pages.traffic.geoMap.title')}
+                description={
+                  scoped
+                    ? t('pages.traffic.geoMap.hintSite')
+                    : t('pages.traffic.geoMap.hint')
+                }
+                action={<Globe weight="duotone" className="h-4 w-4 text-fg-subtle" />}
+              />
+              <CardBody>
+                {geoStatsQuery.isPending && !geoStatsQuery.data ? (
+                  <div className="h-64 animate-pulse rounded-lg bg-recessed" />
+                ) : geoStatsQuery.isError ? (
+                  <ErrorState
+                    error={geoStatsQuery.error}
+                    onRetry={() => geoStatsQuery.refetch()}
+                    retrying={geoStatsQuery.isFetching}
+                  />
+                ) : countryRows.length === 0 ? (
+                  <EmptyState
+                    className="border-0 py-10"
+                    icon={<Globe weight="duotone" className="h-8 w-8" />}
+                    title={t('common.noData')}
+                  />
+                ) : (
+                  <div className="grid grid-cols-1 items-start gap-6 lg:grid-cols-[minmax(0,360px)_minmax(0,1fr)]">
+                    <GlobeChart data={geoStats} />
+                    <CountryTrafficList
+                      rows={countryRows}
+                      onSelect={(code) =>
+                        drillDown('access', `country:${code}`, geoHours)
+                      }
+                    />
+                  </div>
+                )}
+              </CardBody>
+            </Card>
+
+            {/* ASN ranking — which networks the traffic comes from */}
+            <Card>
+              <CardHeader
+                title={t('pages.traffic.topAsns')}
+                description={t('pages.traffic.topAsnsHint')}
+                action={<Buildings weight="duotone" className="h-4 w-4 text-fg-subtle" />}
+              />
+              <CardBody className="p-0">
+                <TopAsnsTable
+                  rows={data?.topAsns}
+                  totalRequests={summary?.requests}
+                  // `!data` rather than `isPending`: the card renders before the
+                  // first response arrives, so it shows the skeleton then and
+                  // keeps the rows on every later background refetch.
+                  loading={!data}
+                  error={overviewQuery.error}
+                  onRetry={() => void overviewQuery.refetch()}
+                  emptyTitle={t('common.noData')}
+                  emptyDescription={t('pages.traffic.topAsnsEmpty')}
                 />
-              ) : geoStats.length === 0 ? (
-                <EmptyState
-                  className="border-0 py-10"
-                  icon={<Globe weight="duotone" className="h-8 w-8" />}
-                  title={t('common.noData')}
-                />
-              ) : (
-                <WorldMapChart data={geoStats} />
-              )}
-            </CardBody>
-          </Card>
+              </CardBody>
+            </Card>
+          </div>
 
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
             {/* Top paths */}
@@ -618,7 +737,10 @@ export function TrafficPanels({ siteId }: { siteId?: string }) {
                       <XAxis dataKey="label" tick={{ fontSize: 11, fill: 'var(--color-text-subtle)' }} tickLine={false} axisLine={{ stroke: 'var(--color-border-line)' }} minTickGap={24} />
                       <YAxis tick={{ fontSize: 11, fill: 'var(--color-text-subtle)' }} tickLine={false} axisLine={false} tickFormatter={(v) => formatLatency(Number(v))} />
                       <Tooltip contentStyle={tooltipStyle} formatter={(v) => formatLatency(Number(v ?? 0))} />
-                      <Line type="monotone" dataKey="latency" name={t('pages.traffic.avgLatency')} stroke="#0051c3" strokeWidth={2} dot={false} />
+                      <Legend wrapperStyle={{ fontSize: 12 }} iconType="circle" />
+                      <Line type="monotone" dataKey="p50" name="p50" stroke="#18794e" strokeWidth={2} dot={false} />
+                      <Line type="monotone" dataKey="p90" name="p90" stroke="#f6821f" strokeWidth={2} dot={false} />
+                      <Line type="monotone" dataKey="p99" name="p99" stroke="#e54d2a" strokeWidth={2} dot={false} />
                     </LineChart>
                   </ResponsiveContainer>
                 </div>

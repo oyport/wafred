@@ -58,7 +58,9 @@ import {
   errorPagesApi,
   errorPageKeys,
   ERROR_PAGE_MESSAGES,
+  CHALLENGE_PAGE_VARIABLES,
   ERROR_PAGE_VARIABLES,
+  defaultChallengePageTemplate,
   defaultErrorPageTemplate,
   renderErrorPagePreview,
 } from '@/api/errorPages'
@@ -894,7 +896,7 @@ function LogRetentionCard({ canWrite }: { canWrite: boolean }) {
   )
 }
 
-/* ── Custom error pages ─────────────────────────────────────────────── */
+/* ── Custom pages (error responses and the challenge page) ───────────── */
 
 interface ErrorPageEditor {
   status_code: number
@@ -983,18 +985,44 @@ function ErrorPagesCard({ canWrite }: { canWrite: boolean }) {
     },
   })
 
+  const challengePageName = t('pages.errorPages.challengePageName')
+  // `503` is the transport status for a challenge, but its page is not the
+  // site/unmatched-host 503 error page. Never label it "Service Unavailable":
+  // that name made operators think editing it would change normal 503s.
+  const genericChallengeNames = new Set([
+    'Service Unavailable',
+    '503 Service Unavailable',
+    '503 · Service Unavailable',
+  ])
+  const pageNameFor = (
+    page: { name?: string } | undefined,
+    pageScope: ErrorPageScope,
+    statusCode: number,
+  ) => {
+    if (pageScope === 'challenge') {
+      const name = page?.name?.trim()
+      return name && !genericChallengeNames.has(name) ? name : challengePageName
+    }
+    return page?.name || ERROR_PAGE_MESSAGES[statusCode] || String(statusCode)
+  }
+
   const openEditor = (statusCode: number, editorScope: ErrorPageScope = scope) => {
     const existing = byStatus.get(statusCode)
     setEditor({
       status_code: statusCode,
-      name: existing?.name ?? ERROR_PAGE_MESSAGES[statusCode] ?? String(statusCode),
-      content_type: (existing?.content_type as ErrorPageContentType) ?? 'text/html',
+      name: pageNameFor(existing, editorScope, statusCode),
+      content_type:
+        editorScope === 'challenge'
+          ? 'text/html'
+          : ((existing?.content_type as ErrorPageContentType) ?? 'text/html'),
       body_template:
         existing?.body_template ??
-        defaultErrorPageTemplate(
-          statusCode,
-          (existing?.content_type as ErrorPageContentType) ?? 'text/html',
-        ),
+        (editorScope === 'challenge'
+          ? defaultChallengePageTemplate()
+          : defaultErrorPageTemplate(
+              statusCode,
+              (existing?.content_type as ErrorPageContentType) ?? 'text/html',
+            )),
       enabled: existing?.enabled ?? true,
       scope: asErrorPageScope(existing?.scope ?? editorScope),
       existingId: existing?.id ?? null,
@@ -1002,7 +1030,11 @@ function ErrorPagesCard({ canWrite }: { canWrite: boolean }) {
   }
 
   const previewHtml = editor
-    ? renderErrorPagePreview(editor.body_template, editor.status_code)
+    ? renderErrorPagePreview(
+        editor.body_template,
+        editor.status_code,
+        editor.scope,
+      )
     : ''
 
   return (
@@ -1034,6 +1066,7 @@ function ErrorPagesCard({ canWrite }: { canWrite: boolean }) {
               [
                 { value: 'site', label: t('pages.errorPages.scopeSite') },
                 { value: 'unmatched_host', label: t('pages.errorPages.scopeUnmatched') },
+                { value: 'challenge', label: t('pages.errorPages.scopeChallenge') },
               ] as const
             ).map((tab) => (
               <button
@@ -1059,6 +1092,14 @@ function ErrorPagesCard({ canWrite }: { canWrite: boolean }) {
               <span>
                 {t('pages.errorPages.scopeUnmatchedHint')}
                 {t('pages.errorPages.scopeUnmatchedFallback')}
+              </span>
+            </p>
+          )}
+          {scope === 'challenge' && (
+            <p className="mb-4 flex items-start gap-2 rounded-md border border-warning/40 bg-warning/8 p-2.5 text-xs text-fg">
+              <Warning weight="duotone" className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+              <span>
+                {t('pages.errorPages.scopeChallengeHint')}
               </span>
             </p>
           )}
@@ -1101,10 +1142,12 @@ function ErrorPagesCard({ canWrite }: { canWrite: boolean }) {
                         </span>
                         <div className="min-w-0">
                           <p className="truncate text-sm font-medium text-fg-strong">
-                            {page?.name || ERROR_PAGE_MESSAGES[code]}
+                            {pageNameFor(page, scope, code)}
                           </p>
                           <p className="mt-0.5 text-xs uppercase tracking-wide text-fg-subtle">
-                            {page?.content_type ?? 'text/html'}
+                            {scope === 'challenge'
+                              ? t('pages.errorPages.challengeTemplate')
+                              : (page?.content_type ?? 'text/html')}
                           </p>
                         </div>
                       </div>
@@ -1156,7 +1199,13 @@ function ErrorPagesCard({ canWrite }: { canWrite: boolean }) {
         open={editor !== null}
         onClose={save.isPending ? () => undefined : () => setEditor(null)}
         size="lg"
-        title={editor ? `${editor.status_code} · ${t('pages.errorPages.editTitle')}` : ''}
+        title={
+          editor
+            ? editor.scope === 'challenge'
+              ? `${editor.status_code} · ${challengePageName}`
+              : `${editor.status_code} · ${t('pages.errorPages.editTitle')}`
+            : ''
+        }
         description={t('pages.errorPages.editDescription')}
         className="max-w-4xl"
         footer={
@@ -1207,6 +1256,7 @@ function ErrorPagesCard({ canWrite }: { canWrite: boolean }) {
               <Select
                 label={t('pages.errorPages.contentType')}
                 value={editor.content_type}
+                disabled={editor.scope === 'challenge'}
                 options={ERROR_PAGE_CONTENT_TYPES.map((c) => ({
                   value: c,
                   label: ERROR_PAGE_CONTENT_TYPE_LABELS[c] ?? c.toUpperCase(),
@@ -1232,15 +1282,31 @@ function ErrorPagesCard({ canWrite }: { canWrite: boolean }) {
                 options={[
                   { value: 'site', label: t('pages.errorPages.scopeSite') },
                   { value: 'unmatched_host', label: t('pages.errorPages.scopeUnmatched') },
+                  { value: 'challenge', label: t('pages.errorPages.scopeChallenge') },
                 ]}
                 onChange={(e) => {
                   const nextScope = e.target.value as ErrorPageScope
                   setEditor((prev) => {
                     if (!prev) return prev
+                    const toChallenge =
+                      nextScope === 'challenge' && prev.scope !== 'challenge'
+                    const fromChallenge =
+                      prev.scope === 'challenge' && nextScope !== 'challenge'
+                    const statusCode = defaultStatusCodeForScope(
+                      nextScope,
+                      prev.status_code,
+                    )
+                    const contentType = toChallenge ? 'text/html' : prev.content_type
                     return {
                       ...prev,
                       scope: nextScope,
-                      status_code: defaultStatusCodeForScope(nextScope, prev.status_code),
+                      status_code: statusCode,
+                      content_type: contentType,
+                      body_template: toChallenge
+                        ? defaultChallengePageTemplate()
+                        : fromChallenge
+                          ? defaultErrorPageTemplate(statusCode, contentType)
+                          : prev.body_template,
                     }
                   })
                 }}
@@ -1316,14 +1382,26 @@ function ErrorPagesCard({ canWrite }: { canWrite: boolean }) {
                   </p>
                 )}
                 <div className="flex max-h-[388px] flex-col gap-1 overflow-y-auto rounded-md border border-line bg-recessed/40 p-2">
-                  {ERROR_PAGE_VARIABLES.map((v) => (
+                  {(editor.scope === 'challenge'
+                    ? CHALLENGE_PAGE_VARIABLES
+                    : ERROR_PAGE_VARIABLES
+                  ).map((v) => (
                     <button
                       key={v.name}
                       type="button"
                       title={v.description}
                       onClick={() =>
                         setEditor((e) =>
-                          e ? { ...e, body_template: `${e.body_template}{{${v.name}}}` } : e,
+                          e
+                            ? {
+                                ...e,
+                                body_template: `${e.body_template}${
+                                  v.name === 'challenge_scripts'
+                                    ? '{{ challenge_scripts | safe }}'
+                                    : `{{${v.name}}}`
+                                }`,
+                              }
+                            : e,
                         )
                       }
                       className="group flex flex-col items-start rounded px-1.5 py-1 text-left transition-colors hover:bg-elevated"
@@ -1350,10 +1428,13 @@ function ErrorPagesCard({ canWrite }: { canWrite: boolean }) {
           setEditor({
             ...pendingReset,
             content_type: pendingReset.content_type,
-            body_template: defaultErrorPageTemplate(
-              pendingReset.status_code,
-              pendingReset.content_type,
-            ),
+            body_template:
+              pendingReset.scope === 'challenge'
+                ? defaultChallengePageTemplate()
+                : defaultErrorPageTemplate(
+                    pendingReset.status_code,
+                    pendingReset.content_type,
+                  ),
           })
           setPendingReset(null)
         }}

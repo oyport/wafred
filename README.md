@@ -83,6 +83,7 @@ The control plane and the data plane talk over the `ControlPlane` gRPC service (
 - **Request / response rewriting** — headers, paths, query strings, status codes and body search/replace.
 - **Custom error pages** rendered with Tera templates — including edge-generated responses such as WAF blocks and paused sites.
 - **Pause a site** from the console: every request gets a `503` maintenance page while the certificate keeps serving and traffic stays logged.
+- **Tunnels** — reach a service inside a private network with **no inbound port and no public IP**: a standalone `wafred-tunnel` connector dials out to an edge, and an origin pool bound to the tunnel is served through the normal request path (WAF, rate limiting, cache, logs, certificates). Pairing and management live in **Agents → Tunnels**; see [user-guide.md](docs/user-guide.md#tunnels-internal-services-without-an-inbound-port).
 
 ### 🔐 TLS & Certificates
 - **Automatic ACME / Let's Encrypt** issuance and renewal on the edge (HTTP-01 and DNS-01).
@@ -161,7 +162,7 @@ The separate three-minute Strict + body soak at 256 concurrent requests complete
 | --- | --- |
 | [`pingwaf-proto`](./wafred-proto) | Control-plane gRPC protocol definitions (single source: `control_plane.proto`) |
 | [`pingwaf-server`](./wafred-server) | Control plane: Axum REST + tonic gRPC + SeaORM/PostgreSQL + ES logs + embedded frontend + agent health monitoring |
-| [`pingwaf-agent`](./wafred-agent) | Data-plane agent: connects to the control plane, caches rules with disk persistence, ships logs/metrics, receives commands |
+| [`wafred-agent`](./wafred-agent) | Data-plane agent: connects to the control plane, caches rules with disk persistence, ships logs/metrics, receives commands |
 | [`pingwaf-waf`](./wafred-waf) | Detection engine: normalize → signatures → expression → anomaly score |
 | [`pingwaf-challenge`](./wafred-challenge) | Dynamic challenges: JS 5-second shield, interactive challenge, PoW, fingerprinting, HMAC clearance cookies |
 | `pingwaf-profiler` / `pingwaf-system` (no README) | In-process CPU/memory attribution and snapshots served at `/api/v1/system/profile` and `/api/v1/system/metrics` |

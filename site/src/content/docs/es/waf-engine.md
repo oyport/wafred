@@ -64,8 +64,13 @@ El binario incluye quince reglas `WAFRED-xxxx` que se cargan según el nivel con
 | `rate_threshold` | 100 peticiones/minuto/IP |
 | `exempt_paths` | `/health`, `/ping` |
 | `pow_difficulty` | `20` |
+| `pow_max_difficulty` | `24` |
+| `pow_issue_limit_per_min` | `120` |
+| `pow_verify_limit_per_min` | `300` |
 
 Los niveles son `None`, `NonInteractive`, `Managed` (elige por riesgo) e `Interactive`. El proof of work usa SHA-256 con objetivo de ceros iniciales. El paso se guarda en `__pingwaf_clearance`, con valor `base64(payload).base64(HMAC-SHA256)` ligado al sitio emisor, imposible de reutilizar en otro dominio.
+
+La dificultad es adaptativa: parte de `pow_difficulty` y sube por cliente (hasta `pow_max_difficulty`) con verificaciones fallidas o volumen de peticiones superior a `rate_threshold`, y vuelve a la base tras un acierto. La emisión y la verificación también tienen tope por IP y minuto (`pow_issue_limit_per_min`, `pow_verify_limit_per_min`): por encima del límite de emisión el visitante recibe una página `429`, y por encima del de verificación la entrega se rechaza sin consumir el reto pendiente.
 
 ## Política de bots
 

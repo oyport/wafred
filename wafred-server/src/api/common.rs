@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::api::error::ApiError;
 use crate::auth::AuthUser;
-use crate::models::{acme_challenge, agent, site};
+use crate::models::{acme_challenge, agent, agent_sites, site};
 
 /// [`axum::Json`] with API-consistent rejection bodies.
 ///
@@ -389,6 +389,14 @@ pub(crate) async fn agent_may_touch_site(
     let Some(row) = agent::Entity::find_by_id(agent_id).one(db).await? else {
         return Ok(false);
     };
+    if row.site_scope == "selected" {
+        return Ok(agent_sites::Entity::find()
+            .filter(agent_sites::Column::AgentId.eq(agent_id))
+            .filter(agent_sites::Column::SiteId.eq(site_id))
+            .one(db)
+            .await?
+            .is_some());
+    }
     match row.site_id {
         Some(bound) => Ok(bound == site_id),
         // A global agent sees every site that exists; a stale id in an agent
@@ -410,13 +418,33 @@ pub(crate) async fn purge_target_agents(
     site_id: Option<Uuid>,
 ) -> Result<Vec<agent::Model>, ApiError> {
     let condition = match site_id {
-        Some(id) => Condition::any()
-            .add(agent::Column::SiteId.eq(id))
-            .add(agent::Column::SiteId.is_null()),
+        Some(id) => {
+            let assigned: Vec<Uuid> = agent_sites::Entity::find()
+                .filter(agent_sites::Column::SiteId.eq(id))
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|row| row.agent_id)
+                .collect();
+            let mut condition =
+                Condition::any().add(agent::Column::SiteId.eq(id)).add(
+                    Condition::all()
+                        .add(agent::Column::SiteId.is_null())
+                        .add(agent::Column::SiteScope.eq("all")),
+                );
+            if !assigned.is_empty() {
+                condition = condition.add(agent::Column::Id.is_in(assigned));
+            }
+            condition
+        },
         // Reserved for a future global purge: no HTTP caller passes `None`
         // today (`POST /cache/purge` requires `site_id`). Kept because a
         // global endpoint would select exactly this set.
-        None => Condition::any().add(agent::Column::SiteId.is_null()),
+        None => Condition::any().add(
+            Condition::all()
+                .add(agent::Column::SiteId.is_null())
+                .add(agent::Column::SiteScope.eq("all")),
+        ),
     };
     Ok(agent::Entity::find().filter(condition).all(db).await?)
 }
@@ -588,6 +616,78 @@ pub fn ensure_acme_wildcard_supported(
         ));
     }
     Ok(())
+}
+
+/// Validate Route 53 settings before they are stored or sent to agents.
+pub(super) fn validate_acme_dns_provider(
+    provider: Option<&str>,
+    challenge: Option<&str>,
+    config: Option<&serde_json::Value>,
+) -> Result<(), ApiError> {
+    let provider =
+        pingap_config::normalize_dns_provider(provider.unwrap_or_default())
+            .ok_or_else(|| {
+                ApiError::BadRequest("unsupported ACME DNS provider".into())
+            })?;
+    if provider == "manual" && challenge == Some(acme_challenge::DNS_01) {
+        return Err(ApiError::BadRequest(
+            "managed DNS-01 requires an automated DNS provider".into(),
+        ));
+    }
+    if provider != "route53" {
+        return Ok(());
+    }
+    if challenge != Some(acme_challenge::DNS_01) {
+        return Err(ApiError::BadRequest("Route 53 requires dns-01".into()));
+    }
+    if let Some(config) = config.filter(|value| !value.is_null()) {
+        let valid = config.as_object().is_some_and(|map| {
+            map.iter().all(|(key, value)| {
+                key == "hosted_zone_id"
+                    && value
+                        .as_str()
+                        .and_then(pingap_config::route53_zone_id)
+                        .is_some()
+            })
+        });
+        if !valid {
+            return Err(ApiError::BadRequest(
+                "Route 53 configuration only accepts a valid hosted_zone_id"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn validates_route53_credential_free_configuration() {
+    let dns01 = Some(acme_challenge::DNS_01);
+    assert!(validate_acme_dns_provider(Some("Route53"), dns01, None).is_ok());
+    assert!(validate_acme_dns_provider(
+        Some("route53"),
+        dns01,
+        Some(&serde_json::json!({"hosted_zone_id": "/hostedzone/Z123"})),
+    )
+    .is_ok());
+    assert!(validate_acme_dns_provider(Some("route53"), None, None).is_err());
+    assert!(validate_acme_dns_provider(Some("unknown"), dns01, None).is_err());
+    assert!(validate_acme_dns_provider(Some("dnspod"), dns01, None).is_ok());
+    assert!(validate_acme_dns_provider(None, dns01, None).is_err());
+    assert!(validate_acme_dns_provider(Some("manual"), dns01, None).is_err());
+    for config in [
+        serde_json::json!({"hosted_zone_id": "bad id"}),
+        serde_json::json!({"endpoint": "https://example.com"}),
+        serde_json::json!({"access_key_id": "example"}),
+    ] {
+        assert!(validate_acme_dns_provider(
+            Some("route53"),
+            dns01,
+            Some(&config)
+        )
+        .is_err());
+    }
 }
 
 /// Checks a site's hostname set against every other site in the database.

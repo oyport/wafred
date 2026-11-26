@@ -143,6 +143,13 @@ jobs:
         if: matrix.toolchain == 'stable'
         run: cargo clippy --locked --all-targets --features full -- -D warnings
 
+      # The agent-only binary has its own feature gate and `required-features`,
+      # so `--all-targets --features full` above deliberately does not build
+      # it. Lint it explicitly: it is a shipped release artifact.
+      - name: Clippy (agent-only build)
+        if: matrix.toolchain == 'stable'
+        run: cargo clippy --locked --bin pingwaf-agent --features full,edge -- -D warnings
+
       - name: Test (workspace, nextest)
         run: cargo nextest run --locked --workspace --features full --no-fail-fast
 
@@ -201,6 +208,14 @@ jobs:
 
       - name: Clippy (rustls backend)
         run: cargo clippy --locked --no-default-features --features=tls-rustls,full --all-targets --all -- --deny=warnings
+
+      # The agent-only target must stay backend-agnostic: it is built with the
+      # openssl backend for release, but nothing in it may assume that.
+      - name: Clippy (agent-only, rustls backend)
+        run: cargo clippy --locked --no-default-features --features=tls-rustls,full,edge --bin pingwaf-agent -- --deny=warnings
+
+      - name: Build (agent-only, rustls backend)
+        run: cargo build --locked --no-default-features --features=tls-rustls,full,edge --bin pingwaf-agent
 
       - name: Test (workspace, nextest, rustls backend)
         run: cargo nextest run --locked --workspace --no-default-features --features=tls-rustls,full --no-fail-fast
@@ -386,6 +401,11 @@ jobs:
           CFLAGS: -march=x86-64 -mtune=generic -mno-avx -mno-avx2
           CXXFLAGS: -march=x86-64 -mtune=generic -mno-avx -mno-avx2
         run: cargo build --locked --release --bin wafred --features full
+
+      # The agent-only artifact is published by release.yml; build it here too
+      # so a release-profile regression is caught on main, not at tag time.
+      - name: Build (release, pingwaf-agent, full, edge)
+        run: cargo build --locked --release --bin pingwaf-agent --features full,edge
 
       - name: Upload release binary for :main image
         uses: actions/upload-artifact@v4

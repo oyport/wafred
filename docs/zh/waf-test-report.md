@@ -4,7 +4,7 @@
 - 语料：[chaitin/blazehttp](https://github.com/chaitin/blazehttp)，commit `afc88a94d03db1cd52156c34c3c9c58053c9f658`，共 33,877 条请求（恶意 658 / 正常 33,219）
 - 环境：五台 Debian 13 虚拟机，隔离 WAF、模拟源站、两台负载机和结果收集机
 
-本轮沿用此前 PingWAF 版本测试所用的语料和分析方法，对 WAFred 1.0.4 重新实测；下表呈现本次 WAFred 结果。拦截和质询都计作攻击命中；正常流量受影响也包括这两类响应。已部署的 all-in-one 进程没有变更。
+本轮沿用此前 WAFred 版本测试所用的语料和分析方法，对 WAFred 1.0.4 重新实测；下表呈现本次 WAFred 结果。拦截和质询都计作攻击命中；正常流量受影响也包括这两类响应。已部署的 all-in-one 进程没有变更。
 
 | 档位 | 攻击样本拦截 | 正常流量受影响 | 回放 p50 / p95 | HTTP 500 |
 |---|---:|---:|---:|---:|
@@ -21,20 +21,20 @@
 | WAFred Normal + body | 658 | 494（75.08%） | 33,219 | 12（0.036%） | 48 ms* |
 | WAFred Strict | 658 | 501（76.14%） | 33,219 | 4（0.012%） | 48 ms* |
 | WAFred Strict + body | 658 | **632（96.05%）** | 33,219 | **19（0.057%）** | 48 ms* |
-| PingWAF 早期 P13 · Normal | 658 | 396（60.2%） | 33,219 | 5（0.015%） | 5 ms‡ |
-| PingWAF 早期 P13 · Normal + body | 658 | 473（71.9%） | 33,219 | 14（0.042%） | ~3 s‡ |
-| PingWAF 早期 P13 · Strict | 658 | 500（76.0%） | 33,219 | 5（0.015%） | 4 ms‡ |
-| PingWAF 早期 P13 · Strict + body | 658 | 617（93.8%） | 33,219 | 21（0.063%） | ~3 s‡ |
+| WAFred 早期 P13 · Normal | 658 | 396（60.2%） | 33,219 | 5（0.015%） | 5 ms‡ |
+| WAFred 早期 P13 · Normal + body | 658 | 473（71.9%） | 33,219 | 14（0.042%） | ~3 s‡ |
+| WAFred 早期 P13 · Strict | 658 | 500（76.0%） | 33,219 | 5（0.015%） | 4 ms‡ |
+| WAFred 早期 P13 · Strict + body | 658 | 617（93.8%） | 33,219 | 21（0.063%） | ~3 s‡ |
 | SafeLine 免费版 · strict | 575 | 438（76.17%） | 33,094 | 73（0.22%） | 64.34 ms† |
 | SafeLine 免费版 · balanced | 575 | 412（71.65%） | 33,094 | 23（0.07%） | 70.05 ms† |
 | ModSecurity PL4 | 575 | 544（94.61%） | 33,094 | 17,362（52.46%） | 28.89 ms† |
 | ModSecurity PL1 | 575 | 401（69.74%） | 33,094 | 5,819（17.58%） | 31.15 ms† |
 | Cloudflare 免费版 | 570 | 61（10.70%） | 32,780 | 23（0.07%） | 288.96 ms† |
 
-PingWAF 早期 P13 行来自同一名义语料上的旧版本测试；当时回放器对请求体 framing 的描述不完整，并产生 15 个 framing 相关 HTTP 500。本轮 WAFred 使用修正后的 framing，因此这里呈现的是各版本实测记录，不是严格控制变量的前后实验。SafeLine、ModSecurity、Cloudflare 数值沿用 [blazehttp 基准](https://github.com/chaitin/blazehttp)的历史记录，本轮未重测，分母也不同。*WAFred p95 包含虚拟机、代理和模拟源站；†其他 p95 使用不同链路，不可直接比较。‡PingWAF p95 来自较早的回放环境，body 档长尾包含客户端上传耗时。
+WAFred 早期 P13 行来自同一名义语料上的旧版本测试；当时回放器对请求体 framing 的描述不完整，并产生 15 个 framing 相关 HTTP 500。本轮 WAFred 使用修正后的 framing，因此这里呈现的是各版本实测记录，不是严格控制变量的前后实验。SafeLine、ModSecurity、Cloudflare 数值沿用 [blazehttp 基准](https://github.com/chaitin/blazehttp)的历史记录，本轮未重测，分母也不同。*WAFred p95 包含虚拟机、代理和模拟源站；†其他 p95 使用不同链路，不可直接比较。‡WAFred p95 来自较早的回放环境，body 档长尾包含客户端上传耗时。
 
 回放器现在会为缺少 framing 头的非空请求体补充准确 `Content-Length`，并截去单个合法长度外的多余尾字节。这修正了 15 条格式异常样本导致的代理 HTTP 500；四档全量回放现在均为 0 个 500。WAFred 归一化也新增未声明类型的 URL-encoded/multipart 字段和 Base64 路径片段检测；Strict 新增两条高置信度 `alert.call`/`prompt.call` 签名。
 
 自签 HTTPS 测试中，显式 `curl --cacert` 验证成功，OpenSSL TLS 1.2/1.3 SNI 握手通过；curl 默认信任库按预期拒绝该自签证书。HTTP/HTTPS 正常请求均返回 200，HTTPS 下的表单 SQL 注入和 Base64 路径攻击返回 403；上游模拟源站使用 HTTP。
 
-256 并发三分钟稳态与 512 并发文件句柄测试来自原部署二进制，而非修复候选版本。完整漏报归因、TLS 测试范围及容量数据见[完整测试报告](../wafred-baseline-test-report-2026-11-22.md)。[基准附录](../waf-benchmark-report.md)并列早期 PingWAF P13 实测与本轮 WAFred 结果。
+256 并发三分钟稳态与 512 并发文件句柄测试来自原部署二进制，而非修复候选版本。完整漏报归因、TLS 测试范围及容量数据见[完整测试报告](../wafred-baseline-test-report-2026-11-22.md)。[基准附录](../waf-benchmark-report.md)并列早期 WAFred P13 实测与本轮 WAFred 结果。

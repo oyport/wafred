@@ -210,9 +210,11 @@ impl Limiter {
         // for the `ip` tag, which has no header to look in, and for a
         // configured key that the request simply does not carry.
         let configured = match self.tag {
-            LimitTag::Query => get_query_value(session.req_header(), &self.key),
+            LimitTag::Query => get_query_value(session.req_header(), &self.key)
+                .map(Cow::Borrowed),
             LimitTag::RequestHeader => {
                 get_req_header_value(session.req_header(), &self.key)
+                    .map(Cow::Borrowed)
             },
             LimitTag::Cookie => {
                 get_cookie_value(session.req_header(), &self.key)
@@ -228,7 +230,7 @@ impl Limiter {
         // degrades is worth more than one that can be switched off by a
         // header the client controls.
         let key: Cow<'_, str> = match configured {
-            Some(value) if !value.is_empty() => Cow::Borrowed(value),
+            Some(value) if !value.is_empty() => value,
             _ => Cow::Borrowed(ensure_client_ip(session, ctx)),
         };
 

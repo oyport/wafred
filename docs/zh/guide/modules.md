@@ -1,7 +1,7 @@
 # WAFred 模块
 
 > 本仓库在下列上游 `pingap-*` 模块之外，还包含 7 个 WAF 专属 crate：
-> `pingwaf-proto`、`pingwaf-server`、`pingwaf-agent`、`pingwaf-waf`、
+> `pingwaf-proto`、`pingwaf-server`、`wafred-agent`、`pingwaf-waf`、
 > `pingwaf-challenge`、`pingwaf-profiler`、`pingwaf-system`。两者的完整说明见
 > [文档索引](../README.md#-crate-文档)。
 >

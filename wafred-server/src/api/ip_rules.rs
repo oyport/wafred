@@ -172,9 +172,13 @@ fn validate_ip_ranges(ranges: &[String]) -> Result<Vec<String>, ApiError> {
         if trimmed.is_empty() {
             continue;
         }
-        // Basic validation: must look like an IP or CIDR
-        let base = trimmed.split('/').next().unwrap_or(trimmed);
-        if base.parse::<std::net::IpAddr>().is_err() {
+        // The whole entry must parse as a CIDR network or a bare address:
+        // validating only the `/` prefix let `10.0.0.0/33` or `/abc` reach the
+        // database, where the data plane's `IpRules::new` dropped them
+        // silently and an allow rule failed open.
+        if trimmed.parse::<ipnet::IpNet>().is_err()
+            && trimmed.parse::<std::net::IpAddr>().is_err()
+        {
             return Err(ApiError::BadRequest(format!(
                 "invalid IP address or CIDR: '{trimmed}'"
             )));
@@ -594,5 +598,23 @@ mod tests {
             out,
             vec!["10.0.0.1".to_string(), "10.0.0.0/24".to_string()]
         );
+    }
+
+    #[test]
+    fn invalid_prefix_lengths_are_rejected_whole_entry() {
+        // Only the part before `/` used to be parsed, so these slipped into
+        // the database while the data plane dropped them silently.
+        for bad in ["10.0.0.0/33", "2001:db8::/129", "10.0.0.0/abc"] {
+            let err = validate_ip_ranges(&[bad.to_string()]).unwrap_err();
+            let ApiError::BadRequest(message) = &err else {
+                panic!("expected bad request for {bad}");
+            };
+            assert!(
+                message.contains(bad),
+                "error message must name the invalid value: {message}"
+            );
+        }
+        // Valid entries still pass.
+        assert!(validate_ip_ranges(&["10.0.0.0/32".to_string()]).is_ok());
     }
 }

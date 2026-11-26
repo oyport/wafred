@@ -23,7 +23,7 @@ WAFred analyse désormais les corps URL-encoded et multipart sans `Content-Type`
 
 ## Référence historique inter-produits
 
-Le graphique compare la mesure actuelle de WAFred 1.0.4 au dernier test de la période PingWAF (P13), tout en conservant les références historiques SafeLine, ModSecurity et Cloudflare. Le test précédent utilisait le même corpus nominal, mais un framing du body plus ancien ; le harnais actuel a corrigé 15 réponses HTTP 500 liées au framing. Ces valeurs sont des résultats par version, pas une expérience avant/après contrôlée. Les autres produits n'ont pas été retestés et leurs dénominateurs et chemins réseau diffèrent. Le p95 WAFred inclut la VM, le proxy et l'origine simulée ; les latences ne sont pas directement comparables.
+Le graphique compare la mesure actuelle de WAFred 1.0.4 au dernier test de la période WAFred (P13), tout en conservant les références historiques SafeLine, ModSecurity et Cloudflare. Le test précédent utilisait le même corpus nominal, mais un framing du body plus ancien ; le harnais actuel a corrigé 15 réponses HTTP 500 liées au framing. Ces valeurs sont des résultats par version, pas une expérience avant/après contrôlée. Les autres produits n'ont pas été retestés et leurs dénominateurs et chemins réseau diffèrent. Le p95 WAFred inclut la VM, le proxy et l'origine simulée ; les latences ne sont pas directement comparables.
 
 ## Corps compressés et HTTPS
 

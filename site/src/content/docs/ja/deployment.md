@@ -33,6 +33,11 @@ docker compose up -d
 
 compose は `ghcr.io/oyport/wafred:latest` を all-in-one モードで `postgres:16-alpine` と一緒に起動し、`80`、`443`、`9080`、`9090` を公開します。データベースのポートは既定で `127.0.0.1` に束縛されます。
 
+初回の compose 実行で最も多い 2 つの失敗：
+
+- `permission denied while trying to connect to the Docker API at unix:///var/run/docker.sock` — ユーザーが `docker` グループに属していません。`sudo docker compose up -d` を実行するか、グループに追加してください（`sudo usermod -aG docker $USER`、再ログインで反映）。
+- `failed to bind host port 127.0.0.1:5432/tcp: address already in use` — ローカルの PostgreSQL がすでに 5432 を使用しています。`.env` に `POSTGRES_PORT=55432` を設定し（または `deploy/compose/install.sh` に `--db-port 55432` を渡す。55432 以上の空きポートを自動選択します）、再起動してください。
+
 > `hostname` は安定させてください。コントロールプレーンは hostname と API key で再登録を突き合わせるため、コンテナ ID が変わると幽霊のようなオフラインノードが残ります。
 
 ## ソースからビルド
@@ -43,7 +48,7 @@ compose は `ghcr.io/oyport/wafred:latest` を all-in-one モードで `postgres
 | Node.js | 26.12.1+ | 埋め込みコンソールのビルド（`engine-strict`） |
 | `protoc` | 比較的新しいもの | gRPC コード生成。**必須** |
 | `cmake` | 比較的新しいもの | TLS バックエンド |
-| PostgreSQL | 14+（16 推奨） | コントロールプレーンの保存先 |
+| PostgreSQL | 14+。ネイティブインストールはディストリビューションのパッケージ名に従う（Ubuntu 24.04 は `postgresql-16`、26.04 は `postgresql-18`） | コントロールプレーンの保存先 |
 
 `protoc` がないと `pingwaf-proto` がプレースホルダを書き出し、後続のクレートがビルドできません。
 

@@ -875,6 +875,10 @@ fn ssl_to_proto(
         acme_challenge_type,
         acme_dns_provider,
         acme_dns_config,
+        acme_issuer_agent_id: selected
+            .and_then(|cert| cert.acme_issuer_agent_id)
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
         min_tls_version: row.min_tls_version.clone(),
         hsts_enabled: row.hsts_enabled,
         hsts_max_age: row.hsts_max_age.max(0) as u32,
@@ -1000,6 +1004,12 @@ fn pools_to_proto(
             // values the data plane parses, and the CHECK constraint keeps
             // anything else out of the row.
             address_family: pool.address_family.clone(),
+            // Empty for a direct origin. When set, the data plane resolves
+            // the peers through the tunnel connector instead of dialing them.
+            tunnel_id: pool
+                .tunnel_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
         });
     }
     configs
@@ -1328,6 +1338,10 @@ fn challenge_to_proto(
             request_threshold: c.rate_threshold.max(0) as u32,
             browser_integrity_check: c.browser_integrity_check,
             tls_fingerprint_check: c.tls_fingerprint_check,
+            base_difficulty: c.base_difficulty.max(0) as u32,
+            max_difficulty: c.max_difficulty.max(0) as u32,
+            issue_limit_per_minute: c.issue_limit_per_min.max(0) as u32,
+            verify_limit_per_minute: c.verify_limit_per_min.max(0) as u32,
         },
         None => ChallengeConfig {
             enabled: false,
@@ -1338,6 +1352,13 @@ fn challenge_to_proto(
             request_threshold: 0,
             browser_integrity_check: false,
             tls_fingerprint_check: false,
+            // A site that never saved challenge settings keeps the defaults
+            // every other site runs with; the agent treats 0 as "unset", but
+            // stating them keeps the bundle readable.
+            base_difficulty: 0,
+            max_difficulty: 0,
+            issue_limit_per_minute: 0,
+            verify_limit_per_minute: 0,
         },
     }
 }
@@ -1848,6 +1869,12 @@ pub async fn build_rule_bundle(
         })
         .map(rule_to_proto)
         .collect();
+
+    // The complete tunnel policy rides in every bundle (like `site_policies`),
+    // so one per-site push is enough for the edge to learn a tunnel that was
+    // created after it connected.
+    let (tunnels, tunnel_settings) =
+        crate::tunnel_policy::bundle_tunnels(db).await?;
 
     let mut bundle = RuleBundle {
         site_id: site_row.id.to_string(),
@@ -2832,6 +2859,7 @@ mod tests {
         is_default: bool,
     ) -> site_upstream_pools::Model {
         site_upstream_pools::Model {
+            tunnel_id: None,
             id: Uuid::new_v4(),
             site_id: Uuid::nil(),
             name: name.into(),
@@ -3308,6 +3336,7 @@ mod tests {
             acme_challenge_type: acme_challenge::HTTP_01.to_string(),
             acme_dns_provider: None,
             acme_dns_config: None,
+            acme_issuer_agent_id: None,
             status: "active".to_string(),
             failure_reason: None,
             created_at: Utc::now(),

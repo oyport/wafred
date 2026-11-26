@@ -1,3 +1,4 @@
+pub mod body_budget;
 pub mod cache;
 pub mod cert_events;
 pub mod cert_status;
@@ -97,6 +98,11 @@ pub struct AccessLogEntry {
     pub referer: String,
     pub tls_version: String,
     pub country_code: String,
+    /// Autonomous system number of `client_ip`, as resolved by the data
+    /// plane's GeoIP data. 0 means "not resolved" (a private/reserved address,
+    /// a GeoIP miss, or a caller that did not look it up) and the control
+    /// plane stores it as NULL, so the traffic pages never rank a bogus AS0.
+    pub asn: u32,
     /// Who the request was made by, when the site authenticated them (the
     /// OIDC session's `sub`). Empty for an anonymous request, which is the
     /// ordinary case. An identifier the provider issued, never a secret.
@@ -352,6 +358,11 @@ impl WafredAgent {
 
     /// Log an access entry (non-blocking, queued for batch shipping).
     pub fn log_access(&self, entry: AccessLogEntry) {
+        // A tunneled origin is reached through a loopback bridge, so the peer
+        // address pingora reports is `127.0.0.1:<port>`. Resolve it back to the
+        // tunnel and the internal target: the operator needs to see where the
+        // request actually went, and a loopback port is noise.
+        let upstream_addr = tunnel_upstream_label(&entry.upstream_addr);
         let request_headers = combine_headers(entry.request_headers);
         let response_headers = combine_headers(entry.response_headers);
         let log_entry = client::LogEntry {
@@ -373,7 +384,7 @@ impl WafredAgent {
             response_body: entry.response_body,
             response_body_size: entry.response_body_size,
             response_body_truncated: entry.response_body_truncated,
-            upstream_addr: entry.upstream_addr,
+            upstream_addr,
             upstream_latency_ms: entry.upstream_latency_ms,
             upstream_status: entry.upstream_status,
             waf_score: 0,
@@ -395,7 +406,7 @@ impl WafredAgent {
             ja3_hash: String::new(),
             country_code: entry.country_code,
             city: String::new(),
-            asn: 0,
+            asn: entry.asn,
             user_agent: entry.user_agent,
             referer: entry.referer,
         };
@@ -508,6 +519,18 @@ pub async fn start_agent(
 /// Get the global agent instance (shorthand for [`WafredAgent::instance`]).
 pub fn agent_instance() -> Option<Arc<WafredAgent>> {
     WafredAgent::instance()
+}
+
+/// Rewrites a loopback bridge address to `tunnel://<name>/<target>`.
+///
+/// Anything else (a direct origin, an empty address) is returned untouched.
+fn tunnel_upstream_label(addr: &str) -> String {
+    let Ok(addr) = addr.parse::<std::net::SocketAddr>() else {
+        return addr.to_string();
+    };
+    wafred_tunnel::installed_registry()
+        .and_then(|registry| registry.upstream_label(addr))
+        .unwrap_or_else(|| addr.to_string())
 }
 
 #[cfg(test)]

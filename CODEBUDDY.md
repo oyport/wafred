@@ -7,7 +7,7 @@
 WAFred：基于 `pingap`（Cloudflare Pingora 反向代理）的分布式、集中管控 Web 应用防火墙。
 
 - **控制面** `pingwaf-server`：Axum REST API + tonic gRPC + SeaORM/PostgreSQL，内嵌 `web/` 控制台（rust-embed）
-- **数据面** `pingwaf-agent`：gRPC 双向流同步规则（arc-swap 热更新）
+- **数据面** `wafred-agent`：gRPC 双向流同步规则（arc-swap 热更新）
 - **WAF 引擎** `pingwaf-waf`：normalize → 签名（libinjection/Aho-Corasick）→ 表达式 → 异常评分
 - **协议真源** `wafred-proto/proto/control_plane.proto`
 - `pingap-*` 系列 crate 是真实存在的代理底座（**不是**过时名称）；`pingwaf-*` 是 WAF 层

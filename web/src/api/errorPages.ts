@@ -8,7 +8,7 @@ import type {
 } from './types'
 
 /**
- * Custom error pages — `/api/v1/error-pages` (administrators only).
+ * Custom pages — `/api/v1/error-pages` (administrators only).
  *
  * One global template per status code: the list applies to every site, so the
  * settings page is the only place to edit it. The template is rendered with a
@@ -51,6 +51,20 @@ export const ERROR_PAGE_VARIABLES = [
       'Backend address that was tried, e.g. 10.0.0.9:8080 (empty on non-upstream errors)',
   },
 ] as const
+/** Variables available only to the challenge-page template. */
+export const CHALLENGE_PAGE_VARIABLES = [
+  {
+    name: 'challenge_scripts',
+    description:
+      'Compiled fingerprint, proof-of-work, verification and redirect scripts. Always use it as {{ challenge_scripts | safe }}.',
+  },
+  { name: 'brand_name', description: 'Brand name (HTML-escaped by Tera)' },
+  { name: 'request_id', description: 'Unique id for this challenge' },
+  { name: 'difficulty', description: 'Proof-of-work difficulty in leading zero bits' },
+  { name: 'verify_endpoint', description: 'Endpoint the page posts the solution to' },
+  { name: 'original_url', description: 'URL to redirect to after verification' },
+] as const
+
 
 /** Sample values used by the live-preview iframe. */
 export const ERROR_PAGE_SAMPLE: Record<string, string> = {
@@ -68,6 +82,20 @@ export const ERROR_PAGE_SAMPLE: Record<string, string> = {
   upstream_name: '',
   upstream_addr: '',
 }
+/** Sample values for the challenge-page live preview. */
+export const CHALLENGE_PAGE_SAMPLE: Record<string, string> = {
+  ...ERROR_PAGE_SAMPLE,
+  error_code: '503',
+  error_message: 'Service Unavailable',
+  brand_name: 'WAFred',
+  request_id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+  difficulty: '20',
+  verify_endpoint: '/_pingwaf/challenge/verify',
+  original_url: '/',
+  challenge_scripts:
+    '<script>/* compiled challenge scripts are injected here at runtime */</script>',
+}
+
 
 const HTML_TEMPLATE = `<!doctype html>
 <html lang="en">
@@ -196,6 +224,57 @@ export function defaultErrorPageTemplate(
   return gateway ? HTML_GATEWAY_TEMPLATE : HTML_TEMPLATE
 }
 
+/**
+ * The default challenge-page template. It is presentation only: the required
+ * DOM ids are dereferenced by the compiled script, and the script itself is
+ * injected at `{{ challenge_scripts | safe }}`.
+ */
+export function defaultChallengePageTemplate(): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>Checking your browser — {{ brand_name }}</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f8f9fa; color: #1a1a2e; }
+    .card { text-align: center; padding: 48px 32px; max-width: 480px; }
+    .brand { font-size: 18px; font-weight: 700; margin-bottom: 24px; }
+    .countdown { font-size: 20px; font-weight: 700; color: #2563eb; }
+    .spinner-wrap { margin: 24px auto; width: 64px; height: 64px; }
+    .spinner { width: 64px; height: 64px; border-radius: 50%;
+      border: 3px solid #e2e8f0; border-top-color: #2563eb;
+      animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    h1 { font-size: 20px; margin: 12px 0; }
+    .subtitle { color: #555; font-size: 14px; line-height: 1.6; }
+    .status { display: none; margin-top: 20px; font-size: 13px; }
+    .status.visible { display: block; }
+    .progress-bar { display: none; height: 4px; background: #e2e8f0; margin-top: 16px; }
+    .progress-bar.visible { display: block; }
+    .progress-bar .fill { height: 100%; width: 0; background: #2563eb; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand">{{ brand_name }}</div>
+    <div class="spinner-wrap" id="spinnerWrap"><div class="spinner"></div></div>
+    <div class="countdown" id="countdown">5</div>
+    <h1 id="title">Checking your browser…</h1>
+    <p class="subtitle" id="subtitle">Please wait while we verify your browser.</p>
+    <div class="progress-bar" id="progressBar"><div class="fill" id="progressFill"></div></div>
+    <div class="status" id="status"></div>
+    <p class="subtitle">Ray ID: {{ request_id }}</p>
+  </div>
+  {{ challenge_scripts | safe }}
+</body>
+</html>`
+}
+
 /** Friendly reason phrases for the default status codes. */
 export const ERROR_PAGE_MESSAGES: Record<number, string> = {
   404: 'Not Found',
@@ -215,15 +294,21 @@ export function renderErrorPageTemplate(
   template: string,
   sample: Record<string, string> = ERROR_PAGE_SAMPLE,
 ): string {
-  return template.replace(/\{\{\s*(\w+)\s*\}\}/g, (match, key: string) =>
-    key in sample ? sample[key] : match,
+  return template.replace(
+    /\{\{\s*(\w+)(?:\s*\|\s*safe)?\s*\}\}/g,
+    (match, key: string) => (key in sample ? sample[key] : match),
   )
 }
 
-/** Render the editor preview using the selected response status. */
-export function renderErrorPagePreview(template: string, statusCode: number): string {
+/** Render the editor preview using the selected response status and scope. */
+export function renderErrorPagePreview(
+  template: string,
+  statusCode: number,
+  scope: 'site' | 'unmatched_host' | 'challenge' = 'site',
+): string {
+  const base = scope === 'challenge' ? CHALLENGE_PAGE_SAMPLE : ERROR_PAGE_SAMPLE
   return renderErrorPageTemplate(template, {
-    ...ERROR_PAGE_SAMPLE,
+    ...base,
     error_code: String(statusCode),
     error_message: ERROR_PAGE_MESSAGES[statusCode] ?? String(statusCode),
   })

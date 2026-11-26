@@ -63,7 +63,6 @@ impl HashStrategy {
             },
             HashStrategy::Cookie(key) => {
                 get_cookie_value(session.req_header(), key)
-                    .map(Cow::Borrowed)
                     .unwrap_or(Cow::Borrowed(""))
             },
             HashStrategy::Query(key) => {

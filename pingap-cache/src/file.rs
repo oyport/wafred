@@ -1130,6 +1130,24 @@ mod tests {
     use std::time::{Duration, SystemTime};
     use tempfile::{TempDir, tempdir};
 
+    /// Backdates a file's access time.
+    ///
+    /// `filetime::set_file_atime` is deprecated by the crate, and the path-based
+    /// `std::fs::set_times` is still unstable on the 1.96 MSRV job
+    /// (`feature(fs_set_times)`), so the handle API — `File::set_times`, stable
+    /// since 1.75 — is used instead.
+    fn backdate_access_time(path: &std::path::Path, age: Duration) {
+        let handle = File::options()
+            .write(true)
+            .open(path)
+            .expect("the cache file exists");
+        handle
+            .set_times(
+                std::fs::FileTimes::new().set_accessed(SystemTime::now() - age),
+            )
+            .expect("a writable handle can set the access time");
+    }
+
     /// Tests the `parse_params` function with various query string configurations.
     #[test]
     fn test_parse_params() {
@@ -1248,12 +1266,7 @@ mod tests {
             .await
             .unwrap();
         File::create(&old_file_path).unwrap();
-        let old_time = SystemTime::now() - Duration::from_secs(3600);
-        filetime::set_file_atime(
-            &old_file_path,
-            filetime::FileTime::from_system_time(old_time),
-        )
-        .unwrap();
+        backdate_access_time(&old_file_path, Duration::from_secs(3600));
 
         // Create a new file with a recent access time.
         let new_file_path = cache.get_file_path("new_key", "ns");
@@ -1474,13 +1487,10 @@ mod tests {
         cache.put("b", b"", obj(2)).await.unwrap();
         assert_eq!(2068, cache.current_size.load(Ordering::Relaxed));
         // `a` is the one nobody touched for an hour.
-        filetime::set_file_atime(
-            cache.get_file_path("a", ""),
-            filetime::FileTime::from_system_time(
-                SystemTime::now() - Duration::from_secs(3600),
-            ),
-        )
-        .unwrap();
+        backdate_access_time(
+            &cache.get_file_path("a", ""),
+            Duration::from_secs(3600),
+        );
 
         cache.put("c", b"", obj(3)).await.unwrap();
         assert_eq!(true, cache.get("a", b"").await.unwrap().is_none());

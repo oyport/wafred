@@ -202,6 +202,10 @@ const quickstart = {
         a: "La console utilise HTTPS avec un certificat auto-signé. Faites confiance au certificat téléchargé ou importez le vôtre via Réglages → HTTPS du plan de contrôle ; renseignez WAFRED_TLS_SANS.",
       },
       {
+        q: "compose échoue avec \"failed to bind host port 127.0.0.1:5432/tcp: address already in use\"",
+        a: "Un PostgreSQL local occupe déjà le 5432. Mappez la pile compose sur un autre port hôte avec POSTGRES_PORT=55432 — ou passez --db-port 55432 à deploy/compose/install.sh, qui choisit automatiquement un port libre à partir de 55432 — puis relancez.",
+      },
+      {
         q: "Un agent n'apparaît jamais",
         a: "Vérifiez qu'il atteint le plan gRPC sur :9090 (WAFRED_SERVER_URL) et qu'aucun pare-feu ni proxy TLS ne l'en empêche.",
       },

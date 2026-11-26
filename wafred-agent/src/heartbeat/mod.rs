@@ -65,6 +65,8 @@ pub struct SystemMetrics {
     pub requests_per_second: u64,
     pub blocked_requests_total: u64,
     pub requests_total: u64,
+    /// Resident set size of this process; `None` when unavailable.
+    pub process_rss_bytes: Option<u64>,
 }
 
 /// Collects system and application metrics for the agent heartbeat.
@@ -83,6 +85,8 @@ pub struct MetricsCollector {
     rps_state: std::sync::Mutex<RpsState>,
     /// Last calculated RPS value
     cached_rps: AtomicU64,
+    /// Log entries discarded before the control plane stored them
+    logs_dropped_total: AtomicU64,
 }
 
 impl MetricsCollector {
@@ -94,7 +98,20 @@ impl MetricsCollector {
             active_connections: AtomicI64::new(0),
             rps_state: std::sync::Mutex::new(RpsState::default()),
             cached_rps: AtomicU64::new(0),
+            logs_dropped_total: AtomicU64::new(0),
         }
+    }
+
+    /// Count log entries that will never reach the control plane, wherever
+    /// they were discarded. Returns the running total.
+    pub fn record_logs_dropped(&self, count: u64) -> u64 {
+        self.logs_dropped_total.fetch_add(count, Ordering::Relaxed) + count
+    }
+
+    /// Log entries discarded since the process started; shipped with every
+    /// heartbeat so the loss is visible on the control plane.
+    pub fn logs_dropped_total(&self) -> u64 {
+        self.logs_dropped_total.load(Ordering::Relaxed)
     }
 
     /// Record a request (called on every proxied request).
@@ -155,6 +172,7 @@ impl MetricsCollector {
             requests_per_second: rps,
             blocked_requests_total: self.blocked_requests_total(),
             requests_total: self.requests_total(),
+            process_rss_bytes: probe::process_rss_bytes(),
         }
     }
 
@@ -183,6 +201,7 @@ impl MetricsCollector {
             requests_per_second: rps,
             blocked_requests_total: self.blocked_requests_total(),
             requests_total: self.requests_total(),
+            process_rss_bytes: probe::process_rss_bytes(),
         }
     }
 

@@ -64,6 +64,18 @@ pub struct DecodedValue<'a> {
     /// contain the same strings benignly, so the engine weights blob hits
     /// as weak signals.
     pub field: bool,
+    /// Full severity despite not being a field.
+    ///
+    /// The blob path is chosen by the *container*, and the container is
+    /// attacker-controlled: malformed JSON, a multipart part that declares
+    /// `application/octet-stream`, or a payload past the form cap all land in
+    /// the blob. Demoting those made "type one brace less" a bypass
+    /// (2026-11-19 review, DR32-01/02). This flag marks a blob whose content
+    /// is textual and was *not* fully unpacked into members — the only
+    /// carrier of what the client sent — so the detectors score it normally.
+    /// A blob that was parsed into members, or that is binary, keeps the weak
+    /// weighting.
+    pub text: bool,
 }
 
 /// Fully normalized view of an inbound HTTP request. Borrows the request's
@@ -109,6 +121,12 @@ pub struct Truncation {
     pub query_params: bool,
     pub form_params: bool,
     pub multipart_parts: bool,
+    /// A single multipart part was longer than the per-value decode cap. This
+    /// is a *value* truncation, not a structural one: the part list is intact,
+    /// the tail of one field was not decoded. Keeping it separate matters
+    /// because `multipart-parts` is the marker an operator reads as "the part
+    /// list was cut" (review of 0.32.33, H1).
+    pub multipart_values: bool,
     pub decoded_values: bool,
     pub value_len: bool,
     pub body_scan_cap: bool,
@@ -119,6 +137,7 @@ impl Truncation {
         !(self.query_params
             || self.form_params
             || self.multipart_parts
+            || self.multipart_values
             || self.decoded_values
             || self.value_len
             || self.body_scan_cap)
@@ -138,6 +157,9 @@ impl Truncation {
         }
         if self.multipart_parts {
             reasons.push("multipart-parts");
+        }
+        if self.multipart_values {
+            reasons.push("multipart-values");
         }
         if self.decoded_values {
             reasons.push("decoded-values");
@@ -240,6 +262,7 @@ pub fn normalize_request<'a>(
         name: Cow::Borrowed(""),
         decoded: decoded_path_raw,
         field: true,
+        text: true,
     });
     // Some routers expose a base64-encoded token as a standalone path
     // segment (`/YWxlcnQuY2FsbC...`). The full path starts with `/`, which
@@ -309,6 +332,7 @@ pub fn normalize_request<'a>(
             name: Cow::Borrowed(k.as_str()),
             decoded,
             field: true,
+            text: true,
         });
     }
 
@@ -367,6 +391,11 @@ pub fn normalize_request<'a>(
             {
                 let delimiter = format!("--{boundary}");
                 let mut parts = text.split(&delimiter);
+                // A part we cannot read as text is not "covered" by a typed
+                // member: its bytes only exist in the blob below, so the blob
+                // must score normally when it is textual. Skipping the part
+                // used to make `Content-Type: application/octet-stream` a way
+                // to hide a payload from the field-level detectors.
                 for part in parts.by_ref().take(MAX_MULTIPART_PARTS) {
                     let part = part.strip_prefix("\r\n").unwrap_or(part);
                     if part.is_empty() || part.starts_with("--") {
@@ -382,6 +411,10 @@ pub fn normalize_request<'a>(
                     // File parts are bytes, not form input: the blob below
                     // still scans them.
                     if head_lower.contains("filename=") {
+                        // A file the operator uploaded is not a typed form
+                        // field: keep the weak weighting so uploading a SQL
+                        // dump, an access log or an ASCII-heavy PDF does not
+                        // block on strings those files legitimately contain.
                         continue;
                     }
                     if head_lower.contains("content-type:")
@@ -389,6 +422,7 @@ pub fn normalize_request<'a>(
                         && !head_lower.contains("json")
                         && !head_lower.contains("xml")
                     {
+                        uncovered_part = true;
                         continue;
                     }
                     let content =
@@ -403,6 +437,10 @@ pub fn normalize_request<'a>(
                         while end > 0 && !content.is_char_boundary(end) {
                             end -= 1;
                         }
+                        // The tail of this part was not decoded into a member;
+                        // the blob below is the only place it is scanned. It is
+                        // a value-level cut, not a structural one.
+                        truncation.multipart_values = true;
                         &content[..end]
                     } else {
                         content
@@ -422,6 +460,7 @@ pub fn normalize_request<'a>(
                             .into_owned(),
                         ),
                         field: true,
+                        text: true,
                     });
                 }
                 if parts.next().is_some() {
@@ -429,13 +468,22 @@ pub fn normalize_request<'a>(
                 }
             }
             // Keep the raw body as a blob too: file parts are not form
-            // fields, and the blob scan still covers them.
+            // fields, and the blob scan still covers them. When the parts
+            // were fully unpacked the members carry the payload, so the blob
+            // stays weak; a truncated part surface means the blob is the only
+            // carrier and must score normally.
             let decoded = decode_value(text, max_decode_layers, decode_escapes);
+            let blob = decoded.into_owned();
+            let full = (truncation.multipart_parts
+                || truncation.multipart_values
+                || uncovered_part)
+                && looks_textual(&blob);
             decoded_values.push(DecodedValue {
                 source: ValueSource::Body,
                 name: Cow::Borrowed(""),
-                decoded: Cow::Owned(decoded.into_owned()),
+                decoded: Cow::Owned(blob),
                 field: false,
+                text: full,
             });
         } else if contains_ci(content_type, "application/x-www-form-urlencoded")
             || looks_like_form_body(text)
@@ -449,13 +497,18 @@ pub fn normalize_request<'a>(
             );
             // Keep the raw body as a blob too, matching multipart/JSON: a
             // payload that a per-value cap cut off is still covered by the
-            // linear blob scan.
+            // linear blob scan. A truncated form surface leaves the tail in
+            // this blob only, so it scores normally instead of as a weak
+            // signal (DR32-02: parameter 513 used to be a free bypass).
             let decoded = decode_value(text, max_decode_layers, decode_escapes);
+            let blob = decoded.into_owned();
+            let full = truncation.form_params && looks_textual(&blob);
             decoded_values.push(DecodedValue {
                 source: ValueSource::Body,
                 name: Cow::Borrowed(""),
-                decoded: Cow::Owned(decoded.into_owned()),
+                decoded: Cow::Owned(blob),
                 field: false,
+                text: full,
             });
         } else if contains_ci(content_type, "json") || looks_like_json(text) {
             // Structured bodies: keep the raw blob (bulk content can be
@@ -463,25 +516,42 @@ pub fn normalize_request<'a>(
             // detectors see typed inputs — with JSON escape handling
             // (`\u003c`) resolved by the parser itself.
             let decoded = decode_value(text, max_decode_layers, decode_escapes);
+            let blob = decoded.into_owned();
+            let blob_index = decoded_values.len();
             decoded_values.push(DecodedValue {
                 source: ValueSource::Body,
                 name: Cow::Borrowed(""),
-                decoded: Cow::Owned(decoded.into_owned()),
+                decoded: Cow::Owned(blob),
                 field: false,
+                text: false,
             });
-            unpack_json(
+            let before = decoded_values.len();
+            let members_truncated = unpack_json(
                 text,
                 max_decode_layers,
                 decode_escapes,
                 &mut decoded_values,
             );
+            // A body the parser could not unpack (or could only partly
+            // unpack) has no members to carry the payload: the blob is the
+            // request. This is the DR32-01 shape — one missing brace used to
+            // turn a blocked statement into a 2-point weak signal.
+            if decoded_values.len() == before || members_truncated {
+                if let Some(blob) = decoded_values.get_mut(blob_index) {
+                    blob.text = looks_textual(&blob.decoded);
+                }
+            }
         } else {
+            // No container to unpack: whatever the client sent is the input.
             let decoded = decode_value(text, max_decode_layers, decode_escapes);
+            let blob = decoded.into_owned();
+            let full = looks_textual(&blob);
             decoded_values.push(DecodedValue {
                 source: ValueSource::Body,
                 name: Cow::Borrowed(""),
-                decoded: Cow::Owned(decoded.into_owned()),
+                decoded: Cow::Owned(blob),
                 field: false,
+                text: full,
             });
         }
     }
@@ -753,6 +823,7 @@ fn parse_query<'a>(
         // A query value that is itself serialized JSON (`?id={"id":"…"}`) is
         // unpacked in place, same as form fields — the container shape hides
         // the member payloads from every detector otherwise.
+        let mut nested_truncated = false;
         if !val_decoded.is_empty()
             && unpack_string_json(
                 &val_decoded,
@@ -761,6 +832,7 @@ fn parse_query<'a>(
                 max_decode_layers,
                 decode_escapes,
                 decoded_values,
+                &mut nested_truncated,
             )
         {
             continue;
@@ -777,6 +849,7 @@ fn parse_query<'a>(
                 name: Cow::Borrowed(""),
                 decoded: key_decoded.clone(),
                 field: true,
+                text: true,
             });
         }
         decoded_values.push(DecodedValue {
@@ -784,6 +857,7 @@ fn parse_query<'a>(
             name: key_decoded,
             decoded: val_decoded,
             field: true,
+            text: true,
         });
     }
     if let Some(tail) = pairs.next() {
@@ -800,6 +874,9 @@ fn parse_query<'a>(
                     .into_owned(),
             ),
             field: false,
+            // Query values never reach the weak branch (`source` is not
+            // `Body`), so this flag is inert here; `false` keeps it honest.
+            text: false,
         });
     }
 }
@@ -944,6 +1021,7 @@ fn parse_form_body(
         // embed `param={"add":5,"delete":0}`) is unpacked in place — the
         // `"key":value` container shape trips libinjection's quote-keyword
         // fingerprint on completely benign payloads.
+        let mut nested_truncated = false;
         if !val_decoded.is_empty()
             && unpack_string_json(
                 &val_decoded,
@@ -952,8 +1030,12 @@ fn parse_form_body(
                 max_decode_layers,
                 decode_escapes,
                 decoded_values,
+                &mut nested_truncated,
             )
         {
+            if nested_truncated {
+                truncation.form_params = true;
+            }
             continue;
         }
         // Mirror the query-side key scan surface (1KB bound) — form keys are
@@ -964,6 +1046,7 @@ fn parse_form_body(
                 name: Cow::Borrowed(""),
                 decoded: Cow::Owned(key_decoded.to_string()),
                 field: true,
+                text: true,
             });
         }
         decoded_values.push(DecodedValue {
@@ -971,6 +1054,7 @@ fn parse_form_body(
             name: Cow::Owned(key_decoded.into_owned()),
             decoded: Cow::Owned(val_decoded.into_owned()),
             field: true,
+            text: true,
         });
     }
     if let Some(tail) = pairs.next() {
@@ -983,8 +1067,33 @@ fn parse_form_body(
                     .into_owned(),
             ),
             field: false,
+            // Form pairs past the cap: nothing else carries them.
+            text: true,
         });
     }
+}
+
+/// Whether a decoded blob is text a client could have typed.
+///
+/// Binary uploads decode (lossily) into replacement characters and control
+/// bytes; an injection typed into a body does not. This is what keeps the
+/// weak weighting for genuine file uploads while a textual payload that the
+/// container hid from the parser scores normally.
+fn looks_textual(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    let mut total = 0usize;
+    let mut control = 0usize;
+    for ch in value.chars() {
+        total += 1;
+        if ch == '\u{FFFD}'
+            || (ch.is_control() && ch != '\t' && ch != '\n' && ch != '\r')
+        {
+            control += 1;
+        }
+    }
+    control * 20 <= total
 }
 
 /// Upper bounds that keep JSON unpacking a bounded operation regardless of
@@ -1031,14 +1140,15 @@ fn unpack_json<'a>(
     max_decode_layers: usize,
     decode_escapes: bool,
     decoded_values: &mut Vec<DecodedValue<'a>>,
-) {
+) -> bool {
     if body.len() > JSON_MAX_VALUE_LEN * 64 {
-        return;
+        return true;
     }
     let Ok(root) = serde_json::from_str::<serde_json::Value>(body) else {
-        return;
+        return false;
     };
     let mut count = 0usize;
+    let mut truncated = false;
     walk_json(
         &root,
         0,
@@ -1047,7 +1157,9 @@ fn unpack_json<'a>(
         decode_escapes,
         decoded_values,
         &mut count,
+        &mut truncated,
     );
+    truncated
 }
 
 /// Parse a string value that is itself serialized JSON and unpack its
@@ -1063,6 +1175,7 @@ fn unpack_string_json<'a>(
     max_decode_layers: usize,
     decode_escapes: bool,
     decoded_values: &mut Vec<DecodedValue<'a>>,
+    truncated: &mut bool,
 ) -> bool {
     if depth >= JSON_MAX_DEPTH || s.is_empty() || s.len() > JSON_MAX_VALUE_LEN {
         return false;
@@ -1090,6 +1203,9 @@ fn unpack_string_json<'a>(
     };
     let before = decoded_values.len();
     let mut count = 0usize;
+    // The nested walk shares the caller's truncation flag: a member hidden by
+    // the budget inside a serialized-JSON string is just as unextracted as one
+    // at the top level, and the container is replaced either way.
     walk_json(
         &nested,
         depth + 1,
@@ -1098,6 +1214,7 @@ fn unpack_string_json<'a>(
         decode_escapes,
         decoded_values,
         &mut count,
+        truncated,
     );
     // Replace the container only when members were actually extracted —
     // a value the depth budget rejected stays put rather than vanishing.
@@ -1207,6 +1324,9 @@ fn expand_base64<'a>(
             } else {
                 format!("{}.b64", decoded_values[index].name)
             });
+            // The decoded value becomes a field, so a cut inside it is not a
+            // blob-coverage question; the scratch flag is discarded.
+            let mut ignored_truncation = false;
             if looks_like_json(&decoded)
                 && unpack_string_json(
                     &decoded,
@@ -1215,6 +1335,7 @@ fn expand_base64<'a>(
                     max_decode_layers,
                     decode_escapes,
                     decoded_values,
+                    &mut ignored_truncation,
                 )
             {
                 continue;
@@ -1239,6 +1360,7 @@ fn expand_base64<'a>(
                         max_decode_layers,
                         decode_escapes,
                         decoded_values,
+                        &mut ignored_truncation,
                     ) {
                         continue;
                     }
@@ -1249,6 +1371,7 @@ fn expand_base64<'a>(
                 name,
                 decoded: Cow::Owned(decoded),
                 field: true,
+                text: true,
             });
         }
         layer_start = layer_end;
@@ -1340,6 +1463,7 @@ fn expand_b64_substrings<'a>(
                 name,
                 decoded: Cow::Owned(decoded),
                 field: true,
+                text: true,
             });
         }
     }
@@ -1406,13 +1530,22 @@ fn walk_json<'a>(
     decode_escapes: bool,
     decoded_values: &mut Vec<DecodedValue<'a>>,
     count: &mut usize,
+    truncated: &mut bool,
 ) {
     if *count >= JSON_MAX_VALUES {
+        // Members past the extraction budget are not in the field set; the
+        // blob is the only place their bytes are scanned, so the caller must
+        // know the extraction was partial (2026-11-19 review, M2).
+        *truncated = true;
         return;
     }
     match value {
         serde_json::Value::String(s) => {
-            if s.is_empty() || s.len() > JSON_MAX_VALUE_LEN {
+            if s.is_empty() {
+                return;
+            }
+            if s.len() > JSON_MAX_VALUE_LEN {
+                *truncated = true;
                 return;
             }
             // A string member that is itself serialized JSON (nested
@@ -1426,6 +1559,7 @@ fn walk_json<'a>(
                 max_decode_layers,
                 decode_escapes,
                 decoded_values,
+                truncated,
             ) {
                 *count += 1;
                 return;
@@ -1436,11 +1570,13 @@ fn walk_json<'a>(
                 name: Cow::Owned(path),
                 decoded: Cow::Owned(decoded.into_owned()),
                 field: true,
+                text: true,
             });
             *count += 1;
         },
         serde_json::Value::Array(items) => {
             if depth >= JSON_MAX_DEPTH {
+                *truncated = true;
                 return;
             }
             for (i, item) in items.iter().enumerate() {
@@ -1452,11 +1588,13 @@ fn walk_json<'a>(
                     decode_escapes,
                     decoded_values,
                     count,
+                    truncated,
                 );
             }
         },
         serde_json::Value::Object(map) => {
             if depth >= JSON_MAX_DEPTH {
+                *truncated = true;
                 return;
             }
             for (k, v) in map {
@@ -1473,6 +1611,7 @@ fn walk_json<'a>(
                     decode_escapes,
                     decoded_values,
                     count,
+                    truncated,
                 );
             }
         },
@@ -1489,6 +1628,7 @@ fn walk_json<'a>(
                 name: Cow::Owned(path),
                 decoded: Cow::Owned(n.to_string()),
                 field: true,
+                text: true,
             });
             *count += 1;
         },
@@ -1501,6 +1641,7 @@ fn walk_json<'a>(
                 name: Cow::Owned(path),
                 decoded: Cow::Owned(b.to_string()),
                 field: true,
+                text: true,
             });
             *count += 1;
         },
@@ -1533,6 +1674,7 @@ fn parse_cookies<'a>(
             name: key_decoded,
             decoded: val_decoded,
             field: true,
+            text: true,
         });
     }
 }
@@ -1911,6 +2053,35 @@ mod tests {
             .decoded_values
             .iter()
             .any(|value| value.field && value.name == "upload"));
+    }
+
+    /// H1: a part longer than the per-value decode cap is a *value* cut, not a
+    /// structural one. The marker an operator reads must not say "the part
+    /// list was truncated" when only one field was long.
+    #[test]
+    fn a_long_part_reports_a_value_cut_not_a_structural_one() {
+        let long = "x".repeat(MAX_DECODED_VALUE_LEN + 64);
+        let body = format!(
+            "--X\r\nContent-Disposition: form-data; name=\"body\"\r\n\
+             Content-Type: text/plain\r\n\r\n{long}\r\n--X--\r\n"
+        );
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "multipart/form-data; boundary=X".to_string(),
+        )];
+        let req = normalize_request(
+            "POST",
+            "/comment",
+            "",
+            &headers,
+            Some(body.as_bytes()),
+            3,
+            false,
+        );
+        assert!(req.truncation.multipart_values, "{:?}", req.truncation);
+        assert!(!req.truncation.multipart_parts, "{:?}", req.truncation);
+        let detail = req.truncation.detail().unwrap_or_default();
+        assert!(detail.contains("multipart-values"), "{detail}");
     }
 
     #[test]

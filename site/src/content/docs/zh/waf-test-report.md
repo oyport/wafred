@@ -23,7 +23,7 @@ WAFred 新增有界的未声明类型 URL-encoded / multipart 表单解析、Bas
 
 ## 与其他防火墙的历史比较
 
-图表将 WAFred 1.0.4 本轮实测与 PingWAF 早期版本最后一轮 P13 结果并列，并保留 SafeLine、ModSecurity 和 Cloudflare 的历史参考。早期测试使用相同名义语料，但请求体 framing 路径不同；本轮回放器修正了 15 个 framing 相关 HTTP 500。这里呈现的是各版本的实测记录，并非严格控制变量的前后实验。其他产品本轮未重测，样本分母和网络链路也不同。WAFred p95 包含虚拟机、代理及模拟源站，不宜直接比较不同链路的时延。
+图表将 WAFred 1.0.4 本轮实测与 WAFred 早期版本最后一轮 P13 结果并列，并保留 SafeLine、ModSecurity 和 Cloudflare 的历史参考。早期测试使用相同名义语料，但请求体 framing 路径不同；本轮回放器修正了 15 个 framing 相关 HTTP 500。这里呈现的是各版本的实测记录，并非严格控制变量的前后实验。其他产品本轮未重测，样本分母和网络链路也不同。WAFred p95 包含虚拟机、代理及模拟源站，不宜直接比较不同链路的时延。
 
 ## 压缩请求体与 HTTPS
 
@@ -35,4 +35,4 @@ gzip 套件中，关闭请求体检查时拦截 0/8 条攻击；Normal + body �
 
 256 并发三分钟 soak、512 并发文件句柄结果来自原部署二进制，不是本次修复候选版。原进程软 `nofile=1,024` 在 512 并发出现 502；隔离副本提高到 65,536 后未出现 502，部署中的 all-in-one 没有修改。
 
-安全矩阵使用隔离的 HTTP/1.1 代理和模拟源站。真实业务源站、HTTP/2/HTTP/3、生产路由、限速/CC 和候选版本高并发 soak 仍待补测。完整漏报归因、机器分工和归档见[WAFred 完整基准报告](https://github.com/oyport/wafred/blob/main/docs/wafred-baseline-test-report-2026-11-22.md)。本轮沿用早期 PingWAF 测试的语料和分析脉络；[基准附录](https://github.com/oyport/wafred/blob/main/docs/waf-benchmark-report.md)同时呈现相关背景与 WAFred 当前实测。
+安全矩阵使用隔离的 HTTP/1.1 代理和模拟源站。真实业务源站、HTTP/2/HTTP/3、生产路由、限速/CC 和候选版本高并发 soak 仍待补测。完整漏报归因、机器分工和归档见[WAFred 完整基准报告](https://github.com/oyport/wafred/blob/main/docs/wafred-baseline-test-report-2026-11-22.md)。本轮沿用早期 WAFred 测试的语料和分析脉络；[基准附录](https://github.com/oyport/wafred/blob/main/docs/waf-benchmark-report.md)同时呈现相关背景与 WAFred 当前实测。

@@ -10,6 +10,7 @@
 
 pub mod ai;
 pub mod api;
+pub mod asn;
 pub mod auth;
 pub mod boot_history;
 pub mod config;
@@ -29,8 +30,11 @@ pub mod models;
 pub mod monitoring;
 pub mod notify;
 pub mod pki;
+pub mod site_cert;
 pub mod subscription;
 pub mod tls;
+pub mod tunnel_policy;
+pub mod tunnel_token;
 
 pub use config::ServerConfig;
 
@@ -45,6 +49,9 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 
 use crate::api::state::AppState;
+
+mod acme_state_sync;
+mod site_cert_renewal;
 use crate::es::{ensure_index_template, ElasticsearchClient};
 use crate::grpc::{AgentRegistry, ControlPlaneService};
 use crate::migration::Migrator;
@@ -62,6 +69,11 @@ use crate::models::{instance_setting, role, user};
 pub async fn start_server(mut config: ServerConfig) -> anyhow::Result<()> {
     // ── 1. Validate ──────────────────────────────────────────────────────────
     config.validate()?;
+
+    // The tunnel session-token key is derived from the JWT secret: initialise
+    // it once, before any pairing RPC can mint a token or a bundle can carry
+    // the public half.
+    crate::tunnel_token::init(&config.jwt_secret);
 
     tracing::info!(
         http_addr = %config.http_addr,
@@ -91,6 +103,21 @@ pub async fn start_server(mut config: ServerConfig) -> anyhow::Result<()> {
         .await
         .map_err(|err| anyhow::anyhow!("migration failed: {err}"))?;
     tracing::info!("schema migrations applied");
+
+    // Load the MaxMind ASN database (when one is configured) before the first
+    // log batch arrives: the read is file I/O, so it runs on a blocking thread
+    // rather than inside the ingestion path. A missing database is not an
+    // error — `access_logs.asn` then stays NULL and the ASN ranking is empty.
+    if let Err(error) = tokio::task::spawn_blocking(|| {
+        crate::asn::warm();
+        // The name mapping is also a lazy file read; warm it here so the first
+        // analytics request never touches the filesystem.
+        crate::asn::warm_names();
+    })
+    .await
+    {
+        tracing::warn!(%error, "ASN warm-up task failed");
+    }
 
     // Apply retention at startup as well as in the daily monitor: a scope that
     // has not produced a new version recently must not keep expired rows.
@@ -212,6 +239,14 @@ pub async fn start_server(mut config: ServerConfig) -> anyhow::Result<()> {
         control_tls: control_tls.clone(),
         protection: Arc::new(api::self_protection::SelfProtection::new()),
     };
+
+    // All-in-one: the embedded data plane issues ACME certificates into its
+    // local acme_state.toml. Mirror them into site_certificates so every
+    // agent receives the PEM instead of each trying (and failing) its own
+    // HTTP-01 order. A server-only deployment has no path and skips this.
+    if let Some(path) = shared_config.acme_state_path.as_deref() {
+        acme_state_sync::spawn(state.clone(), std::path::PathBuf::from(path));
+    }
 
     // ── 6d. Control plane self-protection ───────────────────────────────────
     // Load the initial policy (access log, IP allowlist, WAF), start the log
@@ -415,6 +450,22 @@ pub async fn start_server(mut config: ServerConfig) -> anyhow::Result<()> {
 
     // ── 9d. Start the certificate expiry scanner ────────────────────────────
     let _cert_expiry_handle = notify::cert_expiry::start(db.clone());
+
+    // ── 9e. Issue and renew self-signed site certificates ───────────────────
+    // A site that enables HTTPS with the self-signed mode used to push a TLS
+    // listener with no certificate, so every handshake failed. Issue the leaf
+    // now (before the first config push) and keep it renewed from here on.
+    match site_cert_renewal::reconcile(&state).await {
+        Ok(0) => {},
+        Ok(count) => {
+            tracing::info!(count, "issued self-signed site certificates")
+        },
+        Err(err) => tracing::warn!(
+            error = %err,
+            "self-signed certificate reconcile failed"
+        ),
+    }
+    let _site_cert_handle = site_cert_renewal::spawn(state.clone());
 
     // ── 10. Spawn and wait for shutdown ─────────────────────────────────────
     tokio::select! {

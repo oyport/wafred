@@ -60,7 +60,17 @@ const STATS_LIMIT: i64 = 20;
 pub struct CountryStat {
     pub country_code: String,
     pub requests: i64,
+    /// Requests the WAF refused in the same window (HTTP 403/429, the same
+    /// definition `analytics::top-ips` uses). Drives the globe's threat layer,
+    /// so the map can show where attacks come from next to where traffic does.
+    pub blocked: i64,
 }
+
+/// WAF refusal, matching `analytics::BLOCKED_REQUESTS_FILTER` — one definition
+/// per surface so "blocked" cannot mean 403-only on one page and 403+429 on
+/// another.
+const BLOCKED_SQL: &str =
+    "COUNT(*) FILTER (WHERE status_code = 403 OR status_code = 429)";
 
 /// Routes contributed to `/api/v1`.
 pub fn routes() -> Router<AppState> {
@@ -96,11 +106,13 @@ async fn geo_stats(
         chrono::Utc::now() - chrono::Duration::hours(STATS_WINDOW_HOURS);
     let rows = query_all(
         &state.db,
-        "SELECT country_code, COUNT(*) AS requests \
-         FROM access_logs \
-         WHERE site_id = $1 AND timestamp >= $2 \
-           AND country_code IS NOT NULL AND country_code <> '' \
-         GROUP BY country_code ORDER BY requests DESC LIMIT $3",
+        &format!(
+            "SELECT country_code, COUNT(*) AS requests, {BLOCKED_SQL} AS blocked \
+             FROM access_logs \
+             WHERE site_id = $1 AND timestamp >= $2 \
+               AND country_code IS NOT NULL AND country_code <> '' \
+             GROUP BY country_code ORDER BY requests DESC LIMIT $3"
+        ),
         vec![id.into(), since.into(), STATS_LIMIT.into()],
     )
     .await?;
@@ -114,6 +126,7 @@ async fn geo_stats(
                 requests: row
                     .try_get::<i64>("", "requests")
                     .unwrap_or_default(),
+                blocked: row.try_get::<i64>("", "blocked").unwrap_or_default(),
             })
             .collect(),
     ))
@@ -141,11 +154,11 @@ async fn geo_global_stats(
 
     // Same visibility rule the config-push path uses: administrators see
     // everything, tenants see the sites they own.
-    let mut sql = String::from(
-        "SELECT country_code, COUNT(*) AS requests \
+    let mut sql = format!(
+        "SELECT country_code, COUNT(*) AS requests, {BLOCKED_SQL} AS blocked \
          FROM access_logs \
          WHERE timestamp >= $1 \
-           AND country_code IS NOT NULL AND country_code <> ''",
+           AND country_code IS NOT NULL AND country_code <> ''"
     );
     let mut values: Vec<sea_orm::Value> = vec![since.into()];
     if !current.is_admin() {
@@ -180,6 +193,7 @@ async fn geo_global_stats(
                 requests: row
                     .try_get::<i64>("", "requests")
                     .unwrap_or_default(),
+                blocked: row.try_get::<i64>("", "blocked").unwrap_or_default(),
             })
             .collect(),
     ))

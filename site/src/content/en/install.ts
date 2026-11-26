@@ -46,7 +46,7 @@ const install = {
       {
         id: "agent",
         label: "Agent",
-        body: "A data-plane node that proxies traffic and connects to a control plane over gRPC. Keeps no database; needs --server-url and an enrollment key.",
+        body: "A data-plane node that proxies traffic and connects to a control plane over gRPC. The installer fetches the agent-only build (no database, REST API or dashboard); needs --server-url and an enrollment key. The control plane must be 0.32.40+ for certificate distribution; agents are currently unbound and receive every site owned by the key's owner.",
         flags: ["--mode agent", "--server-url https://cp:9090", "--api-key pwk_…"],
       },
     ],
@@ -146,7 +146,7 @@ const install = {
         },
         {
           title: "Sign in",
-          body: "Open https://<host>:9080 and use ADMIN_EMAIL / ADMIN_PASSWORD (the default password must be changed at first sign-in). Then add a site.",
+          body: "Open https://<host>:9080 and use ADMIN_EMAIL / ADMIN_PASSWORD. On a fresh database sign-in succeeds, but every write (add a site, add a rule) answers 403 {\"code\":\"password_change_required\"} until the seeded password is changed: in the console under Settings → Account, or via the API — PUT /api/v1/auth/password with current_password / new_password returns 204 and revokes the current token, so sign in again with the new password. Then add a site.",
         }
       ],
       fields: [
@@ -199,10 +199,13 @@ const install = {
       upgradeTitle: "Upgrading",
       upgradeBody:
         "Pulls the image for the tag in your .env and recreates the container with the same volumes — configuration, data and certificates survive the restart. Pin the tag when you want controlled upgrades.",
-      upgradeCommand: "docker compose pull && docker compose up -d",
+      upgradeCommand:
+        "sudo docker compose pull && sudo docker compose up -d   # drop sudo if your user is in the docker group",
       requirements: [
         "Docker Engine 24+ with the Compose v2 plugin (docker compose, not the legacy docker-compose binary).",
+        "Docker permissions: without sudo (or membership in the docker group) compose fails with permission denied … docker.sock. Users in the docker group can drop the sudo.",
         "Ports 80, 443, 9080 and 9090 free on the host — or override them in the fields below.",
+        "If the host already runs PostgreSQL on 5432, the installer picks a free port from 55432 up (or accept --db-port) and writes it to POSTGRES_PORT in .env.",
         "No external database needed: the compose file ships its own PostgreSQL 16 container with named volumes.",
         "The dashboard serves HTTPS with a self-signed certificate on first boot. Upload a real one under Settings → Control plane HTTPS, or set TLS_ENABLED=false for plain HTTP.",
       ],

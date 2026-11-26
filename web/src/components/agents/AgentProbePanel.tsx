@@ -5,6 +5,7 @@ import {
   Area,
   AreaChart,
   CartesianGrid,
+  ComposedChart,
   Legend,
   Line,
   LineChart,
@@ -59,7 +60,8 @@ interface ProbePoint {
   load1: number | null
   load5: number | null
   load15: number | null
-  memoryPercent: number | null
+  memoryUsed: number | null
+  processRss: number | null
   rxRate: number | null
   txRate: number | null
 }
@@ -86,35 +88,7 @@ export function AgentProbePanel({ agentId }: { agentId: string }) {
     [samplesQuery.data],
   )
 
-  const points = useMemo<ProbePoint[]>(() => {
-    const ascending = [...samples].sort(
-      (a, b) => sampleTime(a) - sampleTime(b),
-    )
-
-    return ascending.map((sample, i) => {
-      const previous = i > 0 ? ascending[i - 1] : undefined
-      const previousAt = previous ? sampleTime(previous) : 0
-      const at = sampleTime(sample)
-      const elapsed = (at - previousAt) / 1000
-      const rate = (current: number | null, before: number | null) => {
-        if (current === null || before === null || elapsed <= 0) return null
-        // Counters reset when the host reboots; clamp instead of drawing a spike.
-        return Math.max(0, (current - before) / elapsed)
-      }
-
-      return {
-        at,
-        time: formatTime(sample.sampled_at),
-        cpu: sample.cpu_usage_percent,
-        load1: sample.load1,
-        load5: sample.load5,
-        load15: sample.load15,
-        memoryPercent: percent(sample.memory_used_bytes, sample.memory_total_bytes),
-        rxRate: rate(sample.net_rx_bytes, previous?.net_rx_bytes ?? null),
-        txRate: rate(sample.net_tx_bytes, previous?.net_tx_bytes ?? null),
-      }
-    })
-  }, [samples])
+  const points = useMemo<ProbePoint[]>(() => buildProbePoints(samples), [samples])
 
   const latest = useMemo(() => latestSample(samples), [samples])
   const memoryPercent = percent(latest?.memory_used_bytes, latest?.memory_total_bytes)
@@ -204,7 +178,7 @@ export function AgentProbePanel({ agentId }: { agentId: string }) {
           title={t('pages.agents.probe.memoryPercent')}
           description={t('pages.agents.probe.memoryHint')}
         >
-          <AreaChart data={points} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
+          <ComposedChart data={points} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
             <defs>
               <linearGradient id="probeMem" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0%" stopColor="#0051c3" stopOpacity={0.35} />
@@ -213,10 +187,33 @@ export function AgentProbePanel({ agentId }: { agentId: string }) {
             </defs>
             <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border-line)" vertical={false} />
             <XAxis dataKey="time" tick={axisTick} tickLine={false} axisLine={{ stroke: 'var(--color-border-line)' }} minTickGap={28} />
-            <YAxis tick={axisTick} tickLine={false} axisLine={false} domain={[0, 100]} tickFormatter={(v: number) => `${v}%`} />
-            <Tooltip contentStyle={tooltipStyle} formatter={(v) => formatPercent(Number(v ?? 0) / 100)} />
-            <Area type="monotone" dataKey="memoryPercent" name={t('pages.agents.probe.memory')} stroke="#0051c3" strokeWidth={2} fill="url(#probeMem)" connectNulls />
-          </AreaChart>
+            <YAxis
+              tick={axisTick}
+              tickLine={false}
+              axisLine={false}
+              tickFormatter={(v: number) => formatSize(v)}
+            />
+            <Tooltip contentStyle={tooltipStyle} formatter={memoryTooltipValue} />
+            <Legend wrapperStyle={{ fontSize: 12 }} iconType="circle" formatter={(value) => (value === 'processRss' ? t('pages.agents.probe.memoryProcessRss') : value)} />
+            <Area
+              type="monotone"
+              dataKey="memoryUsed"
+              name={t('pages.agents.probe.memory')}
+              stroke="#0051c3"
+              strokeWidth={2}
+              fill="url(#probeMem)"
+              connectNulls
+            />
+            <Line
+              type="monotone"
+              dataKey="processRss"
+              name="processRss"
+              stroke="#e54d2a"
+              strokeWidth={2}
+              dot={false}
+              connectNulls
+            />
+          </ComposedChart>
         </ProbeChart>
 
         <ProbeChart
@@ -311,6 +308,50 @@ function ProbeTile({
 function sampleTime(sample: HostSample): number {
   const parsed = new Date(sample.sampled_at).getTime()
   return Number.isNaN(parsed) ? 0 : parsed
+}
+
+/**
+ * Chart-ready points from newest-first API samples: sorted ascending, network
+ * counters differenced into rates, memory as a host percentage, plus the agent
+ * process's own RSS (`null` for old agents — drawn as a gap via connectNulls).
+ */
+export function buildProbePoints(samples: HostSample[]): ProbePoint[] {
+  const ascending = [...samples].sort((a, b) => sampleTime(a) - sampleTime(b))
+
+  return ascending.map((sample, i) => {
+    const previous = i > 0 ? ascending[i - 1] : undefined
+    const previousAt = previous ? sampleTime(previous) : 0
+    const at = sampleTime(sample)
+    const elapsed = (at - previousAt) / 1000
+    const rate = (current: number | null, before: number | null) => {
+      if (current === null || before === null || elapsed <= 0) return null
+      // Counters reset when the host reboots; clamp instead of drawing a spike.
+      return Math.max(0, (current - before) / elapsed)
+    }
+
+    return {
+      at,
+      time: formatTime(sample.sampled_at),
+      cpu: sample.cpu_usage_percent,
+      load1: sample.load1,
+      load5: sample.load5,
+      load15: sample.load15,
+      memoryUsed: sample.memory_used_bytes,
+      processRss: sample.process_rss_bytes,
+      rxRate: rate(sample.net_rx_bytes, previous?.net_rx_bytes ?? null),
+      txRate: rate(sample.net_tx_bytes, previous?.net_tx_bytes ?? null),
+    }
+  })
+}
+
+/**
+ * Tooltip value for the memory chart: the RSS series is absolute bytes (so it
+ * must never be divided by 100 like the percentage series).
+ */
+export function memoryTooltipValue(value: unknown, _name: unknown): string {
+  // recharts calls formatter(value, name, item, ...): the FIRST argument is the
+  // value. Both memory series are in bytes now, so format uniformly as a size.
+  return formatSize(Number(value ?? 0))
 }
 
 /** Newest sample by `sampled_at`, which is what the API returns first anyway. */

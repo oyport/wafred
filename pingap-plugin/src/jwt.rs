@@ -547,7 +547,15 @@ impl Plugin for JwtAuth {
         if req_header.uri.path() == self.auth_path {
             return Ok(RequestPluginResult::Skipped);
         }
-        let value = if let Some(key) = &self.header {
+        // Resolved up front so the branch below stays a `&str`: the cookie
+        // accessor may have to join several `Cookie` fields (HTTP/2 splits
+        // them), which allocates, and the joined value has to outlive the
+        // borrow of it.
+        let cookie_value = self
+            .cookie
+            .as_ref()
+            .and_then(|key| pingap_core::get_cookie_value(req_header, key));
+        let value: &str = if let Some(key) = &self.header {
             let value = pingap_core::get_req_header_value(req_header, key)
                 .unwrap_or_default();
             let bearer = "Bearer ";
@@ -556,8 +564,8 @@ impl Plugin for JwtAuth {
             } else {
                 value
             }
-        } else if let Some(key) = &self.cookie {
-            pingap_core::get_cookie_value(req_header, key).unwrap_or_default()
+        } else if let Some(value) = cookie_value.as_deref() {
+            value
         } else if let Some(key) = &self.query {
             pingap_core::get_query_value(req_header, key).unwrap_or_default()
         } else {

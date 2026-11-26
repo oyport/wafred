@@ -83,6 +83,7 @@
 - **请求 / 响应改写**——头部、路径、查询参数、状态码与响应体查找替换。
 - **自定义错误页**，基于 Tera 模板渲染；对 WAF 拦截、站点暂停等边缘生成的响应同样生效。
 - **暂停站点**——在控制台一键暂停后，所有请求返回 `503` 维护页，证书照常握手、流量照常入日志。
+- **隧道（Tunnel）**——内网服务**无需入站端口、无需公网 IP** 即可接入：独立二进制 `wafred-tunnel` 主动向边缘节点拨号，绑定隧道的源站池经正常请求链路（WAF、限流、缓存、日志、证书）转发。配对与管理统一在 **边缘节点 → 隧道** 页；详见 [用户指南](docs/zh/user-guide.md#tunnel内网服务免入站端口接入)。
 
 ### 🔐 TLS 与证书
 - **ACME / Let's Encrypt 自动签发与续期**，直接在边缘完成（HTTP-01 与 DNS-01）。
@@ -161,7 +162,7 @@ WAFred 行是 2026-11-22 修正 framing 后的本地实测。PingWAF 早期 P13 
 | --- | --- |
 | [`pingwaf-proto`](./wafred-proto) | 控制面 gRPC 协议定义（单一来源：`control_plane.proto`） |
 | [`pingwaf-server`](./wafred-server) | 控制面：Axum REST + tonic gRPC + SeaORM/PostgreSQL + ES 日志 + 内嵌前端 + Agent 健康监控 |
-| [`pingwaf-agent`](./wafred-agent) | 数据面 Agent：连接控制面、规则缓存 + 磁盘持久化、回传日志/指标、接收命令 |
+| [`wafred-agent`](./wafred-agent) | 数据面 Agent：连接控制面、规则缓存 + 磁盘持久化、回传日志/指标、接收命令 |
 | [`pingwaf-waf`](./wafred-waf) | 检测引擎：归一化 → 签名 → 表达式 → 异常评分 |
 | [`pingwaf-challenge`](./wafred-challenge) | 动态挑战子系统：JS 5 秒盾、交互式挑战、PoW、浏览器指纹、HMAC 签名 clearance cookie |
 | `pingwaf-profiler` / `pingwaf-system`（无 README） | 进程内 CPU/内存归因与快照，经 `/api/v1/system/profile` 与 `/api/v1/system/metrics` 提供 |

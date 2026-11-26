@@ -14,6 +14,12 @@ export interface DialogProps {
   footer?: ReactNode
   size?: 'sm' | 'md' | 'lg' | 'xl'
   className?: string
+  /**
+   * When false, the dialog can only be closed through its own controls: the
+   * overlay, Escape and the close button are inert. Used for a dialog that
+   * carries a secret shown exactly once, where a stray click would destroy it.
+   */
+  dismissible?: boolean
 }
 
 const sizeClasses = {
@@ -42,6 +48,7 @@ export function Dialog({
   footer,
   size = 'md',
   className,
+  dismissible = true,
 }: DialogProps) {
   const { t } = useTranslation()
   const panelRef = useRef<HTMLDivElement>(null)
@@ -50,7 +57,7 @@ export function Dialog({
   useEffect(() => {
     if (!open) return
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
+      if (e.key === 'Escape' && dismissible) onClose()
       if (e.key === 'Tab' && panelRef.current) {
         // Simple focus trap: cycle Tab/Shift+Tab between the first and last
         // focusable elements so keyboard focus cannot escape the dialog.
@@ -79,7 +86,7 @@ export function Dialog({
       document.removeEventListener('keydown', onKey)
       document.body.style.overflow = prev
     }
-  }, [open, onClose])
+  }, [open, onClose, dismissible])
 
   useEffect(() => {
     if (!open) return
@@ -103,7 +110,7 @@ export function Dialog({
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div
         className="absolute inset-0 animate-fade-in bg-overlay"
-        onClick={onClose}
+        onClick={dismissible ? onClose : undefined}
         aria-hidden
       />
       <div
@@ -128,13 +135,15 @@ export function Dialog({
                 <p className="mt-0.5 text-[13px] text-fg-subtle">{description}</p>
               )}
             </div>
-            <Button
-              size="icon"
-              variant="ghost"
-              aria-label={t('common.close')}
-              onClick={onClose}
-              icon={<X weight="bold" className="h-4 w-4" />}
-            />
+            {dismissible && (
+              <Button
+                size="icon"
+                variant="ghost"
+                aria-label={t('common.close')}
+                onClick={onClose}
+                icon={<X weight="bold" className="h-4 w-4" />}
+              />
+            )}
           </div>
         )}
         {children && (

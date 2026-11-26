@@ -25,6 +25,18 @@ path = "src/main.rs"
 name = "wafred"
 path = "src/main.rs"
 
+# Edge-agent-only build: the data plane and its rule cache, without the
+# control plane (PostgreSQL, the REST API and the embedded dashboard). It is
+# compiled as its own release artifact so an agent node does not download or
+# map the control plane's code and assets; `--mode agent` in install.sh fetches
+# it. `required-features` keeps a plain `cargo build` from silently producing a
+# fat agent binary, and `edge` only gates code — it does not change the
+# dependency graph, so the two builds share the cargo cache.
+[[bin]]
+name = "wafred-agent"
+path = "src/edge_main.rs"
+required-features = ["edge"]
+
 [lints.clippy]
 # Set the unwrap_used lint level to deny
 unwrap_used = "deny"
@@ -77,10 +89,11 @@ pingap-webhook = { workspace = true }
 pingwaf-server = { path = "wafred-server" }
 # TLS backend is selected by this crate's own feature chain (`openssl` /
 # `tls-rustls`), mirroring the `pingap-*` workspace convention: the
-# dependency must not drag `pingwaf-agent`'s default (openssl) into a
+# dependency must not drag `wafred-agent`'s default (openssl) into a
 # rustls build — the two pingora backends are mutually exclusive and
 # unify into a compile error if both end up on.
 pingwaf-agent = { path = "wafred-agent", default-features = false }
+wafred-tunnel = { workspace = true }
 anyhow = { workspace = true }
 pingora = { workspace = true }
 regex = { workspace = true }
@@ -155,6 +168,13 @@ tracing = [
 ]
 full = ["tracing", "imageoptim"]
 perf = ["pyro", "full"]
+# Edge-agent build (`--bin wafred-agent --features edge`). It compiles the
+# data plane and its rule cache only: the control-plane modules and the pingap
+# admin plugin (which embeds the dashboard) are `#[cfg(not(feature = "edge"))]`,
+# so the linker never pulls in PostgreSQL, the REST API or the web assets. The
+# feature deliberately changes no dependency, which keeps the release build's
+# cargo cache warm for both binaries.
+edge = []
 
 
 [dev-dependencies]
@@ -290,6 +310,7 @@ members = [
     "wafred-waf",
     "wafred-challenge",
     "wafred-agent",
+    "wafred-tunnel",
 ]
 [workspace.package]
 version = "1.0.4"
@@ -397,6 +418,7 @@ pingap-sentry = { version = "1.0.4", path = "pingap-sentry" }
 pingap-upstream = { version = "1.0.4", path = "pingap-upstream", default-features = false }
 pingap-util = { version = "1.0.4", path = "pingap-util" }
 pingap-webhook = { version = "1.0.4", path = "pingap-webhook" }
+wafred-tunnel = { path = "wafred-tunnel", default-features = false }
 # Released crates.io versions; all three must stay on the same version so cargo
 # resolves one copy of pingora-core.
 # The TLS backend (`openssl` or `rustls`) is chosen by the top-level
@@ -486,8 +508,13 @@ tracing-subscriber = { version = "0.3.23", features = [
     "env-filter",
     "tracing-log",
 ], default-features = false }
-url = "2.5.8"
+url = "2.5.9"
 urlencoding = "2.1.3"
+# Stream multiplexer for the tunnel data plane. Both ends open streams over one
+# outbound connection: the connector opens the control stream, the edge opens
+# one stream per proxied connection. A server-initiated stream is exactly what
+# HTTP/2 cannot do, which is why this is not `h2`.
+yamux = "0.14.1"
 uuid = { version = "1.26.1", features = [
     "v4",
     "v7",
@@ -517,6 +544,9 @@ rhai = "1"
 sea-orm = { version = "1.1", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros"] }
 sea-orm-migration = { version = "1.1", features = ["sqlx-postgres", "runtime-tokio-rustls"] }
 tokio-stream = { version = "0.1", features = ["net"] }
+# The tunnel listener and connector speak TLS through the same rustls the rest
+# of the process already uses; this is the tokio adapter for it.
+tokio-rustls = "0.26.6"
 # tonic-build 0.14 dropped its prost code generator (`configure()` /
 # `compile_protos()`); that half now lives in `tonic-prost-build`, which must be
 # kept on the same version as `tonic` so the generated stubs match the runtime.
@@ -527,7 +557,6 @@ tower-http = { version = "0.7", features = ["cors", "compression-gzip", "set-hea
 # Shared by benches / tests across pingap-* crates.
 bytemuck = "1.25.2"
 criterion = { version = "0.8.2", features = ["html_reports"] }
-filetime = "0.2.29"
 # imageoptim: keep the feature set here so members do not restate versions.
 image = { version = "0.25.10", default-features = false, features = [
     "rayon",

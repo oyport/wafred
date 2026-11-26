@@ -181,6 +181,13 @@ pub struct ServerConfig {
     /// plaintext and marks the deployment degraded.
     #[serde(default)]
     pub grpc_tls_mode: GrpcTlsMode,
+    /// Path to the embedded data plane's `acme_state.toml` (all-in-one
+    /// only). The control plane syncs the PEMs the data plane's ACME task
+    /// issued from this file into `site_certificates`, so every agent can
+    /// serve them; without it an edge agent that never received the PEM keeps
+    /// re-issuing HTTP-01 challenges it cannot answer.
+    #[serde(default)]
+    pub acme_state_path: Option<String>,
     /// HMAC secret used to sign access, refresh and agent tokens.
     #[serde(default = "default_jwt_secret")]
     pub jwt_secret: String,
@@ -279,6 +286,7 @@ impl Default for ServerConfig {
             grpc_tls_cert: None,
             grpc_tls_key: None,
             grpc_tls_mode: GrpcTlsMode::default(),
+            acme_state_path: None,
             jwt_secret: DEFAULT_JWT_SECRET.to_string(),
             jwt_expiration_hours: DEFAULT_JWT_EXPIRATION_HOURS,
             refresh_token_expiration_hours: DEFAULT_REFRESH_EXPIRATION_HOURS,

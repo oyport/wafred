@@ -302,7 +302,7 @@ test.describe('WAF custom rules', () => {
       await downgradeDialog.getByRole('checkbox').check()
       await expect(confirmMonitor).toBeEnabled()
       await confirmMonitor.click()
-      await expect(toast(page, 'Mode applied to all rules')).toBeVisible()
+      await expect(toast(page, 'Site protection mode updated')).toBeVisible()
       await expect(page.getByText(/Site mode\s+Monitor/)).toBeVisible({
         timeout: 30_000,
       })

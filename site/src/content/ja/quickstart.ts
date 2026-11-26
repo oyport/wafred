@@ -37,7 +37,7 @@ const quickstart = {
       {
         label: "PostgreSQL",
         value: "14+（16 推奨）",
-        note: "サイト、ルール、バージョンを保存します。",
+        note: "サイト、ルール、バージョンを保存します。ネイティブインストールのパッケージ名はディストリビューションによって異なります（Ubuntu 24.04 は postgresql-16、26.04 は postgresql-18）— apt-cache search --names-only '^postgresql-[0-9]+$' で確認してください。",
       },
       {
         label: "ポート",
@@ -67,15 +67,15 @@ const quickstart = {
         },
         {
           title: "スタックを起動",
-          body: "外部から到達できるホストでは JWT_SECRET と ADMIN_PASSWORD を先に設定します。",
+          body: "外部から到達できるホストでは JWT_SECRET と ADMIN_PASSWORD を先に設定します。sudo なし（かつ docker グループ未所属）では compose は permission denied … docker.sock で失敗します。docker グループ所属のユーザーは sudo を省けます。",
           code: {
             lang: "bash",
-            code: "export JWT_SECRET=\"$(openssl rand -hex 32)\"\nexport ADMIN_PASSWORD=\"$(openssl rand -hex 16)\"\ndocker compose up -d",
+            code: "export JWT_SECRET=\"$(openssl rand -hex 32)\"\nexport ADMIN_PASSWORD=\"$(openssl rand -hex 16)\"\n# docker グループ所属なら sudo は不要\nsudo docker compose up -d",
           },
         },
         {
           title: "コンソールを開く",
-          body: "初回起動で生成した自己署名証明書で HTTPS を提供するため、信頼するか独自証明書をアップロードするまでブラウザは警告します。",
+          body: "初回起動で生成した自己署名証明書で HTTPS を提供するため、信頼するか独自証明書をアップロードするまでブラウザは警告します。新規データベースではログイン自体は成功しますが、初期パスワードを変更するまで、すべての書き込み操作は 403 password_change_required を返します — 「設定 → アカウント」から、または PUT /api/v1/auth/password（current_password / new_password を渡す。成功時は 204 を返し、現在のトークンは失効するため新しいパスワードで再ログインが必要）で変更してください。",
           code: {
             lang: "bash",
             code: "curl --connect-timeout 2 --max-time 3 http://localhost:9080/healthz\n# {\"status\":\"ok\",\"database\":\"up\"}",
@@ -142,7 +142,7 @@ const quickstart = {
   },
   credentials: {
     title: "初回ログイン",
-    lead: "コントロールプレーンは初回起動時に管理者を作成し、コンソールはパスワード変更を強制します。",
+    lead: "コントロールプレーンは初回起動時に管理者を作成し、コンソールはパスワード変更を強制します — 「設定 → アカウント」から、または PUT /api/v1/auth/password（current_password / new_password を渡す。成功時は 204 を返し、現在のトークンは失効するため新しいパスワードで再ログインが必要）で変更してください。変更前は、すべての書き込み操作が 403 password_change_required を返します。",
     rows: [
       { label: "コンソール", value: "https://localhost:9080" },
       { label: "メール", value: "admin@wafred.local" },
@@ -200,6 +200,10 @@ const quickstart = {
       {
         q: "ブラウザが証明書を拒否する",
         a: "コンソールは自己署名証明書で HTTPS を提供します。ダウンロードした証明書を信頼するか、設定 → コントロールプレーン HTTPS で独自証明書をアップロードしてください。WAFRED_TLS_SANS で実際のホスト名を指定します。",
+      },
+      {
+        q: "compose が \"failed to bind host port 127.0.0.1:5432/tcp: address already in use\" で失敗する",
+        a: "ローカルの PostgreSQL がすでに 5432 を使用しています。POSTGRES_PORT=55432 で別のホストポートにマッピングして再起動してください（compose インストーラなら --db-port 55432 も渡せます。55432 以上の空きポートを自動選択します）。",
       },
       {
         q: "エージェントが一覧に出ない",

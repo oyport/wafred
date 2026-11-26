@@ -1,4 +1,8 @@
 # Configuration for cargo-audit / the security-audit CI job.
+#
+# Re-check every entry when Cargo.lock changes. An ignore that no longer matches
+# any vulnerable version in the lock must be removed: it would otherwise mute
+# the advisory id forever and hide a later regression (see issue #104).
 
 [advisories]
 # Every entry here MUST say why it is ignored and what unblocks removing it.
@@ -28,15 +32,6 @@ ignore = [
     # upstream main branch still depends on it. Remove when Pingora replaces it.
     "RUSTSEC-2025-0134",
 
-    # quick-xml 0.26 (RUSTSEC-2026-0194/0195, uncontrolled recursion and
-    # potential XSS in untrusted documents). It reaches this tree through
-    # pprof 0.15 -> inferno 0.11, and pprof pins inferno ^0.11, so there is no
-    # semver-compatible upgrade. quick-xml is only used on the Linux pprof
-    # flamegraph rendering path, parsing locally collected sampling data — it
-    # never parses untrusted input. Remove once pprof allows inferno 0.12+.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
-
     # unsafe-libyaml 0.2.11 (RUSTSEC-2024-0449, unmaintained — the repo was
     # archived in March 2024, not a vulnerability). It is a non-optional
     # dependency of pingora-core 0.9 (via the deprecated serde_yaml 0.9, used
@@ -48,17 +43,6 @@ ignore = [
     # TOML/HCL/KDL, and the YAML path parses the operator's local config, not
     # network input. Remove when pingora drops serde_yaml.
     "RUSTSEC-2024-0449",
-
-    # ruzstd 0.8.3 (RUSTSEC-2026-0344, decompression bomb: tiny input can
-    # exhaust memory). The fixed 0.9.1 line is only pulled by object 0.40,
-    # but pyroscope 2.1.1 — the latest release, and the sole path by which
-    # object reaches this tree (pingap-pyroscope profiling) — pins object
-    # ^0.39, which requires ruzstd ^0.8.1, so there is no semver-compatible
-    # upgrade. Exposure is limited: object uses ruzstd to decode compressed
-    # debug sections of local binaries while resolving profiling symbols —
-    # the input is the host's own executable, never attacker-controlled
-    # network data. Remove when pyroscope allows object 0.40+.
-    "RUSTSEC-2026-0344",
 
     # webpki-roots 0.26.11 (RUSTSEC-2026-0381, the bundled root set still
     # trusts distrusted emSign intermediates). The 1.x copy in this tree is

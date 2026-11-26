@@ -61,6 +61,9 @@ pub struct HostSample {
     pub process_count: u32,
     pub tcp_connections: u32,
     pub uptime_secs: u64,
+    /// Resident set size of this agent process; `None` when unavailable
+    /// (non-Linux, or `/proc` unreadable).
+    pub process_rss_bytes: Option<u64>,
 }
 
 /// Where a node is reachable, split the way operators think about it.
@@ -342,6 +345,7 @@ impl Sampler {
             process_count,
             tcp_connections: count_tcp_connections(),
             uptime_secs: read_uptime(),
+            process_rss_bytes: process_rss_bytes(),
         }
     }
 }
@@ -595,6 +599,27 @@ fn read_memory() -> Memory {
     Memory::default()
 }
 
+/// Resident set size of this process, in bytes. Linux reads `VmRSS:` from
+/// `/proc/self/status` (`strip_prefix` keeps `VmHWM`/`VmSize` from matching);
+/// other platforms have no equivalent that is cheap to read, so `None`.
+#[cfg(target_os = "linux")]
+pub fn process_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+    let kb = line
+        .strip_prefix("VmRSS:")?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    Some(kb * 1024)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn process_rss_bytes() -> Option<u64> {
+    None
+}
+
 #[cfg(target_os = "linux")]
 fn read_load() -> (f64, f64, f64, u32) {
     let Ok(loadavg) = std::fs::read_to_string("/proc/loadavg") else {
@@ -790,6 +815,23 @@ pub fn spawn(
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn process_rss_is_positive_on_linux_and_none_elsewhere() {
+        let rss = process_rss_bytes();
+        if cfg!(target_os = "linux") {
+            let bytes = rss.expect("VmRSS must be readable on Linux");
+            assert!(bytes > 0, "RSS must be positive, got {bytes}");
+            // A running agent is at least one page; also sanity-check the
+            // KB→bytes conversion kept the value page-multiple-free scale.
+            assert!(
+                bytes.is_multiple_of(1024),
+                "RSS comes from kB, must be KB-scaled"
+            );
+        } else {
+            assert_eq!(rss, None);
+        }
+    }
 
     #[test]
     fn container_and_loopback_addresses_are_rejected() {

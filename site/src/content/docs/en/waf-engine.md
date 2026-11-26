@@ -67,7 +67,12 @@ Fifteen `WAFRED-xxxx` rules ship in the binary and are loaded according to the c
 | `exempt_paths` | `/health`, `/ping` |
 | `browser_integrity_check` | `true` |
 | `pow_difficulty` | `20` |
+| `pow_max_difficulty` | `24` |
+| `pow_issue_limit_per_min` | `120` |
+| `pow_verify_limit_per_min` | `300` |
 | `submission_max_age_secs` | `300` |
+
+Difficulty is adaptive: it starts at `pow_difficulty` and rises per client (up to `pow_max_difficulty`) with failed verifications and with request volume above `rate_threshold`, then drops back to the base after a successful pass. Issuance and verification are also capped per IP and minute (`pow_issue_limit_per_min`, `pow_verify_limit_per_min`): over the issuance limit the visitor gets a `429` page, and over the verification limit the submission is refused without spending the pending challenge.
 
 Challenge levels are `None`, `NonInteractive`, `Managed` (picks per request risk) and `Interactive`. Proof of work uses SHA-256 with a leading-zero target. A pass is stored in `__pingwaf_clearance`, a cookie whose value is `base64(payload).base64(HMAC-SHA256)` and which is bound to the host that issued it, so it cannot be replayed against another hostname. Alternate domains of the same site each need their own pass.
 

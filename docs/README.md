@@ -77,7 +77,7 @@ WAFred adds seven WAF-specific crates on top of the `pingap` proxy foundation.
 | --- | --- |
 | [pingwaf-proto](../wafred-proto) | Control-plane gRPC protocol definitions (single source: `control_plane.proto`) |
 | [pingwaf-server](../wafred-server) | Control plane: Axum REST + tonic gRPC + SeaORM/PostgreSQL + ES logs + embedded frontend + agent health monitoring |
-| [pingwaf-agent](../wafred-agent) | Data-plane agent: connects to the control plane, caches rules with disk persistence, ships logs/metrics, receives commands |
+| [wafred-agent](../wafred-agent) | Data-plane agent: connects to the control plane, caches rules with disk persistence, ships logs/metrics, receives commands |
 | [pingwaf-waf](../wafred-waf) | Detection engine: normalize → signatures → expression → anomaly score |
 | [pingwaf-challenge](../wafred-challenge) | Dynamic challenges: JS 5-second shield, interactive challenge, PoW, fingerprinting, HMAC clearance cookies |
 | `pingwaf-profiler` (no README) | Module/method CPU and memory attribution tables served at `/api/v1/system/profile` |

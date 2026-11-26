@@ -236,17 +236,27 @@ pub struct WafEngineConfig {
     /// unlike managed rules, a custom rule's id never starts with
     /// `WAFRED-`, so membership here is the only downgrade source.
     pub monitor_custom_rules: std::collections::HashSet<String>,
-    /// Soft wall-clock ceiling for one inspection; **disabled by default**.
+    /// Soft wall-clock ceiling for one inspection.
     ///
-    /// When enabled, deep detection stops if it is exceeded and the verdict
-    /// carries `request=deadline`; the data plane treats that like a
-    /// truncation (event, and a rejection under the truncation policy). It is
-    /// a safety valve on top of the per-request caps, not the primary bound,
-    /// and it is opt-in because a wall-clock limit makes verdicts depend on
-    /// scheduler load: on a busy host it can skip Stage-1 detection for a
-    /// request that would otherwise block. Zero (the default) disables it.
+    /// Deep detection stops if it is exceeded and the verdict carries
+    /// `request=deadline`; the data plane treats that like a truncation
+    /// (event, and a rejection under the truncation policy). It is a safety
+    /// valve on top of the per-request caps, not the primary bound: a
+    /// wall-clock limit makes verdicts depend on scheduler load, so on a busy
+    /// host it can skip Stage-1 detection for a request that would otherwise
+    /// block. The default ([`DEFAULT_INSPECTION_DEADLINE`]) is 20 ms — short
+    /// enough not to fire on a healthy request, and the request that trips it
+    /// is reported, never read as a clean pass. `Duration::ZERO` disables it.
     pub inspection_deadline: Duration,
 }
+
+/// Default soft deadline for one inspection.
+///
+/// The deadline is a safety valve on top of the per-request caps: a request
+/// the engine did not finish must not read as a clean pass. It is short enough
+/// to stay invisible on a healthy request and long enough not to fire on a
+/// loaded host during Stage-1 detection. `Duration::ZERO` disables it.
+pub const DEFAULT_INSPECTION_DEADLINE: Duration = Duration::from_millis(20);
 
 impl Default for WafEngineConfig {
     fn default() -> Self {
@@ -265,7 +275,7 @@ impl Default for WafEngineConfig {
             monitor_managed_rules: std::collections::HashSet::new(),
             disabled_managed_rules: std::collections::HashSet::new(),
             monitor_custom_rules: std::collections::HashSet::new(),
-            inspection_deadline: Duration::ZERO,
+            inspection_deadline: DEFAULT_INSPECTION_DEADLINE,
         }
     }
 }
@@ -1155,7 +1165,9 @@ impl WafEngine {
             let (is_sqli, sqli_fp) = detect_sqli(needle);
             if is_sqli {
                 let weak = is_meta_header
-                    || (value.source == ValueSource::Body && !value.field);
+                    || (value.source == ValueSource::Body
+                        && !value.field
+                        && !value.text);
                 // Same zero-score rule as the needle gate: a union-select
                 // or into-file fingerprint without statement structure is
                 // a search phrase, and the needle hit for it is skipped
@@ -1224,7 +1236,9 @@ impl WafEngine {
                             value.source != ValueSource::Body,
                         ));
                 let weak = is_meta_header
-                    || (value.source == ValueSource::Body && !value.field);
+                    || (value.source == ValueSource::Body
+                        && !value.field
+                        && !value.text);
                 let (severity, critical) =
                     if weak { (2, false) } else { (5, true) };
                 let monitored =
@@ -1982,7 +1996,13 @@ mod tests {
     use super::*;
 
     fn engine() -> WafEngine {
-        WafEngine::new(&WafEngineConfig::default())
+        // No wall-clock deadline in unit tests: the production default is a
+        // safety valve, and a slow CI host must not turn a verdict test into a
+        // timing test.
+        WafEngine::new(&WafEngineConfig {
+            inspection_deadline: Duration::ZERO,
+            ..WafEngineConfig::default()
+        })
     }
 
     fn req(method: &str, path: &str, query: &str) -> RequestData {
@@ -3447,6 +3467,120 @@ mod tests {
         ));
         let v = e.inspect(&r);
         assert_ne!(v.action, WafAction::Block, "details: {}", v.details);
+    }
+
+    /// DR32-01: a body the JSON parser could not read is the only carrier of
+    /// what the client sent. Demoting it to a weak signal made "omit one
+    /// brace" a stable bypass.
+    #[test]
+    fn malformed_json_body_keeps_full_severity() {
+        let e = engine();
+        let mut r = req("POST", "/api/feedback", "");
+        r.headers
+            .push(("Content-Type".into(), "application/json".into()));
+        r.body = Some(bytes::Bytes::from_static(br#"{"q":"1' OR 1=1--""#));
+        assert_eq!(e.inspect(&r).action, WafAction::Block);
+    }
+
+    /// The control for the test above: the same statement, in a body the
+    /// parser *can* read, is caught through its member.
+    #[test]
+    fn well_formed_json_body_member_is_detected() {
+        let e = engine();
+        let mut r = req("POST", "/api/feedback", "");
+        r.headers
+            .push(("Content-Type".into(), "application/json".into()));
+        r.body = Some(bytes::Bytes::from_static(br#"{"q":"1' OR 1=1--"}"#));
+        assert_eq!(e.inspect(&r).action, WafAction::Block);
+    }
+
+    /// DR32-02: pairs past the form-parameter cap land in the tail blob. They
+    /// are still input, so they must not be scored as a weak signal.
+    #[test]
+    fn form_parameter_past_the_cap_keeps_full_severity() {
+        let e = engine();
+        let mut body = String::new();
+        for index in 0..520 {
+            body.push('f');
+            body.push_str(&index.to_string());
+            body.push_str("=x&");
+        }
+        body.push_str("tail=1' OR 1=1--");
+        let mut r = req("POST", "/api/feedback", "");
+        r.headers.push((
+            "Content-Type".into(),
+            "application/x-www-form-urlencoded".into(),
+        ));
+        r.body = Some(bytes::Bytes::from(body));
+        assert_eq!(e.inspect(&r).action, WafAction::Block);
+    }
+
+    /// DR32-01, multipart shape: declaring a binary content type on a part
+    /// used to hide it from the field-level detectors.
+    #[test]
+    fn multipart_part_behind_a_binary_content_type_keeps_full_severity() {
+        let e = engine();
+        let body = "--X\r\nContent-Disposition: form-data; name=\"c\"\r\n\
+                    Content-Type: application/octet-stream\r\n\r\n\
+                    1' OR 1=1--\r\n--X--\r\n";
+        let mut r = req("POST", "/api/upload", "");
+        r.headers.push((
+            "Content-Type".into(),
+            "multipart/form-data; boundary=X".into(),
+        ));
+        r.body = Some(bytes::Bytes::from(body.as_bytes().to_vec()));
+        assert_eq!(e.inspect(&r).action, WafAction::Block);
+    }
+
+    /// False-positive guard: a genuinely binary body keeps the weak weighting,
+    /// so an uploaded archive that happens to contain quote characters is not
+    /// turned into a blocking verdict.
+    #[test]
+    fn binary_body_keeps_the_weak_weighting() {
+        let e = engine();
+        let mut bytes = vec![0u8, 159, 146, 150, 1, 2, 3];
+        bytes.extend_from_slice(b"' OR 1=1--");
+        bytes.extend_from_slice(&[0u8, 255, 254, 253]);
+        let mut r = req("POST", "/api/upload", "");
+        r.headers
+            .push(("Content-Type".into(), "application/octet-stream".into()));
+        r.body = Some(bytes::Bytes::from(bytes));
+        assert_ne!(e.inspect(&r).action, WafAction::Block);
+    }
+
+    /// M1: an uploaded file is not a typed form field. The operator's audit
+    /// log, SQL dump or an ASCII-heavy PDF legitimately contains strings the
+    /// detectors match, so a file part keeps the weak weighting.
+    #[test]
+    fn multipart_file_upload_keeps_the_weak_weighting() {
+        let e = engine();
+        let body = "--X\r\nContent-Disposition: form-data; name=\"dump\"; \
+                    filename=\"dump.sql\"\r\nContent-Type: application/sql\r\n\r\n\
+                    INSERT INTO t VALUES ('x'); -- 1' OR 1=1--\r\n--X--\r\n";
+        let mut r = req("POST", "/api/upload", "");
+        r.headers.push((
+            "Content-Type".into(),
+            "multipart/form-data; boundary=X".into(),
+        ));
+        r.body = Some(bytes::Bytes::from(body.as_bytes().to_vec()));
+        assert_ne!(e.inspect(&r).action, WafAction::Block);
+    }
+
+    /// M2: JSON extraction stops at its member budget. Members past it only
+    /// exist in the blob, so the blob must score normally — the same shape as
+    /// the form-parameter cap fixed for DR32-02.
+    #[test]
+    fn json_member_overflow_keeps_full_severity() {
+        let e = engine();
+        let mut members: Vec<String> =
+            (0..70).map(|i| format!("\"k{i}\":\"v\"")).collect();
+        members.push("\"tail\":\"1' OR 1=1--\"".to_string());
+        let body = format!("{{{}}}", members.join(","));
+        let mut r = req("POST", "/api/feedback", "");
+        r.headers
+            .push(("Content-Type".into(), "application/json".into()));
+        r.body = Some(bytes::Bytes::from(body));
+        assert_eq!(e.inspect(&r).action, WafAction::Block);
     }
 
     #[test]

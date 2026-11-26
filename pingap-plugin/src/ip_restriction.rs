@@ -212,8 +212,10 @@ type = "deny"
         .unwrap();
         assert_eq!("request", params.plugin_step.to_string());
         let description = format!("{:?}", params.ip_rules);
-        assert_eq!(true, description.contains("ip_net_list"));
-        assert_eq!(true, description.contains("[1.1.1.0/24, 2.1.1.0/24]"));
+        // The compiled representation is normalised into per-family merged
+        // ranges (pingap-util IpRules) plus an exact-IP set.
+        assert_eq!(true, description.contains("v4_ranges"));
+        assert_eq!(true, description.contains("v6_ranges"));
         assert_eq!(true, description.contains("ip_set"));
         assert_eq!(true, description.contains("10.1.1.1"));
         assert_eq!(true, description.contains("192.168.1.1"));

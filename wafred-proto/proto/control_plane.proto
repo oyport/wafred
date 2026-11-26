@@ -28,6 +28,12 @@ service ControlPlane {
   // Configuration sync (agent pulls full site config)
   rpc GetSiteConfig(GetSiteConfigRequest) returns (SiteConfig);
 
+  // Certificate publication (designated issuer agent -> control plane).
+  // The control plane validates the caller, the site assignment, the
+  // certificate's designation, the hostname set and the key/leaf pair before
+  // atomically promoting the material and fanning it out.
+  rpc PublishCertificate(PublishCertificateRequest) returns (PublishCertificateResponse);
+
   // Visitor authentication.
   //
   // A protected site's visitors are signed in by the data plane, but their
@@ -66,6 +72,18 @@ service ControlPlane {
   // its password changed since. That is what this answers, and the data plane
   // caches the answer briefly rather than asking on every request.
   rpc VisitorValidateSession(VisitorValidateRequest) returns (VisitorValidateResponse);
+
+  // Tunnel connectors.
+  //
+  // A connector runs inside a private network and dials out; these two RPCs
+  // are its only contact with the control plane. `PairTunnel` is
+  // unauthenticated by design (the one-time pairing token is the credential,
+  // and the caller has nothing else yet) and rate limited per peer.
+  // `TunnelControl` is the long-lived channel: the connector reports its
+  // health, the control plane pushes the ingress list, the target policy and
+  // revocations. The data path itself never touches the control plane.
+  rpc PairTunnel(PairTunnelRequest) returns (PairTunnelResponse);
+  rpc TunnelControl(stream TunnelConnectorMessage) returns (stream TunnelConnectorCommand);
 }
 
 // A session as the data plane holds it.
@@ -161,6 +179,33 @@ message AgentHeartbeat {
   // than the full set. The control plane must then keep the rows it did not
   // see instead of treating them as revoked.
   bool blocked_ips_truncated = 21;
+
+  // Why the data plane is not running the configuration named by
+  // `config_hash`: the hash is what the agent last received, and a reload
+  // that failed part-way leaves the proxy on a mix of old and new state.
+  // Empty when the last reload applied in full. Sent together with
+  // `health = AGENT_HEALTH_DEGRADED`; the agent retries on its own.
+  string config_apply_error = 22;
+
+  // Access-log and security-event entries this agent discarded since its
+  // process started: its queue was full while the control plane was
+  // unreachable, or the control plane refused to store them. Cumulative, so
+  // a value lower than the previous heartbeat's means the agent restarted.
+  // Always 0 from agents that predate the field.
+  uint64 logs_dropped_total = 23;
+
+  // Resident set size of the agent process itself, in bytes — the binary's
+  // own memory, distinct from `memory_usage_bytes` (whole-node usage).
+  // Absent on agents that predate the field: the control plane must render
+  // unknown, never 0.
+  optional uint64 process_rss_bytes = 24;
+
+  // State of this agent's tunnel listener. Absent = the listener is not
+  // enabled (or the agent predates tunnels).
+  optional TunnelListenerStatus tunnel_listener = 25;
+
+  // Connector sessions this agent currently holds, for the tunnel page.
+  repeated TunnelSessionReport tunnel_sessions = 26;
 }
 
 // Backend health of one upstream, reported per heartbeat.
@@ -232,6 +277,10 @@ message HostSample {
   uint32 process_count = 17;
   uint32 tcp_connections = 18;
   uint64 uptime_secs = 19;
+
+  // RSS of the agent process at this sample, in bytes. Absent (or on older
+  // agents: not sent at all) = unknown, not 0.
+  optional uint64 process_rss_bytes = 20;
 }
 
 message ServerCommand {
@@ -867,6 +916,19 @@ message ChallengeConfig {
   uint32 request_threshold = 10;         // Requests per minute to trigger
   bool browser_integrity_check = 11;
   bool tls_fingerprint_check = 12;
+
+  // Adaptive proof-of-work difficulty. `base_difficulty` is the work a normal
+  // visitor does; the edge raises it (up to `max_difficulty`) for a host+IP
+  // under request or verification-failure pressure. Zero means "unset": an
+  // agent talking to an older control plane falls back to 20 / 24, which is
+  // the difficulty every deployment ran with before it was configurable.
+  uint32 base_difficulty = 13;
+  uint32 max_difficulty = 14;
+
+  // Per host+IP limits in a 60-second window, for challenge issuance and for
+  // solution verification. Zero means "unset" (agent falls back to 120 / 300).
+  uint32 issue_limit_per_minute = 15;
+  uint32 verify_limit_per_minute = 16;
 }
 
 enum ChallengeLevel {
@@ -978,6 +1040,9 @@ message SslConfig {
   // predates these fields keeps serving both protocols.
   optional bool http1_enabled = 21;
   optional bool http2_enabled = 22;
+  // Agent allowed to issue this certificate (the site_certificates row's
+  // acme_issuer_agent_id). Empty keeps the agent-level acme_issuer scope.
+  string acme_issuer_agent_id = 23;
 }
 
 enum AcmeChallengeType {
@@ -1008,6 +1073,12 @@ message UpstreamConfig {
   // records only). Empty is treated as "auto" by the agent, so an older
   // control plane that never sets it keeps the IPv4-first behaviour.
   string address_family = 13;
+
+  // Tunnel this pool's origins sit behind. Empty = a direct origin (the
+  // historic behaviour). When set, every peer address is resolved by the
+  // tunnel connector inside the private network instead of by the edge, and
+  // the edge reaches it through a loopback bridge.
+  string tunnel_id = 14;
 }
 
 message UpstreamPeer {
@@ -1221,6 +1292,20 @@ message CertEventAck {
   string error_message = 3;
 }
 
+message PublishCertificateRequest {
+  string agent_token = 1;
+  string site_id = 2;
+  // Comma-separated SAN list, exactly as the issuer stored it.
+  string domains = 3;
+  string cert_pem = 4;
+  string key_pem = 5;
+}
+
+message PublishCertificateResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
 // ============================================================
 // Metrics
 // ============================================================
@@ -1431,4 +1516,133 @@ message VisitorPasskey {
   string name = 2;
   string created_at = 3;
   string last_used_at = 4;
+}
+
+// ============================================================
+// Tunnel
+// ============================================================
+
+// One tunnel as the control plane distributes it to the edges.
+message TunnelConfig {
+  string tunnel_id = 1;
+  string name = 2;
+  // Lower-case hex Ed25519 public key a connector's session token must verify
+  // against. The edge never sees a reusable secret: the control plane mints a
+  // short-lived token, the connector presents it, and the edge only checks the
+  // signature and the expiry. Empty = the tunnel is not paired yet, and no
+  // session can be opened for it.
+  string session_public_key = 3;
+  bool enabled = 4;
+  // Internal `host:port` origins the connector serves, deduplicated from the
+  // pools bound to this tunnel.
+  repeated string targets = 5;
+}
+
+// Deployment-wide tunnel limits.
+message TunnelSettings {
+  uint32 max_streams = 1;
+  // Session liveness bound: a control stream silent for this long is closed.
+  uint32 idle_timeout_secs = 2;
+  uint32 heartbeat_secs = 3;
+  // Lifetime of a connector session token. The connector receives a fresh one
+  // on every config push and periodically, so the value bounds how long a
+  // revoked tunnel can still be opened by a partitioned edge.
+  uint32 session_token_ttl_secs = 4;
+}
+
+// What an agent reports about its tunnel listener.
+message TunnelListenerStatus {
+  bool active = 1;
+  // The address the listener actually bound (`0.0.0.0:9443`).
+  string addr = 2;
+  // Lower-case hex SHA-256 of the certificate leaf; connectors pin it.
+  string cert_sha256 = 3;
+  // Why a configured listener is not running (bind failure, unusable
+  // certificate). Empty when it is active or was never configured.
+  string last_error = 4;
+}
+
+// One connector session held by an agent.
+message TunnelSessionReport {
+  string tunnel_id = 1;
+  string connector_version = 2;
+  string hostname = 3;
+  google.protobuf.Timestamp connected_at = 4;
+  uint32 streams_active = 5;
+  uint32 rtt_ms = 6;
+}
+
+// A connector asking to be paired. The token is single use and expires.
+message PairTunnelRequest {
+  string pairing_token = 1;
+  string hostname = 2;
+  string version = 3;
+  string os_info = 4;
+}
+
+message PairTunnelResponse {
+  string tunnel_id = 1;
+  string name = 2;
+  // The long-lived connector credential. Returned exactly once; the control
+  // plane keeps only its SHA-256. It authenticates the *control stream* — the
+  // edges never see it, they only verify the short-lived session token below.
+  string credential = 3;
+  repeated TunnelIngress ingress = 4;
+  repeated string targets = 5;
+  TunnelSettings settings = 6;
+  // A short-lived Ed25519 token the connector presents to the edges.
+  string session_token = 7;
+  int64 session_token_expires_at = 8;
+}
+
+// One edge endpoint a connector dials, with the certificate it must pin.
+message TunnelIngress {
+  string endpoint = 1;             // host:port
+  repeated string fingerprints = 2;  // lower-case hex SHA-256 of the leaf
+}
+
+// Connector -> control plane on the `TunnelControl` stream.
+message TunnelConnectorMessage {
+  oneof kind {
+    TunnelConnectorHello hello = 1;
+    TunnelConnectorHeartbeat heartbeat = 2;
+  }
+}
+
+message TunnelConnectorHello {
+  string tunnel_id = 1;
+  string credential = 2;
+  string version = 3;
+  string hostname = 4;
+  string os_info = 5;
+}
+
+message TunnelConnectorHeartbeat {
+  uint32 sessions = 1;
+  uint32 streams_active = 2;
+  repeated string connected_ingress = 3;
+}
+
+// Control plane -> connector on the `TunnelControl` stream.
+message TunnelConnectorCommand {
+  oneof kind {
+    TunnelConnectorConfig config = 1;
+    TunnelConnectorRevoked revoked = 2;
+  }
+}
+
+message TunnelConnectorConfig {
+  repeated TunnelIngress ingress = 1;
+  repeated string targets = 2;
+  TunnelSettings settings = 3;
+  bool enabled = 4;
+  // A freshly minted session token (and its expiry, unix seconds). Pushed on
+  // every config change and periodically, so the connector always holds one
+  // that is valid for at least two thirds of its lifetime.
+  string session_token = 5;
+  int64 session_token_expires_at = 6;
+}
+
+message TunnelConnectorRevoked {
+  string message = 1;
 }

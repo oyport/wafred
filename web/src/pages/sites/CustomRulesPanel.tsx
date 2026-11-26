@@ -60,7 +60,6 @@ export function CustomRulesPanel() {
   const [pendingGroupDelete, setPendingGroupDelete] = useState<RuleGroup | null>(null)
   const [groupDialogOpen, setGroupDialogOpen] = useState(false)
   const [groupName, setGroupName] = useState('')
-  const [groupPhase, setGroupPhase] = useState('request')
 
   const rulesQuery = useQuery({
     queryKey: ruleKeys.list(siteId, { search: debouncedSearch || undefined }),
@@ -200,8 +199,9 @@ export function CustomRulesPanel() {
   })
 
   const createGroup = useMutation({
+    // Every rule is evaluated in the request phase; the engine has no other.
     mutationFn: () =>
-      rulesApi.createGroup(siteId, { name: groupName.trim(), phase: groupPhase }),
+      rulesApi.createGroup(siteId, { name: groupName.trim(), phase: 'request' }),
     onSuccess: (group) => {
       toast.success(t('pages.waf.groupCreated'), group.name)
       setGroupDialogOpen(false)
@@ -439,7 +439,10 @@ export function CustomRulesPanel() {
                           aria-label={group.name}
                           onCheckedChange={(enabled) => toggleGroup.mutate({ group, enabled })}
                         />
-                        {canWrite && (
+                        {canWrite &&
+                          !allRules.some(
+                            (r) => r.group_id === group.id && r.managed_rule_id,
+                          ) && (
                           <Button
                             size="icon"
                             variant="ghost"
@@ -629,15 +632,6 @@ export function CustomRulesPanel() {
             autoFocus
             placeholder={t('pages.waf.groupNamePlaceholder')}
             onChange={(e) => setGroupName(e.target.value)}
-          />
-          <Select
-            label={t('pages.waf.phase')}
-            value={groupPhase}
-            options={['request', 'response', 'custom'].map((p) => ({
-              value: p,
-              label: t(`pages.waf.phase_${p}`, p),
-            }))}
-            onChange={(e) => setGroupPhase(e.target.value)}
           />
         </div>
       </Dialog>

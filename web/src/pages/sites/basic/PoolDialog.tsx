@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Lock } from '@phosphor-icons/react'
 import { Dialog } from '@/components/ui/Dialog'
 import { Button } from '@/components/ui/Button'
@@ -9,6 +9,7 @@ import { Select } from '@/components/ui/Select'
 import { Switch } from '@/components/ui/Switch'
 import { useToast } from '@/components/ui/Toast'
 import { sitesApi, siteKeys } from '@/api/sites'
+import { tunnelsApi } from '@/api/tunnels'
 import { errorMessage } from '@/api/errors'
 import type { CreatePoolRequest, UpdatePoolRequest, UpstreamPool } from '@/api/types'
 import {
@@ -45,6 +46,14 @@ export function PoolDialog({
     request.mode === 'edit' ? poolFormFromPool(request.pool) : emptyPoolForm(),
   )
   const [error, setError] = useState<string | null>(null)
+  // Tunnel connectors this pool may be bound to; a stale list is harmless
+  // (the server rejects an unknown id with a 400).
+  const tunnelsQuery = useQuery({
+    queryKey: ['tunnels', 'pool-options'],
+    queryFn: () => tunnelsApi.list(),
+    staleTime: 60_000,
+  })
+  const tunnels = tunnelsQuery.data?.items ?? []
 
   // `$host` forwards the client's Host header as the SNI; the server rejects
   // it when the pool skips origin certificate verification (400).
@@ -137,6 +146,7 @@ export function PoolDialog({
           sni: sni ?? '',
           verify_cert: sni ? verifyCertPayload(form.verifyCert) : null,
           address_family: form.addressFamily,
+          tunnel_id: form.tunnelId,
           ...healthCheck,
         },
       })
@@ -150,6 +160,7 @@ export function PoolDialog({
         sni,
         verify_cert: sni ? verifyCertPayload(form.verifyCert) : null,
         address_family: form.addressFamily,
+        tunnel_id: form.tunnelId || null,
         ...healthCheck,
       },
     })
@@ -283,6 +294,22 @@ export function PoolDialog({
               addressFamily: e.target.value as AddressFamilyOption,
             }))
           }
+        />
+        {/* Reaching this pool through a tunnel connector instead of dialing
+            the origin from the edge. The node addresses are then resolved by
+            the connector, inside the private network. */}
+        <Select
+          label={t('pages.basic.tunnel', 'Tunnel')}
+          value={form.tunnelId}
+          hint={t(
+            'pages.basic.tunnelHint',
+            'When set, the connector resolves these node addresses inside the private network.',
+          )}
+          options={[
+            { value: '', label: t('pages.basic.tunnelNone', 'Direct (no tunnel)') },
+            ...(tunnels ?? []).map((tunnel) => ({ value: tunnel.id, label: tunnel.name })),
+          ]}
+          onChange={(e) => setForm((f) => ({ ...f, tunnelId: e.target.value }))}
         />
         <Switch
           checked={form.healthCheckEnabled}

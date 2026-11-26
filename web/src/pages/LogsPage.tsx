@@ -97,6 +97,7 @@ const ACTION_TONE: Record<string, 'danger' | 'warning' | 'info' | 'success' | 'n
   blocked: 'danger',
   challenge: 'warning',
   js_challenge: 'warning',
+  monitor: 'warning',
   log: 'info',
   allow: 'success',
   allowed: 'success',
@@ -145,6 +146,12 @@ function ruleLink(event: SecurityEvent): string {
 /* ── Query validation (UX-16) ──────────────────────────────────── */
 
 /**
+ * Decisions a log row can carry. The data plane writes `pass`, `monitor`,
+ * `block`, `challenge` and `log`; the rest are rule actions kept for older rows.
+ */
+const LOG_ACTIONS = ['block', 'challenge', 'monitor', 'pass', 'log', 'js_challenge', 'allow']
+
+/**
  * Enumerated query values: the one-click candidates offered for a typo, plus
  * the predicate that decides whether a value is acceptable at all. The parser
  * already rejects some of these (e.g. `status:abc`); the others (`action`,
@@ -169,12 +176,9 @@ const QUERY_VALUE_VALIDATORS: Record<
       ),
   },
   action: {
-    values: ['block', 'challenge', 'js_challenge', 'log', 'allow'],
+    values: LOG_ACTIONS,
     hintKey: 'actionValues',
-    accepts: (value) =>
-      ['block', 'challenge', 'js_challenge', 'log', 'allow'].includes(
-        value.toLowerCase(),
-      ),
+    accepts: (value) => LOG_ACTIONS.includes(value.toLowerCase()),
   },
   cache_status: {
     values: ['hit', 'miss', 'bypass'],

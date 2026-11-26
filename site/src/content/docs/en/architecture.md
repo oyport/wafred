@@ -22,6 +22,8 @@ The dashboard is compiled into the binary with `rust-embed`, so there is no sepa
 
 `wafred agent` accepts traffic on `:80` and `:443`, evaluates WAF rules, terminates TLS and proxies to origin pools. It keeps a disk-backed rule cache under `cache_dir` and rebuilds its in-memory provider whenever the cached configuration hash changes — roughly every five seconds. Requests always read the current provider through `ArcSwap`, so a policy change never requires a restart.
 
+An edge can also accept **tunnels**: with `tunnel_addr` set it listens on `9443` for a `wafred-tunnel` connector running inside a private network, and opens a loopback bridge per tunnel target. The bridge is an ordinary origin, so a service behind NAT goes through the same rule evaluation, cache, logging and certificate handling as a direct origin. The connector only dials out, and the edge verifies a short-lived Ed25519 session token instead of holding the connector's credential — see [Tunnels](/docs/tunnel/).
+
 ## The gRPC contract
 
 The single source of truth is `wafred-proto/proto/control_plane.proto`. Seven RPCs make up the service:

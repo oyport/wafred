@@ -15,6 +15,7 @@ const features = {
       { id: "cc-bot", label: "CC et bots" },
       { id: "access-control", label: "Contrôle d'accès" },
       { id: "traffic-caching", label: "Trafic et cache" },
+      { id: "tunnel", label: "Tunnels" },
       { id: "tls", label: "TLS" },
       { id: "observability", label: "Observabilité" },
       { id: "operations", label: "Exploitation" },
@@ -104,6 +105,25 @@ const features = {
         id: "caching",
         caption: "Règles de cache, TTL et quota du site.",
         alt: "Configuration du cache en périphérie dans la console",
+      },
+    },
+    {
+      id: "tunnel",
+      icon: "network",
+      kicker: "Accessibilité",
+      title: "Protéger un service sans porte publique",
+      lead: "Un connecteur dans le réseau privé se connecte en sortie à l'edge : un NAS, une application interne ou une page d'administration derrière un NAT bénéficie du même WAF, sans port entrant ni IP publique sur cet hôte.",
+      points: [
+        "Le connecteur n'établit que des connexions sortantes ; l'edge termine le côté public et fournit au pool une adresse de pont loopback.",
+        "L'edge ne voit jamais les identifiants du connecteur : il vérifie un jeton de session Ed25519 de courte durée et épingle le certificat de l'edge.",
+        "Un hôte sans sortie directe atteint le plan de contrôle et les edges via un proxy SOCKS5.",
+        "Une seule console pilote tout : création, appairage, rattachement du pool, rotation, révocation, désactivation, suppression.",
+      ],
+      note: "connecteur sortant → listener d'edge → pont loopback",
+      scene: {
+        id: "agents",
+        caption: "Les tunnels se gèrent à côté de l'inventaire des edges.",
+        alt: "Onglet Tunnels de la console WAFred",
       },
     },
     {

@@ -31,6 +31,11 @@ pub mod site_certificates {
         pub acme_dns_provider: Option<String>,
         #[sea_orm(column_type = "JsonBinary")]
         pub acme_dns_config: Option<Json>,
+        /// Agent allowed to issue this certificate. `None` keeps the
+        /// agent-level `agents.acme_issuer` behaviour; when set, only this
+        /// agent receives the ACME material and only its publication is
+        /// accepted.
+        pub acme_issuer_agent_id: Option<Uuid>,
         pub status: String,
         /// Why the control plane last gave up on an ACME issuance; set when a
         /// `pending` order goes stale, cleared on retry or success.

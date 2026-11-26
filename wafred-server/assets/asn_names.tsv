@@ -1,0 +1,90 @@
+# ASN name snapshot bundled into the control plane.
+#
+# Format: <as number><TAB><organization name>
+#   - `AS`/`as` prefix, blank lines and `#` comments are accepted.
+#   - One tab separates the number from the name; the name may contain spaces,
+#     commas and dots (it may not contain a tab).
+#   - Malformed lines are skipped with a warning; they never fail startup.
+#
+# Provenance: hand-curated from the public RIR/PeeringDB registrations of the
+# networks that dominate internet traffic (CDNs, hyperscalers, large ISPs and
+# hosting providers). It is a *snapshot*, not an authoritative registry: an
+# operator who needs complete or freshly verified coverage exports a
+# two-column TSV from PeeringDB (or any ASN→organization source) and points
+# WAFRED_ASN_NAMES_FILE at it — entries there override the ones below.
+# Anything still unresolved is rendered as `Unknown (AS<number>)`, never as a
+# bare number.
+#
+# Entries are grouped by category for reviewability; the parser does not care
+# about order and a later line for the same AS number replaces an earlier one.
+
+# ── CDN / edge ───────────────────────────────────────────────────────────────
+13335	Cloudflare, Inc.
+20940	Akamai Technologies, Inc.
+54113	Fastly, Inc.
+19551	Imperva, Inc.
+30148	Sucuri Inc.
+22822	Edgio (Limelight Networks)
+199524	G-Core Labs S.A.
+
+# ── Hyperscalers ─────────────────────────────────────────────────────────────
+714	Apple Inc.
+8075	Microsoft Corporation
+15169	Google LLC
+16509	Amazon.com, Inc. (AWS)
+14618	Amazon.com, Inc. (AWS US East)
+32934	Meta Platforms, Inc.
+396982	Google LLC (Google Cloud)
+
+# ── Hosting / cloud providers ────────────────────────────────────────────────
+31898	Oracle Corporation
+36351	IBM Cloud (SoftLayer)
+12876	Scaleway SAS
+14061	DigitalOcean, LLC
+16276	OVH SAS
+20473	The Constant Company, LLC (Vultr)
+24940	Hetzner Online GmbH
+33070	Rackspace Technology
+51167	Contabo GmbH
+63949	Akamai Connected Cloud (Linode)
+202053	UpCloud Ltd
+16265	LeaseWeb Netherlands B.V.
+49981	WorldStream B.V.
+8560	IONOS SE
+
+# ── Asia-Pacific ─────────────────────────────────────────────────────────────
+3462	HiNet (Chunghwa Telecom)
+4538	China Education and Research Network (CERNET)
+4766	Korea Telecom
+9808	China Mobile
+4134	Chinanet (China Telecom)
+4837	China Unicom
+9498	Bharti Airtel Ltd.
+2516	KDDI CORPORATION
+17676	SoftBank Corp.
+37963	Alibaba (Hangzhou) Technology Co., Ltd.
+45090	Shenzhen Tencent Computer Systems Company Limited
+45102	Alibaba (US) Technology Co., Ltd.
+55836	Reliance Jio Infocomm Limited
+132203	Tencent Building, Kejiao Road (Tencent Cloud)
+
+# ── Europe ───────────────────────────────────────────────────────────────────
+2856	British Telecommunications PLC
+3215	Orange S.A.
+3269	Telecom Italia S.p.A. (TIM)
+3320	Deutsche Telekom AG
+3352	Telefonica de Espana S.A.U.
+
+# ── North America ────────────────────────────────────────────────────────────
+701	Verizon Business
+174	Cogent Communications
+209	Lumen Technologies (CenturyLink)
+1299	Arelion Sweden AB (Telia Carrier)
+2914	NTT America, Inc.
+3257	GTT Communications Inc.
+3356	Lumen Technologies (Level 3)
+7018	AT&T Services, Inc.
+7922	Comcast Cable Communications, LLC
+10796	Charter Communications (Spectrum)
+20115	Charter Communications
+22773	Cox Communications Inc.

@@ -23,7 +23,7 @@ WAFred incorpora análisis acotado de formularios URL-encoded y multipart sin `C
 
 ## Referencia histórica entre productos
 
-El gráfico compara la medición actual de WAFred 1.0.4 con la última ejecución de la etapa PingWAF (P13) y conserva las referencias históricas de SafeLine, ModSecurity y Cloudflare. La ejecución anterior usó el mismo corpus nominal, pero una ruta de framing anterior; el arnés actual corrigió 15 respuestas HTTP 500 asociadas al framing. Por eso, se muestran resultados registrados por versión, no un experimento controlado antes/después. Los otros productos no se probaron de nuevo y sus denominadores y rutas de red son distintos. El p95 de WAFred incluye la VM, el proxy y el origen simulado y no se compara directamente con otros valores.
+El gráfico compara la medición actual de WAFred 1.0.4 con la última ejecución de la etapa WAFred (P13) y conserva las referencias históricas de SafeLine, ModSecurity y Cloudflare. La ejecución anterior usó el mismo corpus nominal, pero una ruta de framing anterior; el arnés actual corrigió 15 respuestas HTTP 500 asociadas al framing. Por eso, se muestran resultados registrados por versión, no un experimento controlado antes/después. Los otros productos no se probaron de nuevo y sus denominadores y rutas de red son distintos. El p95 de WAFred incluye la VM, el proxy y el origen simulado y no se compara directamente con otros valores.
 
 ## Cuerpos comprimidos y HTTPS
 

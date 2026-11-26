@@ -82,6 +82,11 @@ pub struct AgentConfig {
     /// 0 disables metric shipping
     #[serde(default = "default_metrics_ship_interval")]
     pub metrics_ship_interval_secs: u64,
+    /// Address the tunnel listener binds, e.g. `0.0.0.0:9443`. Empty or absent
+    /// disables the listener: an edge only accepts tunnel connectors when an
+    /// operator explicitly turned it on.
+    #[serde(default)]
+    pub tunnel_addr: Option<String>,
 }
 
 fn default_heartbeat_interval() -> u64 {
@@ -140,6 +145,7 @@ impl Default for AgentConfig {
             probe_interval_secs: default_probe_interval(),
             probe_disk_path: default_probe_disk_path(),
             metrics_ship_interval_secs: default_metrics_ship_interval(),
+            tunnel_addr: None,
         }
     }
 }

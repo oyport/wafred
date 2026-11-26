@@ -55,6 +55,7 @@ buffer_days = 30
 | `ali` | Alibaba Cloud DNS | `https://alidns.aliyuncs.com?access_key_id=xxx&access_key_secret=xxx` |
 | `cf` | Cloudflare | `https://api.cloudflare.com?token=xxx` |
 | `huawei` | Huawei Cloud DNS | `https://dns.{region}.myhuaweicloud.com?access_key_id=xxx&access_key_secret=xxx` |
+| `route53` | Amazon Route 53 | `https://route53.amazonaws.com?hosted_zone_id=Z123EXAMPLE` |
 | `tencent` | DNSPod / Tencent Cloud | `https://dnspod.tencentcloudapi.com?access_key_id=xxx&access_key_secret=xxx` |
 | `manual` or unset | — | No API. The TXT record is logged and you add it yourself. |
 
@@ -67,12 +68,37 @@ Any value in `dns_service_url` may be written as `$ENV:NAME` and is read from th
 environment, so credentials stay out of the configuration file.
 
 The provider adds the `_acme-challenge` TXT record, waits for validation, and
-removes it afterwards. The zone is the registrable domain of the record name,
-resolved against the public suffix list (`example.co.uk`, not `co.uk`). With
+removes it afterwards. Alibaba, Cloudflare, Huawei, and Tencent use the
+registrable domain determined by the public suffix list. With
 `manual` (or an empty provider) the challenge is attempted only once per
 process start, since there is nothing to poll; the TXT value is logged and
 also written to the storage category, from where the hourly sweep removes it
 a day later.
+
+### Amazon Route 53
+
+Select DNS-01 and `route53`. Include both hostnames on the site for a single
+certificate covering the apex and wildcard. On EC2, attach an instance role
+and enable IMDSv2.
+The agent uses the AWS SDK credential chain. Supply any non-EC2 credentials
+through the process environment or shared AWS configuration. The provider uses
+the AWS commercial Route 53 endpoint.
+
+An optional `hosted_zone_id` selects a public hosted zone. With no ID, the agent
+lists public hosted zones, selects the closest matching zone and checks its NS
+records with the agent's DNS resolver. Configure the zone ID if discovery is
+ambiguous. Use a resolver with a public DNS view for ACME.
+
+Allow `route53:GetHostedZone`, `route53:ListResourceRecordSets` and
+`route53:ChangeResourceRecordSets` on the selected zone. Discovery also requires
+`route53:ListHostedZones`. Where possible, restrict mutations to the
+`_acme-challenge` TXT names and the `CREATE` and `DELETE` actions. Deploy one
+issuer per certificate and distribute its PEM to other agents. When the
+control plane’s embedded data plane is the issuer, set
+`PINGAP_DISABLE_ACME=true` on agents that only consume its certificates.
+Independent issuers can open duplicate orders even when TXT updates preserve
+both values. Cleanup removes values from acknowledged writes. A timed-out
+write can leave a TXT value for an operator to review.
 
 ## Certificate configuration
 
@@ -81,7 +107,7 @@ a day later.
 | `domains` | string | Comma-separated domain list |
 | `acme` | string | `lets_encrypt` to enable ACME for this certificate |
 | `dns_challenge` | bool | Use DNS-01 instead of HTTP-01 |
-| `dns_provider` | string | `ali`, `cf`, `huawei`, `tencent`, `manual` |
+| `dns_provider` | string | `ali`, `cf`, `huawei`, `tencent`, `route53`, `manual` |
 | `dns_service_url` | string | Provider endpoint and credentials |
 | `buffer_days` | int | Renew this many days before expiry |
 | `is_default` | bool | Serve this certificate when SNI matches nothing |

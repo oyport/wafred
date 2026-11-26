@@ -28,8 +28,10 @@ rules), and the resulting verdict is mapped onto the proxy pipeline.
 | `max_body_size` | int | `65536` | Upper bound (bytes) of the body read when `inspect_body` is on. |
 | `body_stage_policy` | string | `balanced` | What to do when the body staging budget runs out: `balanced` forwards the checked prefix and emits `body_prefix_only`; `strict` rejects instead of forwarding an uninspected tail; `throughput` withholds nothing. |
 | `encoded_body_policy` | string | `inspect_wire` | What to do with a `Content-Encoding` the engine cannot undo: `inspect_wire` scans the encoded bytes and emits `body_encoded_uninspected`; `reject` answers `415`. |
-| `truncated_body_policy` | string | `monitor` | What to do when the scan surface was truncated (query/form/value/body cap, or an enabled inspection deadline): `monitor` forwards and emits `body_scan_truncated` / `body_scan_deadline`; `reject` answers `413`. `body_stage_policy = "strict"` keeps its own rejection behaviour regardless. |
-| `pow_difficulty` | int | `20` | Proof-of-work difficulty used when a `Challenge` verdict delegates to the challenge subsystem. |
+| `truncated_body_policy` | string | `monitor` | What to do when the scan surface was truncated (query/form/value/body cap, or an inspection deadline): `monitor` forwards and emits `body_scan_truncated` / `body_scan_deadline`; `reject` answers `413` for a `pass` or `monitor` verdict (never for `block`, and never in observation mode). `body_stage_policy = "strict"` rejects regardless of this value. An unrecognised value is treated as `reject` and logged. |
+| `pow_difficulty` | int | `20` | Base proof-of-work difficulty for a `Challenge` verdict, used when the site carries no challenge settings (standalone mode). A site that has them uses its own `base_difficulty`/`max_difficulty`. |
+| `pow_max_difficulty` | int | `24` | Adaptive ceiling paired with `pow_difficulty` for a site without challenge settings. Set it equal to `pow_difficulty` to pin the work. |
+| `pow_issue_limit_per_min` | int | `120` | Fallback per-host+IP challenge-issuance budget for a site without challenge settings. It shares the process-wide budget with the challenge plugin, so pages minted here count against the site's `issue_limit_per_min` too. |
 | `step` | string | `early_request` | `early_request` or `request`. Any other value is a configuration error. |
 
 ## Verdicts
@@ -107,9 +109,11 @@ stacks = ["php"]
 
 - `waf` runs at `early_request` by default, ahead of most other plugins, so
   malicious traffic is rejected before authentication, caching or upstream work.
-- Pair with [`challenge`](challenge.md): a `Challenge` verdict renders the
-  challenge page, and the challenge plugin's verify endpoint completes the flow.
-  Keep `pow_difficulty` and `cookie_secret` consistent between the two.
+- Pair with [`challenge`](challenge.md): a `Challenge` verdict is minted through
+  the challenge subsystem's guarded path — the site's difficulty, the shared
+  per-host+IP issuance budget and the adaptive pressure all apply — and the
+  challenge plugin's verify endpoint completes the flow. Keep `cookie_secret`
+  consistent between the two.
 - The engine runs on **every** request. Leave `inspect_body` off unless you need
   body-level detection, and keep `max_body_size` bounded.
 - **Body inspection is prefix-only**: with `inspect_body` on, only the first
@@ -136,15 +140,23 @@ stacks = ["php"]
   still scanned as one blob, and the verdict carries
   `request=truncated(...)`; the data plane emits a `body_scan_truncated`
   security event. With `truncated_body_policy = "reject"` (or
-  `body_stage_policy = "strict"`) a truncated-but-clean request is rejected
-  with `413` instead of being forwarded, because "pad the payload past the
-  inspection surface" is exactly the shape that used to bypass detection.
-- **Deep detection has an optional soft per-request deadline (off by
-  default).** When enabled it stops Stage-1 detection and the verdict carries
+  `body_stage_policy = "strict"`) a truncated request is rejected with `413`
+  instead of being forwarded, because "pad the payload past the inspection
+  surface" is exactly the shape that used to bypass detection. The rejection
+  applies to `pass` **and** `monitor` verdicts — a truncated request almost
+  always scores a weak monitor hit, and requiring `pass` meant the policy
+  never fired — but never to `block` (the block page says more) and never on
+  a site in observation mode (`mode = "monitor"`), whose contract is to
+  record and forward.
+- **Deep detection has a soft per-request deadline (20 ms by default).**
+  When it trips, Stage-1 detection stops and the verdict carries
   `request=deadline` (`body_scan_deadline` event); the truncation policy
   decides whether such a request is forwarded or rejected. It is a safety
-  valve on top of the per-request caps, not the primary bound, and it is
-  opt-in because a wall-clock limit makes verdicts depend on scheduler load.
+  valve on top of the per-request caps, not the primary bound: a wall-clock
+  limit makes verdicts depend on scheduler load, so on a busy host it can
+  skip Stage-1 detection for a request that would otherwise block — which is
+  why the request it trips on is always reported rather than read as a clean
+  pass. `WafEngineConfig::inspection_deadline = Duration::ZERO` disables it.
 - The engine is held behind `Arc<RwLock<..>>` and per-domain engines are cached,
   so control-plane rule updates hot-reload without restarting pingap. Cached
   engines idle for more than 600 seconds are evicted, least-recently-used

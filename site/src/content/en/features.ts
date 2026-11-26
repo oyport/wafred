@@ -15,6 +15,7 @@ const features = {
       { id: "cc-bot", label: "CC & bot" },
       { id: "access-control", label: "Access control" },
       { id: "traffic-caching", label: "Traffic & cache" },
+      { id: "tunnel", label: "Tunnels" },
       { id: "tls", label: "TLS" },
       { id: "observability", label: "Observability" },
       { id: "operations", label: "Operations" },
@@ -104,6 +105,25 @@ const features = {
         id: "caching",
         caption: "Cache rules, TTLs and per-site quota.",
         alt: "Edge caching configuration in the WAFred console",
+      },
+    },
+    {
+      id: "tunnel",
+      icon: "network",
+      kicker: "Reach",
+      title: "Serve a service that has no public door",
+      lead: "A connector inside the private network dials out to the edge, so a NAS, an intranet app or an admin page behind NAT is protected by the same WAF — with no inbound port and no public IP on that host.",
+      points: [
+        "The connector only makes outbound connections; the edge terminates the public side and hands the pool a loopback bridge address.",
+        "Edges never see the connector's credential: they verify a short-lived Ed25519 session token and pin the edge certificate.",
+        "A host with no direct egress reaches both the control plane and the edges through a SOCKS5 proxy.",
+        "One console drives it end to end: create, pair, bind an origin pool, rotate, revoke, disable or delete.",
+      ],
+      note: "outbound connector → edge listener → loopback bridge",
+      scene: {
+        id: "agents",
+        caption: "Tunnels live next to the edge inventory, with pairing, sessions and limits.",
+        alt: "Tunnels tab in the WAFred console",
       },
     },
     {

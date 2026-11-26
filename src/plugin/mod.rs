@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(not(feature = "edge"))]
 use crate::process::get_admin_addr;
 use ahash::AHashMap;
 use arc_swap::ArcSwap;
@@ -21,28 +22,39 @@ use pingap_plugin::get_plugin_factory;
 // Reuse the canonical plugin-config helpers instead of keeping a second copy.
 // `get_hash_key` in particular MUST stay byte-identical to the one plugins use
 // to compute their config key, otherwise hot-reload change detection breaks.
-pub(crate) use pingap_plugin::{
-    get_hash_key, get_int_conf, get_step_conf, get_str_conf, get_str_slice_conf,
-};
+pub(crate) use pingap_plugin::{get_hash_key, get_step_conf, get_str_conf};
+#[cfg(not(feature = "edge"))]
+pub(crate) use pingap_plugin::{get_int_conf, get_str_slice_conf};
+#[cfg(not(feature = "edge"))]
 use pingap_proxy::ServerConf;
+#[cfg(not(feature = "edge"))]
 use pingap_util::base64_encode;
+#[cfg(not(feature = "edge"))]
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 use std::collections::HashMap;
+#[cfg(not(feature = "edge"))]
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{error, info};
 
+#[cfg(not(feature = "edge"))]
 mod admin;
 mod stats;
 
-/// UUID for the admin server plugin, generated at runtime
+/// UUID for the admin server plugin, generated at runtime.
+///
+/// The plugin embeds the pingap dashboard (`rust-embed`), which is exactly the
+/// payload the agent-only build exists to leave out, so it is compiled only
+/// into the control-plane/all-in-one binary.
+#[cfg(not(feature = "edge"))]
 pub static ADMIN_SERVER_PLUGIN: &str = "pingap:admin";
 
 static LOG_TARGET: &str = "main::plugin";
 
+#[cfg(not(feature = "edge"))]
 #[derive(Debug, PartialEq, Deserialize, Serialize, Default)]
 struct AdminPluginParams {
     max_age: Option<String>,
@@ -61,6 +73,7 @@ struct AdminPluginParams {
 ///
 /// # Errors
 /// Returns Error::Invalid if URL parsing fails
+#[cfg(not(feature = "edge"))]
 pub fn parse_admin_plugin(
     addr: &str,
 ) -> Result<(ServerConf, String, PluginConf)> {
@@ -317,8 +330,11 @@ pub fn try_init_plugins(
         .map(|(name, value)| (name.to_string(), value.clone()))
         .collect();
 
-    // add admin plugin
-    let mut errors = vec![];
+    // Add the admin plugin. The edge build has no admin surface (the module
+    // and its embedded dashboard are compiled out), and `get_admin_addr()` is
+    // never set there, so the block disappears with it.
+    let mut errors: Vec<Error> = vec![];
+    #[cfg(not(feature = "edge"))]
     if let Some(addr) = &get_admin_addr() {
         match parse_admin_plugin(addr) {
             Ok((_, name, proxy_plugin_info)) => {

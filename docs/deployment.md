@@ -5,7 +5,7 @@
 | Requirement | Minimum | Recommended |
 |-------------|---------|-------------|
 | OS | Linux (amd64/arm64), macOS | Ubuntu 22.04+, Debian 12+ |
-| PostgreSQL | 14+ | 16 |
+| PostgreSQL | 14+ | 16+ — native packages follow the distribution (`postgresql-18` on Ubuntu 26.04, `postgresql-16` on 24.04); check with `apt-cache search --names-only '^postgresql-[0-9]+$'` |
 | RAM | 512 MB | 2 GB+ |
 | Disk | 1 GB | 10 GB+ (logs, cache) |
 | Ports | 80, 443, 9080, 9090 | — |
@@ -306,11 +306,22 @@ the script resolved from your options.
 > Alpine, ...) `install.sh` stops with the loader's error — build from source
 > there, or run the container image.
 
+> **Manual tarball install.** The archive contains `wafred`, `wafred.service`
+> and `wafred.toml` **inside** `wafred-linux-<arch>/`; copy the unit from
+> there, not from the top of the extraction directory. Use `WAFRED_DB_URL`
+> (not `WAFRED_DATABASE_URL`) for a non-default database, set
+> `WAFRED_SECRET_KEY` and an admin password before the first start, and keep
+> the unit's `WorkingDirectory=/var/lib/wafred` so the relative
+> `cache_dir = "./data/cache"` is writable under `ProtectSystem=strict`. A
+> manual unit has no memory probe; pin `MIMALLOC_ARENA_RESERVE` on hosts below
+> 4 GiB. The full checklist is in [quick-start Path 3](./quick-start.md#path-3-binary--systemd-production).
+
 ### 2. Set Up PostgreSQL
 
 ```bash
-# Install PostgreSQL
-sudo apt install postgresql-16
+# Install PostgreSQL (use the distribution's default package; Ubuntu 26.04
+# ships postgresql-18 and has no postgresql-16. Anything 14+ works.)
+sudo apt install postgresql
 
 # Create user and database
 sudo -u postgres createuser wafred
@@ -436,7 +447,7 @@ server-side log batch size (`500`) are compiled-in constants with no override.
 | `heartbeat_interval_secs` | int | `30` | Fallback heartbeat frequency, used only when the control plane hands no interval down at registration |
 | `log_batch_size` | int | `100` | Log entries before flush |
 | `log_flush_interval_secs` | int | `5` | Max time between flushes |
-| `max_body_log_size` | int | `8192` | Max request body bytes to log |
+| `max_body_log_size` | int | `8192` | Max body bytes to log per direction (request and response), 64 KiB ceiling, `0` disables body capture. Bodies held for logging are capped at 32 MiB for the in-flight requests and 32 MiB for the log queue: above the default, a busy node logs some entries without their body, marked truncated |
 | `metrics_ship_interval_secs` | int | `30` | Edge-metrics ship interval; `0` disables shipping |
 | `auto_upgrade` | bool | `false` | Install the control plane's build automatically when the versions differ. Replaces the binary and restarts the process — see [Agent Self-Upgrade](#agent-self-upgrade) |
 | `upgrade_url` | string | — | Control plane REST base (`https://cp.example.com:9080`) used only by the upgrade endpoints. Auto-upgrade stays disabled while this is unset |
@@ -530,6 +541,46 @@ wafred server --db-url "postgres://..." --admin-addr 0.0.0.0:9080 --grpc-addr 0.
 wafred agent --server-url "https://control-plane:9090" --server-ca-cert /var/lib/wafred/data/grpc-ca.pem --api-key "your-agent-key"
 ```
 
+**Tunnel connector (optional, for services inside a private network):**
+
+```bash
+# on a host inside the private network; the token comes from
+# Agents -> Tunnels -> Create tunnel
+wafred-tunnel pair --config /etc/wafred/tunnel.toml \
+  --token "<pairing-token>" --server-url "https://control-plane:9090" \
+  --server-ca-cert /etc/wafred/tunnel-ca.pem
+wafred-tunnel run --config /etc/wafred/tunnel.toml
+```
+
+The connector dials out only: it never needs an inbound port. On the edge side,
+enable the listener and give that edge a public ingress address:
+
+```toml
+[agent]
+tunnel_addr = "0.0.0.0:9443"
+```
+
+then set **Agents → [node] → Tunnel ingress** to `edge1.example.com:9443`.
+Bind an origin pool to the tunnel in the site's origin pool settings; its node
+addresses are then resolved by the connector inside the private network. See
+[user-guide.md](user-guide.md#tunnels-internal-services-without-an-inbound-port).
+
+In the compose deployment the listener is off unless the variable reaches the
+container — compose only passes the environment a service declares, so add
+`WAFRED_TUNNEL_ADDR=0.0.0.0:9443` to the `wafred` service's `environment:`
+block (the shipped file already forwards `${WAFRED_TUNNEL_ADDR}` and publishes
+`${WAFRED_TUNNEL_BIND:-127.0.0.1}:9443:9443`), set
+`WAFRED_TUNNEL_BIND=0.0.0.0` when the connectors are on other hosts, and open
+`9443` in the firewall and the cloud security group. A value in `.env` alone is
+never passed through.
+
+A connector host with **no direct egress** can reach both the control plane and
+the edges through a SOCKS5 proxy: add `socks5_proxy = "10.0.0.1:1080"` (plus
+`socks5_username` / `socks5_password` when the proxy requires them) to
+`tunnel.toml`, or pass `--socks5-proxy` to `install.sh --mode tunnel`. Target
+names are resolved by the proxy, the handshake is bounded, and a dial never
+falls back to a direct connection.
+
 The gRPC listener serves TLS by default, so `server_url` should be `https://`
 with the CA that signed the control plane's certificate in
 `server_ca_cert` (self-signed control plane: download the CA from
@@ -538,7 +589,24 @@ the host agents dial, set `server_tls_name` to a SAN it does carry — the
 parameter requires 0.32.17 or newer; on older binaries, point the SAN name at
 the control plane in `/etc/hosts` instead.
 
-Generate an agent API key from the dashboard: **Settings → API Keys → Create Key**.
+Create the enrollment key from the console's **Nodes → Add node** flow (or
+`POST /api/v1/agents/enroll`); it returns the install command. Agent scope defaults to **All sites** owned by its API key. In **Agents → [node] → Site scope**, choose **Selected sites** to send only the sites that edge should serve. Keep the control plane dashboard site out of a separate edge’s selection; its loopback dashboard address is not available there.
+
+For ACME, the control plane must be **0.32.40 or newer**: that release syncs
+the PEMs issued by its embedded data plane into `site_certificates` and pushes
+them to the agents. An older control plane sends `acme_email` without a PEM,
+so each agent starts its own HTTP-01 order; the CA validation request reaches
+the host that owns port 80 (usually the control plane), not the agent, and the
+order fails with `acme_failed`. If the control plane cannot be upgraded yet,
+set `PINGAP_DISABLE_ACME=true` in the agent unit and upload certificates
+instead. An agent that really is the HTTP-01 endpoint for its domains can
+still issue locally, but a remote agent behind the control plane cannot.
+
+The installer copies `--server-ca-cert` to `/etc/wafred/grpc-ca.pem` and
+writes that durable path into the config/unit; the source file may live in a
+temporary directory. The console's generated command does not include the CA
+or `--server-tls-name`, so add them when the control plane uses its
+self-signed certificate.
 
 The log, certificate-event and metric shipping streams authenticate with the
 agent token sent as `x-agent-token` gRPC metadata. **In distributed
@@ -777,6 +845,15 @@ Configure through the dashboard:
 
 Certificates are automatically renewed before expiry.
 
+In **all-in-one** mode the embedded data plane is the ACME issuer. The control
+plane mirrors the PEMs it issues (from the data plane's `acme_state.toml`) into
+the ACME-managed `site_certificates` rows every 30 seconds and pushes the
+updated bundle to every agent, so an edge agent whose port 80 points at the
+control plane does not have to issue (and fail) its own HTTP-01 order. Set
+`WAFRED_ACME_STATE` to override the file path. A remote agent that is itself
+the HTTP-01 endpoint can still issue locally; use **DNS-01** when it is not the
+instance owning the domain's port 80.
+
 ### Manual Certificates
 
 Upload PEM-encoded certificate and key through the dashboard or API:
@@ -977,7 +1054,8 @@ network — that sends agent traffic and credentials in plaintext.
 | 80 | TCP | HTTP traffic / ACME HTTP-01 | Yes (for proxied sites) |
 | 443 | TCP | HTTPS traffic | Yes (for proxied sites) |
 | 9080 | TCP | Admin dashboard + REST API (HTTPS) | Yes |
-| 9090 | TCP | gRPC control plane (agents) | Distributed mode |
+| 9090 | TCP | gRPC control plane (agents and tunnel connectors) | Distributed mode |
+| 9443 | TCP | Tunnel listener (`agent.tunnel_addr`) | Only on edges that terminate tunnels |
 | 5432 | TCP | PostgreSQL | Internal only |
 
 ```bash
@@ -986,7 +1064,16 @@ sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
 sudo ufw allow from 203.0.113.10 to any port 9080 proto tcp  # admin/VPN only
 sudo ufw allow from 203.0.113.0/24 to any port 9090 proto tcp # agent nodes only
+sudo ufw allow 9443/tcp                                       # tunnel connectors (see below)
 ```
+
+`9443` is the tunnel listener and is **off by default**: only an edge that an
+operator explicitly made a tunnel ingress accepts connector sessions
+(`agent.tunnel_addr`, or `--tunnel-addr 0.0.0.0:9443`). It must be reachable
+from wherever the connectors run — that is the whole point of the tunnel, and
+the only port a private-network host needs to reach. The connectors themselves
+need **outbound** 9090 (control plane) and 9443 (ingress edges) and nothing
+inbound.
 
 `9080` is the authenticated admin console, not a public API. Prefer binding it
 to a private interface or loopback and reaching it through a VPN/SSH tunnel
@@ -1167,6 +1254,14 @@ change has to reach the fleet immediately.
 Take a backup before every upgrade, and pin the exact version you deploy —
 `:latest` makes an upgrade an unauditable drift and leaves you without a known
 rollback target.
+
+> **Console listen address.** New installs bind the console on `0.0.0.0:9080`.
+> An upgrade never rewrites an existing configuration, so an installation
+> created before that change keeps `admin_addr = "127.0.0.1:9080"` (and compose
+> keeps the old `.env` value) and stays reachable only from the host itself.
+> Set `admin_addr = "0.0.0.0:9080"` — or `WAFRED_ADMIN_BIND=0.0.0.0` in
+> `.env` — when you want the new behavior, then restrict the port with a
+> firewall or a reverse proxy.
 
 ### Docker
 
@@ -1476,6 +1571,19 @@ psql "postgres://wafred:password@localhost:5432/wafred" -c "SELECT 1"
 2. Check the API key is valid
 3. Review agent logs: `RUST_LOG=debug wafred agent --server-url ...`
 4. Ensure clocks are synchronized (NTP)
+
+`wrong version number` on port **443** is not a control-plane connection
+error: it means a client spoke plaintext HTTP to the TLS listener (a scanner
+or a misconfigured client). It is expected noise on a public edge; filter or
+rate-limit it in the log collector rather than disabling the listener's error
+target. Control-plane TLS problems are the `UnknownIssuer` / `NotValidForName`
+family covered under [Agent Can't Reach the Control Plane](#agent-cant-reach-the-control-plane).
+
+If `/etc/wafred/wafred.toml` already exists, `install.sh --server-url …`
+and `--api-key …` do **not** rewrite it: in agent mode the file wins over the
+unit's environment. The effective URL is the one in the startup log
+(`server_url=…`); edit `[agent]` in the file and restart when it differs from
+what the installer was given.
 
 TLS handshake errors (`GoAway … FRAME_SIZE_ERROR`, `UnknownIssuer`,
 `NotValidForName`) have a dedicated walkthrough under

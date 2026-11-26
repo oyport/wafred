@@ -866,7 +866,7 @@ impl Oidc {
     /// The session of a request, when it has one that still holds.
     fn session(&self, session: &Session, now: u64) -> Option<SessionData> {
         let cookie = get_cookie_value(session.req_header(), &self.cookie_name)?;
-        self.unseal::<SessionData>(cookie)
+        self.unseal::<SessionData>(&cookie)
             .filter(|data| now < data.exp)
     }
 
@@ -1230,7 +1230,7 @@ impl Oidc {
         }
         let cookie_name = self.login_cookie_name(&state);
         let login = get_cookie_value(header, &cookie_name)
-            .and_then(|cookie| self.unseal::<Login>(cookie))
+            .and_then(|cookie| self.unseal::<Login>(&cookie))
             .filter(|login| {
                 constant_time_eq(login.state.as_bytes(), state.as_bytes())
             })
@@ -1417,7 +1417,7 @@ impl Oidc {
         // host this agent does not serve.
         let site_id = agent
             .get_rules_for_domain(&host)
-            .map(|rules| rules.site_id.clone())
+            .map(|rules| rules.site_id.to_string())
             .unwrap_or_default();
         // The scheme the browser used, not the last hop's: an event recorded
         // for a site behind a TLS-terminating proxy should not claim http.

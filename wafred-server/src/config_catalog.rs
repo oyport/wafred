@@ -244,6 +244,15 @@ pub static GLOBAL_TABLES: &[TableSpec] = &[
         order: "id",
         secrets: &[],
     },
+    TableSpec {
+        name: "tunnel_settings",
+        scopes: GD,
+        filter: Filter::Singleton,
+        layer: 1,
+        key: Some("id"),
+        order: "id",
+        secrets: &[],
+    },
     global("error_pages", "status_code"),
 ];
 
@@ -295,6 +304,14 @@ pub static DEPLOYMENT_ONLY_TABLES: &[TableSpec] = &[
         key: Some("key"),
         order: "key",
         secrets: &[],
+    },
+    // The credential and the pairing token are only ever stored as digests,
+    // but they are still credential material: a restore brings the connector
+    // back without a re-pair, and a backup dump must not carry them in clear
+    // (they are hashes, so the secret is not recoverable either way).
+    TableSpec {
+        secrets: &["credential_sha256", "pairing_token_hash"],
+        ..deployment("tunnel_connectors", 1, "id")
     },
 ];
 

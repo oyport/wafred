@@ -30,9 +30,10 @@ use super::{
 };
 use crate::bot_dns::{DnsVerdict, bot_dns_verifier, known_bot_family};
 use crate::challenge::{
-    ChallengeKind, VERIFY_ENDPOINT, basic_auth_page, block_page,
-    build_challenge_response, fail_closed_page, paused_page, rate_limit_page,
-    resolve_cookie_secret,
+    ChallengeKind, ChallengeLimits, DEFAULT_ISSUE_LIMIT_PER_MIN,
+    DEFAULT_VERIFY_LIMIT_PER_MIN, MintRequest, VERIFY_ENDPOINT,
+    basic_auth_page, block_page, fail_closed_page, mint_challenge, paused_page,
+    rate_limit_page, resolve_cookie_secret,
 };
 use crate::host_cache::{HostCacheSweep, touch};
 use crate::path_filter::{MatchType, PathFilter};
@@ -52,6 +53,7 @@ use pingap_core::{
 use pingap_util::{IpRules, base64_decode};
 use pingora::http::{ResponseHeader, Version};
 use pingora::proxy::Session;
+use pingwaf_agent::body_budget::{BodyBudget, LOG_BODY_BUDGET_BYTES};
 use pingwaf_agent::cache::{
     AiCrawlConfig as CacheAiCrawlConfig,
     BasicAuthConfig as CacheBasicAuthConfig,
@@ -1061,7 +1063,7 @@ impl SiteContext {
                 .bot_protection
                 .as_ref()
                 .filter(|cfg| cfg.enabled)
-                .map(BotPolicy::build),
+                .and_then(BotPolicy::build),
             ai_bots: ai_bot_rules(site_rules.ai_crawl.as_ref()),
             rate_limits: (!rate_limits.rules.is_empty()).then_some(rate_limits),
             mtls: MtlsPolicy::build(site_rules.ssl_config.as_ref()),
@@ -1222,7 +1224,9 @@ struct IpRule {
     id: String,
     name: String,
     action: IpRuleAction,
-    ranges: IpRules,
+    /// Shared with every identical range set in the process
+    /// (see [`shared_ip_rules`]).
+    ranges: Arc<IpRules>,
     /// Empty scope = the whole site.
     path: Option<PathFilter>,
 }
@@ -1319,11 +1323,41 @@ impl AccessPolicy {
                         None
                     },
                 };
+                // Malformed entries (`10.0.0.0/33`, `/abc`, …) are dropped
+                // silently by `IpRules::new`, which made a block rule
+                // degrade without a trace; the control plane now rejects
+                // them at write time, so landing here means legacy or
+                // out-of-band data — warn with the offending values and
+                // keep enforcing the valid remainder.
+                let ranges = match IpRules::try_new(&rule.ip_ranges) {
+                    Ok(parsed) => shared_ip_rules_parsed(&rule.ip_ranges, parsed),
+                    Err(err) => {
+                        warn!(
+                            site_id = %site_rules.site_id,
+                            rule_id = %rule.id,
+                            rule_name = %rule.name,
+                            error = %err,
+                            "ip access rule contains invalid IP ranges; \
+                             they are ignored"
+                        );
+                        let valid: Vec<String> = rule
+                            .ip_ranges
+                            .iter()
+                            .filter(|r| {
+                                let r = r.trim();
+                                r.parse::<IpNet>().is_ok()
+                                    || r.parse::<IpAddr>().is_ok()
+                            })
+                            .cloned()
+                            .collect();
+                        shared_ip_rules(&valid)
+                    },
+                };
                 Some(IpRule {
                     id: rule.id.clone(),
                     name: rule.name.clone(),
                     action,
-                    ranges: IpRules::new(&rule.ip_ranges),
+                    ranges,
                     path,
                 })
             })
@@ -1513,15 +1547,18 @@ enum BotDecision {
 }
 
 impl BotPolicy {
-    fn build(cfg: &CacheBotProtection) -> Self {
+    /// `None` for the `allow` action: nothing is enforced or recorded, so
+    /// there is no policy to run.
+    fn build(cfg: &CacheBotProtection) -> Option<Self> {
         let action = match cfg.action {
+            CacheWafAction::Allow => return None,
             CacheWafAction::Log => BotAction::Log,
             CacheWafAction::Challenge | CacheWafAction::JsChallenge => {
                 BotAction::Challenge
             },
             _ => BotAction::Block,
         };
-        Self {
+        Some(Self {
             whitelist: cfg
                 .known_bots_whitelist
                 .iter()
@@ -1540,7 +1577,7 @@ impl BotPolicy {
                 })
                 .collect(),
             dns_verification: cfg.dns_verification_enabled,
-        }
+        })
     }
 
     fn denial(&self, detail: String) -> Denial {
@@ -1899,32 +1936,49 @@ impl CompiledRateRule {
         })
     }
 
-    /// Counter key for this rule and request: the rule id (a UUID, unique
-    /// across sites) plus the value of every tracked characteristic. Requests
-    /// missing a parameterized value (absent header/cookie/query) share the
-    /// `-` bucket instead of bypassing the counter.
+    /// Counter key for this rule and request: a digest of the rule id (a
+    /// UUID, unique across sites) and the value of every tracked
+    /// characteristic.
+    ///
+    /// The values are attacker-chosen and unbounded (a path, a header, a
+    /// query value), so they are not stored: the table keeps 16 bytes per
+    /// counter whatever the request looked like.
     fn counter_key(
         &self,
         request_data: &RequestData,
         host: &str,
         asn: Option<u32>,
-    ) -> String {
-        let mut key = String::with_capacity(64);
-        key.push_str(&self.id);
+    ) -> RateKey {
+        let mut digest = RateKeyDigest::new();
+        digest.push(&self.id);
+        self.key_parts(request_data, host, asn, |part| digest.push(part));
+        digest.finish()
+    }
+
+    /// Feeds `sink` the value of every tracked characteristic, in rule
+    /// order. Requests missing a parameterized value (absent
+    /// header/cookie/query) share the `-` bucket instead of bypassing the
+    /// counter.
+    fn key_parts(
+        &self,
+        request_data: &RequestData,
+        host: &str,
+        asn: Option<u32>,
+        mut sink: impl FnMut(&str),
+    ) {
         for c in &self.chars {
-            key.push('\u{1f}');
             match c {
-                RateChar::Ip => key.push_str(&request_data.client_ip),
-                RateChar::Host => key.push_str(host),
-                RateChar::Path => key.push_str(&request_data.path),
-                RateChar::Country => key.push_str(
-                    request_data.country_code.as_deref().unwrap_or("-"),
-                ),
-                RateChar::Asn => match asn {
-                    Some(n) => key.push_str(&n.to_string()),
-                    None => key.push('-'),
+                RateChar::Ip => sink(&request_data.client_ip),
+                RateChar::Host => sink(host),
+                RateChar::Path => sink(&request_data.path),
+                RateChar::Country => {
+                    sink(request_data.country_code.as_deref().unwrap_or("-"))
                 },
-                RateChar::Header(name) => key.push_str(
+                RateChar::Asn => match asn {
+                    Some(n) => sink(&n.to_string()),
+                    None => sink("-"),
+                },
+                RateChar::Header(name) => sink(
                     request_data
                         .headers
                         .iter()
@@ -1932,7 +1986,7 @@ impl CompiledRateRule {
                         .map(|(_, v)| v.trim())
                         .unwrap_or("-"),
                 ),
-                RateChar::Cookie(name) => key.push_str(
+                RateChar::Cookie(name) => sink(
                     request_data
                         .headers
                         .iter()
@@ -1944,7 +1998,7 @@ impl CompiledRateRule {
                         })
                         .unwrap_or("-"),
                 ),
-                RateChar::Query(name) => key.push_str(
+                RateChar::Query(name) => sink(
                     request_data
                         .query
                         .split('&')
@@ -1956,7 +2010,51 @@ impl CompiledRateRule {
                 ),
             }
         }
-        key
+    }
+}
+
+/// Fixed-size key of one rate limit counter (see
+/// [`CompiledRateRule::counter_key`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RateKey(u128);
+
+/// Two independently keyed 64-bit hashes make up a [`RateKey`]. The keys are
+/// drawn once per process, so a client cannot compute two requests that land
+/// on the same counter, and 128 bits put an accidental collision (one client
+/// inheriting another's count or ban) out of reach at any table size.
+static RATE_KEY_HASHERS: LazyLock<
+    [std::collections::hash_map::RandomState; 2],
+> = LazyLock::new(Default::default);
+
+struct RateKeyDigest {
+    high: std::collections::hash_map::DefaultHasher,
+    low: std::collections::hash_map::DefaultHasher,
+}
+
+impl RateKeyDigest {
+    fn new() -> Self {
+        use std::hash::BuildHasher;
+        let [high, low] = &*RATE_KEY_HASHERS;
+        Self {
+            high: high.build_hasher(),
+            low: low.build_hasher(),
+        }
+    }
+
+    /// `str` hashes as its bytes plus a terminator, so the parts stay
+    /// delimited: ("ab", "c") and ("a", "bc") give different keys.
+    fn push(&mut self, part: &str) {
+        use std::hash::Hash;
+        part.hash(&mut self.high);
+        part.hash(&mut self.low);
+    }
+
+    fn finish(self) -> RateKey {
+        use std::hash::Hasher;
+        RateKey(
+            (u128::from(self.high.finish()) << 64)
+                | u128::from(self.low.finish()),
+        )
     }
 }
 
@@ -2015,10 +2113,17 @@ const RATE_COUNTERS_GC_THRESHOLD: usize = 65_536;
 /// the CPU cost on the hot path.
 const RATE_COUNTERS_GC_INTERVAL_SECS: u64 = 30;
 
-/// Past this many counters the sweep cadence tightens to every second: the
-/// map is growing faster than the relaxed interval can trim it, and memory
-/// pressure matters more than the (still once-per-second) O(N) sweep.
-const RATE_COUNTERS_GC_PANIC_THRESHOLD: usize = 262_144;
+/// Hard cap on live counters, all sites together. Sweeping only removes
+/// *expired* entries, so a flood of unique keys inside one window (a rule
+/// keyed on the path or a query value needs no botnet for that) used to grow
+/// the table for as long as the window lasted. At the cap a new key is only
+/// admitted after [`RateCounters::shed`] made room for it; with 16-byte keys
+/// the whole table then stays within a few tens of MiB.
+const RATE_COUNTERS_MAX_ENTRIES: usize = 262_144;
+
+/// Room one shed pass tries to free, so a table hovering at the cap is not
+/// walked again a second later.
+const RATE_COUNTERS_SHED_ROOM: usize = RATE_COUNTERS_MAX_ENTRIES / 8;
 
 /// Below `RATE_COUNTERS_GC_THRESHOLD` the map still needs occasional pruning:
 /// keys that stop receiving traffic (one-off scanner IP/path combinations)
@@ -2027,6 +2132,105 @@ const RATE_COUNTERS_GC_PANIC_THRESHOLD: usize = 262_144;
 /// at this size the map is cheap to keep, and the goal is bounded staleness,
 /// not per-request freshness.
 const RATE_COUNTERS_IDLE_GC_INTERVAL_SECS: u64 = 600;
+
+/// Rate limit counters of every site, capped at
+/// [`RATE_COUNTERS_MAX_ENTRIES`].
+#[derive(Default)]
+struct RateCounters {
+    map: DashMap<RateKey, RateCounter>,
+    /// Unix second of the last shed pass: at the cap the table is walked at
+    /// most once a second, whatever the request rate.
+    last_shed: AtomicU64,
+    /// Requests a rule did not count because the table was full.
+    uncounted: AtomicU64,
+}
+
+impl RateCounters {
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn sweep_expired(&self, now: u64) {
+        self.map.retain(|_, counter| now < counter.expires_at);
+    }
+
+    /// Whether a counter for a key not yet in the table may be created.
+    ///
+    /// `false` means the request goes uncounted for this rule: the table is
+    /// full of counters that carry more state than a first hit would, and
+    /// keeping those (the running bans above all) is worth more than
+    /// starting one more.
+    fn admit(&self, now: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.map.len() < RATE_COUNTERS_MAX_ENTRIES {
+            return true;
+        }
+        let last = self.last_shed.load(Relaxed);
+        if now != last
+            && self
+                .last_shed
+                .compare_exchange(last, now, Relaxed, Relaxed)
+                .is_ok()
+        {
+            self.shed(now);
+            if self.map.len() < RATE_COUNTERS_MAX_ENTRIES {
+                return true;
+            }
+        }
+        let uncounted = self.uncounted.fetch_add(1, Relaxed) + 1;
+        // 1, 2, 4, 8, ... : enough to notice, never one line per request.
+        if uncounted.is_power_of_two() {
+            warn!(
+                counters = self.map.len(),
+                uncounted,
+                "rate limit counter table is full; requests with new keys are not counted"
+            );
+        }
+        false
+    }
+
+    /// Frees [`RATE_COUNTERS_SHED_ROOM`] entries: expired counters first,
+    /// then the lowest counts. Keys under a running ban are never dropped —
+    /// a flood of fresh keys must not be a way to lift one — and a counter
+    /// that is close to its threshold outlives the single hits a unique-key
+    /// flood consists of.
+    fn shed(&self, now: u64) {
+        // Live, unbanned counters by magnitude of their count.
+        let mut magnitudes = [0usize; 33];
+        self.map.retain(|_, counter| {
+            if now >= counter.expires_at {
+                return false;
+            }
+            if now >= counter.blocked_until {
+                magnitudes[count_magnitude(counter.count)] += 1;
+            }
+            true
+        });
+        let keep = RATE_COUNTERS_MAX_ENTRIES - RATE_COUNTERS_SHED_ROOM;
+        let excess = self.map.len().saturating_sub(keep);
+        if excess == 0 {
+            return;
+        }
+        let mut freed = 0;
+        let mut cutoff = 0;
+        for (magnitude, counters) in magnitudes.iter().enumerate() {
+            if freed >= excess {
+                break;
+            }
+            freed += counters;
+            cutoff = magnitude + 1;
+        }
+        self.map.retain(|_, counter| {
+            now < counter.blocked_until
+                || count_magnitude(counter.count) >= cutoff
+        });
+    }
+}
+
+/// 0 for a count of 0, then one step per doubling: 1, 2-3, 4-7, ...
+fn count_magnitude(count: u32) -> usize {
+    (u32::BITS - count.leading_zeros()) as usize
+}
 
 fn unix_now() -> u64 {
     crate::host_cache::unix_now()
@@ -2058,7 +2262,7 @@ impl RateLimitPolicy {
     /// the request continue.
     fn evaluate(
         &self,
-        counters: &DashMap<String, RateCounter>,
+        counters: &RateCounters,
         request_data: &RequestData,
         host: &str,
         cleared: bool,
@@ -2073,8 +2277,7 @@ impl RateLimitPolicy {
             // size so a policy-less site does not pay an O(N) scan per
             // request.
             if counters.len() > 1024 {
-                let now = unix_now();
-                counters.retain(|_, counter| counter.expires_at > now);
+                counters.sweep_expired(unix_now());
             }
             return RateOutcome { deny: None, logged };
         }
@@ -2121,17 +2324,13 @@ impl RateLimitPolicy {
                 continue;
             }
             let key = rule.counter_key(request_data, host, asn);
-            // Throttled sweep at every water level: above the threshold, at
-            // most one retain per interval (one per second once the panic
-            // threshold is passed) instead of a full O(N) walk on every
-            // request once an attacker has pushed the map past the threshold;
-            // below it, a slow idle interval still purges expired entries.
-            // The compare-exchange picks a single racer to run it; the
-            // others proceed without the walk.
-            let interval = if counters.len() >= RATE_COUNTERS_GC_PANIC_THRESHOLD
-            {
-                1
-            } else if counters.len() > RATE_COUNTERS_GC_THRESHOLD {
+            // Throttled sweep of expired counters at every water level: at
+            // most one retain per interval instead of a full O(N) walk on
+            // every request once an attacker has pushed the map past the
+            // threshold; below it, a slow idle interval still purges expired
+            // entries. The compare-exchange picks a single racer to run it;
+            // the others proceed without the walk.
+            let interval = if counters.len() > RATE_COUNTERS_GC_THRESHOLD {
                 RATE_COUNTERS_GC_INTERVAL_SECS
             } else {
                 RATE_COUNTERS_IDLE_GC_INTERVAL_SECS
@@ -2150,15 +2349,26 @@ impl RateLimitPolicy {
                     )
                     .is_ok()
             {
-                counters.retain(|_, entry| now < entry.expires_at);
+                counters.sweep_expired(now);
             }
             let window = now / rule.period_secs;
-            let mut entry = counters.entry(key).or_insert(RateCounter {
-                window,
-                count: 0,
-                blocked_until: 0,
-                expires_at: 0,
-            });
+            // A key already in the table is always counted; only a new one
+            // has to be admitted, and that happens with no shard lock held
+            // (shedding walks the whole map).
+            let mut entry = match counters.map.get_mut(&key) {
+                Some(entry) => entry,
+                None => {
+                    if !counters.admit(now) {
+                        continue;
+                    }
+                    counters.map.entry(key).or_insert(RateCounter {
+                        window,
+                        count: 0,
+                        blocked_until: 0,
+                        expires_at: 0,
+                    })
+                },
+            };
             if entry.window != window {
                 entry.window = window;
                 entry.count = 0;
@@ -2273,18 +2483,19 @@ impl ExpressionState {
     }
 }
 
-/// Parses the `Cookie` header into name/value pairs.
+/// Parses the `Cookie` header(s) into name/value pairs.
+///
+/// HTTP/2 clients may split the cookie jar across several `Cookie` fields
+/// (RFC 9113 §8.2.3) and Chromium does so once the jar grows. Reading only the
+/// first field hid every cookie after the split — including the clearance
+/// cookie, which made the challenge re-issue forever (2026-11-24, issue #108).
 fn parse_cookies(
     headers: &[(String, String)],
 ) -> Vec<(Cow<'static, str>, Cow<'static, str>)> {
-    let Some(raw) = headers
+    headers
         .iter()
-        .find(|(k, _)| k == "cookie")
-        .map(|(_, v)| v.as_str())
-    else {
-        return Vec::new();
-    };
-    raw.split(';')
+        .filter(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+        .flat_map(|(_, v)| v.split(';'))
         .filter_map(|pair| {
             let (name, value) = pair.trim().split_once('=')?;
             Some((
@@ -2295,18 +2506,30 @@ fn parse_cookies(
         .collect()
 }
 
+/// The request's User-Agent, used to bind a challenge to the client that
+/// requested it.
+fn request_user_agent(headers: &[(String, String)]) -> &str {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, value)| value.as_str())
+        .unwrap_or_default()
+}
+
 /// Extracts the clearance cookie value, if the client carries one.
+///
+/// Every `Cookie` field is searched, in wire order: an HTTP/2 client may split
+/// the jar over several fields, and the clearance one can land in any of them.
 fn clearance_cookie(headers: &[(String, String)]) -> Option<String> {
     headers
         .iter()
-        .find(|(k, _)| k == "cookie")
-        .and_then(|(_, v)| {
-            v.split(';').find_map(|pair| {
-                let (name, value) = pair.trim().split_once('=')?;
-                name.trim()
-                    .eq_ignore_ascii_case(CLEARANCE_COOKIE_NAME)
-                    .then(|| value.trim().to_string())
-            })
+        .filter(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+        .flat_map(|(_, v)| v.split(';'))
+        .find_map(|pair| {
+            let (name, value) = pair.trim().split_once('=')?;
+            name.trim()
+                .eq_ignore_ascii_case(CLEARANCE_COOKIE_NAME)
+                .then(|| value.trim().to_string())
         })
 }
 
@@ -2372,6 +2595,11 @@ struct PendingAccess {
     referer: String,
     tls_version: String,
     country_code: String,
+    /// Autonomous system number of `client_ip`, resolved once in the request
+    /// phase. 0 when the address is private/reserved, the embedded GeoIP
+    /// database has no answer, or no agent is attached (the field is only
+    /// collected for the log pipeline).
+    asn: u32,
     /// Who the request was made by, backfilled by the OIDC plugin once it has
     /// validated a session. Empty while the request is anonymous, and also
     /// when the site has no gate at all.
@@ -2387,6 +2615,9 @@ struct PendingAccess {
     /// Body bytes the log keeps per direction, resolved from the agent
     /// config when the request arrived. 0 disables body capture.
     body_limit: usize,
+    /// What the body prefixes held here are charged against while the entry
+    /// sits in the pool.
+    body_charge: BodyCharge,
     /// Response facts, present once `handle_response` held the entry back
     /// for body capture.
     response: Option<ResponseFacts>,
@@ -2484,6 +2715,32 @@ impl ResponseFacts {
             let room = limit - buf.len();
             buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
         }
+    }
+
+    /// Absorbs one streamed chunk for an entry still held in the pending
+    /// pool, charging the bytes it keeps against the pool's body budget.
+    ///
+    /// When the budget cannot take them, capture stops for the rest of the
+    /// response: what was kept so far stays, and the log marks the body as
+    /// truncated. Byte counting carries on regardless.
+    fn absorb_held(
+        &mut self,
+        chunk: &[u8],
+        limit: usize,
+        charge: &mut BodyCharge,
+    ) {
+        let limit = if self.capture_body { limit } else { 0 };
+        let kept = self.body.as_ref().map_or(0, Vec::len);
+        let wanted = chunk.len().min(limit.saturating_sub(kept));
+        if wanted > 0 && !charge.try_add(wanted) {
+            self.capture_body = false;
+            // An empty prefix (rather than none) is what makes `truncated`
+            // report a body that was there but not kept.
+            self.body.get_or_insert_with(Vec::new);
+            self.body_size += chunk.len() as u64;
+            return;
+        }
+        self.absorb(chunk, limit);
     }
 
     /// Whether the kept prefix is shorter than the body it came from.
@@ -2761,6 +3018,9 @@ fn mark_pending_path_requires_oidc(request_id: &str) -> bool {
 /// Backfills the request-body facts of a pending access entry once the
 /// request-body filter has seen the body. A no-op when the entry is gone
 /// (the request was already answered or swept).
+///
+/// The prefix is charged against the pool's body budget. When it does not
+/// fit, the entry records the size and logs the body as truncated instead.
 fn amend_pending_access_body(
     request_id: &str,
     body: Option<Vec<u8>>,
@@ -2768,9 +3028,15 @@ fn amend_pending_access_body(
     truncated: bool,
 ) {
     if let Some(mut entry) = PENDING_ACCESS.get_mut(request_id) {
-        entry.request_body = body;
+        let entry = &mut *entry;
+        if let Some(replaced) = entry.request_body.take() {
+            entry.body_charge.release(replaced.len());
+        }
+        let offered = body.as_ref().is_some_and(|bytes| !bytes.is_empty());
+        let kept = body.filter(|bytes| entry.body_charge.try_add(bytes.len()));
+        entry.request_body_truncated = truncated || (offered && kept.is_none());
+        entry.request_body = kept;
         entry.request_body_size = size;
-        entry.request_body_truncated = truncated;
     }
 }
 
@@ -2864,6 +3130,35 @@ struct DeferredBody {
     /// body is released to the upstream un-inspected, so a client dripping
     /// bytes slowly cannot hold the upstream connection forever.
     deadline: Instant,
+}
+
+/// Whether a request whose scan surface was truncated must be answered `413`.
+///
+/// Three exemptions, each with a reason: a `block` verdict keeps its own path
+/// (the block page says more), observation mode never blocks, and the policy
+/// has to actually ask for rejection. Truncation is otherwise the
+/// "pad past the inspection surface" bypass, so the default answer is yes.
+fn truncated_request_rejects(
+    policy: TruncatedBodyPolicy,
+    stage: BodyStagePolicy,
+    action_is_block: bool,
+    observe: bool,
+) -> bool {
+    !observe
+        && !action_is_block
+        && (policy == TruncatedBodyPolicy::Reject
+            || stage == BodyStagePolicy::Strict)
+}
+
+/// Whether a body-stage failure may reject the request.
+///
+/// Observation mode promises "record, never block", so a site in it releases
+/// what it staged and lets the request through even under `strict`. The
+/// decision is a pure function so both body-stage rejections
+/// (`408` on the stage deadline, `413` on the inspection cap) share one rule
+/// and one test.
+fn body_stage_rejects(policy: BodyStagePolicy, observing: bool) -> bool {
+    policy == BodyStagePolicy::Strict && !observing
 }
 
 /// Per-request ACME http-01 path prefix. Requests under it are never
@@ -3143,6 +3438,7 @@ fn emit_access(
         referer: pending.referer,
         tls_version: pending.tls_version,
         country_code: pending.country_code,
+        asn: pending.asn,
         user_identity: pending.user_identity,
         request_headers: pending.request_headers,
         request_body: pending.request_body,
@@ -3298,6 +3594,14 @@ pub(crate) fn emit_challenge_access(
             .unwrap_or_default()
             .to_string(),
         country_code: String::new(),
+        // No `RequestData` on this path, so the country is unknown; the
+        // address is right here, though, and one embedded-database lookup
+        // keeps challenged requests in the ASN ranking.
+        asn: client_ip
+            .parse()
+            .ok()
+            .and_then(lookup_asn_addr)
+            .unwrap_or(0),
         // Filled in by the OIDC plugin when a session names the caller; this
         // response is generated before that plugin runs.
         user_identity: String::new(),
@@ -3310,6 +3614,7 @@ pub(crate) fn emit_challenge_access(
         request_body_size: 0,
         request_body_truncated: false,
         body_limit: log_body_limit(),
+        body_charge: BodyCharge::new(&PENDING_BODIES),
         response: None,
         waf_triggered: false,
         // This entry is built for a response the plugin generated itself —
@@ -3456,8 +3761,12 @@ pub struct WafPlugin {
     /// first KiB of every body is captured for the access log.
     inspect_body: bool,
     max_body_size: usize,
-    /// Proof-of-work difficulty used when delegating a `Challenge` verdict.
-    pow_difficulty: u32,
+    /// Guards used when a `Challenge` verdict has to mint a page for a site
+    /// that carries no challenge configuration (standalone mode): this
+    /// plugin's `pow_difficulty` as the base, the documented adaptive ceiling
+    /// and per-IP issuance budget. A site that does carry settings uses those
+    /// instead — see [`mint_challenge`].
+    mint_fallback: ChallengeLimits,
     /// Max time a body may stay withheld from the upstream before the
     /// fail-open flush (`min(configured, 30s)`, default 30s).
     body_stage_timeout: Duration,
@@ -3486,9 +3795,9 @@ pub struct WafPlugin {
     /// Separate sweep gate for the by-site id table, so a deleted site's
     /// compiled automaton cannot stay resident forever.
     site_context_sweep: HostCacheSweep,
-    /// Rate limit counters, keyed by rule id and characteristic values. Kept
-    /// on the plugin so they survive per-site context rebuilds.
-    rate_counters: DashMap<String, RateCounter>,
+    /// Rate limit counters of every site. Kept on the plugin so they survive
+    /// per-site context rebuilds.
+    rate_counters: RateCounters,
 }
 
 /// How a body whose staging budget ran out is handled.
@@ -3505,9 +3814,20 @@ enum BodyStagePolicy {
 impl BodyStagePolicy {
     fn parse(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
+            "" => Self::Balanced,
+            "balanced" => Self::Balanced,
             "strict" | "fail_closed" | "fail-closed" => Self::Strict,
             "throughput" => Self::Throughput,
-            _ => Self::Balanced,
+            // A typo used to select the most permissive tier silently. The
+            // operator asked for something; give them the safe reading and
+            // tell them the value was not understood.
+            other => {
+                warn!(
+                    value = %other,
+                    "unknown body_stage_policy; treating it as strict"
+                );
+                Self::Strict
+            },
         }
     }
 }
@@ -3524,8 +3844,17 @@ enum EncodedBodyPolicy {
 impl EncodedBodyPolicy {
     fn parse(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
+            "" | "inspect_wire" | "inspect-wire" | "monitor" => {
+                Self::InspectWire
+            },
             "reject" | "fail_closed" | "fail-closed" => Self::Reject,
-            _ => Self::InspectWire,
+            other => {
+                warn!(
+                    value = %other,
+                    "unknown encoded_body_policy; rejecting encoded bodies"
+                );
+                Self::Reject
+            },
         }
     }
 }
@@ -3547,8 +3876,18 @@ enum TruncatedBodyPolicy {
 impl TruncatedBodyPolicy {
     fn parse(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
+            // Unset keeps the documented default: forward, but emit an event.
+            "" | "monitor" => Self::Monitor,
             "reject" | "fail_closed" | "fail-closed" => Self::Reject,
-            _ => Self::Monitor,
+            // `strict` is the natural typo for a fail-closed policy and used
+            // to select `monitor`, i.e. the opposite of what was asked.
+            other => {
+                warn!(
+                    value = %other,
+                    "unknown truncated_body_policy; rejecting truncated requests"
+                );
+                Self::Reject
+            },
         }
     }
 }
@@ -3744,7 +4083,7 @@ fn build_site_engine(cfg: &CacheWafConfig) -> WafEngine {
         rules,
         enable_managed_rules: true,
         fast_path_block_on_critical: true,
-        inspection_deadline: WafEngineConfig::default().inspection_deadline,
+        inspection_deadline: pingwaf_waf::engine::DEFAULT_INSPECTION_DEADLINE,
     };
     WafEngine::new(&engine_config)
 }
@@ -3768,7 +4107,10 @@ impl WafPlugin {
         site_rules: &Arc<CacheSiteRules>,
     ) -> Arc<SiteContext> {
         let now = crate::host_cache::unix_now();
-        match self.site_contexts_by_id.entry(site_rules.site_id.clone()) {
+        match self
+            .site_contexts_by_id
+            .entry(site_rules.site_id.to_string())
+        {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                 if Arc::ptr_eq(&entry.get().rules, site_rules) {
                     touch(&entry.get().last_used, now);
@@ -3885,7 +4227,7 @@ impl WafPlugin {
         let choice = context.choice(&site_rules);
         ResolvedSite {
             choice,
-            site_id: site_rules.site_id.clone(),
+            site_id: site_rules.site_id.to_string(),
             context: Some(context),
         }
     }
@@ -4188,7 +4530,7 @@ impl WafPlugin {
         request_data: &RequestData,
         denial: &Denial,
         original_url: &str,
-        pow_difficulty: u32,
+        mint_fallback: ChallengeLimits,
         skip_challenge: bool,
         event_type: &str,
     ) -> RequestPluginResult {
@@ -4222,7 +4564,7 @@ impl WafPlugin {
             }
             return RequestPluginResult::Continue;
         }
-        let response = if denial.challenge {
+        let (response, challenged) = if denial.challenge {
             // A client holding a valid clearance for this site already
             // solved its challenge: re-issuing it would loop forever, so
             // let it pass.
@@ -4233,17 +4575,25 @@ impl WafPlugin {
             if clearance_valid(clearance_cookie(&request_data.headers), host) {
                 return RequestPluginResult::Continue;
             }
-            build_challenge_response(
+            let outcome = mint_challenge(MintRequest {
                 request_id,
                 original_url,
-                host,
-                pow_difficulty,
-                ChallengeKind::Js,
-            )
+                site_id: host,
+                client_ip: &request_data.client_ip,
+                user_agent: request_user_agent(&request_data.headers),
+                // The WAF keeps no per-IP request window, so this mint
+                // carries failure pressure only.
+                request_rate: 0,
+                kind: ChallengeKind::Js,
+                fallback: mint_fallback,
+                fallback_rate_threshold: u32::MAX,
+            });
+            let challenged = outcome.is_challenge();
+            (outcome.into_response(), challenged)
         } else {
-            block_page(request_id, &verdict.details)
+            (block_page(request_id, &verdict.details), false)
         };
-        let response = stamp_mitigated(response, denial.challenge);
+        let response = stamp_mitigated(response, challenged);
         emit_generated_access(agent, request_id, &response);
         RequestPluginResult::Respond(response)
     }
@@ -4332,15 +4682,27 @@ impl WafPlugin {
         // passing it silently.
         let scan_incomplete = verdict.details.contains("request=truncated")
             || verdict.details.contains("request=deadline");
-        if verdict.action == WafAction::Pass
-            && scan_incomplete
-            && (self.truncated_body_policy == TruncatedBodyPolicy::Reject
-                || self.body_stage_policy == BodyStagePolicy::Strict)
+        // Every verdict except Block passes the request on: Pass forwards it
+        // and Monitor forwards it after logging. Both are exactly the shape a
+        // truncation policy exists to stop, so the gate must not ask for
+        // `Pass` alone — a truncated request almost always scores a weak
+        // Monitor hit, and the 413 never fired (2026-11-19 review, DR32-03).
+        // A Block verdict keeps its own path: the block page and its event
+        // say more than a 413.
+        // Observation mode records and forwards, always: its block/challenge
+        // verdicts are already demoted to monitor, so rejecting here would
+        // reintroduce blocking under the one mode that promises none
+        // (review of 0.32.33, H2). `observe` is the *site's* flag — the same
+        // signal the demotion above uses — not the plugin's global mode: a
+        // site can be in observation while the plugin default stays `block`.
+        if scan_incomplete
+            && truncated_request_rejects(
+                self.truncated_body_policy,
+                self.body_stage_policy,
+                verdict.action == WafAction::Block,
+                observe,
+            )
         {
-            // A truncated-but-clean request is the bypass shape: reject it
-            // and keep the reason visible in the event stream. Block/Monitor
-            // verdicts keep their own path below (the block page and its
-            // event matter more than the 413).
             if !defer_events {
                 Self::log_event(
                     site_id,
@@ -4474,7 +4836,7 @@ impl WafPlugin {
             &rule_name,
             Self::engine_event_type(&verdict),
         );
-        let response = if verdict.action == WafAction::Block {
+        let (response, challenged) = if verdict.action == WafAction::Block {
             // Auto-block the client for a grace window: repeat requests are
             // refused at the edge (see the entry check above) instead of
             // running the engine every time.
@@ -4486,7 +4848,7 @@ impl WafPlugin {
                     &format!("waf: {rule_name}"),
                 );
             }
-            block_page(request_id, &verdict.details)
+            (block_page(request_id, &verdict.details), false)
         } else {
             if skip_challenge {
                 // The path exception exempts this request from challenges.
@@ -4507,24 +4869,31 @@ impl WafPlugin {
                 }
                 return VerdictOutcome::Continue;
             }
-            // Challenge verdict — delegate to the challenge subsystem.
+            // Challenge verdict — delegate to the challenge subsystem through
+            // the same guarded mint the CC gate uses, so the site's
+            // difficulty and per-IP issuance budget apply here too.
             let original_url = if request_data.query.is_empty() {
                 request_data.path.clone()
             } else {
                 format!("{}?{}", request_data.path, request_data.query)
             };
-            build_challenge_response(
+            let outcome = mint_challenge(MintRequest {
                 request_id,
-                &original_url,
-                host,
-                self.pow_difficulty,
-                ChallengeKind::Js,
-            )
+                original_url: &original_url,
+                site_id: host,
+                client_ip: &request_data.client_ip,
+                user_agent: request_user_agent(&request_data.headers),
+                request_rate: 0,
+                kind: ChallengeKind::Js,
+                fallback: self.mint_fallback,
+                fallback_rate_threshold: u32::MAX,
+            });
+            let challenged = outcome.is_challenge();
+            (outcome.into_response(), challenged)
         };
         // D26: an upstream 403 and a WAF block share the status code; the
         // marker is what makes the origin of the response unambiguous.
-        let response =
-            stamp_mitigated(response, verdict.action == WafAction::Challenge);
+        let response = stamp_mitigated(response, challenged);
         // The access entry is emitted here, before `handle_request` gets the
         // Respond outcome: fill the request facts first.
         backfill_pending_facts(request_id, request_data);
@@ -4586,6 +4955,27 @@ impl TryFrom<&PluginConf> for WafPlugin {
                 .clamp(1, 8 * 1024 * 1024) as usize;
         let pow_difficulty =
             get_int_conf_or_default(value, "pow_difficulty", 20) as u32;
+        // A rule/access/rate-limit challenge is minted through the same
+        // guarded path as the CC gate; these are the fallbacks for a site
+        // without challenge settings (standalone mode). `pow_max_difficulty`
+        // defaults to the documented adaptive ceiling, so pinning the
+        // difficulty means setting it equal to `pow_difficulty`.
+        let mint_fallback = ChallengeLimits::standalone(
+            pow_difficulty,
+            get_int_conf_or_default(
+                value,
+                "pow_max_difficulty",
+                i64::from(pingwaf_challenge::DEFAULT_MAX_DIFFICULTY),
+            )
+            .clamp(0, i64::from(u32::MAX)) as u32,
+            get_int_conf_or_default(
+                value,
+                "pow_issue_limit_per_min",
+                i64::from(DEFAULT_ISSUE_LIMIT_PER_MIN),
+            )
+            .clamp(0, i64::from(u32::MAX)) as u32,
+            DEFAULT_VERIFY_LIMIT_PER_MIN,
+        );
         // Mirrors the site's `downstream_read_timeout`: withheld bodies are
         // released once the client stops making progress. Hard-capped at
         // 30s; unset means 30s.
@@ -4641,7 +5031,8 @@ impl TryFrom<&PluginConf> for WafPlugin {
             rules: Vec::new(),
             enable_managed_rules: true,
             fast_path_block_on_critical: true,
-            inspection_deadline: WafEngineConfig::default().inspection_deadline,
+            inspection_deadline:
+                pingwaf_waf::engine::DEFAULT_INSPECTION_DEADLINE,
         };
 
         Ok(Self {
@@ -4655,7 +5046,7 @@ impl TryFrom<&PluginConf> for WafPlugin {
             ml_threshold,
             inspect_body,
             max_body_size,
-            pow_difficulty,
+            mint_fallback,
             body_stage_timeout,
             body_stage_policy,
             encoded_body_policy,
@@ -4665,7 +5056,7 @@ impl TryFrom<&PluginConf> for WafPlugin {
             site_contexts_by_id: DashMap::new(),
             context_sweep: HostCacheSweep::default(),
             site_context_sweep: HostCacheSweep::default(),
-            rate_counters: DashMap::new(),
+            rate_counters: RateCounters::default(),
         })
     }
 }
@@ -4824,6 +5215,15 @@ impl Plugin for WafPlugin {
         } else {
             None
         };
+        // AS number of the client, for the same consumer: the traffic pages
+        // rank networks by request count, and the control plane cannot
+        // resolve a name without the number. Resolved here (not per log line)
+        // so the pending entry carries it into every response path.
+        let asn = if agent.is_some() {
+            client_addr.and_then(lookup_asn_addr)
+        } else {
+            None
+        };
 
         // ── Full-request log capture and body inspection moved to the
         // request-body filter: body bytes are no longer read here. Reading
@@ -4911,6 +5311,7 @@ impl Plugin for WafPlugin {
                         .unwrap_or_default()
                         .to_string(),
                     country_code: String::new(),
+                    asn: asn.unwrap_or(0),
                     // Backfilled by the OIDC plugin
                     // (`amend_pending_access_identity`) once it has validated
                     // a session: this entry is built during the request phase,
@@ -4924,6 +5325,7 @@ impl Plugin for WafPlugin {
                     request_body_size: 0,
                     request_body_truncated: false,
                     body_limit,
+                    body_charge: BodyCharge::new(&PENDING_BODIES),
                     response: None,
                     waf_triggered: false,
                     // Set when a path exception skips the challenge layer
@@ -5219,7 +5621,7 @@ impl Plugin for WafPlugin {
                         &request_data,
                         denial,
                         &original_url,
-                        self.pow_difficulty,
+                        self.mint_fallback,
                         bypasses("challenge"),
                         "ip_geo",
                     ));
@@ -5355,7 +5757,7 @@ impl Plugin for WafPlugin {
                             &request_data,
                             &denial,
                             &original_url,
-                            self.pow_difficulty,
+                            self.mint_fallback,
                             bypasses("challenge"),
                             "ai_bot",
                         ));
@@ -5401,7 +5803,7 @@ impl Plugin for WafPlugin {
                             &request_data,
                             &denial,
                             &original_url,
-                            self.pow_difficulty,
+                            self.mint_fallback,
                             bypasses("challenge"),
                             "bot",
                         ));
@@ -5535,13 +5937,27 @@ impl Plugin for WafPlugin {
                         );
                     }
                     let response = if tripped.challenge {
-                        build_challenge_response(
-                            &request_id,
-                            &original_url,
-                            &host,
-                            self.pow_difficulty,
-                            ChallengeKind::Js,
-                        )
+                        // A rate-limit rule that answers with a challenge
+                        // mints it through the same guarded path as the CC
+                        // gate: the site's difficulty and the shared per-IP
+                        // issuance budget apply, and the page is stamped as a
+                        // challenge (or as a rate limit when the budget
+                        // refuses it).
+                        let outcome = mint_challenge(MintRequest {
+                            request_id: &request_id,
+                            original_url: &original_url,
+                            site_id: &host,
+                            client_ip: &request_data.client_ip,
+                            user_agent: request_user_agent(
+                                &request_data.headers,
+                            ),
+                            request_rate: 0,
+                            kind: ChallengeKind::Js,
+                            fallback: self.mint_fallback,
+                            fallback_rate_threshold: u32::MAX,
+                        });
+                        let challenged = outcome.is_challenge();
+                        stamp_mitigated(outcome.into_response(), challenged)
                     } else {
                         rate_limit_page(
                             &request_id,
@@ -5895,7 +6311,11 @@ impl Plugin for WafPlugin {
             && !entry.passthrough
             && Instant::now() >= entry.deadline
         {
-            if self.body_stage_policy == BodyStagePolicy::Strict {
+            let observing = entry
+                .deferred
+                .as_ref()
+                .is_some_and(|deferred| deferred.observe);
+            if body_stage_rejects(self.body_stage_policy, observing) {
                 warn!(
                     request_id = %request_id,
                     "body stage timeout; rejecting (strict policy)"
@@ -6030,7 +6450,12 @@ impl Plugin for WafPlugin {
                         *body = Some(Bytes::new());
                     },
                     StageAction::Flush(staged) => {
-                        if self.body_stage_policy == BodyStagePolicy::Strict {
+                        let observing = entry
+                            .deferred
+                            .as_ref()
+                            .is_some_and(|deferred| deferred.observe);
+                        if body_stage_rejects(self.body_stage_policy, observing)
+                        {
                             warn!(
                                 request_id = %request_id,
                                 "body exceeded the inspection cap; rejecting (strict policy)"
@@ -6354,13 +6779,12 @@ impl Plugin for WafPlugin {
         let Some(mut entry) = PENDING_ACCESS.get_mut(&request_id) else {
             return Ok(ResponseBodyPluginResult::Unchanged);
         };
-        let entry_limit = entry.body_limit;
+        let entry = &mut *entry;
         let Some(facts) = entry.response.as_mut() else {
             return Ok(ResponseBodyPluginResult::Unchanged);
         };
-        let limit = if facts.capture_body { entry_limit } else { 0 };
         if let Some(chunk) = body.as_ref() {
-            facts.absorb(chunk, limit);
+            facts.absorb_held(chunk, entry.body_limit, &mut entry.body_charge);
         }
         Ok(ResponseBodyPluginResult::Unchanged)
     }
@@ -6522,6 +6946,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn identical_ip_ranges_share_one_compiled_instance() {
+        let a = vec!["10.0.0.0/24".to_string(), "192.168.1.1".to_string()];
+        // Same content, different vector instances (what two sites carry).
+        let b = vec!["10.0.0.0/24".to_string(), "192.168.1.1".to_string()];
+        let shared_a = shared_ip_rules(&a);
+        let shared_b = shared_ip_rules(&b);
+        assert!(Arc::ptr_eq(&shared_a, &shared_b));
+        assert!(Arc::strong_count(&shared_a) > 1);
+
+        // A different set must not share.
+        let c = vec!["10.0.1.0/24".to_string()];
+        assert!(!Arc::ptr_eq(&shared_a, &shared_ip_rules(&c)));
+        // Whitespace-only differences normalise to the same content.
+        let a_trimmed =
+            vec![" 10.0.0.0/24 ".to_string(), " 192.168.1.1 ".to_string()];
+        assert!(Arc::ptr_eq(&shared_a, &shared_ip_rules(&a_trimmed)));
+    }
+
+    #[test]
     fn acme_exemption_requires_a_token_shape() {
         assert!(is_acme_challenge_path(
             "/.well-known/acme-challenge/LoqXcYV8-q"
@@ -6672,7 +7115,7 @@ ml_threshold = 0.75
             site_id: "site-1".into(),
             domain: "example.com".into(),
             alternate_domains: Vec::new(),
-            status: pingwaf_agent::cache::site_status::ACTIVE.into(),
+            status: pingwaf_agent::cache::SiteStatus::Active,
             downstream_timeout_secs: 60,
             waf_config: waf,
             rate_limit_rules: Vec::new(),
@@ -6701,6 +7144,17 @@ ml_threshold = 0.75
             path_exceptions: Vec::new(),
             path_restrictions: Vec::new(),
         }
+    }
+
+    /// Guards a standalone WAF plugin would use for a mint, with the
+    /// difficulty pinned at `base` so a test can assert what the page says.
+    fn test_mint_fallback(base: u32) -> ChallengeLimits {
+        ChallengeLimits::standalone(
+            base,
+            base,
+            DEFAULT_ISSUE_LIMIT_PER_MIN,
+            DEFAULT_VERIFY_LIMIT_PER_MIN,
+        )
     }
 
     fn probe(query: &str) -> RequestData {
@@ -6895,6 +7349,60 @@ ml_threshold = 0.75
         assert_eq!(
             TruncatedBodyPolicy::parse("FAIL-CLOSED"),
             TruncatedBodyPolicy::Reject
+        );
+        // Unknown values fail closed: `strict` is the natural typo for a
+        // fail-closed policy and used to select `monitor`, the opposite.
+        assert_eq!(
+            TruncatedBodyPolicy::parse("strict"),
+            TruncatedBodyPolicy::Reject
+        );
+        assert_eq!(
+            TruncatedBodyPolicy::parse("rejcet"),
+            TruncatedBodyPolicy::Reject
+        );
+    }
+
+    /// The 413 gate: rejection only when a policy asks for it, never for a
+    /// block verdict and never in observation mode (review of 0.32.33, H2).
+    #[test]
+    fn truncated_requests_are_rejected_only_when_the_policy_says_so() {
+        use BodyStagePolicy::{Balanced, Strict};
+        use TruncatedBodyPolicy::{Monitor as TruncMon, Reject};
+
+        // Default policy, block-mode site: forward with an event.
+        assert!(!truncated_request_rejects(TruncMon, Balanced, false, false));
+        // Either knob rejects.
+        assert!(truncated_request_rejects(Reject, Balanced, false, false));
+        assert!(truncated_request_rejects(TruncMon, Strict, false, false));
+        // A block verdict keeps its own page.
+        assert!(!truncated_request_rejects(Reject, Strict, true, false));
+        // Observation mode forwards even under the strictest combination.
+        assert!(!truncated_request_rejects(Reject, Strict, false, true));
+    }
+
+    /// Body-stage failures follow the same rule: observation mode releases
+    /// what it staged instead of answering 408/413.
+    #[test]
+    fn body_stage_never_rejects_in_observation_mode() {
+        use BodyStagePolicy::{Balanced, Strict, Throughput};
+
+        assert!(body_stage_rejects(Strict, false));
+        assert!(!body_stage_rejects(Strict, true));
+        assert!(!body_stage_rejects(Balanced, false));
+        assert!(!body_stage_rejects(Throughput, false));
+    }
+
+    #[test]
+    fn body_and_encoded_policies_fail_closed_on_unknown_values() {
+        assert_eq!(BodyStagePolicy::parse(""), BodyStagePolicy::Balanced);
+        assert_eq!(BodyStagePolicy::parse("strictt"), BodyStagePolicy::Strict);
+        assert_eq!(
+            EncodedBodyPolicy::parse(""),
+            EncodedBodyPolicy::InspectWire
+        );
+        assert_eq!(
+            EncodedBodyPolicy::parse("rejcet"),
+            EncodedBodyPolicy::Reject
         );
     }
 
@@ -8049,12 +8557,14 @@ inspect_body = true"###,
                 referer: "ref".to_string(),
                 tls_version: String::new(),
                 country_code: String::new(),
+                asn: 0,
                 user_identity: String::new(),
                 request_headers: Vec::new(),
                 request_body: None,
                 request_body_size: 0,
                 request_body_truncated: false,
                 body_limit: 0,
+                body_charge: BodyCharge::new(&PENDING_BODIES),
                 response: None,
                 waf_triggered: false,
                 path_bypasses_challenge: false,
@@ -9434,6 +9944,34 @@ inspect_body = true"###,
         );
     }
 
+    /// The client's AS number survives the hop from the pending entry to the
+    /// shipped log entry.
+    ///
+    /// Regression: the protocol field (`LogEntry.asn`) and the Elasticsearch
+    /// document both carried an ASN, but `AccessLogEntry` had no field for it
+    /// and the agent hardcoded 0, so the control plane's ASN column could
+    /// never be populated and the traffic pages had no networks to rank.
+    ///
+    /// The lookup itself is not asserted here on purpose: the embedded GeoIP
+    /// snapshot the edge ships carries country ranges only, so a real address
+    /// currently resolves to "unknown" (0). What must not regress is the
+    /// pass-through — a resolved number has to reach the wire.
+    #[tokio::test]
+    async fn test_access_log_carries_the_client_asn() {
+        let (_guard, agent, _dir) = install_test_agent().await;
+        let mut pending = skip_pending("/whoami", false);
+        pending.asn = 15_169; // AS15169, Google LLC
+        emit_access(&agent, "req-asn", pending, ResponseFacts::generated(200));
+
+        let entry = agent.client.pop_log().await.unwrap();
+        assert_eq!("req-asn", entry.request_id);
+        assert_eq!(
+            15_169, entry.asn,
+            "the ASN must reach the shipped entry, not be dropped in the \
+             agent's conversion"
+        );
+    }
+
     #[test]
     fn cap_headers_limits_size_and_count() {
         let headers: Vec<(String, String)> = (0..100)
@@ -10040,7 +10578,8 @@ inspect_body = true"###,
             known_bots_whitelist: vec!["Googlebot".to_string()],
             verified_bot_ranges: Vec::new(),
             dns_verification_enabled: false,
-        });
+        })
+        .unwrap();
 
         assert!(matches!(
             policy
@@ -10084,6 +10623,26 @@ inspect_body = true"###,
         ));
     }
 
+    /// `allow` used to fall into the catch-all arm and block every scripted
+    /// client; `log` still records without enforcing.
+    #[tokio::test]
+    async fn bot_action_allow_enforces_nothing() {
+        let cfg = |action| CacheBotProtection {
+            enabled: true,
+            action,
+            known_bots_whitelist: Vec::new(),
+            verified_bot_ranges: Vec::new(),
+            dns_verification_enabled: false,
+        };
+        assert!(BotPolicy::build(&cfg(CacheWafAction::Allow)).is_none());
+
+        let log = BotPolicy::build(&cfg(CacheWafAction::Log)).unwrap();
+        assert!(matches!(
+            log.evaluate(None, "curl/8.4.0").await,
+            BotDecision::LogOnly(_)
+        ));
+    }
+
     /// Verified crawler IP ranges pass without any user-agent signal, and a
     /// miss falls through to the user-agent classification. Bare IPs compile
     /// into /32 host ranges; malformed entries are dropped at build time.
@@ -10100,7 +10659,8 @@ inspect_body = true"###,
                 "not-a-range".to_string(),
             ],
             dns_verification_enabled: false,
-        });
+        })
+        .unwrap();
         assert_eq!(policy.verified_ranges.len(), 3);
 
         // Inside the published range: a scripted client nobody whitelisted.
@@ -10332,13 +10892,13 @@ inspect_body = true"###,
             }],
             last_gc_sweep: AtomicU64::new(0),
         };
-        let counters: DashMap<String, RateCounter> = DashMap::new();
+        let counters = RateCounters::default();
 
         // Fill the map past the GC threshold with already-expired entries.
         let now = unix_now();
         for i in 0..=RATE_COUNTERS_GC_THRESHOLD {
-            counters.insert(
-                format!("stale-{i}"),
+            counters.map.insert(
+                RateKey(i as u128),
                 RateCounter {
                     window: 0,
                     count: 1,
@@ -10349,7 +10909,7 @@ inspect_body = true"###,
         }
 
         let request = RequestData::new("GET", "/");
-        let evaluate = |counters: &DashMap<String, RateCounter>| {
+        let evaluate = |counters: &RateCounters| {
             policy.evaluate(counters, &request, "example.com", false, None)
         };
 
@@ -10362,8 +10922,8 @@ inspect_body = true"###,
         // "now": the interval has not elapsed, so repeated evaluations must
         // not sweep — the map stays at threshold+1 entries.
         for i in 0..=RATE_COUNTERS_GC_THRESHOLD {
-            counters.insert(
-                format!("stale2-{i}"),
+            counters.map.insert(
+                RateKey(i as u128),
                 RateCounter {
                     window: 0,
                     count: 1,
@@ -10408,15 +10968,15 @@ inspect_body = true"###,
             }],
             last_gc_sweep: AtomicU64::new(0),
         };
-        let counters: DashMap<String, RateCounter> = DashMap::new();
+        let counters = RateCounters::default();
 
         let request = RequestData::new("GET", "/");
-        let evaluate = |counters: &DashMap<String, RateCounter>| {
+        let evaluate = |counters: &RateCounters| {
             policy.evaluate(counters, &request, "example.com", false, None)
         };
         let stale = |i: usize| {
             (
-                format!("stale-{i}"),
+                RateKey(i as u128),
                 RateCounter {
                     window: 0,
                     count: 1,
@@ -10431,7 +10991,7 @@ inspect_body = true"###,
         // creates survives.
         for i in 0..3 {
             let (k, v) = stale(i);
-            counters.insert(k, v);
+            counters.map.insert(k, v);
         }
         evaluate(&counters);
         assert_eq!(counters.len(), 1);
@@ -10440,7 +11000,7 @@ inspect_body = true"###,
         // evaluations must not sweep the small map.
         for i in 0..3 {
             let (k, v) = stale(i);
-            counters.insert(k, v);
+            counters.map.insert(k, v);
         }
         policy
             .last_gc_sweep
@@ -10650,7 +11210,7 @@ inspect_body = true"###,
             rules: vec![rule],
             last_gc_sweep: AtomicU64::new(0),
         };
-        let counters: DashMap<String, RateCounter> = DashMap::new();
+        let counters = RateCounters::default();
         let request = RequestData::new("GET", "/api/x");
         let outcome = policy.evaluate(
             &counters,
@@ -10661,7 +11221,7 @@ inspect_body = true"###,
         );
         assert!(outcome.deny.is_none());
         assert!(
-            counters.is_empty(),
+            counters.map.is_empty(),
             "an excepted request must not be counted"
         );
     }
@@ -10746,32 +11306,219 @@ inspect_body = true"###,
             scheme: "http".to_string(),
             protocol: "HTTP/1.1".to_string(),
         };
-        let sep = '\u{1f}';
+        let parts = |request: &RequestData| {
+            let mut parts = Vec::new();
+            rule.key_parts(request, "s.test", None, |part| {
+                parts.push(part.to_string())
+            });
+            parts
+        };
+        let key =
+            |request: &RequestData| rule.counter_key(request, "s.test", None);
 
         let full = request(
             vec![("x-api-key", "v1"), ("Cookie", "a=1; Session=abc; b=2")],
             "lang=en&page=2",
         );
-        assert_eq!(
-            format!("rl-h{sep}v1{sep}abc{sep}en"),
-            rule.counter_key(&full, "s.test", None)
-        );
+        assert_eq!(parts(&full), ["v1", "abc", "en"]);
 
         // Header matching is case-insensitive; a present-but-empty query
         // value keys as "" rather than the missing bucket.
         let mixed = request(vec![("X-API-KEY", "v1")], "lang=");
-        assert_eq!(
-            format!("rl-h{sep}v1{sep}-{sep}"),
-            rule.counter_key(&mixed, "s.test", None)
-        );
+        assert_eq!(parts(&mixed), ["v1", "-", ""]);
 
         // Requests missing every parameterized value share the '-' bucket
         // instead of bypassing the counter.
         let empty = request(Vec::new(), "page=2");
-        assert_eq!(
-            format!("rl-h{sep}-{sep}-{sep}-"),
-            rule.counter_key(&empty, "s.test", None)
+        assert_eq!(parts(&empty), ["-", "-", "-"]);
+
+        // Same values, same counter — however the request spelled them.
+        let respelled = request(
+            vec![("X-API-KEY", " v1 "), ("cookie", "Session=abc")],
+            "page=2&lang=en",
         );
+        assert_eq!(key(&full), key(&respelled));
+        assert_ne!(key(&full), key(&mixed));
+        assert_ne!(key(&mixed), key(&empty));
+    }
+
+    /// HTTP/2 clients may split the cookie jar over several `Cookie` fields
+    /// (RFC 9113 §8.2.3, exercised by Chromium). Both the cookie map and the
+    /// clearance extractor used to read only the first field, so a valid
+    /// clearance placed after the split point was invisible and every request
+    /// was challenged again (2026-11-24, issue #108).
+    #[test]
+    fn cookies_are_read_from_every_cookie_field() {
+        let headers = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<(String, String)>>()
+        };
+
+        let split = headers(&[
+            ("cookie", "app_id=12345; preferences=A=1|B=1"),
+            ("cookie", "session_id=98765"),
+            ("cookie", "__pingwaf_clearance=signed-token"),
+        ]);
+        let names: Vec<String> = parse_cookies(&split)
+            .into_iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["app_id", "preferences", "session_id", "__pingwaf_clearance"]
+        );
+        assert_eq!(clearance_cookie(&split).as_deref(), Some("signed-token"));
+
+        // The layout must not matter: one joined field and a clearance in the
+        // first field both resolve to the same value.
+        let joined =
+            headers(&[("Cookie", "app_id=1; __pingwaf_clearance=t; b=2")]);
+        assert_eq!(clearance_cookie(&joined).as_deref(), Some("t"));
+        let first = headers(&[
+            ("Cookie", "__pingwaf_clearance=t2"),
+            ("cookie", "app_id=1"),
+        ]);
+        assert_eq!(clearance_cookie(&first).as_deref(), Some("t2"));
+
+        // No clearance anywhere stays None instead of matching something else.
+        let none = headers(&[("cookie", "app_id=1"), ("cookie", "b=2")]);
+        assert_eq!(clearance_cookie(&none), None);
+    }
+
+    /// The key is a digest, so what it must not lose is the boundary between
+    /// the parts and the rule they belong to.
+    #[test]
+    fn rate_key_keeps_parts_and_rules_apart() {
+        let rule = |id: &str| CompiledRateRule {
+            id: id.to_string(),
+            name: "k".to_string(),
+            expression: None,
+            exception: None,
+            chars: vec![RateChar::Host, RateChar::Path],
+            period_secs: 60,
+            threshold: 1,
+            mitigation_secs: 0,
+            action: RateAction::Block,
+        };
+        let a = rule("rule-a");
+        let key = |rule: &CompiledRateRule, host: &str, path: &str| {
+            rule.counter_key(&RequestData::new("GET", path), host, None)
+        };
+        assert_eq!(key(&a, "a.test", "/x"), key(&a, "a.test", "/x"));
+        assert_ne!(key(&a, "a.test", "/x"), key(&a, "a.tes", "t/x"));
+        assert_ne!(
+            key(&a, "a.test", "/x"),
+            key(&rule("rule-b"), "a.test", "/x")
+        );
+        assert_eq!(std::mem::size_of::<RateKey>(), 16);
+    }
+
+    fn counter(count: u32, blocked_until: u64, expires_at: u64) -> RateCounter {
+        RateCounter {
+            window: 0,
+            count,
+            blocked_until,
+            expires_at,
+        }
+    }
+
+    /// A flood of unique keys inside one window cannot grow the table past
+    /// the cap: the single hits it consists of are the first to go, and the
+    /// counters that matter — bans, and clients on their way to one — stay.
+    #[test]
+    fn rate_counters_are_capped_and_shed_the_cheapest_first() {
+        let counters = RateCounters::default();
+        let now = unix_now();
+        let live = now + 600;
+
+        counters
+            .map
+            .insert(RateKey(u128::MAX), counter(1, live, live));
+        counters
+            .map
+            .insert(RateKey(u128::MAX - 1), counter(40, 0, live));
+        let mut next = 0u128;
+        while counters.len() < RATE_COUNTERS_MAX_ENTRIES {
+            counters.map.insert(RateKey(next), counter(1, 0, live));
+            next += 1;
+        }
+
+        assert!(counters.admit(now), "shedding makes room for a new key");
+        assert!(
+            counters.len()
+                <= RATE_COUNTERS_MAX_ENTRIES - RATE_COUNTERS_SHED_ROOM
+        );
+        assert!(
+            counters.map.contains_key(&RateKey(u128::MAX)),
+            "a running ban survives the shed"
+        );
+        assert!(
+            counters.map.contains_key(&RateKey(u128::MAX - 1)),
+            "a counter with real state outlives single hits"
+        );
+    }
+
+    /// A table full of running bans has nothing cheaper than a new key: the
+    /// request goes uncounted, and the table is not walked again within the
+    /// same second.
+    #[test]
+    fn rate_counters_full_of_bans_refuse_new_keys() {
+        let policy = RateLimitPolicy {
+            rules: vec![CompiledRateRule {
+                id: "rl-cap".to_string(),
+                name: "cap".to_string(),
+                expression: None,
+                exception: None,
+                chars: vec![RateChar::Ip],
+                period_secs: 60,
+                threshold: 1,
+                mitigation_secs: 600,
+                action: RateAction::Block,
+            }],
+            // The expired-counter sweep is not what this test is about.
+            last_gc_sweep: AtomicU64::new(unix_now()),
+        };
+        let counters = RateCounters::default();
+        let live = unix_now() + 600;
+        for i in 0..RATE_COUNTERS_MAX_ENTRIES {
+            counters
+                .map
+                .insert(RateKey(i as u128), counter(2, live, live));
+        }
+
+        let mut request = RequestData::new("GET", "/");
+        request.client_ip = "198.51.100.7".to_string();
+        for _ in 0..3 {
+            let outcome =
+                policy.evaluate(&counters, &request, "s.test", false, None);
+            assert!(outcome.deny.is_none(), "an uncounted request passes");
+        }
+        assert_eq!(counters.len(), RATE_COUNTERS_MAX_ENTRIES);
+        assert_eq!(
+            counters
+                .uncounted
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+
+        // A key that already has a counter is still enforced at the cap.
+        let known = policy.rules[0].counter_key(&request, "s.test", None);
+        counters.map.remove(&RateKey(0));
+        counters.map.insert(known, counter(2, live, live));
+        let outcome =
+            policy.evaluate(&counters, &request, "s.test", false, None);
+        assert!(outcome.deny.is_some(), "the ban of a known key holds");
+    }
+
+    #[test]
+    fn count_magnitude_steps_once_per_doubling() {
+        let magnitudes: Vec<usize> = [0, 1, 2, 3, 4, 7, 8, u32::MAX]
+            .into_iter()
+            .map(count_magnitude)
+            .collect();
+        assert_eq!(magnitudes, [0, 1, 2, 2, 3, 3, 4, 32]);
     }
 
     #[test]
@@ -10790,7 +11537,7 @@ inspect_body = true"###,
             }],
             last_gc_sweep: AtomicU64::new(0),
         };
-        let counters: DashMap<String, RateCounter> = DashMap::new();
+        let counters = RateCounters::default();
         let request = |ip: &str, path: &str| RequestData {
             method: "GET".to_string(),
             path: path.to_string(),
@@ -11069,12 +11816,14 @@ inspect_body = true"###,
             referer: String::new(),
             tls_version: String::new(),
             country_code: String::new(),
+            asn: 0,
             user_identity: String::new(),
             request_headers: Vec::new(),
             request_body: None,
             request_body_size: 0,
             request_body_truncated: false,
             body_limit: 0,
+            body_charge: BodyCharge::new(&PENDING_BODIES),
             response: None,
             waf_triggered,
             path_bypasses_challenge: false,
@@ -11082,6 +11831,125 @@ inspect_body = true"###,
             path_requires_oidc: false,
             start: Instant::now(),
         }
+    }
+
+    /// A pending entry charged against `budget` instead of the shared pool,
+    /// so a test owns the numbers it asserts on.
+    fn budgeted_pending(budget: &'static BodyBudget) -> PendingAccess {
+        PendingAccess {
+            body_limit: 4096,
+            body_charge: BodyCharge::new(budget),
+            ..skip_pending("/upload", false)
+        }
+    }
+
+    /// The pool's body budget decides whether a request-body prefix is kept:
+    /// one that does not fit leaves the entry in place, logged as truncated,
+    /// and the bytes come back when an entry leaves the pool.
+    #[test]
+    fn request_body_prefix_is_charged_against_the_pool_budget() {
+        static BUDGET: BodyBudget = BodyBudget::new(1000);
+        PENDING_ACCESS
+            .insert("body-budget-a".to_string(), budgeted_pending(&BUDGET));
+        PENDING_ACCESS
+            .insert("body-budget-b".to_string(), budgeted_pending(&BUDGET));
+
+        amend_pending_access_body(
+            "body-budget-a",
+            Some(vec![b'a'; 700]),
+            700,
+            false,
+        );
+        amend_pending_access_body(
+            "body-budget-b",
+            Some(vec![b'b'; 700]),
+            700,
+            false,
+        );
+        assert_eq!(700, BUDGET.held());
+        {
+            let kept = PENDING_ACCESS.get("body-budget-a").unwrap();
+            assert_eq!(Some(700), kept.request_body.as_ref().map(Vec::len));
+            assert!(!kept.request_body_truncated);
+        }
+        {
+            let shed = PENDING_ACCESS.get("body-budget-b").unwrap();
+            assert!(shed.request_body.is_none());
+            assert!(shed.request_body_truncated);
+            assert_eq!(700, shed.request_body_size);
+        }
+
+        PENDING_ACCESS.remove("body-budget-a");
+        assert_eq!(0, BUDGET.held(), "a removed entry returns its bytes");
+
+        amend_pending_access_body(
+            "body-budget-b",
+            Some(vec![b'b'; 700]),
+            700,
+            false,
+        );
+        assert_eq!(700, BUDGET.held());
+        // A second amendment replaces the prefix; it is not charged twice.
+        amend_pending_access_body(
+            "body-budget-b",
+            Some(vec![b'b'; 300]),
+            300,
+            false,
+        );
+        assert_eq!(300, BUDGET.held());
+        {
+            let entry = PENDING_ACCESS.get("body-budget-b").unwrap();
+            assert_eq!(Some(300), entry.request_body.as_ref().map(Vec::len));
+            assert!(!entry.request_body_truncated);
+        }
+        PENDING_ACCESS.remove("body-budget-b");
+        assert_eq!(0, BUDGET.held());
+    }
+
+    /// A held response charges only the bytes it keeps, and stops capturing —
+    /// keeping what it has, marked truncated — once the pool is full.
+    #[test]
+    fn response_body_prefix_is_charged_against_the_pool_budget() {
+        static BUDGET: BodyBudget = BodyBudget::new(1000);
+        let capturing = || {
+            let mut facts = ResponseFacts::generated(200);
+            facts.capture_body = true;
+            facts
+        };
+
+        let mut charge = BodyCharge::new(&BUDGET);
+        let mut facts = capturing();
+        facts.absorb_held(&[b'x'; 600], 4096, &mut charge);
+        facts.absorb_held(&[b'x'; 600], 4096, &mut charge);
+        facts.absorb_held(&[b'x'; 100], 4096, &mut charge);
+        assert_eq!(Some(600), facts.body.as_ref().map(Vec::len));
+        assert_eq!(1300, facts.body_size);
+        assert!(facts.truncated());
+        assert_eq!(600, BUDGET.held());
+
+        // Nothing was kept for this one, yet its log still says a body was
+        // there.
+        let mut late_charge = BodyCharge::new(&BUDGET);
+        let mut late = capturing();
+        late.absorb_held(&[b'x'; 500], 4096, &mut late_charge);
+        assert_eq!(Some(0), late.body.as_ref().map(Vec::len));
+        assert!(late.truncated());
+        assert_eq!(600, BUDGET.held());
+
+        drop(charge);
+        assert_eq!(0, BUDGET.held());
+
+        // Only the kept prefix is charged, never the whole chunk; a response
+        // whose body is not captured is charged nothing.
+        let mut charge = BodyCharge::new(&BUDGET);
+        let mut facts = capturing();
+        facts.absorb_held(&[b'x'; 5000], 256, &mut charge);
+        facts.absorb_held(&[b'x'; 5000], 256, &mut charge);
+        assert_eq!(256, BUDGET.held());
+        let mut uncaptured = ResponseFacts::generated(200);
+        uncaptured.absorb_held(&[b'x'; 500], 4096, &mut charge);
+        assert!(uncaptured.body.is_none());
+        assert_eq!(256, BUDGET.held());
     }
 
     #[tokio::test]
@@ -11310,7 +12178,7 @@ inspect_body = true"###,
             &request,
             &denial,
             "/x",
-            4,
+            test_mint_fallback(4),
             true,
             "ip_geo",
         );
@@ -11326,7 +12194,7 @@ inspect_body = true"###,
             &request,
             &denial,
             "/x",
-            4,
+            test_mint_fallback(4),
             false,
             "ip_geo",
         );
@@ -11346,11 +12214,106 @@ inspect_body = true"###,
             &request,
             &block,
             "/x",
-            4,
+            test_mint_fallback(4),
             true,
             "ip_geo",
         );
         assert!(matches!(blocked, RequestPluginResult::Respond(_)));
+    }
+
+    /// Reads one response header value, case-insensitively.
+    fn response_header(resp: &HttpResponse, name: &str) -> Option<String> {
+        resp.headers
+            .as_ref()?
+            .iter()
+            .find(|(n, _)| n.as_str() == name)
+            .map(|(_, v)| v.to_str().unwrap_or_default().to_string())
+    }
+
+    /// Regression (R2): a challenge minted by a WAF rule / access verdict goes
+    /// through the same guarded path as the CC gate.
+    ///
+    /// It used to be built with the plugin's static `pow_difficulty`, which no
+    /// site configures and which no per-IP budget covered — so a rule
+    /// challenge ignored the site's difficulty and could be minted without
+    /// limit. The mint must now use the site's base difficulty, record that
+    /// difficulty for verification, and cost the shared issuance budget.
+    #[tokio::test]
+    async fn waf_challenge_verdicts_share_the_site_difficulty_and_budget() {
+        let (_guard, _agent, _dir) =
+            crate::challenge::tests::install_challenge_agent(Some(
+                crate::challenge::tests::site_challenge_config(1, 300, 6, 6),
+            ))
+            .await;
+        let denial = Denial {
+            rule_id: "ip1".to_string(),
+            rule_name: "IP rule".to_string(),
+            detail: "client ip matched challenge rule".to_string(),
+            challenge: true,
+            basic_auth: false,
+        };
+        let mut request = probe("");
+        // A client no other test uses: the guards are process-wide.
+        request.client_ip = "198.51.100.21".to_string();
+        // A fallback that would mint difficulty 20: the site's 6 must win.
+        let fallback = test_mint_fallback(20);
+
+        let first = WafPlugin::deny_request(
+            None,
+            "site-1",
+            "req-waf-mint-1",
+            "example.com",
+            &request,
+            &denial,
+            "/x",
+            fallback,
+            false,
+            "ip_geo",
+        );
+        let RequestPluginResult::Respond(resp) = first else {
+            panic!("a challenge denial must answer");
+        };
+        assert_eq!(http::StatusCode::SERVICE_UNAVAILABLE, resp.status);
+        let body = String::from_utf8_lossy(&resp.body).to_string();
+        assert!(
+            body.contains("difficulty: 6"),
+            "the site's base difficulty must be used: {body}"
+        );
+        assert_eq!(
+            Some("challenge".to_string()),
+            response_header(&resp, "x-pingwaf-mitigated")
+        );
+        // The page states the difficulty the verifier will demand.
+        let pending = crate::challenge::peek_pending("req-waf-mint-1")
+            .expect("the WAF mint must register a pending challenge");
+        assert_eq!(6, pending.difficulty);
+
+        // The shared budget refuses the next page for the same client: a rule
+        // challenge cannot be used to bypass the per-IP limit.
+        let second = WafPlugin::deny_request(
+            None,
+            "site-1",
+            "req-waf-mint-2",
+            "example.com",
+            &request,
+            &denial,
+            "/x",
+            fallback,
+            false,
+            "ip_geo",
+        );
+        let RequestPluginResult::Respond(resp) = second else {
+            panic!("over the budget the WAF must answer");
+        };
+        assert_eq!(http::StatusCode::TOO_MANY_REQUESTS, resp.status);
+        assert_eq!(
+            Some("block".to_string()),
+            response_header(&resp, "x-pingwaf-mitigated")
+        );
+        assert!(
+            crate::challenge::peek_pending("req-waf-mint-2").is_none(),
+            "a refused page must not leave a pending challenge"
+        );
     }
 
     #[test]

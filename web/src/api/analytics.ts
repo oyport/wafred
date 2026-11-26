@@ -8,6 +8,7 @@ import type {
   SitesOverviewResponse,
   StatusCodeCount,
   TimeBucket,
+  TopAsn,
   TopIpsQuery,
   TopIp,
   TopPath,
@@ -49,6 +50,14 @@ export const analyticsApi = {
 
   topPaths: (params: RangeQuery = {}) =>
     apiClient.get<TopPath[]>('/analytics/top-paths', { query: { limit: 10, ...params } }),
+
+  /**
+   * Networks ranked by requests (`requests DESC, asn ASC`). Rows whose ASN
+   * could not be resolved are stored as NULL server-side and are absent here;
+   * the server caps `limit` at 100.
+   */
+  topAsns: (params: RangeQuery = {}) =>
+    apiClient.get<TopAsn[]>('/analytics/top-asns', { query: { limit: 10, ...params } }),
 
   statusCodes: (params: RangeQuery = {}) =>
     apiClient.get<StatusCodeCount[]>('/analytics/status-codes', { query: params }),
