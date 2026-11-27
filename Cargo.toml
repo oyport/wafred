@@ -486,6 +486,7 @@ time = { version = "0.3.55", features = ["local-offset"] }
 TinyUFO = "0.9.1"
 # Pingora 0.9.1 supports the Tokio 1.54 buffer-capacity checks.
 tokio = { version = "=1.54.1", default-features = false, features = ["fs"] }
+tokio-util = { version = "0.7.20", features = ["compat"] }
 toml = "1.1.6"
 hcl-rs = "0.20"
 kdl = "6.7.1"
