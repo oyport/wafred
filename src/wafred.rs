@@ -5227,7 +5227,7 @@ mod tests {
         assert!(
             config
                 .servers
-                .get("pingwaf_tls")
+                .get("wafred_tls")
                 .is_some_and(|server| server.global_certificates == Some(true))
         );
     }

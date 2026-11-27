@@ -614,14 +614,14 @@ mod tests {
         assert_eq!(SITE_TABLES.len(), 27);
         // log_retention_settings moved from deployment-only to global: the
         // static-asset access-log filter rides inside every rule bundle.
-        assert_eq!(GLOBAL_TABLES.len(), 5);
+        assert_eq!(GLOBAL_TABLES.len(), 6);
         assert_eq!(DEPLOYMENT_ONLY_TABLES.len(), 9);
-        assert_eq!(tables_for(VersionScope::Deployment).len(), 41);
+        assert_eq!(tables_for(VersionScope::Deployment).len(), 42);
         let names: BTreeSet<_> = tables_for(VersionScope::Deployment)
             .into_iter()
             .map(|table| table.name)
             .collect();
-        assert_eq!(names.len(), 41, "table names must be unique");
+        assert_eq!(names.len(), 42, "table names must be unique");
     }
 
     #[test]
