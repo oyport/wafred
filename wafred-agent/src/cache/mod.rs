@@ -199,9 +199,9 @@ impl SiteStatus {
 /// Rules for a single site/domain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiteRules {
-    pub site_id: String,
-    pub domain: String,
-    pub alternate_domains: Vec<String>,
+    pub site_id: Arc<str>,
+    pub domain: Arc<str>,
+    pub alternate_domains: Vec<Arc<str>>,
     /// Per-host HTTP/HTTPS listener assignments. Missing values in old cache
     /// files are reconstructed as the legacy 80/443 defaults.
     #[serde(default)]
@@ -1885,7 +1885,7 @@ impl RuleCache {
             .inner
             .load()
             .sites
-            .get(&site_id)
+            .get(site_id.as_str())
             .map(|site| site.host_bindings.clone());
         let mut converted = Self::convert_bundle(bundle);
         // A rule bundle does not carry site-level fields. Preserve the value
@@ -2139,6 +2139,33 @@ impl RuleCache {
                 } else {
                     site.downstream_timeout_secs
                 };
+            site_rules.host_bindings = if site.host_bindings.is_empty() {
+                std::iter::once(site.domain.as_str())
+                    .chain(
+                        site.alternate_domains
+                            .iter()
+                            .map(String::as_str),
+                    )
+                    .map(|hostname| HostPortBinding {
+                        hostname: hostname.to_string(),
+                        http_port: Some(80),
+                        https_port: Some(443),
+                    })
+                    .collect()
+            } else {
+                site.host_bindings
+                    .iter()
+                    .map(|binding| HostPortBinding {
+                        hostname: binding.hostname.clone(),
+                        http_port: u16::try_from(binding.http_port)
+                            .ok()
+                            .filter(|port| *port > 0),
+                        https_port: u16::try_from(binding.https_port)
+                            .ok()
+                            .filter(|port| *port > 0),
+                    })
+                    .collect()
+            };
             site_rules.proxy_trust = ProxyTrustConfig {
                 enabled: site.trust_proxy_headers,
                 header: site.trusted_header.clone(),
@@ -2181,79 +2208,11 @@ impl RuleCache {
             if let Some(ls) = &log_settings {
                 updated.log_settings = Some(Arc::clone(ls));
             }
-
-            for site in &config.sites {
-                if let Some(ref bundle) = site.rules {
-                    let mut site_rules = Self::convert_bundle(bundle);
-                    // Override domain from site-level field
-                    if !site.domain.is_empty() {
-                        // Remove old domain index
-                        updated.domain_index.remove(
-                            normalize_host(&site_rules.domain).as_str(),
-                        );
-                        site_rules.domain = site.domain.clone();
-                    }
-                    site_rules.site_id = site.id.clone();
-                    site_rules.alternate_domains =
-                        site.alternate_domains.clone();
-                    site_rules.host_bindings = if site.host_bindings.is_empty()
-                    {
-                        std::iter::once(site.domain.as_str())
-                            .chain(
-                                site.alternate_domains
-                                    .iter()
-                                    .map(String::as_str),
-                            )
-                            .map(|hostname| HostPortBinding {
-                                hostname: hostname.to_string(),
-                                http_port: Some(80),
-                                https_port: Some(443),
-                            })
-                            .collect()
-                    } else {
-                        site.host_bindings
-                            .iter()
-                            .map(|binding| HostPortBinding {
-                                hostname: binding.hostname.clone(),
-                                http_port: u16::try_from(binding.http_port)
-                                    .ok()
-                                    .filter(|port| *port > 0),
-                                https_port: u16::try_from(binding.https_port)
-                                    .ok()
-                                    .filter(|port| *port > 0),
-                            })
-                            .collect()
-                    };
-                    site_rules.status = site_status_str(site.status);
-                    site_rules.downstream_timeout_secs =
-                        if site.downstream_timeout_secs == 0 {
-                            default_downstream_timeout_secs()
-                        } else {
-                            site.downstream_timeout_secs
-                        };
-                    site_rules.proxy_trust = ProxyTrustConfig {
-                        enabled: site.trust_proxy_headers,
-                        header: site.trusted_header.clone(),
-                        last_hop_only: site.trust_last_hop,
-                        trusted_ranges: site.trusted_proxy_ranges.clone(),
-                    };
-
-                    // Update domain index; the site id is shared between
-                    // this site's entries instead of duplicated per
-                    // domain.
-                    let site_id_key: Arc<str> = Arc::from(site.id.as_str());
-                    updated.domain_index.insert(
-                        Arc::from(normalize_host(&site_rules.domain)),
-                        Arc::clone(&site_id_key),
-                    );
-                    for alt in &site_rules.alternate_domains {
-                        updated.domain_index.insert(
-                            Arc::from(normalize_host(alt)),
-                            Arc::clone(&site_id_key),
-                        );
-                    }
-                    updated.sites.insert(site.id.clone(), Arc::new(site_rules));
-                }
+            if let Some(tunnels) = &tunnels {
+                updated.tunnels = Arc::clone(tunnels);
+            }
+            if let Some(settings) = &tunnel_settings {
+                updated.tunnel_settings = Some(settings.clone());
             }
 
             // A full site config is authoritative: replace both maps with
@@ -4965,7 +4924,7 @@ mod tests {
                     domain: "example.com".into(),
                     alternate_domains: Vec::new(),
                     host_bindings: Vec::new(),
-                    status: site_status::PAUSED.to_string(),
+                    status: SiteStatus::Paused,
                     downstream_timeout_secs: 60,
                     waf_config: None,
                     rate_limit_rules: Vec::new(),
@@ -5136,7 +5095,7 @@ mod tests {
                 domain: DOMAIN.into(),
                 alternate_domains: Vec::new(),
                 host_bindings: Vec::new(),
-                status: site_status::ACTIVE.to_string(),
+                status: SiteStatus::Active,
                 downstream_timeout_secs: 60,
                 waf_config: None,
                 rate_limit_rules: Vec::new(),
