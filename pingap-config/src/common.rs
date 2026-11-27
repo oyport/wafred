@@ -141,6 +141,7 @@ pub fn normalize_dns_provider(value: &str) -> Option<&'static str> {
         "cf" | "cloudflare" => Some("cf"),
         "tencent" | "dnspod" => Some("tencent"),
         "huawei" => Some("huawei"),
+        "route53" => Some("route53"),
         "rainbow" | "rainbowdns" | "dnsmgr" => Some("rainbow"),
         _ => None,
     }

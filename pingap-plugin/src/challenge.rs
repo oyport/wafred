@@ -2868,7 +2868,7 @@ cookie_secret = "test-secret"
             Some("block"),
             header_value(&resp, "x-pingwaf-mitigated").as_deref()
         );
-        assert_eq!(Some("pingwaf"), header_value(&resp, "server").as_deref());
+        assert_eq!(Some("wafred"), header_value(&resp, "server").as_deref());
     }
 
     /// Regression (R1): a full issuance table must not lock new visitors out.
