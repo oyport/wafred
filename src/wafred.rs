@@ -933,7 +933,7 @@ fn tunnel_bridge_addr(
     tunnel_id: &str,
     target: &str,
 ) -> Option<std::net::SocketAddr> {
-    pingwaf_tunnel::installed_registry()
+    wafred_tunnel::installed_registry()
         .and_then(|registry| registry.bridge_addr(tunnel_id, target))
 }
 
@@ -943,21 +943,21 @@ fn tunnel_bridge_addr(
 /// substitution reads, so it has to reflect the cache the build is about to
 /// use.
 fn apply_tunnel_policies(cached: &CachedRules) {
-    let Some(registry) = pingwaf_tunnel::installed_registry() else {
+    let Some(registry) = wafred_tunnel::installed_registry() else {
         return;
     };
     let settings = cached
         .tunnel_settings
-        .map(|settings| pingwaf_tunnel::TunnelSettings {
+        .map(|settings| wafred_tunnel::TunnelSettings {
             max_streams: settings.max_streams.max(1),
             idle_timeout_secs: settings.idle_timeout_secs.max(10),
             heartbeat_secs: settings.heartbeat_secs.max(5),
         })
         .unwrap_or_default();
-    let policies: Vec<pingwaf_tunnel::TunnelPolicy> = cached
+    let policies: Vec<wafred_tunnel::TunnelPolicy> = cached
         .tunnels
         .iter()
-        .map(|tunnel| pingwaf_tunnel::TunnelPolicy {
+        .map(|tunnel| wafred_tunnel::TunnelPolicy {
             tunnel_id: tunnel.tunnel_id.clone(),
             name: tunnel.name.clone(),
             enabled: tunnel.enabled,
@@ -976,10 +976,10 @@ fn apply_tunnel_policies(cached: &CachedRules) {
 async fn start_tunnel_listener(
     addr: &str,
     cache_dir: &str,
-) -> Option<Arc<pingwaf_tunnel::TunnelRegistry>> {
+) -> Option<Arc<wafred_tunnel::TunnelRegistry>> {
     let dir = std::path::Path::new(cache_dir).join("tunnel");
     let names = tunnel_certificate_names();
-    let cert = match pingwaf_tunnel::TunnelCertificate::load_or_generate(
+    let cert = match wafred_tunnel::TunnelCertificate::load_or_generate(
         &dir, &names,
     ) {
         Ok(cert) => cert,
@@ -988,8 +988,8 @@ async fn start_tunnel_listener(
             return None;
         },
     };
-    let registry = pingwaf_tunnel::TunnelRegistry::new();
-    let acceptor = match pingwaf_tunnel::TunnelAcceptor::bind(
+    let registry = wafred_tunnel::TunnelRegistry::new();
+    let acceptor = match wafred_tunnel::TunnelAcceptor::bind(
         addr,
         &cert,
         Arc::clone(&registry),
@@ -1001,7 +1001,7 @@ async fn start_tunnel_listener(
             error!(target: LOG_TARGET, addr, error = %error, "cannot start the tunnel listener");
             // Report the failure instead of looking like "never configured":
             // the console can then say why no edge is offering an ingress.
-            pingwaf_tunnel::install_runtime(pingwaf_tunnel::TunnelRuntime {
+            wafred_tunnel::install_runtime(wafred_tunnel::TunnelRuntime {
                 registry: Arc::clone(&registry),
                 listener_addr: None,
                 cert_fingerprint: cert.fingerprint_sha256.clone(),
@@ -1013,7 +1013,7 @@ async fn start_tunnel_listener(
     let listener_addr = acceptor.local_addr();
     let fingerprint = cert.fingerprint_sha256.clone();
     drop(acceptor.spawn());
-    pingwaf_tunnel::install_runtime(pingwaf_tunnel::TunnelRuntime {
+    wafred_tunnel::install_runtime(wafred_tunnel::TunnelRuntime {
         registry: Arc::clone(&registry),
         listener_addr: Some(listener_addr),
         cert_fingerprint: fingerprint.clone(),
@@ -2726,7 +2726,7 @@ const RELOAD_RETRY_MAX: Duration = Duration::from_secs(300);
 /// touching the cache, so the registry's generation is folded in.
 fn reload_key(rule_cache: &RuleCache) -> Arc<str> {
     let hash = rule_cache.config_hash();
-    match pingwaf_tunnel::installed_registry() {
+    match wafred_tunnel::installed_registry() {
         Some(registry) => Arc::from(format!(
             "{}#{}#{:016x}",
             hash,
