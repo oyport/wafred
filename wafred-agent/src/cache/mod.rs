@@ -2141,11 +2141,7 @@ impl RuleCache {
                 };
             site_rules.host_bindings = if site.host_bindings.is_empty() {
                 std::iter::once(site.domain.as_str())
-                    .chain(
-                        site.alternate_domains
-                            .iter()
-                            .map(String::as_str),
-                    )
+                    .chain(site.alternate_domains.iter().map(String::as_str))
                     .map(|hostname| HostPortBinding {
                         hostname: hostname.to_string(),
                         http_port: Some(80),
