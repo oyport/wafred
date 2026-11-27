@@ -10,7 +10,7 @@ import {
 } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Link, useSearchParams } from 'react-router-dom'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ShieldWarning,
   Warning,
@@ -47,7 +47,7 @@ import { agentsApi } from '@/api/agents'
 import { errorMessage } from '@/api/errors'
 import { downloadJson, fileTimestamp, logKeys, logsApi } from '@/api/logs'
 import { apiProtectionApi, apiProtectionKeys } from '@/api/apiProtection'
-import { blockedIpsApi } from '@/api/blockedIps'
+import { blockedIpsApi, blockedIpKeys } from '@/api/blockedIps'
 import { countryFlag } from '@/api/geo'
 import { useCanWrite, useSitesList } from '@/hooks'
 import { useAuthStore } from '@/stores/authStore'
@@ -337,6 +337,7 @@ function validateLogQuery(draft: string, tab: Tab): QueryIssue[] {
 export function LogsPage() {
   const { t } = useTranslation()
   const toast = useToast()
+  const queryClient = useQueryClient()
   const canWrite = useCanWrite()
   const isAdmin = useAuthStore((s) => s.user?.role) === 'admin'
   const [searchParams, setSearchParams] = useSearchParams()
@@ -750,6 +751,14 @@ export function LogsPage() {
       })
     },
     onSuccess: () => {
+      if (blockTarget) {
+        void queryClient.invalidateQueries({
+          queryKey: blockedIpKeys.all(blockTarget.siteId),
+        })
+      }
+      void queryClient.invalidateQueries({
+        queryKey: blockedIpKeys.global,
+      })
       toast.success(t('pages.logs.ipBlocked'), blockTarget?.ip ?? '')
       setBlockTarget(null)
       setBlockHours(0)

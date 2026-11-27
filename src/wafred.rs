@@ -928,6 +928,119 @@ fn site_has_cache_policy(site: &pingwaf_agent::cache::SiteRules) -> bool {
         })
 }
 
+/// The loopback address a tunnel target is reached at, when a session is live.
+fn tunnel_bridge_addr(
+    tunnel_id: &str,
+    target: &str,
+) -> Option<std::net::SocketAddr> {
+    pingwaf_tunnel::installed_registry()
+        .and_then(|registry| registry.bridge_addr(tunnel_id, target))
+}
+
+/// Reconciles the tunnel registry with the policy in the rule cache.
+///
+/// Called before every configuration build: the registry is what the address
+/// substitution reads, so it has to reflect the cache the build is about to
+/// use.
+fn apply_tunnel_policies(cached: &CachedRules) {
+    let Some(registry) = pingwaf_tunnel::installed_registry() else {
+        return;
+    };
+    let settings = cached
+        .tunnel_settings
+        .map(|settings| pingwaf_tunnel::TunnelSettings {
+            max_streams: settings.max_streams.max(1),
+            idle_timeout_secs: settings.idle_timeout_secs.max(10),
+            heartbeat_secs: settings.heartbeat_secs.max(5),
+        })
+        .unwrap_or_default();
+    let policies: Vec<pingwaf_tunnel::TunnelPolicy> = cached
+        .tunnels
+        .iter()
+        .map(|tunnel| pingwaf_tunnel::TunnelPolicy {
+            tunnel_id: tunnel.tunnel_id.clone(),
+            name: tunnel.name.clone(),
+            enabled: tunnel.enabled,
+            session_public_key: tunnel.session_public_key.clone(),
+            targets: tunnel.targets.clone(),
+            settings: settings.clone(),
+        })
+        .collect();
+    registry.apply_policies(policies);
+}
+
+/// Starts the tunnel listener when the agent was configured for one.
+///
+/// Returns the registry so the caller can keep it alive; the process-wide
+/// handle is what the heartbeat and the configuration generator read.
+async fn start_tunnel_listener(
+    addr: &str,
+    cache_dir: &str,
+) -> Option<Arc<pingwaf_tunnel::TunnelRegistry>> {
+    let dir = std::path::Path::new(cache_dir).join("tunnel");
+    let names = tunnel_certificate_names();
+    let cert = match pingwaf_tunnel::TunnelCertificate::load_or_generate(
+        &dir, &names,
+    ) {
+        Ok(cert) => cert,
+        Err(error) => {
+            error!(target: LOG_TARGET, error = %error, "cannot prepare the tunnel certificate");
+            return None;
+        },
+    };
+    let registry = pingwaf_tunnel::TunnelRegistry::new();
+    let acceptor = match pingwaf_tunnel::TunnelAcceptor::bind(
+        addr,
+        &cert,
+        Arc::clone(&registry),
+    )
+    .await
+    {
+        Ok(acceptor) => acceptor,
+        Err(error) => {
+            error!(target: LOG_TARGET, addr, error = %error, "cannot start the tunnel listener");
+            // Report the failure instead of looking like "never configured":
+            // the console can then say why no edge is offering an ingress.
+            pingwaf_tunnel::install_runtime(pingwaf_tunnel::TunnelRuntime {
+                registry: Arc::clone(&registry),
+                listener_addr: None,
+                cert_fingerprint: cert.fingerprint_sha256.clone(),
+                listener_error: Some(error.to_string()),
+            });
+            return Some(registry);
+        },
+    };
+    let listener_addr = acceptor.local_addr();
+    let fingerprint = cert.fingerprint_sha256.clone();
+    drop(acceptor.spawn());
+    pingwaf_tunnel::install_runtime(pingwaf_tunnel::TunnelRuntime {
+        registry: Arc::clone(&registry),
+        listener_addr: Some(listener_addr),
+        cert_fingerprint: fingerprint.clone(),
+        listener_error: None,
+    });
+    info!(target: LOG_TARGET,
+        addr = %listener_addr,
+        fingerprint = %fingerprint,
+        "tunnel listener started"
+    );
+    Some(registry)
+}
+
+/// Subject alternative names for the tunnel certificate.
+///
+/// Cosmetic only: connectors pin the leaf's SHA-256, they do not check a name.
+/// The host name makes `openssl s_client` output explain what the listener is.
+fn tunnel_certificate_names() -> Vec<String> {
+    let mut names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+    if let Some(host) = sysinfo::System::host_name()
+        && !host.trim().is_empty()
+    {
+        names.push(host);
+    }
+    names
+}
+
 fn custom_listener_port_allowed(port: u16) -> bool {
     let start = std::env::var("WAFRED_CUSTOM_PORT_START")
         .ok()
@@ -1529,7 +1642,7 @@ fn convert_cached_rules(
         }
 
         location_prototypes_by_site
-            .insert(site_id.clone(), site_location_names);
+            .insert(site_id.to_string(), site_location_names);
     }
 
     // Host fallback pages: only when at least one enabled error page carries
@@ -1604,15 +1717,6 @@ fn convert_cached_rules(
         location_names.push(UNMATCHED_HOST_LOCATION_NAME.to_string());
     }
 
-    // A site with an ACME certificate but no usable upstream has no location
-    // to proxy to, yet the certificate and its HTTP-01 challenge are still
-    // valid work. Keep the certificate-only config so the challenge handler
-    // and issuance task can run; ordinary requests simply 404/503 until an
-    // upstream is available. Truly empty configs still return None.
-    if location_names.is_empty() && certificates.is_empty() {
-        return None;
-    }
-
     // TLS is a per-server switch in pingap, so each numeric port has one
     // protocol. Host-specific locations are cloned onto their assigned port;
     // the standard 80/443 listeners stay present for compatibility.
@@ -1624,7 +1728,7 @@ fn convert_cached_rules(
     let mut prototype_locations: HashMap<String, LocationConf> = HashMap::new();
     let mut legacy_default_sites = BTreeSet::new();
     for (site_id, site) in &cached.sites {
-        let Some(prototypes) = location_prototypes_by_site.get(site_id) else {
+        let Some(prototypes) = location_prototypes_by_site.get(site_id.as_ref()) else {
             continue;
         };
         let expected: BTreeSet<String> =
@@ -1636,8 +1740,8 @@ fn convert_cached_rules(
                 )
                 .collect();
         let default_bindings: Vec<HostPortBinding> =
-            std::iter::once(site.domain.as_str())
-                .chain(site.alternate_domains.iter().map(String::as_str))
+            std::iter::once(site.domain.as_ref())
+                .chain(site.alternate_domains.iter().map(|domain| domain.as_ref()))
                 .map(|hostname| HostPortBinding {
                     hostname: hostname.to_string(),
                     http_port: Some(80),
@@ -1676,12 +1780,12 @@ fn convert_cached_rules(
     let mut https_locations: BTreeMap<u16, Vec<String>> =
         BTreeMap::from([(443, Vec::new())]);
     for (site_id, site) in &cached.sites {
-        let Some(prototypes) = location_prototypes_by_site.get(site_id) else {
+        let Some(prototypes) = location_prototypes_by_site.get(site_id.as_ref()) else {
             continue;
         };
         let default_bindings: Vec<HostPortBinding> =
-            std::iter::once(site.domain.as_str())
-                .chain(site.alternate_domains.iter().map(String::as_str))
+            std::iter::once(site.domain.as_ref())
+                .chain(site.alternate_domains.iter().map(|domain| domain.as_ref()))
                 .map(|hostname| HostPortBinding {
                     hostname: hostname.to_string(),
                     http_port: Some(80),
@@ -2600,6 +2704,212 @@ pub async fn start_data_plane(
     Ok(())
 }
 
+/// How often the hot-reload watcher looks at the rule cache.
+const RELOAD_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Longest wait between two attempts at a reload that keeps failing. A
+/// failure that will not go away on its own (a certificate that does not
+/// parse) then costs one reload every five minutes, not one every poll.
+const RELOAD_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// The key the hot-reload watcher compares.
+///
+/// The rule cache's hash alone is not enough once tunnels exist: a connector
+/// connecting or dropping changes which pools have an upstream without
+/// touching the cache, so the registry's generation is folded in.
+fn reload_key(rule_cache: &RuleCache) -> Arc<str> {
+    let hash = rule_cache.config_hash();
+    match pingwaf_tunnel::installed_registry() {
+        Some(registry) => Arc::from(format!(
+            "{}#{}#{:016x}",
+            hash,
+            registry.generation(),
+            tunnel_policy_fingerprint(&rule_cache.all_sites())
+        )),
+        None => hash,
+    }
+}
+
+/// Fingerprint of the tunnel policy the edge holds.
+///
+/// The reload pass is the only place that reconciles the registry with the
+/// cache, so a policy change that does not move the config hash (a credential
+/// rotation, a disable, a new target list) must move the key too — otherwise a
+/// revoked tunnel would keep its live session until some unrelated change
+/// happened to trigger a reload, and the documented ≤5s convergence would be
+/// a lie.
+fn tunnel_policy_fingerprint(cached: &CachedRules) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for tunnel in cached.tunnels.iter() {
+        tunnel.tunnel_id.hash(&mut hasher);
+        tunnel.enabled.hash(&mut hasher);
+        tunnel.session_public_key.hash(&mut hasher);
+        tunnel.targets.hash(&mut hasher);
+    }
+    if let Some(settings) = cached.tunnel_settings {
+        (
+            settings.max_streams,
+            settings.idle_timeout_secs,
+            settings.heartbeat_secs,
+        )
+            .hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Decides when the hot-reload watcher applies the rule cache to the proxy.
+///
+/// A configuration counts as applied only once every reload step accepted
+/// it. One that failed is attempted again with a growing delay, and a newer
+/// one from the control plane is attempted at once.
+struct ReloadTracker {
+    /// Hash of the last configuration every reload step accepted.
+    applied: Arc<str>,
+    failure: Option<ReloadFailure>,
+}
+
+struct ReloadFailure {
+    hash: Arc<str>,
+    attempts: u32,
+    retry_at: Instant,
+}
+
+impl ReloadTracker {
+    fn new(applied: Arc<str>) -> Self {
+        Self {
+            applied,
+            failure: None,
+        }
+    }
+
+    /// Whether the cache at `hash` should be applied now. After a failure
+    /// the proxy holds a partial reload, so even a cache that went back to
+    /// the last applied hash has to be applied again.
+    fn is_due(&self, hash: &str, now: Instant) -> bool {
+        match &self.failure {
+            None => *self.applied != *hash,
+            Some(failure) => *failure.hash != *hash || now >= failure.retry_at,
+        }
+    }
+
+    fn succeeded(&mut self, hash: Arc<str>) {
+        self.applied = hash;
+        self.failure = None;
+    }
+
+    /// Records a failed attempt and returns how long until the next one.
+    fn failed(&mut self, hash: Arc<str>, now: Instant) -> Duration {
+        let attempts = match &self.failure {
+            Some(failure) if failure.hash == hash => {
+                failure.attempts.saturating_add(1)
+            },
+            _ => 1,
+        };
+        let delay = reload_retry_delay(attempts);
+        self.failure = Some(ReloadFailure {
+            hash,
+            attempts,
+            retry_at: now + delay,
+        });
+        delay
+    }
+}
+
+/// Delay before attempt `attempts + 1`: one poll interval, doubling up to
+/// [`RELOAD_RETRY_MAX`].
+fn reload_retry_delay(attempts: u32) -> Duration {
+    let doublings = attempts.saturating_sub(1).min(16);
+    RELOAD_POLL_INTERVAL
+        .saturating_mul(1 << doublings)
+        .min(RELOAD_RETRY_MAX)
+}
+
+/// Applies a converted configuration to the running proxy and returns what
+/// went wrong, one entry per failed step; empty when all of it applied.
+///
+/// Every step is attempted even after an earlier one failed, as before: the
+/// providers are independent, and a certificate that does not parse must not
+/// keep a new upstream from loading.
+async fn apply_reload(
+    config_manager: &pingap_config::ConfigManager,
+    converted: PingapConfig,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if converted.locations.is_empty() && converted.certificates.is_empty() {
+        warn!(target: LOG_TARGET, "data plane: nothing left to serve, unloading every site");
+    }
+    let new_toml = match toml::to_string_pretty(&converted) {
+        Ok(new_toml) => new_toml,
+        Err(e) => {
+            error!(target: LOG_TARGET,
+                error = %e,
+                "data plane: reload config serialization failed, keeping current"
+            );
+            return vec![format!("serialize config: {e}")];
+        },
+    };
+    // Fetch-merge-save must be atomic with respect to ACME's own
+    // read-modify-write: an issuance completing while the reload was
+    // reading a PEM-less snapshot used to be clobbered by the reload
+    // save, dropping the certificate from storage (and then from the
+    // SNI table on the next provider rebuild).
+    let config = match config_manager
+        .update_raw(|prev_toml| merge_config_state(&new_toml, &prev_toml))
+        .await
+    {
+        Ok(config) => config,
+        Err(_) => {
+            warn!(target: LOG_TARGET,
+                "data plane: merged reload config failed, using freshly converted config"
+            );
+            errors.push("merge config failed".to_string());
+            converted
+        },
+    };
+    config_manager.set_current_config(config.clone());
+    if let Err(e) = try_init_upstreams(
+        &config.upstreams,
+        config.basic.origin_verify_cert,
+        None,
+    ) {
+        error!(target: LOG_TARGET, error = %e, "data plane: reload upstreams failed");
+        errors.push(format!("upstreams: {e}"));
+    }
+    if let Err(e) = try_init_locations(&config.locations) {
+        error!(target: LOG_TARGET, error = %e, "data plane: reload locations failed");
+        errors.push(format!("locations: {e}"));
+    }
+    if let Err(e) =
+        try_init_server_locations(&config.servers, &config.locations)
+    {
+        error!(target: LOG_TARGET, error = %e, "data plane: reload server locations failed");
+        errors.push(format!("server locations: {e}"));
+    }
+    let (updated, cert_errors) = try_update_certificates(&config.certificates);
+    if !updated.is_empty() {
+        info!(target: LOG_TARGET,
+            certs = updated.join(","),
+            "data plane: certificates reloaded"
+        );
+    }
+    if !cert_errors.is_empty() {
+        error!(target: LOG_TARGET, error = cert_errors, "data plane: certificate reload errors");
+        errors.push(format!("certificates: {cert_errors}"));
+    }
+    let (updated_plugins, plugin_errors) = try_init_plugins(&config.plugins);
+    if !updated_plugins.is_empty() {
+        info!(target: LOG_TARGET,
+            plugins = updated_plugins.join(","),
+            "data plane: plugins reloaded"
+        );
+    }
+    if !plugin_errors.is_empty() {
+        error!(target: LOG_TARGET, error = plugin_errors, "data plane: plugin reload errors");
+        errors.push(format!("plugins: {plugin_errors}"));
+    }
+    errors
+}
+
 /// Run WAFred in the specified mode.
 ///
 /// This function blocks until shutdown is signalled (SIGINT / SIGTERM).
@@ -2874,6 +3184,66 @@ pub fn edge_main() {
     }
 }
 
+/// The pingora-proxy warning emitted for every bodyless HTTP/2 request whose
+/// upstream is HTTP/1.1. It is benign (the response is already complete) but
+/// pingora 0.9.1 logs it per request, which turns a crawler into a log flood.
+/// The fmt layer drops exactly this message; the real fix is upstream.
+fn is_noisy_pingora_body_warning(target: &str, message: &str) -> bool {
+    target == "pingora_proxy::proxy_h1"
+        && message.contains("Upstream body is already finished")
+}
+
+struct DropPingoraBodyWarning;
+
+impl<S: tracing::Subscriber> tracing_subscriber::layer::Filter<S>
+    for DropPingoraBodyWarning
+{
+    fn enabled(
+        &self,
+        _metadata: &tracing::Metadata<'_>,
+        _cx: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        true
+    }
+
+    fn event_enabled(
+        &self,
+        event: &tracing::Event<'_>,
+        _cx: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        if event.metadata().target() != "pingora_proxy::proxy_h1" {
+            return true;
+        }
+        let mut visitor = MessageVisitor { message: None };
+        event.record(&mut visitor);
+        !visitor.message.as_deref().is_some_and(|message| {
+            is_noisy_pingora_body_warning("pingora_proxy::proxy_h1", message)
+        })
+    }
+}
+
+struct MessageVisitor {
+    message: Option<String>,
+}
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(
+        &mut self,
+        field: &tracing::field::Field,
+        value: &dyn std::fmt::Debug,
+    ) {
+        if field.name() == "message" {
+            self.message = Some(format!("{value:?}"));
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = Some(value.to_string());
+        }
+    }
+}
+
 /// Initialize tracing subscriber for WAFred modes.
 fn init_tracing() {
     use tracing_subscriber::{fmt, prelude::*};
@@ -3087,8 +3457,8 @@ mod tests {
     fn site_rules(site_id: &str, domain: &str) -> SiteRules {
         SiteRules {
             host_bindings: vec![],
-            site_id: site_id.to_string(),
-            domain: domain.to_string(),
+            site_id: site_id.to_string().into(),
+            domain: domain.to_string().into(),
             alternate_domains: vec![],
             status: pingwaf_agent::cache::SiteStatus::Active,
             downstream_timeout_secs: 60,
