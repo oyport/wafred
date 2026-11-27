@@ -148,7 +148,7 @@ jobs:
       # it. Lint it explicitly: it is a shipped release artifact.
       - name: Clippy (agent-only build)
         if: matrix.toolchain == 'stable'
-        run: cargo clippy --locked --bin pingwaf-agent --features full,edge -- -D warnings
+        run: cargo clippy --locked --bin wafred-agent --features full,edge -- -D warnings
 
       - name: Test (workspace, nextest)
         run: cargo nextest run --locked --workspace --features full --no-fail-fast
@@ -212,10 +212,10 @@ jobs:
       # The agent-only target must stay backend-agnostic: it is built with the
       # openssl backend for release, but nothing in it may assume that.
       - name: Clippy (agent-only, rustls backend)
-        run: cargo clippy --locked --no-default-features --features=tls-rustls,full,edge --bin pingwaf-agent -- --deny=warnings
+        run: cargo clippy --locked --no-default-features --features=tls-rustls,full,edge --bin wafred-agent -- --deny=warnings
 
       - name: Build (agent-only, rustls backend)
-        run: cargo build --locked --no-default-features --features=tls-rustls,full,edge --bin pingwaf-agent
+        run: cargo build --locked --no-default-features --features=tls-rustls,full,edge --bin wafred-agent
 
       - name: Test (workspace, nextest, rustls backend)
         run: cargo nextest run --locked --workspace --no-default-features --features=tls-rustls,full --no-fail-fast
@@ -404,8 +404,8 @@ jobs:
 
       # The agent-only artifact is published by release.yml; build it here too
       # so a release-profile regression is caught on main, not at tag time.
-      - name: Build (release, pingwaf-agent, full, edge)
-        run: cargo build --locked --release --bin pingwaf-agent --features full,edge
+      - name: Build (release, wafred-agent, full, edge)
+        run: cargo build --locked --release --bin wafred-agent --features full,edge
 
       - name: Upload release binary for :main image
         uses: actions/upload-artifact@v4
