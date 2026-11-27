@@ -1623,8 +1623,8 @@ purge_ip_list = ["192.168.1.1"]
     fn agent_site_rules(cache_rules: Vec<AgentCacheRule>) -> AgentSiteRules {
         AgentSiteRules {
             host_bindings: vec![],
-            site_id: "site-1".to_string(),
-            domain: "example.com".to_string(),
+            site_id: "site-1".into(),
+            domain: "example.com".into(),
             alternate_domains: vec![],
             status: pingwaf_agent::cache::SiteStatus::Active,
             downstream_timeout_secs: 60,

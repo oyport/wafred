@@ -3906,7 +3906,16 @@ async fn upsert_ssl(
     // half-applied posture behind, so both go through one transaction.
     let txn = state.db.begin().await?;
     lock_host_bindings(&txn).await?;
-    let posture = save_tls_posture(&txn, &site, &tls).await?;
+    let posture = save_tls_posture(
+        &txn,
+        &site,
+        &tls,
+        CertSource {
+            uploaded: uploaded_pair,
+            acme_email: payload.acme_email.as_deref(),
+        },
+    )
+    .await?;
 
     let host_bindings = site_host_bindings::Entity::find()
         .filter(site_host_bindings::Column::SiteId.eq(id))

@@ -126,6 +126,7 @@ pub struct RestoreReport {
     pub rows_by_table: BTreeMap<String, usize>,
     pub warnings: Vec<String>,
     pub listener_bindings_changed: bool,
+    pub skipped_rows: usize,
 }
 
 /// Return the custom TCP listeners represented by a set of host-binding rows.
@@ -1599,6 +1600,7 @@ pub async fn apply_restore(
         rows_by_table: BTreeMap::new(),
         warnings: plan.warnings.clone(),
         listener_bindings_changed,
+        skipped_rows: plan.skipped_rows,
     };
     let mut by_layer = plan.tables.iter().collect::<Vec<_>>();
     by_layer.sort_by_key(|prepared| prepared.spec.layer);
