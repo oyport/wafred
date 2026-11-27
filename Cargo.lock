@@ -9109,6 +9109,7 @@ dependencies = [
  "uuid",
  "vergen",
  "vergen-git2",
+ "wafred-tunnel",
 ]
 
 [[package]]
