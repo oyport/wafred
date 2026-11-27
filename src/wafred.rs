@@ -2963,6 +2963,7 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
             proxy_handle.abort();
             Ok(())
         },
+        #[cfg(not(feature = "edge"))]
         RunMode::AllInOne(server_config, mut agent_config) => {
             info!(target: LOG_TARGET,
                 http_addr = %server_config.http_addr,

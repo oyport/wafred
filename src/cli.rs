@@ -690,7 +690,9 @@ fn apply_config_subcommand(command: &mut ConfigCommand) -> Result<(), String> {
 /// warning below still tells them the inline value was visible.
 fn apply_secret_files(command: &mut WafredCommand) -> Result<(), String> {
     match command {
+        #[cfg(not(feature = "edge"))]
         WafredCommand::Server(opts) => apply_common_file(&mut opts.common),
+        #[cfg(not(feature = "edge"))]
         WafredCommand::AllInOne(opts) => {
             apply_common_file(&mut opts.common)?;
             apply_api_key_file(&mut opts.api_key, opts.api_key_file.as_deref())
@@ -798,7 +800,7 @@ pub fn parse_wafred_cli() -> WafredCli {
 /// * `wafred-agent --server-url ...` — the redundant subcommand omitted.
 ///
 /// `--config` layering, `--api-key-file`, `--version` and the inline-secret
-/// warnings are shared with [`parse_pingwaf_cli`].
+/// warnings are shared with [`parse_wafred_cli`].
 #[cfg(feature = "edge")]
 pub fn parse_agent_cli() -> AgentOpts {
     parse_agent_args(std::env::args().collect())
@@ -829,7 +831,7 @@ fn parse_agent_args(args: Vec<String>) -> AgentOpts {
         },
     }
 
-    let mut cli = PingWafCli::parse_from(argv);
+    let mut cli = WafredCli::parse_from(argv);
     if let Err(err) = apply_secret_files(&mut cli.command) {
         eprintln!("wafred-agent: {err}");
         std::process::exit(1);
@@ -838,7 +840,7 @@ fn parse_agent_args(args: Vec<String>) -> AgentOpts {
         eprintln!("warning: {warning}");
     }
     match cli.command {
-        PingWafCommand::Agent(opts) => opts,
+        WafredCommand::Agent(opts) => opts,
         _ => {
             // Only reachable if the injected `agent` was overridden by
             // something clap accepted as a different subcommand; the agent
