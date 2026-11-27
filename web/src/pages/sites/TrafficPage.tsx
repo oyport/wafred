@@ -3,7 +3,6 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  AreaChart,
   Area,
   BarChart,
   Bar,
@@ -418,64 +417,11 @@ export function TrafficPanels({ siteId }: { siteId?: string }) {
         />
       ) : (
         <div className="flex flex-col gap-6">
-          {/* Requests + bandwidth over time, on one aligned bucket grid */}
+          {/* Requests and egress bandwidth share the same aligned buckets. */}
           <Card>
             <CardHeader
               title={t('pages.traffic.requestsAndBandwidth')}
               description={t('pages.traffic.requestsAndBandwidthHint')}
-            />
-            <CardBody>
-              {mergedData.length === 0 ? (
-                <EmptyState
-                  className="border-0 py-10"
-                  icon={<ChartLine weight="duotone" className="h-8 w-8" />}
-                  title={t('pages.traffic.noTraffic')}
-                />
-              ) : (
-                <div className="h-72 w-full">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart data={seriesData} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
-                      <defs>
-                        <linearGradient id="trafficReq" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="0%" stopColor="#d8324f" stopOpacity={0.35} />
-                          <stop offset="100%" stopColor="#d8324f" stopOpacity={0} />
-                        </linearGradient>
-                        <linearGradient id="trafficBlock" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="0%" stopColor="#e54d2a" stopOpacity={0.3} />
-                          <stop offset="100%" stopColor="#e54d2a" stopOpacity={0} />
-                        </linearGradient>
-                      </defs>
-                      <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border-line)" vertical={false} />
-                      <XAxis
-                        dataKey="label"
-                        tick={{ fontSize: 11, fill: 'var(--color-text-subtle)' }}
-                        tickLine={false}
-                        axisLine={{ stroke: 'var(--color-border-line)' }}
-                        minTickGap={24}
-                      />
-                      <YAxis
-                        tick={{ fontSize: 11, fill: 'var(--color-text-subtle)' }}
-                        tickLine={false}
-                        axisLine={false}
-                        tickFormatter={(v: number) => formatCompactNumber(v)}
-                      />
-                      <Tooltip contentStyle={tooltipStyle} formatter={(v) => formatNumber(Number(v ?? 0))} />
-                      <Legend wrapperStyle={{ fontSize: 12 }} iconType="circle" />
-                      <Area type="monotone" dataKey="passed" name={t('pages.traffic.passed')} stroke="#18794e" strokeWidth={2} fill="transparent" />
-                      <Area type="monotone" dataKey="requests" name={t('pages.traffic.requests')} stroke="#d8324f" strokeWidth={2} fill="url(#trafficReq)" />
-                      <Area type="monotone" dataKey="blocked" name={t('pages.traffic.blocked')} stroke="#e54d2a" strokeWidth={2} fill="url(#trafficBlock)" />
-                    </AreaChart>
-                  </ResponsiveContainer>
-                </div>
-              )}
-            </CardBody>
-          </Card>
-
-          {/* Egress bandwidth */}
-          <Card>
-            <CardHeader
-              title={t('pages.traffic.bandwidth')}
-              description={t('pages.traffic.egressHint')}
             />
             <CardBody>
               {mergedData.length === 0 ? (
