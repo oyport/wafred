@@ -6,7 +6,7 @@
 - 候选版本 SHA-256：93b4b6e92e39eb3417dabec510945fe847667660ffad0493c1a3f31d50fc9796
 - 语料：chaitin/blazehttp，commit afc88a94d03db1cd52156c34c3c9c58053c9f658；33,877 条请求，恶意 658、正常 33,219
 - 环境：五台 Debian 13 虚拟机，隔离 WAF、模拟源站、两台负载机和结果收集机
-- 当前结果：[WAF 实测报告](waf-test-report.md)、[完整实验室报告](wafred-baseline-test-report-2026-11-22.md)、[基准摘要及旧版本测试背景](waf-benchmark-report.md)
+- 当前结果：[WAF 实测报告](waf-test-report.md)、[完整实验室报告](../wafred-baseline-test-report-2026-11-22.md)、[基准摘要及旧版本测试背景](../waf-benchmark-report.md)
 
 ## 测试矩阵
 
