@@ -3,6 +3,7 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  AreaChart,
   Area,
   BarChart,
   Bar,
@@ -477,7 +478,7 @@ export function TrafficPanels({ siteId }: { siteId?: string }) {
               description={t('pages.traffic.egressHint')}
             />
             <CardBody>
-              {egressData.length === 0 ? (
+              {mergedData.length === 0 ? (
                 <EmptyState
                   className="border-0 py-10"
                   icon={<UploadSimple weight="duotone" className="h-8 w-8" />}
