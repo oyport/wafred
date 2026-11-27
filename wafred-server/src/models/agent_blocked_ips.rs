@@ -24,6 +24,10 @@ pub mod agent_blocked_ips {
         pub blocked_at: DateTimeUtc,
         /// None = permanent block (no automatic expiry).
         pub expires_at: Option<DateTimeUtc>,
+        /// True when the control plane issued this block manually. Manual
+        /// entries are durable intent and must not be pruned by a heartbeat
+        /// that was sampled before the command reached the agent.
+        pub manual: bool,
         pub created_at: DateTimeUtc,
         pub updated_at: DateTimeUtc,
     }

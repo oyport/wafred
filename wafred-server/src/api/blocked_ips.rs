@@ -580,6 +580,7 @@ async fn manual_block(
             reason: Set(Some(reason.clone())),
             blocked_at: Set(now),
             expires_at: Set(expires_at),
+            manual: Set(true),
             created_at: Set(now),
             updated_at: Set(now),
             ..Default::default()

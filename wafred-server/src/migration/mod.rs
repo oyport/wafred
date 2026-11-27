@@ -125,6 +125,7 @@ pub mod m20240101_000108_tunnel_listener_error;
 pub mod m20240101_000109_acme_dns_provider_backfill;
 pub mod m20240101_000110_agent_acme_issuer;
 pub mod m20240101_000111_certificate_issuer_agent;
+pub mod m20240101_000112_agent_blocked_ip_manual;
 
 use sea_orm_migration::prelude::*;
 
@@ -258,6 +259,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20240101_000109_acme_dns_provider_backfill::Migration),
             Box::new(m20240101_000110_agent_acme_issuer::Migration),
             Box::new(m20240101_000111_certificate_issuer_agent::Migration),
+            Box::new(m20240101_000112_agent_blocked_ip_manual::Migration),
         ]
     }
 }
@@ -269,7 +271,7 @@ mod tests {
     #[test]
     fn migrations_are_ordered_and_unique() {
         let migrations = Migrator::migrations();
-        assert_eq!(migrations.len(), 113);
+        assert_eq!(migrations.len(), 114);
         let names: Vec<String> =
             migrations.iter().map(|m| m.name().to_owned()).collect();
         let mut sorted = names.clone();

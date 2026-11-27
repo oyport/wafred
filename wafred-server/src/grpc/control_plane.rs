@@ -664,6 +664,14 @@ impl ControlPlaneTrait for ControlPlaneService {
             // The registry owns the sender now, so replay through it.
             self.agents.send_command(&agent_id, command).await;
         }
+        replay_manual_blocks(
+            &self.db,
+            &self.agents,
+            agent_id,
+            &visible,
+            &first.blocked_ips,
+        )
+        .await?;
 
         let db = self.db.clone();
         let registry = self.agents.clone();
@@ -2825,12 +2833,89 @@ async fn sweep_host_samples(db: &DatabaseConnection) {
     }
 }
 
+/// Replays the control plane's manual blocks when an agent reconnects. This
+/// also recovers commands that were queued in memory but lost to a server
+/// restart while the target agent was offline.
+async fn replay_manual_blocks(
+    db: &DatabaseConnection,
+    registry: &AgentRegistry,
+    agent_id: Uuid,
+    visible_sites: &[Uuid],
+    reported: &[BlockedIp],
+) -> Result<(), Status> {
+    use std::collections::HashSet;
+
+    if visible_sites.is_empty() {
+        return Ok(());
+    }
+
+    let reported: HashSet<(Uuid, String)> = reported
+        .iter()
+        .filter_map(|entry| {
+            Uuid::parse_str(entry.site_id.trim())
+                .ok()
+                .map(|site_id| (site_id, entry.ip.clone()))
+        })
+        .collect();
+    let now = Utc::now();
+    let blocks = agent_blocked_ip::Entity::find()
+        .filter(agent_blocked_ip::Column::AgentId.eq(agent_id))
+        .filter(agent_blocked_ip::Column::Manual.eq(true))
+        .filter(agent_blocked_ip::Column::SiteId.is_in(visible_sites.to_vec()))
+        .filter(
+            Condition::any()
+                .add(agent_blocked_ip::Column::ExpiresAt.is_null())
+                .add(agent_blocked_ip::Column::ExpiresAt.gt(now)),
+        )
+        .all(db)
+        .await
+        .map_err(db_status)?;
+
+    for block in blocks {
+        if reported.contains(&(block.site_id, block.ip.clone())) {
+            continue;
+        }
+        let duration_seconds = block
+            .expires_at
+            .map(|expires_at| (expires_at - now).num_seconds().max(1));
+        let request = crate::api::agents::CommandRequest {
+            command: "block_ip".to_string(),
+            site_id: Some(block.site_id.to_string()),
+            ip_addresses: vec![block.ip.clone()],
+            urls: Vec::new(),
+            tags: Vec::new(),
+            duration_seconds,
+            reason: block
+                .reason
+                .clone()
+                .or_else(|| Some("manual block from dashboard".to_string())),
+            graceful: true,
+        };
+        match crate::api::agents::build_command(&request, Some(block.site_id)) {
+            Ok(command) => {
+                registry.send_command(&agent_id, command).await;
+            },
+            Err(error) => {
+                tracing::warn!(
+                    %agent_id,
+                    site_id = %block.site_id,
+                    ip = %block.ip,
+                    error = %error,
+                    "could not replay manual IP block to reconnecting agent"
+                );
+            },
+        }
+    }
+    Ok(())
+}
+
 /// Reconciles the control plane's mirror of one agent's dynamic IP blocks.
 ///
 /// The heartbeat carries the agent's *complete* list, so the ingest replaces
 /// rather than appends: rows the agent no longer reports are deleted, known
-/// keys are refreshed in place, and new keys inserted. Entries whose site id
-/// does not parse as a UUID are skipped — the edge only blocks synced sites.
+/// keys are refreshed in place, and new keys inserted. Manual entries remain
+/// until explicitly removed or expired. Entries whose site id does not parse
+/// as a UUID are skipped — the edge only blocks synced sites.
 async fn persist_blocked_ips(
     db: &DatabaseConnection,
     agent_id: Uuid,
@@ -2839,12 +2924,13 @@ async fn persist_blocked_ips(
 ) {
     use std::collections::HashSet;
 
-    // Empty is the common steady state. It means "no blocks": clear the
-    // mirror with one DELETE instead of reading every row and then deleting
-    // the stale set on every heartbeat.
+    // Manual entries are desired state from the control plane, not just a
+    // mirror of the agent's last report. A heartbeat can arrive before an
+    // in-flight block command is applied, so it must not erase manual rows.
     if blocked_ips.is_empty() {
         if let Err(err) = agent_blocked_ip::Entity::delete_many()
             .filter(agent_blocked_ip::Column::AgentId.eq(agent_id))
+            .filter(agent_blocked_ip::Column::Manual.eq(false))
             .exec(db)
             .await
         {
@@ -2878,6 +2964,7 @@ async fn persist_blocked_ips(
                 .expires_at
                 .as_ref()
                 .map(|exp| from_timestamp(Some(exp)))),
+            manual: Set(false),
             created_at: Set(now),
             updated_at: Set(now),
             ..Default::default()
@@ -2904,7 +2991,10 @@ async fn persist_blocked_ips(
     } else {
         existing
             .iter()
-            .filter(|row| !reported.contains(&(row.site_id, row.ip.clone())))
+            .filter(|row| {
+                !row.manual
+                    && !reported.contains(&(row.site_id, row.ip.clone()))
+            })
             .map(|row| row.id)
             .collect()
     };

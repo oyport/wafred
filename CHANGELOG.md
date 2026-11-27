@@ -13,8 +13,8 @@
   operating mode.
 - Improved agent health reporting, scoped site delivery and controlled
   self-upgrade status.
-- Fixed the log detail IP block action leaving blacklist views stale until
-  their next polling refresh.
+- Kept manual IP blocks visible across agent heartbeat reconciliation and
+  replayed them when an agent reconnects.
 
 ### Added
 
