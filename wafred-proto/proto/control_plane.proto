@@ -470,6 +470,10 @@ message RuleBundle {
   repeated PathException path_exceptions = 33;
   // Ordered request path restrictions; evaluated before path exceptions.
   repeated PathRestriction path_restrictions = 34;
+  // Complete tunnel registry and deployment-wide limits; every bundle carries
+  // the same values so an incremental rule push can also refresh tunnel policy.
+  repeated TunnelConfig tunnels = 35;
+  TunnelSettings tunnel_settings = 36;
 }
 
 message PathRestriction {
