@@ -1033,7 +1033,7 @@ async fn start_tunnel_listener(
 /// The host name makes `openssl s_client` output explain what the listener is.
 fn tunnel_certificate_names() -> Vec<String> {
     let mut names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-    if let Some(host) = sysinfo::System::host_name()
+    if let Ok(host) = sysinfo::System::host_name()
         && !host.trim().is_empty()
     {
         names.push(host);
