@@ -3057,11 +3057,11 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
     }
 }
 
-/// Runs the data-plane agent and its reverse proxy until SIGINT/SIGTERM.
+/// Runs the edge-only data-plane agent and its reverse proxy until SIGINT/SIGTERM.
 ///
-/// Shared by the `agent` run mode (all-in-one binary) and the agent-only
-/// `wafred-agent` binary, so the two builds cannot drift in how they start,
-/// report or shut the data plane down.
+/// The main binary uses `run()` so it can also watch for control-plane restart
+/// requests; only the agent-only binary enters through this function.
+#[cfg(feature = "edge")]
 pub(crate) async fn run_agent(config: AgentConfig) -> anyhow::Result<()> {
     info!(target: LOG_TARGET,
         server_url = %config.server_url,
