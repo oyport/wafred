@@ -48,7 +48,7 @@ mod cli;
 mod config_file;
 mod config_manager;
 mod locations;
-mod pingwaf;
+mod wafred;
 mod plugin;
 mod process;
 mod server_locations;
@@ -83,5 +83,5 @@ fn main() {
     #[cfg(not(feature = "dhat"))]
     allocator_tune::apply();
 
-    pingwaf::edge_main();
+    wafred::edge_main();
 }
