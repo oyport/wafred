@@ -6,6 +6,7 @@ import {
 import type { ReactElement } from 'react'
 import { AppLayout } from '@/layouts/AppLayout'
 import { useAuthStore } from '@/stores/authStore'
+import { hasAdminViewAccess } from '@/lib/permissions'
 
 import { LoginPage } from '@/pages/LoginPage'
 import { DashboardPage } from '@/pages/DashboardPage'
@@ -56,8 +57,8 @@ function RequireAuth({ children }: { children: ReactElement }) {
 
 /** Redirects non-admin users to the dashboard (the guards are server-backed too). */
 function RequireAdmin({ children }: { children: ReactElement }) {
-  const role = useAuthStore((s) => s.user?.role)
-  if (role !== 'admin') {
+  const user = useAuthStore((s) => s.user)
+  if (!hasAdminViewAccess(user)) {
     return <Navigate to="/dashboard" replace />
   }
   return children

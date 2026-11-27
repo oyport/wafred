@@ -39,6 +39,7 @@ describe('GET /api/v1/system/nodes contract', () => {
         memory_bytes: null,
         total_memory_bytes: 8589934592,
         used_memory_bytes: 2147483648,
+        process_rss_bytes: null,
         connections: 12,
         rps: null,
         sites: 3,

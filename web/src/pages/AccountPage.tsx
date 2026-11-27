@@ -7,6 +7,7 @@ import { OidcProvidersCard } from '@/components/account/OidcProvidersCard'
 import { VisitorsCard } from '@/components/account/VisitorsCard'
 import { QuickNav } from '@/components/ui/QuickNav'
 import { useAuthStore } from '@/stores/authStore'
+import { hasAdminViewAccess } from '@/lib/permissions'
 import { useCanWrite } from '@/hooks'
 import { accountSections } from './accountNav'
 
@@ -26,7 +27,8 @@ import { accountSections } from './accountNav'
 export function AccountPage() {
   const { t } = useTranslation()
   const canWrite = useCanWrite()
-  const isAdmin = useAuthStore((s) => s.user?.role) === 'admin'
+  const user = useAuthStore((s) => s.user)
+  const isAdmin = hasAdminViewAccess(user)
   const sections = useMemo(() => accountSections(isAdmin), [isAdmin])
   const navItems = useMemo(
     () => sections.map(({ id, labelKey }) => ({ id, label: t(labelKey) })),

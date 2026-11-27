@@ -1,11 +1,18 @@
 pub mod cookie;
+pub mod difficulty;
 pub mod fingerprint;
 pub mod js_challenge;
+pub mod limits;
 
 // Re-export main types for convenient access
 pub use cookie::{
     ClearanceLevel, ClearancePayload, CookieError, CookieManager,
     CLEARANCE_COOKIE_NAME,
+};
+pub use difficulty::{
+    AdaptiveDifficulty, DifficultyState, DEFAULT_BASE_DIFFICULTY,
+    DEFAULT_MAX_DIFFICULTY, DIFFICULTY_DECAY_SECS, MAX_DIFFICULTY,
+    MAX_FAILURE_STEPS, MIN_DIFFICULTY,
 };
 pub use fingerprint::BrowserFingerprint;
 pub use js_challenge::page::POW_JS;
@@ -13,6 +20,10 @@ pub use js_challenge::verify::{check_browser_integrity, IntegrityResult};
 pub use js_challenge::{
     generate_request_id, ChallengeConfig, ChallengeDecision, ChallengeEngine,
     ChallengeRequest, ChallengeResponse, ChallengeSubmission, VerifyResult,
+};
+pub use limits::{
+    FixedWindowLimiter, LimitDecision, DEFAULT_MAX_TRACKED_KEYS,
+    LIMIT_WINDOW_SECS,
 };
 
 /// Challenge level (public enum matching the proto definition)

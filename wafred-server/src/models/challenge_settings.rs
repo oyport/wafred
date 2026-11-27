@@ -20,6 +20,14 @@ pub struct Model {
     pub exempt_paths: Vec<String>,
     pub browser_integrity_check: bool,
     pub tls_fingerprint_check: bool,
+    /// Proof-of-work difficulty (leading zero bits) a quiet visitor solves.
+    pub base_difficulty: i32,
+    /// Ceiling the difficulty may rise to under request/failure pressure.
+    pub max_difficulty: i32,
+    /// Challenge pages issued per host+IP per 60-second window.
+    pub issue_limit_per_min: i32,
+    /// Solution submissions accepted per host+IP per 60-second window.
+    pub verify_limit_per_min: i32,
     pub updated_at: DateTimeUtc,
 }
 

@@ -234,7 +234,12 @@ impl ChallengeEngine {
         submission: &ChallengeSubmission,
         secure: bool,
     ) -> VerifyResult {
-        self.verify_solution_inner(submission, secure, true)
+        self.verify_solution_inner(
+            submission,
+            secure,
+            true,
+            self.config.pow_difficulty,
+        )
     }
 
     /// Verifies a submission whose nonce came from the plugin's pending map.
@@ -244,12 +249,19 @@ impl ChallengeEngine {
     /// server-side value stored in that map, not the signed format the public
     /// engine API uses; requiring the signature made every browser submission
     /// fail with "challenge nonce is invalid or expired".
+    ///
+    /// `difficulty` is the value the edge issued with that challenge — not the
+    /// engine's static one. Adaptive difficulty raises and lowers the required
+    /// work per challenge, so verifying against `config.pow_difficulty` would
+    /// reject every submission issued above it and accept submissions issued
+    /// below it.
     pub fn verify_solution_for_pending(
         &self,
         submission: &ChallengeSubmission,
         secure: bool,
+        difficulty: u32,
     ) -> VerifyResult {
-        self.verify_solution_inner(submission, secure, false)
+        self.verify_solution_inner(submission, secure, false, difficulty)
     }
 
     fn verify_solution_inner(
@@ -257,6 +269,7 @@ impl ChallengeEngine {
         submission: &ChallengeSubmission,
         secure: bool,
         require_signed_nonce: bool,
+        difficulty: u32,
     ) -> VerifyResult {
         // 1. Verify timestamp (prevent replay)
         if !verify_timestamp(
@@ -288,7 +301,7 @@ impl ChallengeEngine {
         if !verify_proof_of_work(
             &submission.challenge_nonce,
             &submission.solution,
-            self.config.pow_difficulty,
+            difficulty,
         ) {
             return VerifyResult::Failed {
                 reason: "proof-of-work verification failed".to_string(),
@@ -919,12 +932,83 @@ mod tests {
             timestamp: chrono::Utc::now().timestamp(),
             site_id: "test-site".to_string(),
         };
-        match engine.verify_solution_for_pending(&submission, true) {
+        match engine.verify_solution_for_pending(&submission, true, 0) {
             VerifyResult::Success { cookie_value, .. } => {
                 assert!(!cookie_value.is_empty())
             },
             VerifyResult::Failed { reason } => {
                 panic!("pending nonce should verify, got: {reason}")
+            },
+        }
+    }
+
+    /// A pending submission is checked against the difficulty the edge issued
+    /// with that challenge, not the engine's static one: adaptive difficulty
+    /// changes the required work per challenge, and the page must be solvable
+    /// exactly as issued.
+    #[test]
+    fn pending_verification_uses_the_issued_difficulty() {
+        // The engine is configured with the historical default of 20 bits…
+        let config = ChallengeConfig {
+            browser_integrity_check: false,
+            pow_difficulty: 20,
+            ..test_config()
+        };
+        let engine = ChallengeEngine::new(config);
+        let nonce = issue_nonce(engine.config.cookie_secret.as_bytes());
+        let submission = ChallengeSubmission {
+            request_id: "pending-difficulty".to_string(),
+            challenge_nonce: nonce.clone(),
+            // …but this challenge was issued at 0 bits, so the trivial answer
+            // the page computed must verify.
+            solution: "anything".to_string(),
+            fingerprint_json: r#"{"user_agent":"Mozilla/5.0 Chrome/120","screen_width":1920,"screen_height":1080,"timezone_offset":-480,"language":"en-US","platform":"Win32","canvas_hash":"abc","webgl_vendor":"Google","webgl_renderer":"ANGLE","plugins_count":3,"touch_support":false,"hardware_concurrency":8,"device_memory":8.0}"#
+                .to_string(),
+            timestamp: chrono::Utc::now().timestamp(),
+            site_id: "test-site".to_string(),
+        };
+        match engine.verify_solution_for_pending(&submission, true, 0) {
+            VerifyResult::Success { .. } => {},
+            VerifyResult::Failed { reason } => {
+                panic!(
+                    "issued difficulty must win over the static one: {reason}"
+                )
+            },
+        }
+
+        // And the reverse: an answer that only satisfies 0 bits must fail a
+        // challenge issued at 12, without spending the nonce (the client can
+        // retry the same page with the right answer).
+        let mut raised = submission.clone();
+        // The trivial answer satisfies 0 bits with probability 1/4096, so pick
+        // a nonce for which it demonstrably does not satisfy 12.
+        loop {
+            let nonce = issue_nonce(engine.config.cookie_secret.as_bytes());
+            if !verify_proof_of_work(&nonce, "anything", 12) {
+                raised.challenge_nonce = nonce;
+                break;
+            }
+        }
+        match engine.verify_solution_for_pending(&raised, true, 12) {
+            VerifyResult::Failed { reason } => {
+                assert!(reason.contains("proof-of-work"), "{reason}");
+            },
+            _ => panic!("a solution below the issued difficulty must fail"),
+        }
+        // The same challenge still verifies once the right answer arrives.
+        let mut solved = raised.clone();
+        solved.solution = (0u32..)
+            .map(|candidate| candidate.to_string())
+            .find(|candidate| {
+                verify_proof_of_work(&raised.challenge_nonce, candidate, 12)
+            })
+            .expect("a 12-bit solution");
+        match engine.verify_solution_for_pending(&solved, true, 12) {
+            VerifyResult::Success { .. } => {},
+            VerifyResult::Failed { reason } => {
+                panic!(
+                    "the nonce must not be spent by a failed proof: {reason}"
+                )
             },
         }
     }

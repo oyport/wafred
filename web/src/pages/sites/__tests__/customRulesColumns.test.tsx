@@ -42,9 +42,9 @@ const columns = buildRuleColumns({
   onDelete: () => undefined,
 })
 
-function render(): string {
+function render(data: Rule[] = [rule]): string {
   return renderToStaticMarkup(
-    <Table columns={columns} data={[rule]} rowKey={(r) => r.id} />,
+    <Table columns={columns} data={data} rowKey={(r) => r.id} />,
   )
 }
 
@@ -71,5 +71,12 @@ describe('CustomRulesPanel rule table layout', () => {
     })
     // The expression paragraph itself stays truncatable, not table-bloating.
     expect(tds[1]).toContain('max-w-0')
+  })
+
+  it('offers no delete button on a row that overrides a built-in rule', () => {
+    expect(render()).toContain('aria-label="common.delete"')
+    const managed = render([{ ...rule, managed_rule_id: 'PINGWAF-1010' }])
+    expect(managed).toContain('aria-label="common.edit"')
+    expect(managed).not.toContain('aria-label="common.delete"')
   })
 })

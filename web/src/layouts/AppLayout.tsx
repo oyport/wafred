@@ -17,6 +17,7 @@ import {
   WarningCircle,
 } from '@phosphor-icons/react'
 import { cn } from '@/lib/utils'
+import { hasAdminViewAccess } from '@/lib/permissions'
 import { Sidebar } from '@/components/ui/Sidebar'
 import { Breadcrumb, type BreadcrumbItem } from '@/components/ui/Breadcrumb'
 import { Button } from '@/components/ui/Button'
@@ -81,7 +82,7 @@ export function AppLayout() {
   const navigate = useNavigate()
   const { resolved, toggle } = useThemeStore()
   const user = useAuthStore((s) => s.user)
-  const isAdmin = user?.role === 'admin'
+  const isAdmin = hasAdminViewAccess(user)
   const isDemo = Boolean(user?.is_demo)
   const logout = useAuthStore((s) => s.logout)
   const toggleAssistant = useAssistantWidgetStore((s) => s.toggle)

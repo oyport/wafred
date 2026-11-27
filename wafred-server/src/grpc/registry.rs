@@ -14,12 +14,18 @@
 //! heartbeat ([`HeartbeatMetrics`]). The heartbeat is otherwise consumed and
 //! dropped, and `requests_per_second` in particular is stored nowhere else, so
 //! this is the only source of a live RPS figure for `/api/v1/system/nodes`.
+//!
+//! Finally it remembers the hash of the configuration last issued to each
+//! agent ([`ConfigSync`]). A push is fire-and-forget — the stream it entered
+//! may already be dead — so the hash every heartbeat reports is checked
+//! against it, and an agent that stays on something else is pushed again.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use pingwaf_proto::control_plane::ServerCommand;
+use pingwaf_proto::control_plane::{server_command::Payload, ServerCommand};
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
@@ -27,6 +33,16 @@ use uuid::Uuid;
 pub const COMMAND_CHANNEL_CAPACITY: usize = 64;
 /// Maximum number of commands retained for an agent that is currently offline.
 pub const PENDING_COMMAND_LIMIT: usize = 64;
+/// Consecutive heartbeats that must report a stale hash before the
+/// configuration is pushed again. The heartbeat that was already on the wire
+/// when a push went out legitimately carries the old one.
+pub const CONFIG_DRIFT_GRACE: u32 = 2;
+/// Wait after the first re-push before the next; doubles per re-push that
+/// did not converge, up to [`CONFIG_REPUSH_COOLDOWN_MAX`]. An agent that
+/// cannot apply the configuration at all is then pushed a full bundle every
+/// ten minutes, not every heartbeat.
+pub const CONFIG_REPUSH_COOLDOWN: Duration = Duration::from_secs(60);
+pub const CONFIG_REPUSH_COOLDOWN_MAX: Duration = Duration::from_secs(600);
 
 struct Connection {
     sender: mpsc::Sender<ServerCommand>,
@@ -44,7 +60,61 @@ struct Inner {
     pending: HashMap<Uuid, VecDeque<ServerCommand>>,
     /// Counters of the last heartbeat on the live stream, one entry per agent.
     metrics: HashMap<Uuid, HeartbeatMetrics>,
+    /// Why the data plane of an agent is not running the configuration it
+    /// received, as of its last heartbeat. Absent when it applied in full.
+    apply_errors: HashMap<Uuid, String>,
+    /// What each agent should be running, and how far it has drifted.
+    config: HashMap<Uuid, ConfigSync>,
+    /// Log entries each agent has discarded since its process started, as
+    /// of its last heartbeat. Kept across reconnects: the count belongs to
+    /// the agent process, not to the stream.
+    log_drops: HashMap<Uuid, u64>,
     next_generation: u64,
+}
+
+/// Reconciliation state of one agent's configuration.
+#[derive(Default)]
+struct ConfigSync {
+    /// Hash of the configuration last issued to the agent, at registration or
+    /// by an `UpdateSite` command. `None` until this process issued one.
+    target: Option<String>,
+    /// Consecutive heartbeats that reported a different hash.
+    mismatches: u32,
+    /// Re-pushes since the agent was last in sync.
+    repushes: u32,
+    last_repush: Option<Instant>,
+}
+
+/// What a heartbeat's `config_hash` says about the agent's configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigDrift {
+    /// The agent runs the configuration last issued to it.
+    InSync,
+    /// It reports something else, but a push may still be on its way or the
+    /// last re-push is too recent to repeat.
+    Settling,
+    /// It stayed on something else: push the configuration again. `expected`
+    /// is the hash it should have reported, `None` when this process never
+    /// issued one.
+    Repush { expected: Option<String> },
+}
+
+/// Hash of the configuration an `UpdateSite` command carries.
+fn update_site_hash(command: &ServerCommand) -> Option<&str> {
+    match &command.payload {
+        Some(Payload::UpdateSite(update)) => update
+            .site_config
+            .as_ref()
+            .map(|config| config.config_hash.as_str()),
+        _ => None,
+    }
+}
+
+fn repush_cooldown(repushes: u32) -> Duration {
+    let doublings = repushes.saturating_sub(1).min(16);
+    CONFIG_REPUSH_COOLDOWN
+        .saturating_mul(1 << doublings)
+        .min(CONFIG_REPUSH_COOLDOWN_MAX)
 }
 
 /// Cheap-to-clone handle to the live agent connections.
@@ -65,6 +135,11 @@ pub struct AgentRegistry {
 /// A zero is what the agent reported, not "unknown": the wire fields are plain
 /// integers, so the two cannot be told apart here. A node with no entry has not
 /// heartbeated since it connected and is reported as unknown by the API.
+///
+/// The one exception is `process_rss_bytes`: it is the first tri-state counter,
+/// an `Option` on the wire. `None` means the agent never reported it (an agent
+/// older than the field), which is distinct from `Some(0)`. The other counters
+/// keep the zero-sentinel convention for wire compatibility.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HeartbeatMetrics {
     /// CPU usage over the agent's last heartbeat interval, in percent.
@@ -75,6 +150,9 @@ pub struct HeartbeatMetrics {
     pub connections: u64,
     /// Requests per second the edge served over the last interval.
     pub rps: u64,
+    /// RSS of the agent process itself, in bytes. The first tri-state counter:
+    /// `None` = the agent never reported it (pre-field build), not zero.
+    pub process_rss_bytes: Option<u64>,
 }
 
 /// Snapshot of one live connection, used by the `/api/v1/agents` endpoints.
@@ -112,6 +190,7 @@ impl AgentRegistry {
         // empty and is filled by the opening heartbeat, which already carries
         // them.
         inner.metrics.remove(&agent_id);
+        inner.apply_errors.remove(&agent_id);
         let drained = inner.pending.remove(&agent_id).unwrap_or_default();
         if !drained.is_empty() {
             tracing::info!(
@@ -135,6 +214,7 @@ impl AgentRegistry {
             Some(current) if current == generation => {
                 inner.connected.remove(agent_id);
                 inner.metrics.remove(agent_id);
+                inner.apply_errors.remove(agent_id);
                 tracing::debug!(%agent_id, "agent heartbeat stream closed");
             },
             Some(_) => {
@@ -159,6 +239,7 @@ impl AgentRegistry {
         // the operator just disconnected must not keep reporting its last
         // heartbeat.
         inner.metrics.remove(agent_id);
+        inner.apply_errors.remove(agent_id);
     }
 
     /// Forgets queued commands for agents that no longer exist. Called by
@@ -175,6 +256,9 @@ impl AgentRegistry {
                 dropped += 1;
             }
             inner.metrics.remove(agent_id);
+            inner.apply_errors.remove(agent_id);
+            inner.config.remove(agent_id);
+            inner.log_drops.remove(agent_id);
         }
         if dropped > 0 {
             tracing::info!(
@@ -200,6 +284,152 @@ impl AgentRegistry {
     /// small and the map is flat.
     pub async fn metrics(&self) -> HashMap<Uuid, HeartbeatMetrics> {
         self.inner.read().await.metrics.clone()
+    }
+
+    /// Retains why the agent's data plane is not running the configuration it
+    /// received (empty = it is). Returns whether this differs from the
+    /// previous heartbeat, so the caller logs transitions rather than every
+    /// heartbeat of a node that stays degraded.
+    pub async fn record_apply_error(
+        &self,
+        agent_id: Uuid,
+        error: &str,
+    ) -> bool {
+        let mut inner = self.inner.write().await;
+        if error.is_empty() {
+            return inner.apply_errors.remove(&agent_id).is_some();
+        }
+        if inner.apply_errors.get(&agent_id).map(String::as_str) == Some(error)
+        {
+            return false;
+        }
+        inner.apply_errors.insert(agent_id, error.to_string());
+        true
+    }
+
+    /// Retains the agent's running total of discarded log entries and
+    /// returns how many were discarded since the previous report.
+    ///
+    /// The total restarts with the agent process, so a lower value than the
+    /// one on record is a fresh count, all of it new.
+    pub async fn record_log_drops(&self, agent_id: Uuid, total: u64) -> u64 {
+        let mut inner = self.inner.write().await;
+        if total == 0 {
+            inner.log_drops.remove(&agent_id);
+            return 0;
+        }
+        let previous = inner.log_drops.insert(agent_id, total).unwrap_or(0);
+        if total >= previous {
+            total - previous
+        } else {
+            total
+        }
+    }
+
+    /// Log entries the agent has discarded since its process started, as of
+    /// its last heartbeat.
+    pub async fn log_drops(&self, agent_id: &Uuid) -> u64 {
+        self.inner
+            .read()
+            .await
+            .log_drops
+            .get(agent_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Why the agent's data plane is not running its configuration, if its
+    /// last heartbeat said so.
+    pub async fn apply_error(&self, agent_id: &Uuid) -> Option<String> {
+        self.inner.read().await.apply_errors.get(agent_id).cloned()
+    }
+
+    /// Starts a registration: the configuration about to be built for the
+    /// response replaces whatever was issued before.
+    ///
+    /// Queued `UpdateSite` commands are dropped — each carries the agent's
+    /// whole configuration, so the fresher one in the response supersedes
+    /// them, and replaying them after it would roll the agent back. Call this
+    /// *before* building that configuration: a change committed afterwards
+    /// queues its own command, which then survives to be replayed.
+    pub async fn begin_registration(&self, agent_id: Uuid) {
+        let mut inner = self.inner.write().await;
+        if let Some(queue) = inner.pending.get_mut(&agent_id) {
+            queue.retain(|command| update_site_hash(command).is_none());
+        }
+        inner.config.insert(agent_id, ConfigSync::default());
+    }
+
+    /// Records the hash of the configuration handed out at registration.
+    /// A push issued since [`Self::begin_registration`] is newer and keeps
+    /// its place as the target.
+    pub async fn note_initial_config(&self, agent_id: Uuid, config_hash: &str) {
+        let mut inner = self.inner.write().await;
+        let sync = inner.config.entry(agent_id).or_default();
+        if sync.target.is_none() {
+            sync.target = Some(config_hash.to_string());
+            sync.mismatches = 0;
+        }
+    }
+
+    /// Checks the hash a heartbeat reported against the configuration last
+    /// issued to the agent and decides whether it has to be pushed again.
+    ///
+    /// The comparison is against the hash that was *sent*, never against a
+    /// freshly built bundle: the fingerprint of two builds of the same
+    /// configuration can differ, which would read as permanent drift.
+    pub async fn observe_config_hash(
+        &self,
+        agent_id: Uuid,
+        reported: &str,
+        now: Instant,
+    ) -> ConfigDrift {
+        let mut inner = self.inner.write().await;
+        let sync = inner.config.entry(agent_id).or_default();
+        if !reported.is_empty() && sync.target.as_deref() == Some(reported) {
+            sync.mismatches = 0;
+            sync.repushes = 0;
+            sync.last_repush = None;
+            return ConfigDrift::InSync;
+        }
+        sync.mismatches = sync.mismatches.saturating_add(1);
+        if sync.mismatches < CONFIG_DRIFT_GRACE {
+            return ConfigDrift::Settling;
+        }
+        if let Some(last) = sync.last_repush {
+            if now.saturating_duration_since(last)
+                < repush_cooldown(sync.repushes)
+            {
+                return ConfigDrift::Settling;
+            }
+        }
+        sync.last_repush = Some(now);
+        sync.repushes = sync.repushes.saturating_add(1);
+        sync.mismatches = 0;
+        ConfigDrift::Repush {
+            expected: sync.target.clone(),
+        }
+    }
+
+    /// Makes `command` the agent's configuration target when it is an
+    /// `UpdateSite`. Each one replaces the agent's whole configuration, so
+    /// the ones still queued are obsolete: left in place they would be
+    /// replayed on the next reconnect, after this newer one.
+    async fn note_config_issued(
+        &self,
+        agent_id: &Uuid,
+        command: &ServerCommand,
+    ) {
+        let Some(hash) = update_site_hash(command) else {
+            return;
+        };
+        let mut inner = self.inner.write().await;
+        if let Some(queue) = inner.pending.get_mut(agent_id) {
+            queue.retain(|queued| update_site_hash(queued).is_none());
+        }
+        let sync = inner.config.entry(*agent_id).or_default();
+        sync.target = Some(hash.to_string());
+        sync.mismatches = 0;
     }
 
     /// True when the agent currently holds an open stream.
@@ -241,6 +471,11 @@ impl AgentRegistry {
         agent_id: &Uuid,
         command: ServerCommand,
     ) -> bool {
+        // Recorded whether or not the command reaches a live stream: the
+        // target is what the agent should run, and a push that got lost is
+        // exactly what the heartbeat comparison has to notice.
+        self.note_config_issued(agent_id, &command).await;
+
         // Grab the sender while holding the read lock only: `send().await`
         // must not block other registry operations.
         let sender = {
@@ -393,10 +628,282 @@ mod tests {
         assert_eq!(registry.pending_count(&agent).await, PENDING_COMMAND_LIMIT);
     }
 
+    fn update_site(hash: &str) -> ServerCommand {
+        use pingwaf_proto::control_plane::{SiteConfig, UpdateSiteCommand};
+        ServerCommand {
+            command_id: Uuid::new_v4().to_string(),
+            r#type: 2, // COMMAND_UPDATE_SITE
+            issued_at: None,
+            payload: Some(Payload::UpdateSite(UpdateSiteCommand {
+                site_config: Some(SiteConfig {
+                    config_hash: hash.to_string(),
+                    ..Default::default()
+                }),
+            })),
+        }
+    }
+
+    fn hashes(commands: &VecDeque<ServerCommand>) -> Vec<Option<&str>> {
+        commands.iter().map(update_site_hash).collect()
+    }
+
+    /// A push that never reached the agent is noticed from the heartbeat: the
+    /// first stale report is tolerated (it may have crossed the push on the
+    /// wire), the second asks for a re-push.
+    #[tokio::test]
+    async fn stale_hash_is_repushed_after_the_grace_heartbeat() {
+        let registry = AgentRegistry::new();
+        let agent = Uuid::new_v4();
+        let now = Instant::now();
+
+        registry.begin_registration(agent).await;
+        registry.note_initial_config(agent, "v1").await;
+        assert_eq!(
+            registry.observe_config_hash(agent, "v1", now).await,
+            ConfigDrift::InSync
+        );
+
+        // The push is issued while the agent has no stream: it is recorded as
+        // the target even though it only reached the pending queue.
+        assert!(!registry.send_command(&agent, update_site("v2")).await);
+        assert_eq!(
+            registry.observe_config_hash(agent, "v1", now).await,
+            ConfigDrift::Settling
+        );
+        assert_eq!(
+            registry.observe_config_hash(agent, "v1", now).await,
+            ConfigDrift::Repush {
+                expected: Some("v2".to_string())
+            }
+        );
+
+        // The agent caught up: back in sync, and the next drift starts over
+        // with a full grace period and no cooldown.
+        assert_eq!(
+            registry.observe_config_hash(agent, "v2", now).await,
+            ConfigDrift::InSync
+        );
+        registry.send_command(&agent, update_site("v3")).await;
+        assert_eq!(
+            registry.observe_config_hash(agent, "v2", now).await,
+            ConfigDrift::Settling
+        );
+        assert_eq!(
+            registry.observe_config_hash(agent, "v2", now).await,
+            ConfigDrift::Repush {
+                expected: Some("v3".to_string())
+            }
+        );
+    }
+
+    /// An agent that cannot converge is not pushed a full bundle on every
+    /// heartbeat: re-pushes are spaced 60 s apart, doubling up to 10 min.
+    #[tokio::test]
+    async fn repushes_back_off_while_the_agent_does_not_converge() {
+        let registry = AgentRegistry::new();
+        let agent = Uuid::new_v4();
+        let start = Instant::now();
+        registry.begin_registration(agent).await;
+        registry.note_initial_config(agent, "want").await;
+
+        let mut repushed_at = Vec::new();
+        // One heartbeat every 10 s for an hour, always on the wrong hash.
+        for tick in 0..360u64 {
+            let now = start + Duration::from_secs(tick * 10);
+            if let ConfigDrift::Repush { expected } =
+                registry.observe_config_hash(agent, "have", now).await
+            {
+                assert_eq!(expected.as_deref(), Some("want"));
+                repushed_at.push(tick * 10);
+            }
+        }
+        let gaps: Vec<u64> = repushed_at
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect();
+        assert_eq!(repushed_at[0], 10, "second stale heartbeat");
+        assert_eq!(&gaps[..5], &[60, 120, 240, 480, 600]);
+        assert!(gaps[5..].iter().all(|gap| *gap == 600));
+
+        assert_eq!(repush_cooldown(0), CONFIG_REPUSH_COOLDOWN);
+        assert_eq!(repush_cooldown(1), CONFIG_REPUSH_COOLDOWN);
+        assert_eq!(repush_cooldown(u32::MAX), CONFIG_REPUSH_COOLDOWN_MAX);
+    }
+
+    /// An agent reporting no hash at all, or one this process never issued
+    /// (control plane restarted and the agent did not re-register), is
+    /// pushed its configuration too.
+    #[tokio::test]
+    async fn unknown_target_and_empty_hash_are_repushed() {
+        let registry = AgentRegistry::new();
+        let agent = Uuid::new_v4();
+        let now = Instant::now();
+
+        assert_eq!(
+            registry.observe_config_hash(agent, "old", now).await,
+            ConfigDrift::Settling
+        );
+        assert_eq!(
+            registry.observe_config_hash(agent, "old", now).await,
+            ConfigDrift::Repush { expected: None }
+        );
+
+        let empty = Uuid::new_v4();
+        registry.note_initial_config(empty, "").await;
+        registry.observe_config_hash(empty, "", now).await;
+        assert!(
+            matches!(
+                registry.observe_config_hash(empty, "", now).await,
+                ConfigDrift::Repush { .. }
+            ),
+            "an empty hash never counts as in sync"
+        );
+    }
+
+    /// Every `UpdateSite` carries the agent's whole configuration, so only
+    /// the newest may be replayed: an older one delivered after it would roll
+    /// the agent back. Other queued commands are untouched.
+    #[tokio::test]
+    async fn newer_configuration_supersedes_queued_ones() {
+        let registry = AgentRegistry::new();
+        let agent = Uuid::new_v4();
+
+        registry.send_command(&agent, update_site("v1")).await;
+        registry.send_command(&agent, restart("keep")).await;
+        registry.send_command(&agent, update_site("v2")).await;
+
+        let (tx, _rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+        let (_, drained) = registry.connect(agent, tx).await;
+        assert_eq!(hashes(&drained), vec![None, Some("v2")]);
+    }
+
+    /// Registration hands out a fresh configuration: what was queued before
+    /// it is obsolete, what is issued after it started is newer and stays —
+    /// both in the queue and as the target.
+    #[tokio::test]
+    async fn registration_drops_stale_pushes_but_keeps_newer_ones() {
+        let registry = AgentRegistry::new();
+        let agent = Uuid::new_v4();
+        let now = Instant::now();
+
+        registry.send_command(&agent, update_site("stale")).await;
+        registry.send_command(&agent, restart("keep")).await;
+        registry.begin_registration(agent).await;
+        // A change committed while the response is being built.
+        registry.send_command(&agent, update_site("newer")).await;
+        registry.note_initial_config(agent, "initial").await;
+
+        let (tx, _rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+        let (_, drained) = registry.connect(agent, tx).await;
+        assert_eq!(hashes(&drained), vec![None, Some("newer")]);
+
+        assert_eq!(
+            registry.observe_config_hash(agent, "newer", now).await,
+            ConfigDrift::InSync,
+            "the push issued during registration is the target"
+        );
+
+        // Without a concurrent push the registration config is the target.
+        registry.begin_registration(agent).await;
+        registry.note_initial_config(agent, "initial").await;
+        assert_eq!(
+            registry.observe_config_hash(agent, "initial", now).await,
+            ConfigDrift::InSync
+        );
+    }
+
+    /// The reload failure belongs to the stream that reported it, and the
+    /// return value marks transitions only.
+    #[tokio::test]
+    async fn apply_error_tracks_transitions_and_the_stream_lifecycle() {
+        let registry = AgentRegistry::new();
+        let agent = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+        let (generation, _) = registry.connect(agent, tx).await;
+
+        assert!(!registry.record_apply_error(agent, "").await);
+        assert_eq!(registry.apply_error(&agent).await, None);
+
+        assert!(registry.record_apply_error(agent, "plugins: boom").await);
+        assert!(!registry.record_apply_error(agent, "plugins: boom").await);
+        assert!(registry.record_apply_error(agent, "upstreams: boom").await);
+        assert_eq!(
+            registry.apply_error(&agent).await.as_deref(),
+            Some("upstreams: boom")
+        );
+
+        assert!(registry.record_apply_error(agent, "").await);
+        assert_eq!(registry.apply_error(&agent).await, None);
+
+        registry.record_apply_error(agent, "plugins: boom").await;
+        registry.disconnect(&agent, generation + 1).await;
+        assert!(
+            registry.apply_error(&agent).await.is_some(),
+            "a superseded stream closing keeps the live report"
+        );
+        registry.disconnect(&agent, generation).await;
+        assert_eq!(registry.apply_error(&agent).await, None);
+
+        registry.record_apply_error(agent, "plugins: boom").await;
+        let (tx, _rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+        registry.connect(agent, tx).await;
+        assert_eq!(registry.apply_error(&agent).await, None);
+
+        registry.record_apply_error(agent, "plugins: boom").await;
+        registry.force_disconnect(&agent).await;
+        assert_eq!(registry.apply_error(&agent).await, None);
+    }
+
+    /// The agent reports a running total; what matters to the operator is
+    /// each increase, including the first report after either side restarted.
+    #[tokio::test]
+    async fn log_drops_report_the_increase_and_survive_reconnects() {
+        let registry = AgentRegistry::new();
+        let agent = Uuid::new_v4();
+
+        assert_eq!(registry.record_log_drops(agent, 0).await, 0);
+        assert_eq!(registry.log_drops(&agent).await, 0);
+
+        assert_eq!(registry.record_log_drops(agent, 5).await, 5);
+        assert_eq!(registry.record_log_drops(agent, 5).await, 0);
+        assert_eq!(registry.record_log_drops(agent, 12).await, 7);
+
+        // A reconnect does not reset the agent's counter, so it must not
+        // look like 12 new losses either.
+        let (tx, _rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+        let (generation, _) = registry.connect(agent, tx).await;
+        registry.disconnect(&agent, generation).await;
+        assert_eq!(registry.log_drops(&agent).await, 12);
+        assert_eq!(registry.record_log_drops(agent, 12).await, 0);
+
+        // The agent process restarted and has lost entries again.
+        assert_eq!(registry.record_log_drops(agent, 3).await, 3);
+        assert_eq!(registry.log_drops(&agent).await, 3);
+    }
+
+    /// A pruned agent leaves nothing behind.
+    #[tokio::test]
+    async fn forget_drops_configuration_state() {
+        let registry = AgentRegistry::new();
+        let agent = Uuid::new_v4();
+        registry.send_command(&agent, update_site("v1")).await;
+        registry.record_apply_error(agent, "plugins: boom").await;
+        registry.record_log_drops(agent, 7).await;
+
+        registry.forget(&[agent]).await;
+
+        let inner = registry.inner.read().await;
+        assert!(!inner.log_drops.contains_key(&agent));
+        assert!(!inner.config.contains_key(&agent));
+        assert!(!inner.apply_errors.contains_key(&agent));
+        assert!(!inner.pending.contains_key(&agent));
+    }
+
     fn counters(cpu_percent: f64, rps: u64) -> HeartbeatMetrics {
         HeartbeatMetrics {
             cpu_percent,
             memory_bytes: 3 << 30,
+            process_rss_bytes: Some(256 << 20),
             connections: 17,
             rps,
         }
@@ -424,6 +931,10 @@ mod tests {
         assert_eq!(entry.memory_bytes, 3 << 30);
         assert_eq!(entry.connections, 17);
         assert_eq!(entry.rps, 42);
+        // The tri-state field survives the retention verbatim: the None that
+        // means "never reported" must not collapse into Some(0) on the way
+        // through the registry.
+        assert_eq!(entry.process_rss_bytes, Some(256 << 20));
 
         // A superseded stream finishing must not erase the live counters.
         registry.disconnect(&agent, generation + 1).await;

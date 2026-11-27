@@ -415,7 +415,23 @@ async fn delete_group(
     load_site_write(&state.db, id, &current).await?;
     find_group(&state, id, target).await?;
 
-    // Rules are cascade-deleted by `fk_rules_group_id`.
+    // Rules are cascade-deleted by `fk_rules_group_id`, which would take the
+    // built-in overrides in the group with them.
+    let managed_overrides = rule::Entity::find()
+        .filter(rule::Column::SiteId.eq(id))
+        .filter(rule::Column::GroupId.eq(target))
+        .filter(rule::Column::ManagedRuleId.is_not_null())
+        .count(&state.db)
+        .await?;
+    if managed_overrides > 0 {
+        return Err(ApiError::BadRequest(
+            "this group holds rules that control built-in managed rules and \
+             cannot be deleted; disable the group or the individual rules \
+             instead"
+                .to_string(),
+        ));
+    }
+
     rule_groups::Entity::delete_by_id(target)
         .exec(&state.db)
         .await?;
@@ -649,7 +665,8 @@ async fn delete_rule(
     let id = parse_uuid(&site_id, "site id")?;
     let target = parse_uuid(&rule_id, "rule id")?;
     load_site_write(&state.db, id, &current).await?;
-    find_rule(&state, id, target).await?;
+    let row = find_rule(&state, id, target).await?;
+    ensure_deletable(&row)?;
 
     rule::Entity::delete_by_id(target).exec(&state.db).await?;
 
@@ -658,6 +675,20 @@ async fn delete_rule(
     notify_config_changed(&state, id, Some(&current.email)).await;
 
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// A row linked to a managed rule is the only record of that rule's
+/// disabled / monitor override: the data plane always loads the managed rule,
+/// so deleting the row would silently put it back in blocking mode.
+fn ensure_deletable(row: &rule::Model) -> Result<(), ApiError> {
+    if row.managed_rule_id.is_some() {
+        return Err(ApiError::BadRequest(
+            "this rule controls a built-in managed rule and cannot be \
+             deleted; disable it or set its mode to monitor instead"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Loads a rule group scoped to a site.
@@ -703,6 +734,39 @@ mod tests {
         .unwrap();
         assert_eq!(tags, vec!["sqli".to_string(), "owasp".to_string()]);
         assert!(normalise_tags(&vec!["x".to_string(); MAX_TAGS + 1]).is_err());
+    }
+
+    #[test]
+    fn managed_overrides_cannot_be_deleted() {
+        let now = chrono::Utc::now();
+        let custom = rule::Model {
+            id: Uuid::new_v4(),
+            group_id: None,
+            site_id: Uuid::new_v4(),
+            name: "r".to_string(),
+            description: None,
+            expression: r#"http.request.method eq "POST""#.to_string(),
+            action: "block".to_string(),
+            severity: 3,
+            tags: Vec::new(),
+            enabled: false,
+            mode: "block".to_string(),
+            priority: 10,
+            managed_rule_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        assert!(ensure_deletable(&custom).is_ok());
+
+        // Even a disabled override: removing it re-enables the managed rule.
+        let managed = rule::Model {
+            managed_rule_id: Some("PINGWAF-1010".to_string()),
+            ..custom
+        };
+        assert!(matches!(
+            ensure_deletable(&managed),
+            Err(ApiError::BadRequest(message)) if message.contains("cannot be deleted")
+        ));
     }
 
     #[test]

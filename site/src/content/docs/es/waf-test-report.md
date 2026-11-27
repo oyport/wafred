@@ -1,78 +1,38 @@
 ---
-title: Informe de pruebas del WAF
-description: Resultados medidos del motor WAF de PingWAF sobre el corpus público chaitin/blazehttp — intercepción, falsos positivos, precisión y latencia.
-minutes: 8
+title: Informe de pruebas de WAFred 1.0.4
+description: Resultados corregidos del corpus completo, correcciones de falsos negativos, pruebas HTTPS autofirmadas y referencias históricas de otros WAF.
+minutes: 5
 ---
 
-## Resultados de un vistazo
+## Resultados principales
 
-Versión 0.32.4, probada el 2026-11-02 sobre el corpus público [chaitin/blazehttp](https://github.com/chaitin/blazehttp): 33 877 mensajes HTTP crudos (658 maliciosos, 33 219 benignos).
+Prueba del 2026-11-22 con una versión candidata de WAFred 1.0.4 compilada localmente y el corpus público chaitin/blazehttp: 33.877 solicitudes HTTP (658 maliciosas y 33.219 benignas). Los bloqueos y desafíos cuentan como detecciones y como tráfico benigno afectado.
 
-> Estos datos son la línea base histórica del proyecto PingWAF. WAFred aún no ha repetido esta prueba; las cifras no representan una versión actual de WAFred.
+| Nivel | Ataques interceptados | Tráfico benigno afectado | Replay p50 / p95 | HTTP 500 |
+|---|---:|---:|---:|---:|
+| Normal | 397/658 (60,33%) | 4/33.219 (0,012%) | 43 / 48 ms | 0 |
+| Normal + inspección del cuerpo | 494/658 (75,08%) | 12/33.219 (0,036%) | 43 / 48 ms | 0 |
+| Strict | 501/658 (76,14%; 491 bloqueos, 10 desafíos) | 4/33.219 (0,012%) | 43 / 48 ms | 0 |
+| Strict + inspección del cuerpo | **632/658 (96,05%; 622 bloqueos, 10 desafíos)** | **19/33.219 (0,057%)** | 43 / 48 ms | 0 |
 
-| Indicador | Resultado |
-| --- | --- |
-| Intercepción con criterio efectivo | 96.6% (616/638) |
-| Intercepción con criterio completo | 93.8% (617/658) |
-| Tráfico benigno afectado | 0.06% (19/33 219) |
-| Precisión | 99.82% |
-| p95 del tier estático | ≤ 2 ms |
+## Correcciones de falsos negativos
 
-¿Qué número usar? El denominador del 96.6% es 638: de las 658 muestras maliciosas se excluyen 20 que ningún WAF del lado del proxy puede decidir — 19 POST/PUT sin `Content-Length` / `Transfer-Encoding` (cuerpo de petición vacío según RFC 7230) y 1 muestra cuyo payload se esconde en un fragmento de URL, que el parser HTTP elimina antes de construir la línea de petición. La cifra con criterio completo (93.8%) se conserva como referencia.
+El replayer original enviaba las muestras sin ajustar. Las solicitudes con cuerpo pero sin `Content-Length` ni `Transfer-Encoding` llegaban al servidor sin cuerpo, lo que infravaloraba la inspección del cuerpo. Ahora se añade una longitud exacta y se recortan los bytes posteriores a un único `Content-Length` válido. Esto también corrigió 15 muestras benignas mal formadas que devolvían HTTP 500 al reenviarse; los cuatro perfiles finales registraron cero HTTP 500.
 
-## Comparativa con otros productos
+WAFred incorpora análisis acotado de formularios URL-encoded y multipart sin `Content-Type`, inspección de segmentos de ruta Base64 y dos firmas exclusivas de Strict para `alert.call` / `prompt.call`. Strict + body interceptó 632/658 ataques; 19 solicitudes benignas fueron bloqueadas o desafiadas (17 bloqueos, 2 desafíos), por lo que deben revisarse antes de habilitarlo.
 
-| Producto / modo | Muestras | Maliciosas | Detección | Benignas | Falsos positivos | Precisión | Tiempo |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| PingWAF Strict+body | 33 877 | 658 | 93.8% (617) | 33 219 | 0.06% (19) | 99.82% | p95 2 ms (loopback) |
-| PingWAF Normal | 33 877 | 658 | 60.2% (396) | 33 219 | 0.01% (4) | 99.21% | p95 2 ms (loopback) |
-| SafeLine gratuito, estricto | 33 669 | 575 | 76.17% (438) | 33 094 | 0.22% (73) | 99.38% | 64.34 ms (pública) |
-| SafeLine gratuito, equilibrado | 33 669 | 575 | 71.65% (412) | 33 094 | 0.07% (23) | 99.45% | 70.05 ms (pública) |
-| ModSecurity PL4 | 33 669 | 575 | 94.61% (544) | 33 094 | 52.46% (17 362) | 48.34% | 28.89 ms (pública) |
-| ModSecurity PL1 | 33 669 | 575 | 69.74% (401) | 33 094 | 17.58% (5 819) | 82.20% | 31.15 ms (pública) |
-| Cloudflare gratuito | 33 669 | 570 | 10.70% (61) | 32 780 | 0.07% (23) | 98.40% | 288.96 ms (pública) |
+## Referencia histórica entre productos
 
-Las dos filas de PingWAF son automedidas (criterio efectivo 96.6%, ver la sección anterior); las demás cifras se citan tal cual del [README de blazehttp](https://github.com/chaitin/blazehttp) y no se volvieron a medir. Los conjuntos de muestras difieren (33 877 vs 33 669 muestras; 658 vs 570–575 maliciosas), y los tiempos de terceros son idas y vueltas por red pública mientras que los de PingWAF son latencia de veredicto en loopback — compare detección y falsos positivos, no milisegundos.
+El gráfico compara la medición actual de WAFred 1.0.4 con la última ejecución de la etapa WAFred (P13) y conserva las referencias históricas de SafeLine, ModSecurity y Cloudflare. La ejecución anterior usó el mismo corpus nominal, pero una ruta de framing anterior; el arnés actual corrigió 15 respuestas HTTP 500 asociadas al framing. Por eso, se muestran resultados registrados por versión, no un experimento controlado antes/después. Los otros productos no se probaron de nuevo y sus denominadores y rutas de red son distintos. El p95 de WAFred incluye la VM, el proxy y el origen simulado y no se compara directamente con otros valores.
 
-## Detección por categoría
+## Cuerpos comprimidos y HTTPS
 
-| Categoría | n.º | Strict+body | Normal |
-| --- | --- | --- | --- |
-| Inyección SQL | 20 | 85.0% | 85.0% |
-| XSS | 30 | 96.7% | 46.7% |
-| Path traversal | 25 | 96.0% | 80.0% |
-| Inyección de comandos | 12 | 83.3% | 25.0% |
-| SSRF | 13 | 100% | 7.7% |
-| Deserialización | 6 | 100% | 16.7% |
-| Inyección CRLF | 5 | 100% | 60.0% |
-| SSTI | 5 | 100% | 60.0% |
-| XXE | 2 | 50.0% | 0% |
-| Log4Shell | 1 | 100% | 100% |
-| Escáneres | 1 | 100% | 0% |
-| Codificación y ofuscación | 538 | 93.9% | 61.9% |
+La suite gzip interceptó 0/8 ataques sin inspección del cuerpo, 7/8 con Normal + inspección y 8/8 con Strict + inspección. Las dos solicitudes benignas pasaron en todos los niveles.
 
-## Novedades de esta versión
+El listener HTTPS aislado usó un certificado autofirmado para `wafred-test.local` y `127.0.0.1`. La validación explícita con `curl --cacert` pasó; el almacén de confianza predeterminado rechazó el certificado como se esperaba. Los handshakes SNI de OpenSSL funcionaron con TLS 1.2 y 1.3. Las solicitudes benignas por HTTP/HTTPS devolvieron 200; los ataques de formulario y ruta Base64 por HTTPS devolvieron 403. TLS terminó en WAFred y el origen simulado usó HTTP.
 
-1. Las búsquedas y valores de telemetría en chino con `and 1=1` ya no se juzgan como SQLi (7 muestras) y las rutas `.github` ya no se tratan como sondeo de dotfiles (1 muestra) — los conteos de las cuatro tiers no cambian (396/473/500/617) y las muestras benignas afectadas bajan de 12/20/12/27 a 4/12/4/19.
-2. Cobertura extremo a extremo de cuerpos de ataque comprimidos: 8/8 gzip maliciosos bloqueados, 2/2 benignos dejan pasar.
-3. Los desafíos (503) y los bloqueos (403) se contabilizan por separado.
+## Capacidad y alcance
 
-| Tier | Intercepción | blocked | challenged | Benignas afectadas | p95 |
-| --- | --- | --- | --- | --- | --- |
-| Normal | 60.2% (396/658) | 396 | 0 | 0.01% (4) | 2 ms |
-| Normal+body | 71.9% (473) | 473 | 0 | 0.04% (12) | 2 ms |
-| Strict | 76.0% (500) | 490 | 10 | 0.01% (4) | 2 ms |
-| Strict+body | 93.8% (617) | 607 | 10 | 0.06% (19) | 2 ms |
+La prueba de tres minutos a 256 conexiones y los resultados del límite de descriptores a 512 se midieron con el binario desplegado original, no con la versión candidata parcheada. El proceso original tenía `nofile=1.024` y generó algunos 502 a 512 conexiones; una copia aislada con 65.536 no generó 502. El proceso all-in-one activo no se modificó.
 
-## De dónde salen los números
-
-Build release del plano de datos TOML estático (`pingwaf -c` con un origen simulado); los 33 877 mensajes crudos se reproducen byte a byte por un socket HTTP/1.1 crudo en loopback, 16 conexiones concurrentes con 5 ms de separación; solo cuentan como intercepciones la página de bloqueo 403 y la de desafío 503 — los rechazos a nivel de protocolo y de método nunca cuentan; 250 pruebas unitarias del motor pasan; y todas las cifras se reproducen con los comandos de la sección siguiente.
-
-## Reproducción
-
-```bash
-git clone --depth 1 https://github.com/chaitin/blazehttp /tmp/blazehttp
-export BLAZEHTTP_ROOT=/tmp/blazehttp
-cargo build --release --bin wafred --features=full
-./tools/waf-bench/run_suite.sh --conf tools/waf-bench/conf/level-strict-body.toml --suite full --group strict-body --out results/0.32.4/strict-body --concurrency 16 --delay-ms 5
-```
+La matriz de seguridad usa un proxy HTTP/1.1 aislado y un origen simulado. Siguen pendientes un origen real, HTTP/2/HTTP/3, rutas de producción, rate limiting/CC y una prueba de alta concurrencia con el candidato. Informe completo: [WAFred 1.0.4](https://github.com/oyport/wafred/blob/main/docs/wafred-baseline-test-report-2026-11-22.md).

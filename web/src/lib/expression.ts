@@ -129,7 +129,11 @@ export const REQUEST_FIELDS: ExpressionField[] = [
   },
 ]
 
-/** Response-side fields — currently only the response status code. */
+/**
+ * Response-side fields — currently only the response status code. Rewrite
+ * rules only: the WAF engine evaluates in the request phase and has no such
+ * field, so the control plane rejects it in a WAF expression.
+ */
 export const RESPONSE_FIELDS: ExpressionField[] = [
   {
     value: 'http.response.status',
@@ -137,9 +141,6 @@ export const RESPONSE_FIELDS: ExpressionField[] = [
     placeholder: '404',
   },
 ]
-
-/** All fields the builder offers (request + response combined). */
-export const EXPRESSION_FIELDS: ExpressionField[] = [...REQUEST_FIELDS, ...RESPONSE_FIELDS]
 
 export const DEFAULT_FIELD = 'http.request.uri.path'
 

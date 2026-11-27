@@ -241,9 +241,25 @@ export function Table<T>({
                         }
                       : undefined
                   }
+                  // A clickable row is a control, so it has to be reachable and
+                  // operable from the keyboard too (Enter/Space), not only with
+                  // a mouse. `shouldIgnoreRowClick` keeps a focused button
+                  // inside the row owning its own activation.
+                  tabIndex={onRowClick ? 0 : undefined}
+                  onKeyDown={
+                    onRowClick
+                      ? (event) => {
+                          if (event.key !== 'Enter' && event.key !== ' ') return
+                          if (shouldIgnoreRowClick(event.target)) return
+                          event.preventDefault()
+                          onRowClick(row)
+                        }
+                      : undefined
+                  }
                   className={cn(
                     'border-b border-line last:border-0 transition-colors',
-                    onRowClick && 'cursor-pointer hover:bg-recessed',
+                    onRowClick &&
+                      'cursor-pointer hover:bg-recessed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand/60',
                   )}
                 >
                   {columns.map((col) => {

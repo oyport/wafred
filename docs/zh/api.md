@@ -313,6 +313,49 @@ warn 日志（见 [CHANGELOG Unreleased](../../CHANGELOG.md) 的 `site_hosts` �
 按 SNI 选择证书且没有默认证书，原先能完成的握手现在会失败——此类源站应改用域名访问。
 详见：[GET /sites/{site_id}/upstream-pools](../api.md#get-sitessite_idupstream-pools)。
 
+## Tunnels（隧道）
+
+> 英文原文见 [`docs/api.md`](../api.md#tunnels)。
+
+隧道让内网服务在不开放任何入站端口的情况下经数据面提供访问。连接器
+（`wafred-tunnel`）主动连接控制面与边缘入口；边缘终止公网侧并通过回环桥接
+转发，WAF、限流、缓存、日志与回源 TLS 等链路完全不变。
+
+一个隧道有三个**相互独立**的状态，控制台分别展示：
+
+| 字段 | 含义 |
+| --- | --- |
+| `paired` | 已有凭据，连接器**可以**连接 |
+| `enabled` | 部署级开关打开且该隧道未被禁用 |
+| `connector_online` | 连接器当前持有控制流 |
+
+`targets` 是**推导值**：绑定到该隧道的源站池的节点地址去重后的集合；`sessions`
+是当前持有会话的边缘节点（每个边缘一条）。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/tunnels` | 列表（`search` / `status` / 分页） |
+| POST | `/tunnels` | 创建并返回**一次性**配对令牌与安装命令（需写权限） |
+| GET | `/tunnels/{id}` | 单个隧道 |
+| PATCH | `/tunnels/{id}` | 改名/描述/启停（`status` 仅 `active`/`disabled`） |
+| DELETE | `/tunnels/{id}` | 删除；仍被源站池引用时返回 `409`，需 `?force=true` 才会清空绑定（池回退为直连源站） |
+| POST | `/tunnels/{id}/pairing` | 重新配对（轮换凭据并断开当前连接器） |
+| POST | `/tunnels/{id}/revoke` | 吊销凭据，隧道回到 `pending` |
+| GET | `/tunnels/{id}/sessions` | 各边缘会话明细 |
+| GET/PUT | `/settings/tunnel` | 部署级限制（仅管理员） |
+
+`pairing_token` **只返回一次**，服务端仅保存其 SHA-256；令牌通过 gRPC
+`PairTunnel` 兑换（不走 REST），按来源地址限流，并按
+`tunnel_settings.pairing_ttl_seconds` 过期。
+
+兑换返回两类凭据：长期 **credential**（只用于连接器与控制面之间的控制流认证，
+不会下发到边缘）与短期 **会话令牌**（连接器向边缘出示）。边缘用规则包中的公钥
+校验其 Ed25519 签名，永远拿不到 credential 本身。
+
+源站池绑定：`POST /sites/{site_id}/upstream-pools` 与
+`PUT …/upstream-pools/{pool_id}` 接受 `tunnel_id`（UUID 或 `null`）。更新时
+**缺省表示保持不变**，空字符串表示解除绑定；未知隧道 id 返回 `400`。
+
 ## System（系统观测）
 
 ### GET /system/nodes
@@ -341,6 +384,7 @@ warn 日志（见 [CHANGELOG Unreleased](../../CHANGELOG.md) 的 `site_hosts` �
       "cpu_percent": 23.4,
       "cpu_source": "probe",
       "memory_bytes": 1073741824,
+      "process_rss_bytes": 268435456,
       "connections": 128,
       "rps": null,
       "sites": 1,
@@ -385,9 +429,10 @@ warn 日志（见 [CHANGELOG Unreleased](../../CHANGELOG.md) 的 `site_hosts` �
 | `cpu_percent` | 节点 CPU 负载，百分比；`null` = 尚无读数 |
 | `cpu_source` | `cpu_percent` 的来源（Unreleased 新增）：`probe` = agent 主机探针的 5 秒区间差分样本，跨 agent 版本可比；`heartbeat` = 无探针样本时回退到心跳值（注意：0.28.3 之前的心跳值是自启动以来的平均，口径不同）；`none` = 两个来源都没有读数 |
 | `memory_bytes` | 节点内存使用，字节；`null` = 尚无样本 |
+| `process_rss_bytes`（Unreleased 新增） | agent 进程自身的 RSS——即二进制自身的内存占用，区别于节点的 `memory_bytes`——单位字节；`null` = 从未上报（早于该字段的 agent 版本），不等于 0 |
 | `connections` | 边缘进程当前处理的连接数；`null` = 从未上报（如指标上报被禁用） |
 | `rps` | 边缘每秒处理请求数；**当前所有节点均为 `null`**——心跳携带计数器但控制面不保留每 agent 副本，字段暂无数据源，保留在契约中因为它是最常被问到的数字 |
-| `sites` | 该 agent 服务的站点数：绑定 agent 为 `1`；全局（未绑定）agent 为其 API key 属主的全部站点——与配置推送相同的可见性 |
+| `sites` | 该 agent 服务的站点数：`site_scope` 为 `selected` 时取 `site_ids`，为 `all` 时取 API key 属主的全部站点 |
 | `last_seen` | 最近一次心跳，服务器时间；`null` = 从未收到 |
 
 控制面尚不知道的字段以 `null` 而非 `0` 表达：从未心跳过的节点报「0 %」会被误读

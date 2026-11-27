@@ -5,8 +5,9 @@ import type { ChallengeConfig, UpdateChallengeRequest } from './types'
  * CC protection / challenge — `/api/v1/sites/{siteId}/challenge`.
  *
  * A single per-site record: the master toggle, under-attack mode, the default
- * challenge level, clearance duration, the per-IP rate threshold and the path
- * exemptions. `GET` creates the row with defaults when absent.
+ * challenge level, clearance duration, the per-IP rate threshold, the path
+ * exemptions, the adaptive proof-of-work range and the per-IP issuance /
+ * verification limits. `GET` creates the row with defaults when absent.
  */
 export const challengeApi = {
   get: (siteId: string) =>
@@ -27,6 +28,10 @@ export function defaultChallengeConfig(): ChallengeConfig {
     exempt_paths: [],
     browser_integrity_check: true,
     tls_fingerprint_check: false,
+    base_difficulty: 20,
+    max_difficulty: 24,
+    issue_limit_per_min: 120,
+    verify_limit_per_min: 300,
   }
 }
 

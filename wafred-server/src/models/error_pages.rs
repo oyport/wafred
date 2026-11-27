@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 pub const SCOPE_SITE: &str = "site";
 /// Page is served when no location matches the request's Host.
 pub const SCOPE_UNMATCHED_HOST: &str = "unmatched_host";
+/// Presentation template for the challenge 503 page. The compiled challenge
+/// JavaScript is injected by the data plane; this scope only controls the page
+/// around it.
+pub const SCOPE_CHALLENGE: &str = "challenge";
 
 #[derive(
     Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize,

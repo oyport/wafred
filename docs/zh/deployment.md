@@ -16,12 +16,20 @@
 | 80 | TCP | HTTP 业务 / ACME HTTP-01 | 代理站点需要 |
 | 443 | TCP | HTTPS 业务 | 代理站点需要 |
 | 9080 | TCP | 控制台 + REST API（HTTPS，自签证书） | 是 |
-| 9090 | TCP | gRPC 控制面（agent 连接） | 分布式模式需要 |
+| 9090 | TCP | gRPC 控制面（agent 与 tunnel 连接器） | 分布式模式需要 |
+| 9443 | TCP | 隧道监听（`agent.tunnel_addr`） | 仅作为隧道入口的边缘节点需要 |
 | 5432 | TCP | PostgreSQL | 仅内网 |
 
 - **9080 是管理面，不要直接暴露公网**：绑定 `127.0.0.1` 或私网，经 VPN/SSH 隧道或反代访问；
 - **9090 只允许 agent 主机访问**；
 - 5432 保持内网/Compose 内部网络。
+
+**隧道（Tunnel）端口**：`9443` 默认**关闭**，只有显式配置了
+`agent.tunnel_addr`（或 `--tunnel-addr 0.0.0.0:9443`）的边缘节点才接受连接器
+会话。该端口需要对连接器所在网络可达——这正是隧道的意义所在；连接器自身只需
+**出站** 9090（控制面）与 9443（入口边缘），不需要任何入站端口。接入步骤见
+[用户指南](user-guide.md#tunnel内网服务免入站端口接入) 与
+[英文部署文档](../deployment.md#firewall--port-requirements)。
 
 ## 3. Docker Compose
 
@@ -51,6 +59,11 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:9080/healthz   # 期
 - **旧版本文件提示**：从旧 release tag 下载的 Compose 文件可能没有 `WAFRED_SECRET_KEY` 透传。请升级到包含该设置的版本，避免密钥未加载时保存敏感凭据。
 
 ## 5. 关键环境变量
+
+> **挑战页模板**：在 **设置 → 自定义页面 → 挑战页**（`scope=challenge`，固定 503）编辑。模板是全局
+> Tera 模板，只控制展示；编译进二进制的挑战 JS 通过 `{{ challenge_scripts | safe }}` 注入，必须保留
+> `countdown`、`title`、`subtitle`、`status`、`spinnerWrap`、`progressBar`、`progressFill` 这些 DOM id，
+> 且不能包含 `<script>`。模板渲染失败、缺少 `| safe`、缺少 DOM id 或包含脚本标签时回退内置页面。
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |

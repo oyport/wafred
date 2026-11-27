@@ -10,6 +10,7 @@ pub mod ai_crawl;
 pub mod ai_rate_limit;
 pub mod analytics;
 pub mod api_protection;
+pub mod asn;
 pub mod auth;
 pub mod blocked_ips;
 pub mod bot;
@@ -52,6 +53,7 @@ pub mod ssl;
 pub mod state;
 pub mod system;
 pub mod system_tls;
+pub mod tunnels;
 pub mod upgrade;
 pub mod users;
 pub(crate) mod validation;
@@ -190,12 +192,14 @@ pub fn build_router(state: AppState) -> Router {
         .merge(users::routes())
         .merge(visitors::routes())
         .merge(agents::routes())
+        .merge(tunnels::routes())
         .merge(upgrade::routes())
         .merge(rules::routes())
         .merge(rate_limiting::routes())
         .merge(cache::routes())
         .merge(logs::routes())
         .merge(analytics::routes())
+        .merge(asn::routes())
         .merge(settings::routes())
         .merge(log_retention::routes())
         .merge(ssl::routes())
@@ -559,7 +563,7 @@ async fn version(State(state): State<AppState>) -> impl IntoResponse {
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
         Json(json!({
-            "name": env!("CARGO_PKG_NAME"),
+            "name": "wafred-server",
             "version": env!("CARGO_PKG_VERSION"),
             "api": API_PREFIX,
             "registration_open": state.config.allow_registration,

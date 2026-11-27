@@ -34,12 +34,25 @@ pub fn set_append_proxy_headers(
     if let Some(location) = &ctx.upstream.location_instance
         && let Some(headers) = location.headers()
     {
+        if location.standard_proxy_headers() {
+            header.remove_header("forwarded");
+        }
         for (k, v, append) in headers {
             // Static values skip convert_header_value entirely (common for
             // proxy_set_headers / proxy_add_headers without `$` substitutions).
             let value = if is_dynamic_header_value(v) {
-                convert_header_value(v, session, ctx)
-                    .unwrap_or_else(|| v.clone())
+                match convert_header_value(v, session, ctx) {
+                    Some(value) => value,
+                    None if location.standard_proxy_headers()
+                        && (v.as_bytes().starts_with(b"$proxy_client_")
+                            || v.as_bytes() == b"$proxy_request_host"
+                            || k == "x-forwarded-port") =>
+                    {
+                        header.remove_header(k);
+                        continue;
+                    },
+                    None => v.clone(),
+                }
             } else {
                 v.clone()
             };
@@ -116,14 +129,23 @@ mod tests {
             .unwrap(),
         );
         ctx.upstream.location_instance = Some(location);
+        header
+            .append_header("x-forwarded-for", "192.0.2.9")
+            .unwrap();
+        header
+            .append_header("x-forwarded-for", "192.0.2.10")
+            .unwrap();
+        header.append_header("forwarded", "for=192.0.2.9").unwrap();
         set_append_proxy_headers(&session, &ctx, &mut header);
+        assert_eq!(1, header.headers.get_all("x-forwarded-for").iter().count());
+        assert!(header.headers.get("forwarded").is_none());
 
         assert_eq!(
             "192.168.1.3",
             header.headers.get("x-real-ip").unwrap().to_str().unwrap()
         );
         assert_eq!(
-            "1.1.1.1, 192.168.1.2, 192.168.1.3",
+            "192.168.1.3",
             header
                 .headers
                 .get("x-forwarded-for")

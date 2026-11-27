@@ -21,7 +21,7 @@ import { buildRulePayload, type RuleFormState } from '@/lib/ruleCache'
 import { siteKeys } from '@/api/sites'
 import {
   buildExpression,
-  EXPRESSION_FIELDS,
+  REQUEST_FIELDS,
   EXPRESSION_OPERATORS,
   parseExpression,
   DEFAULT_FIELD,
@@ -130,7 +130,13 @@ export function RuleDialog({
       if (rule) {
         setForm(formFromRule(rule))
         const parsed = parseExpression(rule.expression)
-        if (parsed) {
+        // A stored field the builder does not offer (an older rule on a field
+        // the engine never had) would render as a blank select; show the raw
+        // text instead so the operator sees what the server will reject.
+        const offered = parsed?.conditions.every((c) =>
+          REQUEST_FIELDS.some((f) => f.value === c.field),
+        )
+        if (parsed && offered) {
           setEditor('builder')
           setConditions(parsed.conditions)
           setCombinator(parsed.combinator)
@@ -332,7 +338,7 @@ export function RuleDialog({
           ) : editor === 'builder' ? (
             <div className="flex flex-col gap-2 rounded-lg border border-line bg-recessed/60 p-3">
               {conditions.map((condition, index) => {
-                const field = EXPRESSION_FIELDS.find((f) => f.value === condition.field)
+                const field = REQUEST_FIELDS.find((f) => f.value === condition.field)
                 return (
                   <div key={index} className="flex flex-col gap-2">
                     <div className="grid grid-cols-1 items-start gap-2 sm:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)_minmax(0,1.4fr)_auto]">
@@ -341,7 +347,7 @@ export function RuleDialog({
                         className="h-9"
                         value={condition.field}
                         onChange={(e) => updateCondition(index, { field: e.target.value })}
-                        options={EXPRESSION_FIELDS.map((f) => ({
+                        options={REQUEST_FIELDS.map((f) => ({
                           value: f.value,
                           label: `${t(`pages.waf.fields.${f.labelKey}`)}  ·  ${f.value}`,
                         }))}

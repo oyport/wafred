@@ -67,7 +67,12 @@ http.request.headers["user-agent"] contains "${jndi:"
 | `exempt_paths` | `/health`、`/ping` |
 | `browser_integrity_check` | `true` |
 | `pow_difficulty` | `20` |
+| `pow_max_difficulty` | `24` |
+| `pow_issue_limit_per_min` | `120` |
+| `pow_verify_limit_per_min` | `300` |
 | `submission_max_age_secs` | `300` |
+
+难度是自适应的：以 `pow_difficulty` 为起点，同一客户端验证失败或请求量超过 `rate_threshold` 时逐步提高（上限 `pow_max_difficulty`），验证通过后回到基础值。签发与验证同时受每 IP 每分钟上限约束（`pow_issue_limit_per_min`、`pow_verify_limit_per_min`）：超过签发上限返回 `429` 页面，超过验证上限则直接拒绝且不消耗待验证的挑战。
 
 挑战等级为 `None`、`NonInteractive`、`Managed`（按请求风险自动选择）与 `Interactive`。工作量证明使用 SHA-256 前导零目标。通过结果存入 `__pingwaf_clearance` Cookie，值为 `base64(payload).base64(HMAC-SHA256)`，并绑定签发它的 Host，因此无法重放到其他域名；同一站点的备用域名也需要分别完成一次质询。
 

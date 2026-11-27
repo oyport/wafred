@@ -7,6 +7,9 @@ import {
   Area,
   LineChart,
   Line,
+  PieChart,
+  Pie,
+  Cell,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -42,9 +45,11 @@ import { ErrorState } from '@/components/ErrorState'
 import { DonutChart } from '@/components/charts/DonutChart'
 import { Skeleton, SkeletonRows } from '@/components/ui/Skeleton'
 import { analyticsApi, analyticsKeys } from '@/api/analytics'
+import { groupStatusCodes } from '@/api/traffic'
 import { agentsApi, agentKeys } from '@/api/agents'
 import { fetchSystemMetrics, debugKeys } from '@/api/debug'
 import { useAuthStore } from '@/stores/authStore'
+import { hasAdminViewAccess } from '@/lib/permissions'
 import { useSitesList } from '@/hooks'
 import { buildLogsDrillDownUrl } from '@/lib/logDrillDown'
 import { cn } from '@/lib/utils'
@@ -57,7 +62,6 @@ import {
   formatBitrate,
   formatBucket,
   formatCompactNumber,
-  formatDateTimeWithZone,
   formatLatency,
   formatNumber,
   formatPercent,
@@ -93,19 +97,28 @@ const SITE_LINE_COLORS = [
   '#db2777',
 ]
 
+/**
+ * Slice palette of the status-code pie — the same four the traffic page uses
+ * (`web/src/pages/sites/TrafficPage.tsx`), one per response family, so the two
+ * pages cannot colour 4xx differently.
+ */
+const STATUS_PIE_COLORS = ['#18794e', '#0051c3', '#ffb224', '#e54d2a']
+
+/** Shared recharts tooltip styling: the traffic page's, verbatim. */
+const CHART_TOOLTIP_STYLE = {
+  background: 'var(--color-bg-elevated)',
+  border: '1px solid var(--color-border-line)',
+  borderRadius: 8,
+  fontSize: 12,
+  color: 'var(--color-text-default)',
+}
+
 /** Badge tone matching the HTTP class of a status code. */
 function statusCodeTone(code: number): 'success' | 'info' | 'warning' | 'danger' {
   if (code < 300) return 'success'
   if (code < 400) return 'info'
   if (code < 500) return 'warning'
   return 'danger'
-}
-
-function statusCodeBar(code: number): string {
-  if (code < 300) return 'bg-success'
-  if (code < 400) return 'bg-focus'
-  if (code < 500) return 'bg-warning'
-  return 'bg-danger'
 }
 
 function intervalFor(hours: number): 'minute' | 'hour' | 'day' {
@@ -137,7 +150,8 @@ export function DashboardPage() {
   const navigate = useNavigate()
   const [hours, setHours] = useState(24)
   const [siteId, setSiteId] = useState<string>('')
-  const isAdmin = useAuthStore((s) => s.user?.role) === 'admin'
+  const user = useAuthStore((s) => s.user)
+  const isAdmin = hasAdminViewAccess(user)
 
   const { data: sites } = useSitesList()
 
@@ -309,6 +323,17 @@ export function DashboardPage() {
   const statusRows = statusCodes.data ?? []
   const statusTotal = statusRows.reduce((sum, row) => sum + row.requests, 0)
 
+  // The pie groups the codes into response families (2xx/3xx/4xx/5xx) exactly
+  // as the traffic page does — individual codes stay listed underneath, so the
+  // per-status numbers the dashboard always showed are not lost.
+  const statusFamilies = useMemo(
+    () => groupStatusCodes(statusCodes.data ?? []),
+    [statusCodes.data],
+  )
+
+  const siteCount = sites?.length
+  const activeSiteCount = sites?.filter((site) => site.status === 'active').length
+
   const s = summary.data
   const onlineAgents = (agents.data ?? []).filter((a) => a.status === 'online').length
   const totalAgents = agents.data?.length ?? 0
@@ -346,6 +371,24 @@ export function DashboardPage() {
         : undefined,
       icon: ArrowsDownUp,
       tone: 'text-link bg-focus/10',
+      detailsTo: '/traffic',
+    },
+    {
+      key: 'visitors',
+      label: t('pages.dashboard.activeVisitors'),
+      value: activeVisitors.data
+        ? formatNumber(activeVisitors.data.active_visitors)
+        : undefined,
+      empty: false,
+      raw: activeVisitors.data
+        ? formatRawValue(activeVisitors.data.active_visitors)
+        : null,
+      help: metricHelp('visitors', activeVisitors.data?.active_visitors ?? 0),
+      sub: activeVisitors.data?.as_of
+        ? `${t('pages.dashboard.asOf')} ${formatTime(activeVisitors.data.as_of)}`
+        : undefined,
+      icon: Users,
+      tone: 'text-brand bg-brand-soft',
       detailsTo: '/traffic',
     },
     {
@@ -416,6 +459,21 @@ export function DashboardPage() {
       icon: Desktop,
       tone: 'text-fg-success bg-success/12',
       detailsTo: '/agents',
+    },
+    {
+      key: 'sites',
+      label: t('pages.dashboard.totalSites'),
+      value: siteCount === undefined ? undefined : formatNumber(siteCount),
+      empty: false,
+      raw: siteCount === undefined ? null : String(siteCount),
+      help: metricHelp('sites', siteCount ?? 0),
+      sub:
+        activeSiteCount === undefined
+          ? undefined
+          : t('pages.dashboard.sitesActive', { count: activeSiteCount }),
+      icon: Globe,
+      tone: 'text-fg bg-recessed',
+      detailsTo: '/sites',
     },
     {
       key: 'cache',
@@ -614,51 +672,96 @@ export function DashboardPage() {
         </div>
       )}
 
-      {/* Live visitors & client types */}
+      {/* Distributions: response status and client mix. Live visitors moved into
+          the KPI row above, where it renders as the same compact card. */}
       <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-2">
         <Card>
           <CardHeader
-            title={t('pages.dashboard.activeVisitors')}
-            description={t('pages.dashboard.activeVisitorsHint')}
-            action={<Users weight="duotone" className="h-4 w-4 text-fg-subtle" />}
+            title={t('pages.dashboard.statusCodes')}
+            description={t('pages.dashboard.statusCodesDescription')}
+            action={
+              statusTotal > 0 ? (
+                <span className="text-xs text-fg-subtle tabular-nums">
+                  {formatNumber(statusTotal)} {t('pages.traffic.requests')}
+                </span>
+              ) : undefined
+            }
           />
           <CardBody>
-            {activeVisitors.isPending ? (
-              <Skeleton className="h-9 w-24" />
-            ) : activeVisitors.isError ? (
-              // The fleet-wide view needs the admin role; a non-admin with
-              // several sites gets a 404 here. Degrade to a placeholder rather
-              // than an error card that would sit on the dashboard forever.
-              <p
-                className="text-xs text-fg-subtle"
-                title={
-                  activeVisitors.error instanceof Error
-                    ? activeVisitors.error.message
-                    : undefined
-                }
-              >
-                —
-              </p>
+            {statusCodes.isPending ? (
+              <Skeleton className="h-64 w-full" />
+            ) : statusCodes.isError ? (
+              <ErrorState
+                variant="inline"
+                error={statusCodes.error}
+                onRetry={() => statusCodes.refetch()}
+                retrying={statusCodes.isFetching}
+              />
+            ) : statusFamilies.length === 0 ? (
+              <EmptyState
+                className="py-10"
+                icon={<Gauge weight="duotone" className="h-7 w-7" />}
+                title={t('pages.dashboard.noTraffic')}
+                description={t('pages.dashboard.noTrafficDescription')}
+              />
             ) : (
-              <div className="flex flex-wrap items-end justify-between gap-2">
-                <div>
-                  <p className="text-3xl font-semibold tracking-tight text-fg-strong tabular-nums">
-                    {formatNumber(activeVisitors.data?.active_visitors ?? 0)}
-                  </p>
-                  <p className="mt-1 text-xs text-fg-subtle">
-                    {t('pages.dashboard.activeVisitorsHint')}
-                  </p>
+              <>
+                <div className="h-56 w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie
+                        data={statusFamilies}
+                        dataKey="requests"
+                        nameKey="family"
+                        cx="50%"
+                        cy="50%"
+                        innerRadius={55}
+                        outerRadius={90}
+                        paddingAngle={2}
+                      >
+                        {statusFamilies.map((entry, i) => (
+                          <Cell
+                            key={entry.family}
+                            fill={STATUS_PIE_COLORS[i % STATUS_PIE_COLORS.length]}
+                          />
+                        ))}
+                      </Pie>
+                      <Tooltip
+                        contentStyle={CHART_TOOLTIP_STYLE}
+                        formatter={(value) => formatNumber(Number(value ?? 0))}
+                      />
+                      <Legend wrapperStyle={{ fontSize: 12 }} iconType="circle" />
+                    </PieChart>
+                  </ResponsiveContainer>
                 </div>
-                {activeVisitors.data?.as_of && (
-                  <span
-                    className="text-xs text-fg-subtle tabular-nums"
-                    title={formatDateTimeWithZone(activeVisitors.data.as_of)}
-                  >
-                    {t('pages.dashboard.asOf')}{' '}
-                    {formatTime(activeVisitors.data.as_of)}
-                  </span>
-                )}
-              </div>
+                {/* Per-code detail: the pie answers "how much failed", this
+                    list keeps the exact status numbers the card always
+                    showed. */}
+                <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1">
+                  {statusRows.map((row) => (
+                    <div
+                      key={row.status_code}
+                      className="flex items-center gap-2 text-xs"
+                    >
+                      <Badge
+                        size="sm"
+                        tone={statusCodeTone(row.status_code)}
+                        className="w-12 justify-center"
+                      >
+                        {row.status_code}
+                      </Badge>
+                      <span className="tabular-nums text-fg">
+                        {formatCompactNumber(row.requests)}
+                      </span>
+                      <span className="ml-auto tabular-nums text-fg-subtle">
+                        {statusTotal > 0
+                          ? formatPercent(row.requests / statusTotal)
+                          : '—'}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </>
             )}
           </CardBody>
         </Card>
@@ -685,7 +788,7 @@ export function DashboardPage() {
               </p>
             ) : (
               <DonutChart
-                height={150}
+                height={168}
                 centerValue={formatNumber(clientTypes.data?.total ?? 0)}
                 centerLabel={t('pages.dashboard.clientTypes')}
                 data={[
@@ -927,6 +1030,7 @@ export function DashboardPage() {
               onRetry={() => void topIps.refetch()}
               siteIdFor={(r) => r.top_site_id ?? null}
               onRowClick={(r) => drillDown('access', `client_ip:${r.client_ip}`)}
+              showAsn
               emptyTitle={t('pages.dashboard.noThreats')}
               emptyDescription={t('pages.dashboard.noThreatsDescription')}
             />
@@ -953,82 +1057,33 @@ export function DashboardPage() {
         </Card>
       </div>
 
-      <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-2">
-        {/* Top paths */}
-        <Card>
-          <CardHeader
-            title={t('pages.dashboard.topPaths')}
-            description={t('pages.dashboard.topPathsDescription')}
-          />
-          <CardBody className="px-0 py-0">
-            {topPaths.isPending ? (
-              <SkeletonRows rows={5} columns={4} />
-            ) : topPaths.isError ? (
-              <div className="p-4">
-                <ErrorState variant="inline" error={topPaths.error} onRetry={() => topPaths.refetch()} />
-              </div>
-            ) : (topPaths.data ?? []).length === 0 ? (
-              <EmptyState
-                className="py-10"
-                icon={<ArrowsDownUp weight="duotone" className="h-7 w-7" />}
-                title={t('pages.dashboard.noTraffic')}
-                description={t('pages.dashboard.noTrafficDescription')}
-              />
-            ) : (
-              <Table columns={pathColumns} data={topPaths.data ?? []} rowKey={(r) => r.path} dense />
-            )}
-          </CardBody>
-        </Card>
-
-        {/* Status codes */}
-        <Card>
-          <CardHeader
-            title={t('pages.dashboard.statusCodes')}
-            description={t('pages.dashboard.statusCodesDescription')}
-          />
-          <CardBody>
-            {statusCodes.isPending ? (
-              <SkeletonRows rows={5} columns={3} />
-            ) : statusCodes.isError ? (
-              <ErrorState
-                variant="inline"
-                error={statusCodes.error}
-                onRetry={() => statusCodes.refetch()}
-                retrying={statusCodes.isFetching}
-              />
-            ) : statusRows.length === 0 ? (
-              <EmptyState
-                className="py-10"
-                icon={<Gauge weight="duotone" className="h-7 w-7" />}
-                title={t('pages.dashboard.noTraffic')}
-                description={t('pages.dashboard.noTrafficDescription')}
-              />
-            ) : (
-              <div className="space-y-3">
-                {statusRows.map((row) => (
-                  <div key={row.status_code} className="flex items-center gap-3">
-                    <Badge size="sm" tone={statusCodeTone(row.status_code)} className="w-14 justify-center">
-                      {row.status_code}
-                    </Badge>
-                    <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-recessed">
-                      <div
-                        className={cn('h-full rounded-full', statusCodeBar(row.status_code))}
-                        style={{ width: `${Math.max(2, (row.requests / statusTotal) * 100)}%` }}
-                      />
-                    </div>
-                    <span className="w-20 text-right text-[13px] tabular-nums text-fg">
-                      {formatCompactNumber(row.requests)}
-                    </span>
-                    <span className="w-12 text-right text-xs tabular-nums text-fg-subtle">
-                      {statusTotal > 0 ? formatPercent(row.requests / statusTotal) : '—'}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            )}
-          </CardBody>
-        </Card>
-      </div>
+      {/* Top paths — full width: its former half-row partner (status codes) is
+          now a distribution chart next to client types, and a path ranking
+          reads better wide. */}
+      <Card className="mt-4">
+        <CardHeader
+          title={t('pages.dashboard.topPaths')}
+          description={t('pages.dashboard.topPathsDescription')}
+        />
+        <CardBody className="px-0 py-0">
+          {topPaths.isPending ? (
+            <SkeletonRows rows={5} columns={4} />
+          ) : topPaths.isError ? (
+            <div className="p-4">
+              <ErrorState variant="inline" error={topPaths.error} onRetry={() => topPaths.refetch()} />
+            </div>
+          ) : (topPaths.data ?? []).length === 0 ? (
+            <EmptyState
+              className="py-10"
+              icon={<ArrowsDownUp weight="duotone" className="h-7 w-7" />}
+              title={t('pages.dashboard.noTraffic')}
+              description={t('pages.dashboard.noTrafficDescription')}
+            />
+          ) : (
+            <Table columns={pathColumns} data={topPaths.data ?? []} rowKey={(r) => r.path} dense />
+          )}
+        </CardBody>
+      </Card>
     </div>
   )
 }

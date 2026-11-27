@@ -102,12 +102,16 @@ impl TrafficSplitting {
         debug!(params = params.to_string(), "new traffic splitting plugin");
         TrafficSplitting::try_from(params)
     }
-    fn get_sticky_value<'a>(&self, session: &'a Session) -> Option<&'a str> {
+    fn get_sticky_value<'a>(
+        &self,
+        session: &'a Session,
+    ) -> Option<Cow<'a, str>> {
         if let Some(sticky_cookie) = &self.sticky_cookie {
             return get_cookie_value(session.req_header(), sticky_cookie);
         }
         if let Some(sticky_header) = &self.sticky_header {
-            return get_req_header_value(session.req_header(), sticky_header);
+            return get_req_header_value(session.req_header(), sticky_header)
+                .map(Cow::Borrowed);
         }
         None
     }
@@ -149,7 +153,7 @@ impl Plugin for TrafficSplitting {
                     if let Some(matcher) = &self.matcher {
                         // if matcher is match, return 0
                         // then the upstream will be hit
-                        if matcher.is_match(value) {
+                        if matcher.is_match(&value) {
                             return 0;
                         } else {
                             return u8::MAX;

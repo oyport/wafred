@@ -17,6 +17,7 @@ import {
   type Icon,
 } from '@phosphor-icons/react'
 import { cn } from '@/lib/utils'
+import { hasAdminViewAccess } from '@/lib/permissions'
 import { useAuthStore } from '@/stores/authStore'
 
 interface NavLeaf {
@@ -46,7 +47,8 @@ const ADMIN_ONLY_PATHS = new Set(['/lifecycle', '/config-versions'])
 export function Sidebar({ collapsed, onNavigate }: SidebarProps) {
   const { t } = useTranslation()
   // Must mirror router/index.tsx's RequireAdmin: hidden, not merely blocked.
-  const isAdmin = useAuthStore((s) => s.user?.role) === 'admin'
+  const user = useAuthStore((s) => s.user)
+  const isAdmin = hasAdminViewAccess(user)
 
   // Static grouping. SSL/TLS and traffic remain the *global* surfaces; each
   // site's own certificates and traffic live in that site's tab bar.

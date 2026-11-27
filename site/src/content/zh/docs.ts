@@ -29,6 +29,14 @@ const docs = {
       topics: ["Docker", "systemd", "端口", "环境变量"],
     },
     {
+      slug: "tunnel",
+      icon: "route",
+      title: "隧道",
+      lead: "让内网服务经 WAF 被访问而无需入站端口：配对、边缘监听、源站池绑定、SOCKS5 出网与运维。",
+      minutes: 12,
+      topics: ['配对', '边缘监听', 'SOCKS5', 'NAT'],
+    },
+    {
       slug: "waf-engine",
       icon: "shield",
       title: "WAF 引擎",

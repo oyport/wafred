@@ -31,7 +31,9 @@ use crate::api::validation::{
     RuleRowFix,
 };
 use crate::auth::AuthUser;
-use crate::grpc::notify_config_changed;
+use crate::grpc::{
+    agents_serving_site, notify_config_changed, notify_site_deleted,
+};
 use crate::models::{
     acme_challenge, agent, bot_protection, cache_rules, certificate_links,
     challenge_settings, geo_rules, ip_access_rules, ip_group_sites, ip_groups,
@@ -42,6 +44,7 @@ use crate::models::{
     tls_version, trusted_header, visitor_site_grant, waf_settings,
     ResponseReplaceConfig, ResponseReplaceRule,
 };
+use crate::site_cert::{self, CertAction, StoredCert};
 
 /// Specific machine-readable code for a hostname another site already serves.
 ///
@@ -554,6 +557,10 @@ pub struct CreatePoolRequest {
     /// `auto` (default) prefers IPv4, `ipv4`/`ipv6` pin one family.
     #[serde(default)]
     pub address_family: Option<String>,
+    /// Tunnel connector that reaches this pool's origins. Empty/omitted keeps
+    /// them direct (the edge dials the address itself).
+    #[serde(default)]
+    pub tunnel_id: Option<String>,
 }
 
 fn default_lb_algorithm() -> String {
@@ -643,6 +650,10 @@ pub struct UpdatePoolRequest {
     /// state the data plane can act on.
     #[serde(default)]
     pub address_family: Option<String>,
+    /// Tunnel connector for this pool's origins: absent leaves the binding
+    /// alone, an empty string clears it (direct origins), a UUID binds it.
+    #[serde(default)]
+    pub tunnel_id: Option<String>,
 }
 
 /// A pool plus its origin nodes, as `list_pools` returns them.
@@ -655,6 +666,44 @@ pub(crate) struct PoolWithMembers {
     #[serde(flatten)]
     pool: site_upstream_pools::Model,
     upstreams: Vec<site_upstreams::Model>,
+}
+
+/// Resolves the `tunnel_id` of a pool request.
+///
+/// `None` and an empty string mean "no tunnel" (direct origins). A non-empty
+/// value must be an existing tunnel id: binding a pool to a tunnel that does
+/// not exist would leave it silently unreachable, and the foreign key would
+/// reject it anyway with a far less useful message.
+///
+/// Binding requires an administrator. A tunnel is deployment infrastructure
+/// shared by several sites, so its id is not a tenant boundary: without this
+/// check a site owner could route their traffic into any tunnel by guessing a
+/// UUID, and through it into a network they were never given.
+async fn resolve_pool_tunnel(
+    state: &AppState,
+    current: &AuthUser,
+    raw: Option<&str>,
+) -> Result<Option<Uuid>, ApiError> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(None);
+    };
+    if !current.is_admin() {
+        return Err(ApiError::Forbidden(
+            "only an administrator can bind an origin pool to a tunnel"
+                .to_string(),
+        ));
+    }
+    let tunnel_id = parse_uuid(raw, "tunnel id")?;
+    let exists = crate::models::tunnel_connector::Entity::find_by_id(tunnel_id)
+        .one(&state.db)
+        .await?
+        .is_some();
+    if !exists {
+        return Err(ApiError::BadRequest(format!(
+            "tunnel {tunnel_id} does not exist"
+        )));
+    }
+    Ok(Some(tunnel_id))
 }
 
 /// A pool's health check posture with defaults applied, ready for storage
@@ -1022,6 +1071,12 @@ impl TlsPosture {
             next.mtls_require_client_cert = false;
             next.mtls_organization = None;
         }
+        // An explicit selection outranks the self-signed switch: the console
+        // sets both when the operator picks a certificate, and clearing
+        // `certificate_id` here afterwards made that selection look ignored.
+        if req.certificate_id.is_some() {
+            next.self_signed = false;
+        }
         if next.self_signed {
             next.certificate_id = None;
             next.https_enabled = true;
@@ -1064,6 +1119,66 @@ impl TlsPosture {
     }
 }
 
+/// Certificate fields a request is about to write.
+///
+/// Validation has to see the state the row will have, not the one it has now:
+/// a single request can upload a PEM and enable HTTPS together.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CertSource<'a> {
+    /// The request carries a complete PEM pair.
+    pub uploaded: bool,
+    /// The ACME address the request sets. `Some("")` clears it.
+    pub acme_email: Option<&'a str>,
+}
+
+/// Writes the certificate columns a posture write resolved to.
+fn apply_cert_action(active: &mut site_ssl::ActiveModel, action: &CertAction) {
+    match action {
+        CertAction::Keep => {},
+        CertAction::Clear => {
+            active.cert_pem = Set(None);
+            active.key_pem = Set(None);
+            active.issuer = Set(None);
+            active.expires_at = Set(None);
+        },
+        CertAction::Set(cert) => {
+            active.cert_pem = Set(Some(cert.cert_pem.clone()));
+            active.key_pem = Set(Some(cert.key_pem.clone()));
+            active.issuer =
+                Set(Some(site_cert::SELF_SIGNED_ISSUER.to_string()));
+            active.expires_at = Set(Some(cert.expires_at));
+        },
+    }
+}
+
+/// Rejects a posture that would push a TLS listener with nothing to serve.
+///
+/// This is the state that shipped silently broken: 443 bound, no certificate
+/// in the bundle, and only a startup log line saying why every handshake
+/// failed. An explicit source is required instead.
+fn require_cert_source(
+    https_enabled: bool,
+    self_signed: bool,
+    inline: bool,
+    selected: bool,
+    acme_email: Option<&str>,
+) -> Result<(), ApiError> {
+    if https_enabled
+        && !self_signed
+        && !inline
+        && !selected
+        && acme_email.is_none()
+    {
+        return Err(ApiError::BadRequest(
+            "HTTPS is enabled but the site has no certificate: choose \
+             self-signed, select or upload a certificate, or configure an \
+             ACME e-mail"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Applies a TLS posture request to the site's `site_ssl` row, creating the row
 /// when the site has none. Returns the stored posture.
 ///
@@ -1073,6 +1188,7 @@ pub(crate) async fn save_tls_posture<C: ConnectionTrait>(
     db: &C,
     site: &site::Model,
     req: &TlsPostureRequest,
+    source: CertSource<'_>,
 ) -> Result<TlsPosture, ApiError> {
     let existing = site_ssl::Entity::find()
         .filter(site_ssl::Column::SiteId.eq(site.id))
@@ -1109,12 +1225,73 @@ pub(crate) async fn save_tls_posture<C: ConnectionTrait>(
         Some(row) => TlsPosture::from_model(row),
         None => TlsPosture::unset(),
     };
-    let next = current.merged(req)?;
+    let mut next = current.merged(req)?;
+
+    // A concrete certificate source outranks the generated leaf: an upload, a
+    // selected row (`merged` already cleared the switch for one) or an ACME
+    // order all mean "stop serving the self-signed certificate". The data
+    // plane prefers an inline PEM over an ACME order, so leaving the generated
+    // material in place would silently disable issuance.
+    let acme_email = match source.acme_email {
+        // An explicit value wins, including `""` (clearing the address).
+        Some(raw) => {
+            let trimmed = raw.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        },
+        None => existing
+            .as_ref()
+            .and_then(|row| row.acme_email.clone())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    };
+    if source.uploaded || acme_email.is_some() {
+        next.self_signed = false;
+    }
+
+    let stored = match &existing {
+        Some(row) => StoredCert {
+            issuer: row.issuer.as_deref(),
+            cert_pem: row.cert_pem.as_deref(),
+            expires_at: row.expires_at,
+        },
+        None => StoredCert::default(),
+    };
+    let action = site_cert::resolve(
+        next.self_signed,
+        &site.domain,
+        &site.alternate_domains,
+        stored,
+        Utc::now(),
+    )
+    .map_err(|err| {
+        ApiError::Internal(format!("cannot issue the site certificate: {err}"))
+    })?;
+
+    // HTTPS with no source at all is the state that silently broke every
+    // handshake: 443 was bound, no certificate was ever pushed, and only a log
+    // line said why. Refuse the save instead of pushing a listener that cannot
+    // complete a handshake.
+    let inline = match &action {
+        CertAction::Set(_) => true,
+        CertAction::Clear => false,
+        CertAction::Keep => {
+            stored.cert_pem.is_some_and(|pem| !pem.trim().is_empty())
+        },
+    };
+    let selected = next.certificate_id.is_some() || source.uploaded;
+    require_cert_source(
+        next.https_enabled,
+        next.self_signed,
+        inline,
+        selected,
+        acme_email.as_deref(),
+    )?;
 
     match existing {
         Some(row) => {
             let mut active: site_ssl::ActiveModel = row.into();
             next.apply_to(&mut active);
+            apply_cert_action(&mut active, &action);
             active.update(db).await?;
         },
         None => {
@@ -1148,6 +1325,7 @@ pub(crate) async fn save_tls_posture<C: ConnectionTrait>(
                 created_at: Set(Utc::now()),
             };
             next.apply_to(&mut active);
+            apply_cert_action(&mut active, &action);
             active.insert(db).await?;
         },
     }
@@ -1994,6 +2172,8 @@ pub(crate) async fn create_site_for_user(
         health_check_timeout_ms: Set(defaults.timeout_ms),
         health_check_unhealthy_threshold: Set(defaults.unhealthy_threshold),
         health_check_healthy_threshold: Set(defaults.healthy_threshold),
+        // A direct origin: the site's upstream address is dialed by the edge.
+        tunnel_id: Set(None),
         // The same default a pool created through the API gets: IPv4 first,
         // which is what makes a domain origin reachable on a host without an
         // IPv6 route.
@@ -2411,6 +2591,7 @@ async fn clone_site(
                 ),
                 health_check_healthy_threshold: Set(defaults.healthy_threshold),
                 address_family: Set(ADDRESS_FAMILY_AUTO.to_string()),
+                tunnel_id: Set(None),
                 is_default: Set(true),
                 created_at: Set(timestamp),
             }
@@ -2517,6 +2698,21 @@ async fn clone_site(
         node.expires_at = Set(None);
         node.created_at = Set(timestamp);
         node.insert(&txn).await?;
+
+        // A self-signed clone needs its own leaf: the source's certificate is
+        // not copied (it does not cover the new hostname), and a TLS listener
+        // without one fails every handshake.
+        if let Some(clone) = site::Entity::find_by_id(new_id).one(&txn).await? {
+            if let Err(err) =
+                crate::site_cert_renewal::issue_if_needed(&txn, &clone).await
+            {
+                tracing::warn!(
+                    site_id = %new_id,
+                    error = %err,
+                    "cannot issue the clone's self-signed certificate"
+                );
+            }
+        }
     }
 
     clone_site_rows!(&txn, waf_settings, source_id, new_id);
@@ -3224,6 +3420,10 @@ async fn create_pool(
         &address_family,
     )?;
 
+    let tunnel_id =
+        resolve_pool_tunnel(&state, &current, payload.tunnel_id.as_deref())
+            .await?;
+
     let mut health_check = PoolHealthCheck::default_values();
     health_check.enabled = payload.health_check_enabled.unwrap_or(false);
     if let Some(path) = non_empty(&payload.health_check_path) {
@@ -3261,6 +3461,7 @@ async fn create_pool(
         health_check_unhealthy_threshold: Set(health_check.unhealthy_threshold),
         health_check_healthy_threshold: Set(health_check.healthy_threshold),
         address_family: Set(address_family),
+        tunnel_id: Set(tunnel_id),
         is_default: Set(false),
         created_at: Set(Utc::now()),
     }
@@ -3357,6 +3558,10 @@ async fn update_pool(
     active.health_check_unhealthy_threshold =
         Set(health_check.unhealthy_threshold);
     active.health_check_healthy_threshold = Set(health_check.healthy_threshold);
+    if let Some(raw) = payload.tunnel_id.as_deref() {
+        active.tunnel_id =
+            Set(resolve_pool_tunnel(&state, &current, Some(raw)).await?);
+    }
 
     let updated = active.update(&state.db).await?;
 
@@ -3660,6 +3865,19 @@ async fn upsert_ssl(
         .cert_pem
         .as_deref()
         .is_some_and(|pem| !pem.trim().is_empty());
+    // A PEM pair is a certificate source in its own right. Half a pair is
+    // not: mixing an uploaded certificate with the generated key (or the
+    // reverse) produces material the edge cannot load, so reject it here.
+    let uploaded_key = payload
+        .key_pem
+        .as_deref()
+        .is_some_and(|pem| !pem.trim().is_empty());
+    if uploaded_cert != uploaded_key {
+        return Err(ApiError::BadRequest(
+            "cert_pem and key_pem must be provided together".to_string(),
+        ));
+    }
+    let uploaded_pair = uploaded_cert;
     if !uploaded_cert && non_empty(&payload.acme_email).is_some() {
         ensure_acme_wildcard_supported(
             &site,
@@ -3720,6 +3938,16 @@ async fn upsert_ssl(
         .one(&txn)
         .await?;
 
+    super::common::validate_acme_dns_provider(
+        payload.acme_dns_provider.as_deref(),
+        payload.acme_challenge_type.as_deref(),
+        payload.acme_dns_config.as_ref().or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|row| row.acme_dns_config.as_ref())
+        }),
+    )?;
+
     let model = match existing {
         Some(row) => {
             let row_id = row.id;
@@ -3731,8 +3959,13 @@ async fn upsert_ssl(
             if let Some(key) = payload.key_pem {
                 active.key_pem = Set(non_empty(&Some(key)));
             }
-            active.issuer = Set(payload.issuer);
-            active.expires_at = Set(expires_at);
+            // The posture writer issued the leaf when self-signed is on; a
+            // request that only edits switches must not blank its issuer and
+            // expiry, which is what marks it as ours.
+            if !posture.self_signed {
+                active.issuer = Set(payload.issuer);
+                active.expires_at = Set(expires_at);
+            }
             active.auto_renew = Set(payload.auto_renew);
             active.acme_email = Set(non_empty(&payload.acme_email));
             active.acme_challenge_type =
@@ -4694,6 +4927,7 @@ mod tests {
         let pool_id = Uuid::new_v4();
         let payload = PoolWithMembers {
             pool: site_upstream_pools::Model {
+                tunnel_id: None,
                 id: pool_id,
                 site_id: Uuid::nil(),
                 name: "origin".into(),
@@ -5138,6 +5372,58 @@ mod tests {
         );
         let orphan = orphan.try_into_model().expect("all fields are set");
         assert!(orphan.group_id.is_none());
+    }
+
+    #[test]
+    fn self_signed_forces_https_on() {
+        let merged = TlsPosture::unset()
+            .merged(&TlsPostureRequest {
+                self_signed: Some(true),
+                ..Default::default()
+            })
+            .expect("self-signed is a complete posture");
+        assert!(merged.self_signed);
+        assert!(
+            merged.https_enabled,
+            "self-signed without HTTPS serves nothing"
+        );
+        assert!(merged.certificate_id.is_none());
+    }
+
+    #[test]
+    fn an_explicit_certificate_selection_outranks_the_self_signed_switch() {
+        let cert_id = Uuid::new_v4();
+        // The console sends both when the operator picks a certificate; the
+        // selection must win instead of being cleared as "self-signed".
+        let merged = TlsPosture::unset()
+            .merged(&TlsPostureRequest {
+                self_signed: Some(true),
+                certificate_id: Some(cert_id),
+                ..Default::default()
+            })
+            .expect("a selection is a valid posture");
+        assert!(!merged.self_signed);
+        assert_eq!(merged.certificate_id, Some(cert_id));
+    }
+
+    #[test]
+    fn https_without_any_certificate_source_is_rejected() {
+        // The shipped-broken state: listener up, nothing to serve, silent 443
+        // failures. Every source has to be accepted instead.
+        let err = require_cert_source(true, false, false, false, None)
+            .expect_err("HTTPS with no source must be refused");
+        assert!(err.to_string().contains("no certificate"));
+
+        require_cert_source(true, true, false, false, None)
+            .expect("self-signed is a source");
+        require_cert_source(true, false, true, false, None)
+            .expect("an inline PEM is a source");
+        require_cert_source(true, false, false, true, None)
+            .expect("a selected certificate is a source");
+        require_cert_source(true, false, false, false, Some("ops@example.com"))
+            .expect("an ACME order is a source");
+        require_cert_source(false, false, false, false, None)
+            .expect("HTTP-only sites need no certificate");
     }
 
     #[test]

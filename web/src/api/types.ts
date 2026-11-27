@@ -34,7 +34,7 @@ export interface User {
   email: string
   name: string | null
   role: UserRole | string
-  /** Private showcase account; the server rejects all persistent changes. */
+  /** Demo account; the server rejects persistent changes for this account. */
   is_demo?: boolean
   /** First sign-in gate: the account must replace its password. */
   must_change_password: boolean
@@ -237,6 +237,12 @@ export interface UpstreamPool {
    * ignores it. Mirrors the DB CHECK constraint (`auto|ipv4|ipv6`).
    */
   address_family: 'auto' | 'ipv4' | 'ipv6' | string
+  /**
+   * Tunnel connector that reaches this pool's origins; null keeps them direct
+   * (the edge dials the address itself). When set, the peer addresses are
+   * resolved by the connector inside the private network.
+   */
+  tunnel_id: string | null
   is_default: boolean
   created_at: string
   /**
@@ -415,6 +421,8 @@ export interface CreatePoolRequest extends PoolHealthCheckFields {
   verify_cert?: boolean | null
   /** Omitted = `auto` (server default: prefer IPv4). */
   address_family?: AddressFamily | string
+  /** Tunnel connector for this pool's origins; omitted = direct origins. */
+  tunnel_id?: string | null
 }
 
 export interface UpdatePoolRequest extends PoolHealthCheckFields {
@@ -430,6 +438,8 @@ export interface UpdatePoolRequest extends PoolHealthCheckFields {
   verify_cert?: boolean | null
   /** Omitted leaves the stored family alone; unknown values are rejected (400). */
   address_family?: AddressFamily | string
+  /** Absent leaves the binding alone; an empty string clears it. */
+  tunnel_id?: string | null
 }
 
 export interface CreateRouteRequest {
@@ -1044,6 +1054,10 @@ export interface TimeBucket {
   client_errors: number
   server_errors: number
   avg_latency_ms: number
+  /** Total-latency percentiles for the bucket (`PERCENTILE_CONT` server-side). */
+  p50_latency_ms: number
+  p90_latency_ms: number
+  p99_latency_ms: number
   blocked: number
 }
 
@@ -1080,6 +1094,31 @@ export interface TopIp {
   blocked: number
   /** Site the IP most recently requested; the target for quick actions. */
   top_site_id?: string | null
+  /**
+   * Network the address belongs to, when the edge resolved one. `null` for
+   * private addresses, agents without GeoIP ASN data and rows written before
+   * the column existed — render `—`, never a guess.
+   */
+  asn?: number | null
+  /**
+   * Organization behind `asn` from the control plane's ASN table; the
+   * `Unknown (AS<n>)` fallback is localised by `isUnknownAsnName`.
+   */
+  asn_name?: string | null
+}
+
+/**
+ * `api::analytics::TopAsn` — one network in the ASN traffic ranking.
+ *
+ * `asn` is a real AS number (never 0: unresolved addresses are stored as NULL
+ * and excluded from the ranking). `asn_name` is resolved by the control plane
+ * from its bundled/operator ASN table and reads `Unknown (AS<number>)` when the
+ * network has no entry — the UI still localises that fallback.
+ */
+export interface TopAsn {
+  asn: number
+  asn_name: string
+  requests: number
 }
 
 /** `api::analytics::TopPath` */
@@ -1133,6 +1172,17 @@ export interface Agent {
   id: string
   site_id: string | null
   site_domain: string | null
+  /** `all` = every site owned by the API key; `selected` = `site_ids`. */
+  site_scope: 'all' | 'selected'
+  /**
+   * Whether the agent may run ACME issuance and receive DNS provider
+   * credentials. Consumers serve the distributed PEM without seeing the token.
+   */
+  acme_issuer: boolean
+  /** Sites assigned to a selected agent; empty for `all`. */
+  site_ids: string[]
+  /** Domains matching `site_ids`, in order. */
+  site_domains: string[]
   hostname: string
   /** Operator-assigned label; null = show the hostname instead. */
   display_name: string | null
@@ -1158,7 +1208,20 @@ export interface Agent {
   /** Used memory (kept as `memory_bytes` for compatibility). */
   used_memory_bytes: number | null
   memory_bytes: number | null
+  /** Agent 进程自身 RSS（字节）；null = 旧 agent 未上报。 */
+  process_rss_bytes: number | null
   status: AgentStatus | string
+  /**
+   * Why the node is degraded: the reload its data plane could not apply.
+   * null when the configuration is in effect or the node is not connected.
+   */
+  status_reason?: string | null
+  /**
+   * Log entries the agent discarded since its process started, before the
+   * control plane stored them. 0 when nothing was lost or the node is unknown
+   * to this control plane instance.
+   */
+  logs_dropped?: number
   api_key_id: string | null
   config_hash: string | null
   last_heartbeat: string | null
@@ -1171,6 +1234,98 @@ export interface Agent {
   pending_commands: number
   /** Whether the gRPC control plane serves TLS; false = plaintext (degraded). */
   grpc_tls: boolean
+  /**
+   * Public `host:port` a tunnel connector dials to reach this node's tunnel
+   * listener; null = the node is not offered as a tunnel ingress.
+   */
+  tunnel_ingress_addr: string | null
+  /** The address the tunnel listener bound; null = the listener is off. */
+  tunnel_listener_addr: string | null
+  /** SHA-256 of the listener's certificate leaf, which connectors pin. */
+  tunnel_cert_sha256: string | null
+  /**
+   * Why a configured tunnel listener is not running (bind failure, unusable
+   * certificate); null when it is active or was never configured.
+   */
+  tunnel_listener_error: string | null
+}
+
+export interface UpdateAgentSitesRequest {
+  scope: 'all' | 'selected'
+  site_ids?: string[]
+}
+
+/** One edge session held by a tunnel connector. */
+export interface TunnelSession {
+  agent_id: string
+  agent_name: string
+  agent_status: string
+  connected_at: string
+  last_seen_at: string
+  streams_active: number
+  rtt_ms: number
+  version: string | null
+  hostname: string | null
+}
+
+/**
+ * A tunnel connector as the console shows it.
+ *
+ * `paired` says a credential exists (the connector can connect at all);
+ * `connector_online` says it is connected right now; `enabled` folds in the
+ * deployment switch and the row's own status.
+ */
+export interface Tunnel {
+  id: string
+  name: string
+  description: string | null
+  status: 'pending' | 'active' | 'disabled' | string
+  paired: boolean
+  enabled: boolean
+  connector_online: boolean
+  connector_version: string | null
+  connector_hostname: string | null
+  last_seen_at: string | null
+  /** Internal `host:port` origins the connector serves. */
+  targets: string[]
+  /** Domains of the sites bound to this tunnel (the blast radius of disabling it). */
+  sites: string[]
+  /**
+   * Public endpoints a connector can dial right now. Empty = no edge offers an
+   * ingress (no listener bound, or its ingress address is unset).
+   */
+  ingress: string[]
+  sessions: TunnelSession[]
+  created_at: string
+  updated_at: string
+}
+
+/** What creating a tunnel (or rotating its credential) returns. */
+export interface TunnelPairing {
+  tunnel: Tunnel
+  /** The one-time token; shown once, only its digest is stored. */
+  pairing_token: string
+  /** Install-and-pair one-liner for the private-network host. */
+  pairing_command: string
+  expires_at: string
+}
+
+/** `tunnel_settings` — the deployment-wide tunnel limits (single row). */
+export interface TunnelSettings {
+  id: number
+  enabled: boolean
+  pairing_ttl_seconds: number
+  max_streams_per_session: number
+  max_targets_per_tunnel: number
+  idle_timeout_seconds: number
+  heartbeat_seconds: number
+  /**
+   * Lifetime of a connector session token. The connector gets a fresh one on
+   * every config push; the value also bounds how long a partitioned edge keeps
+   * accepting a revoked tunnel.
+   */
+  session_token_ttl_seconds: number
+  updated_at: string
 }
 
 export interface AgentListQuery extends PaginationQuery {
@@ -1196,6 +1351,8 @@ export interface HostSample {
   memory_total_bytes: number | null
   memory_used_bytes: number | null
   memory_available_bytes: number | null
+  /** Agent 进程自身 RSS（字节）；null = 旧 agent 未上报。 */
+  process_rss_bytes: number | null
   swap_total_bytes: number | null
   swap_used_bytes: number | null
   disk_total_bytes: number | null
@@ -1522,6 +1679,20 @@ export interface VersionResponse {
 export interface SystemStatusResponse {
   /** Whether the gRPC control plane serves TLS; false = plaintext (degraded). */
   grpc_tls: boolean
+  /**
+   * Public `host:port` a tunnel connector dials to reach this node's tunnel
+   * listener; null = the node is not offered as a tunnel ingress.
+   */
+  tunnel_ingress_addr: string | null
+  /** The address the tunnel listener bound; null = the listener is off. */
+  tunnel_listener_addr: string | null
+  /** SHA-256 of the listener's certificate leaf, which connectors pin. */
+  tunnel_cert_sha256: string | null
+  /**
+   * Why a configured tunnel listener is not running (bind failure, unusable
+   * certificate); null when it is active or was never configured.
+   */
+  tunnel_listener_error: string | null
 }
 
 /* ── SSL / TLS ────────────────────────────────────────────────────── */
@@ -1535,10 +1706,8 @@ export const ACME_CHALLENGE_TYPES: AcmeChallengeType[] = ['http-01', 'dns-01']
 export const ACME_DNS_PROVIDERS = [
   'cloudflare',
   'route53',
-  'digitalocean',
   'aliyun',
   'dnspod',
-  'cloudxns',
   'huawei',
   'rainbow',
   'manual',
@@ -1575,6 +1744,8 @@ export interface SslCertificate {
   acme_challenge_type: string
   acme_dns_provider: string | null
   acme_dns_config: unknown | null
+  /** Agent allowed to issue this certificate; null = agent-level scope. */
+  acme_issuer_agent_id?: string | null
   status: CertificateStatus | string
   /** Why the last ACME issuance was given up on; null while healthy. */
   failure_reason: string | null
@@ -1668,6 +1839,8 @@ export interface CreateSslRequest {
   acme_challenge_type?: AcmeChallengeType | string | null
   acme_dns_provider?: string | null
   acme_dns_config?: unknown | null
+  /** Agent allowed to issue this certificate; omit for the agent-level scope. */
+  acme_issuer_agent_id?: string | null
   /** Manual upload. */
   cert_pem?: string | null
   key_pem?: string | null
@@ -2128,6 +2301,17 @@ export interface ChallengeConfig {
   exempt_paths: string[]
   browser_integrity_check: boolean
   tls_fingerprint_check: boolean
+  /**
+   * Proof-of-work difficulty (leading zero bits) a normal visitor solves.
+   * Default 20; the adaptive step starts here.
+   */
+  base_difficulty: number
+  /** Ceiling the difficulty may rise to under request/failure pressure. */
+  max_difficulty: number
+  /** Challenge pages issued per IP per 60-second window (over it: 429). */
+  issue_limit_per_min: number
+  /** Solution submissions accepted per IP per 60-second window. */
+  verify_limit_per_min: number
 }
 
 /** Patch semantics: omitted fields keep their current value (mirrors the server). */
@@ -2332,7 +2516,7 @@ export interface CreateRewriteRuleRequest {
 
 export type UpdateRewriteRuleRequest = Partial<CreateRewriteRuleRequest>
 
-/* ── Custom error pages ───────────────────────────────────────────── */
+/* ── Custom pages ───────────────────────────────────────────── */
 
 export type ErrorPageContentType = 'text/html' | 'application/json' | 'text/plain'
 
@@ -2358,7 +2542,7 @@ export const ERROR_PAGE_STATUS_CODES = [403, 429, 502, 503, 504] as const
  * site or a client reaches the gateway by bare IP. Upsert is keyed on
  * `(scope, status_code)`.
  */
-export type ErrorPageScope = 'site' | 'unmatched_host'
+export type ErrorPageScope = 'site' | 'unmatched_host' | 'challenge'
 
 export interface ErrorPage {
   id: string
@@ -2511,6 +2695,8 @@ export const BASIC_AUTH_MAX_DELAY_SECONDS = 10
 export interface GeoCountryStat {
   country_code: string
   requests: number
+  /** Requests the WAF refused (403/429) in the same window. */
+  blocked?: number
 }
 
 /* ── Traffic analytics (site-scoped) ──────────────────────────────── */
@@ -2528,6 +2714,7 @@ export interface TrafficOverview {
   topPaths: TopPath[]
   topIps: TopIp[]
   topRules: TopRule[]
+  topAsns: TopAsn[]
   statusCodes: StatusCodeCount[]
 }
 

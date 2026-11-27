@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { defaultErrorPageTemplate, ERROR_PAGE_MESSAGES, renderErrorPagePreview } from './errorPages'
+import {
+  defaultChallengePageTemplate,
+  defaultErrorPageTemplate,
+  ERROR_PAGE_MESSAGES,
+  renderErrorPagePreview,
+} from './errorPages'
 
 describe('error page editor preview', () => {
   it.each([403, 404, 421, 429, 502, 503, 504])('renders the selected %i status instead of the sample 403', (status) => {
@@ -13,5 +18,15 @@ describe('error page editor preview', () => {
     const template = '{{ error_code }} {{error_message}} {{host}} {{unknown}}'
     expect(renderErrorPagePreview(template, 404)).toBe('404 Not Found 203.0.113.10 {{unknown}}')
     expect(renderErrorPagePreview(template, 503)).toBe('503 Service Unavailable 203.0.113.10 {{unknown}}')
+  })
+})
+
+describe('challenge page preview', () => {
+  it('renders the challenge sample scripts and required DOM ids', () => {
+    const html = renderErrorPagePreview(defaultChallengePageTemplate(), 503, 'challenge')
+    expect(html).toContain('<script>/* compiled challenge scripts are injected here at runtime */</script>')
+    expect(html).toContain('id="countdown"')
+    expect(html).toContain('id="spinnerWrap"')
+    expect(html).toContain('WAFred')
   })
 })

@@ -1107,6 +1107,32 @@ template = '{"error":"rate_limit_exceeded","request_id":"{{ request_id }}"}'
         );
     }
     #[test]
+    fn site_pages_ignore_challenge_scope() {
+        let page = |scope: &str, name: &str| CustomErrorPage {
+            id: name.to_string(),
+            status_code: 503,
+            content_type: "text/html".to_string(),
+            body_template: format!("<p>{name}</p>"),
+            name: name.to_string(),
+            enabled: true,
+            scope: scope.to_string(),
+        };
+        let (_, map) = build_site_pages(&[
+            page("challenge", "challenge-page"),
+            page("site", "site-page"),
+        ])
+        .unwrap();
+        assert_eq!(map.get(&503).unwrap().name, "site-page");
+
+        let (_, only_challenge) =
+            build_site_pages(&[page("challenge", "challenge-page")]).unwrap();
+        assert!(
+            only_challenge.is_empty(),
+            "the challenge template must not be served as a normal 503 error page"
+        );
+    }
+
+    #[test]
     fn identical_page_sets_share_tera() {
         let page = |name: &str| CustomErrorPage {
             id: name.to_string(),

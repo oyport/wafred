@@ -36,6 +36,9 @@ pub mod host_samples {
         pub process_count: Option<i32>,
         pub tcp_connections: Option<i32>,
         pub uptime_secs: Option<i64>,
+        /// RSS of the agent process itself at sampling time. `None` = the
+        /// agent build predates the field; there is no zero sentinel.
+        pub process_rss_bytes: Option<i64>,
         pub created_at: DateTimeUtc,
     }
 

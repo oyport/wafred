@@ -32,9 +32,10 @@
 | 文档 | 内容 |
 | --- | --- |
 | [waf-test-plan.md](waf-test-plan.md) | WAF 测试方案——分层模型、blazehttp 用例选取与组织、矩阵、口径、验收门槛 |
-| [waf-test-report.md](waf-test-report.md) | 面向用户的实测结果报告——拦截率、误报率、横向对比 |
-| [waf-test-report-internal.md](waf-test-report-internal.md) | 维护者配套说明——分母、逐样本归因、回归证据、限制与待办 |
-| [waf-benchmark-report.md](../waf-benchmark-report.md) | 逐轮基准数据附录——P0 → P14 迭代史、分类表与语义门取舍理由 |
+| [waf-test-report.md](waf-test-report.md) | 当前 WAFred 1.0.4 实测结果——拦截率、误报、性能与限制 |
+| [../wafred-baseline-test-report-2026-11-22.md](../wafred-baseline-test-report-2026-11-22.md) | 完整实验报告——机器分工、指标、异常、限制与归档校验值 |
+| [waf-test-report-internal.md](waf-test-report-internal.md) | WAFred 1.0.4 当前漏报归因、自签 HTTPS 与容量记录 |
+| [waf-benchmark-report.md](../waf-benchmark-report.md) | WAFred 1.0.4 当前档位结果、其他防火墙对比与早期测试背景 |
 | [waf-engine-review.md](../waf-engine-review.md) | 引擎复盘与设计记录——每个检测器为何存在、为哪种失败形态而建 |
 
 工具链：[`tools/waf-bench/`](../../tools/waf-bench)——套件清单、回放器、汇总器、判决差异工具。
@@ -74,7 +75,7 @@ WAFred 在 `pingap` 代理基础之上新增了 **7 个 WAF 专属 crate**。
 | --- | --- |
 | [pingwaf-proto](../../wafred-proto) | 控制面 gRPC 协议定义（单一来源：`control_plane.proto`） |
 | [pingwaf-server](../../wafred-server) | 控制面：Axum REST + tonic gRPC + SeaORM/PostgreSQL + ES 日志 + 内嵌前端 + Agent 健康监控 |
-| [pingwaf-agent](../../wafred-agent) | 数据面 Agent：连接控制面、规则缓存 + 磁盘持久化、回传日志/指标、接收命令 |
+| [wafred-agent](../../wafred-agent) | 数据面 Agent：连接控制面、规则缓存 + 磁盘持久化、回传日志/指标、接收命令 |
 | [pingwaf-waf](../../wafred-waf) | 检测引擎：归一化 → 签名 → 表达式 → 异常评分 |
 | [pingwaf-challenge](../../wafred-challenge) | 动态挑战：JS 5 秒盾、交互式挑战、PoW、浏览器指纹、HMAC clearance cookie |
 | `pingwaf-profiler`（无 README） | 模块/方法 CPU 与内存归因表，经 `/api/v1/system/profile` 提供 |

@@ -1,5 +1,6 @@
 //! Aggregation endpoints backing the dashboard charts: traffic over time, the
-//! rules that fire most often, the loudest client IPs and the hottest paths.
+//! rules that fire most often, the loudest client IPs, the busiest networks
+//! (ASNs) and the hottest paths.
 //!
 //! The queries are hand-written SQL because sea-query's builder cannot express
 //! `FILTER (WHERE …)` aggregates or `date_trunc` bucketing without giving up
@@ -244,6 +245,11 @@ pub struct TimeBucket {
     pub client_errors: i64,
     pub server_errors: i64,
     pub avg_latency_ms: i64,
+    /// Median total latency in the bucket. A mean hides the tail that users
+    /// actually feel, so the chart plots p50/p90/p99 together.
+    pub p50_latency_ms: i64,
+    pub p90_latency_ms: i64,
+    pub p99_latency_ms: i64,
     pub blocked: i64,
 }
 
@@ -266,6 +272,27 @@ pub struct TopIp {
     /// one-click block/challenge from the dashboard's cross-site view);
     /// `None` when the log rows carry no resolvable site.
     pub top_site_id: Option<Uuid>,
+    /// Autonomous system the address belongs to, when the edge resolved one.
+    /// `None` for private addresses, an agent without GeoIP ASN data, and rows
+    /// written before the column existed.
+    pub asn: Option<u32>,
+    /// Organization behind `asn`, resolved from the control plane's ASN table
+    /// (`Unknown (AS<number>)` when it has no entry). The console shows it as
+    /// the hover text of the AS number; `None` when `asn` is `None`.
+    pub asn_name: Option<String>,
+}
+
+/// One network in the ASN traffic ranking.
+#[derive(Debug, Serialize)]
+pub struct TopAsn {
+    /// AS number as recorded by the edge. Never 0: rows without a resolved
+    /// ASN are stored as NULL and are excluded from the ranking.
+    pub asn: u32,
+    /// Organization name resolved by [`crate::asn`], or
+    /// `Unknown (AS<number>)` when the mapping has no entry — a row is never
+    /// labelled with just a number.
+    pub asn_name: String,
+    pub requests: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -330,6 +357,7 @@ pub fn routes() -> Router<AppState> {
         .route("/analytics/sites-over-time", get(sites_over_time))
         .route("/analytics/top-rules", get(top_rules))
         .route("/analytics/top-ips", get(top_ips))
+        .route("/analytics/top-asns", get(top_asns))
         .route("/analytics/top-paths", get(top_paths))
         .route("/analytics/status-codes", get(status_codes))
         .route("/analytics/sites", get(sites_overview))
@@ -908,7 +936,10 @@ async fn requests_over_time(
                 COALESCE(SUM(response_size) FILTER (WHERE cache_status = 'hit'), 0)::BIGINT AS cache_saved_bytes, \
                 COUNT(*) FILTER (WHERE status_code >= 400 AND status_code < 500) AS client_errors, \
                 COUNT(*) FILTER (WHERE status_code >= 500) AS server_errors, \
-                COALESCE(AVG(total_latency_ms), 0)::BIGINT AS avg_latency_ms \
+                COALESCE(AVG(total_latency_ms), 0)::BIGINT AS avg_latency_ms, \
+                COALESCE(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY total_latency_ms), 0)::BIGINT AS p50_latency_ms, \
+                COALESCE(PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY total_latency_ms), 0)::BIGINT AS p90_latency_ms, \
+                COALESCE(PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY total_latency_ms), 0)::BIGINT AS p99_latency_ms \
          FROM access_logs WHERE {where_sql} \
          GROUP BY bucket ORDER BY bucket ASC"
     );
@@ -925,6 +956,9 @@ async fn requests_over_time(
             client_errors: get_value::<i64>(row, "client_errors"),
             server_errors: get_value::<i64>(row, "server_errors"),
             avg_latency_ms: get_value::<i64>(row, "avg_latency_ms"),
+            p50_latency_ms: get_value::<i64>(row, "p50_latency_ms"),
+            p90_latency_ms: get_value::<i64>(row, "p90_latency_ms"),
+            p99_latency_ms: get_value::<i64>(row, "p99_latency_ms"),
             blocked: 0,
         });
     }
@@ -1223,12 +1257,17 @@ fn top_ips_sql(
         (String::new(), "ORDER BY requests DESC")
     };
 
+    // The ASN projection follows `top_asns_sql`'s validity range: an address
+    // the edge never resolved (`0`), a legacy out-of-range value, or a mix
+    // inside one IP's rows all collapse to NULL rather than to a plausible
+    // wrong network. The CASE is evaluated per row before the aggregate.
     let sql = format!(
         "SELECT client_ip, \
                 MAX(country_code) AS country_code, \
                 COUNT(*) AS requests, \
                 {BLOCKED_REQUESTS_FILTER} AS blocked, \
-                (ARRAY_AGG(site_id ORDER BY timestamp DESC))[1] AS top_site_id \
+                (ARRAY_AGG(site_id ORDER BY timestamp DESC))[1] AS top_site_id, \
+                MAX(CASE WHEN asn > 0 AND asn <= {MAX_ASN} THEN asn END) AS asn \
          FROM access_logs WHERE {where_sql} \
          GROUP BY client_ip {having}{order} LIMIT ${placeholder}"
     );
@@ -1251,16 +1290,114 @@ async fn top_ips(
     let rows = query_all(&state.db, &sql, values).await?;
     Ok(Json(
         rows.iter()
-            .map(|row| TopIp {
-                client_ip: get_value::<String>(row, "client_ip"),
-                country_code: try_get::<String>(row, "country_code"),
-                requests: get_value::<i64>(row, "requests"),
-                blocked: get_value::<i64>(row, "blocked"),
-                top_site_id: try_get::<Uuid>(row, "top_site_id"),
+            .map(|row| {
+                // BIGINT → u32 like `top_asn`: a value outside the unsigned
+                // 32-bit range or 0 is not a network and must not be shown as
+                // a different, plausible-looking one.
+                let asn = try_get::<i64>(row, "asn")
+                    .and_then(|asn| u32::try_from(asn).ok())
+                    .filter(|asn| *asn != 0);
+                TopIp {
+                    client_ip: get_value::<String>(row, "client_ip"),
+                    country_code: try_get::<String>(row, "country_code"),
+                    requests: get_value::<i64>(row, "requests"),
+                    blocked: get_value::<i64>(row, "blocked"),
+                    top_site_id: try_get::<Uuid>(row, "top_site_id"),
+                    asn,
+                    asn_name: asn.map(crate::asn::display_name),
+                }
             })
             .collect::<Vec<_>>(),
     )
     .into_response())
+}
+
+/// AS numbers are unsigned 32-bit, so anything outside `1..=u32::MAX` is not a
+/// network: 0 means "not resolved" (ingestion stores that as NULL) and a larger
+/// value cannot come from the agent's protocol field. Kept as one constant so
+/// the SQL filter and [`top_asn`]'s conversion cannot drift apart.
+const MAX_ASN: i64 = u32::MAX as i64;
+
+/// Statement for `top-asns`; see [`top_rules_sql`] for the bound-limit rule.
+///
+/// The validity filter is part of the statement, not the row mapper: `LIMIT`
+/// must count *valid* networks, otherwise a window dominated by legacy rows
+/// (AS0, an out-of-range value written by hand) would answer fewer than
+/// `limit` rows. `asn IS NOT NULL` keeps the partial index
+/// `idx_access_logs_asn_site_time` applicable; `asn > 0 AND asn <= MAX_ASN`
+/// is the same range [`top_asn`] accepts. `MAX_ASN` is a compile-time constant,
+/// never caller input, so interpolating it adds no injection surface. `asn ASC`
+/// breaks ties deterministically so identical polls do not reshuffle the table.
+fn top_asns_sql(resolved: &Resolved) -> (String, Vec<Value>) {
+    let (where_sql, mut values) = resolved.filter("access_logs");
+    let placeholder = resolved.next_placeholder();
+    values.push(Value::from(resolved.bound_limit()));
+
+    let sql = format!(
+        "SELECT asn, COUNT(*) AS requests \
+         FROM access_logs WHERE {where_sql} \
+           AND asn IS NOT NULL AND asn > 0 AND asn <= {MAX_ASN} \
+         GROUP BY asn ORDER BY requests DESC, asn ASC LIMIT ${placeholder}"
+    );
+    (sql, values)
+}
+
+/// Maps one aggregated row onto the API row.
+///
+/// `asn` comes back as BIGINT, so it is converted explicitly rather than
+/// truncated: a value outside the unsigned 32-bit range cannot be a real AS
+/// number and must never be shown as a different, plausible-looking network.
+///
+/// This is a backstop, not the page-shaping filter: [`top_asns_sql`] already
+/// restricts the aggregate to `1..=MAX_ASN`, so every row the statement
+/// returns is accepted here and `LIMIT` is never under-filled. The check stays
+/// because a future statement change must not be able to smuggle a bogus ASN
+/// into the response.
+fn top_asn(asn: i64, requests: i64) -> Option<TopAsn> {
+    let asn = u32::try_from(asn).ok().filter(|asn| *asn != 0)?;
+    Some(TopAsn {
+        asn,
+        asn_name: crate::asn::display_name(asn),
+        requests,
+    })
+}
+
+/// Builds the response rows from the aggregated `(asn, requests)` pairs.
+///
+/// Split from the handler so the range check and the name fallback are
+/// testable without a database; an empty window is an empty vector, which is
+/// the documented "no traffic" answer rather than an error. The statement
+/// already filters the range (see [`top_asns_sql`]), so the filter here cannot
+/// shrink a page below the requested `limit`.
+fn top_asn_rows(pairs: impl IntoIterator<Item = (i64, i64)>) -> Vec<TopAsn> {
+    pairs
+        .into_iter()
+        .filter_map(|(asn, requests)| top_asn(asn, requests))
+        .collect()
+}
+
+/// `GET /api/v1/analytics/top-asns`
+///
+/// Networks ranked by request count inside the same window and site scope as
+/// every other analytics endpoint (`site_id`, `from`, `to`, `range`,
+/// `limit`). Rows whose ASN is unknown — an address the agent's GeoIP
+/// database could not map, a private address, or a log written before the
+/// column existed — are not part of the ranking.
+async fn top_asns(
+    State(state): State<AppState>,
+    current: AuthUser,
+    Query(query): Query<RangeQuery>,
+) -> Result<Json<Vec<TopAsn>>, ApiError> {
+    let resolved = resolve(&state, &current, &query).await?;
+    let (sql, values) = top_asns_sql(&resolved);
+
+    let rows = query_all(&state.db, &sql, values).await?;
+    Ok(Json(top_asn_rows(rows.iter().map(|row| {
+        (
+            get_value::<i64>(row, "asn"),
+            get_value::<i64>(row, "requests"),
+        )
+    }))))
 }
 
 /// `GET /api/v1/analytics/top-paths`
@@ -1495,6 +1632,7 @@ mod tests {
                 top_rules_sql(&resolved),
                 top_ips_sql(&resolved, false),
                 top_ips_sql(&resolved, true),
+                top_asns_sql(&resolved),
             ] {
                 let placeholder =
                     format!("LIMIT ${}", resolved.next_placeholder());
@@ -1539,6 +1677,119 @@ mod tests {
         // same aggregate expression; two occurrences prove they are.
         assert_eq!(sql.matches(BLOCKED_REQUESTS_FILTER).count(), 2, "{sql}");
         assert_eq!(values.len(), scoped.next_placeholder());
+    }
+
+    /// The threat table labels each address with the network it belongs to.
+    /// The projection must collapse "unresolved" (`0`), a legacy out-of-range
+    /// value and a NULL to the same NULL, so the console renders the number it
+    /// was given rather than a plausible-looking wrong network.
+    #[test]
+    fn top_ips_projects_only_a_valid_asn() {
+        for blocked_only in [false, true] {
+            let (sql, _) = top_ips_sql(&resolved(None), blocked_only);
+            assert!(
+                sql.contains(&format!(
+                    "MAX(CASE WHEN asn > 0 AND asn <= {MAX_ASN} THEN asn END) AS asn"
+                )),
+                "{sql}"
+            );
+        }
+    }
+
+    /// `GET /analytics/top-asns`: the statement groups by ASN over the same
+    /// window/site filter as every other endpoint, drops unresolved rows
+    /// before grouping, and orders by request count with a deterministic
+    /// tie-break.
+    #[test]
+    fn top_asns_groups_by_asn_and_excludes_unresolved_rows() {
+        let (sql, values) = top_asns_sql(&resolved(None));
+        assert!(sql.contains("AND asn IS NOT NULL"), "{sql}");
+        assert!(sql.contains("AND asn > 0 AND asn <= 4294967295"), "{sql}");
+        assert!(sql.contains("GROUP BY asn"), "{sql}");
+        assert!(
+            sql.ends_with("ORDER BY requests DESC, asn ASC LIMIT $3"),
+            "{sql}"
+        );
+        assert_eq!(values.len(), 3);
+
+        let scoped = resolved(Some(Uuid::new_v4()));
+        let (sql, values) = top_asns_sql(&scoped);
+        assert!(sql.contains("AND site_id = $3"), "{sql}");
+        assert!(sql.ends_with("LIMIT $4"), "{sql}");
+        assert_eq!(values.len(), 4);
+    }
+
+    /// The response rows: a known network carries its organization name, an
+    /// unlisted one keeps its number inside `Unknown (AS…)`, and a value that
+    /// cannot be an AS number is dropped rather than mislabelled.
+    #[test]
+    fn top_asn_rows_resolve_names_and_drop_impossible_numbers() {
+        let rows = top_asn_rows([
+            (13335, 1_520),
+            (64_512, 12),
+            (0, 5),
+            (-7, 3),
+            (i64::from(u32::MAX) + 1, 1),
+        ]);
+        assert_eq!(2, rows.len(), "{rows:?}");
+        assert_eq!(13335, rows[0].asn);
+        assert_eq!("Cloudflare, Inc.", rows[0].asn_name);
+        assert_eq!(1_520, rows[0].requests);
+        assert_eq!(64_512, rows[1].asn);
+        assert_eq!("Unknown (AS64512)", rows[1].asn_name);
+        assert_eq!(12, rows[1].requests);
+    }
+
+    /// Regression (R5): the validity filter belongs to the statement, so
+    /// `LIMIT` counts valid networks. Filtering only in the mapper meant a
+    /// window dominated by AS0 / out-of-range rows could answer fewer than
+    /// `limit` rows — the filter now runs before the aggregate is ordered and
+    /// capped, and the mapper accepts exactly the range the statement admits.
+    #[test]
+    fn top_asns_filters_invalid_rows_before_the_limit() {
+        let (sql, values) = top_asns_sql(&resolved(None));
+
+        // The predicate is inside the WHERE clause, i.e. it runs before
+        // GROUP BY/ORDER BY/LIMIT rather than after the cap.
+        let where_end = sql.find("GROUP BY").expect("statement groups");
+        let limit = sql.find("LIMIT ").expect("statement caps");
+        let range = sql
+            .find("AND asn > 0 AND asn <= 4294967295")
+            .expect("validity range is in the statement");
+        assert!(range < where_end, "{sql}");
+        assert!(where_end < limit, "{sql}");
+        assert_eq!(values.len(), 3);
+
+        // The mapper accepts every value the statement admits (so it can
+        // never shrink a page) and still rejects everything the statement
+        // excludes.
+        for admitted in [1_i64, 13_335, MAX_ASN] {
+            assert!(
+                top_asn(admitted, 1).is_some(),
+                "AS{admitted} is admitted by the statement and must map"
+            );
+        }
+        for rejected in [0_i64, -1, MAX_ASN + 1] {
+            assert!(
+                top_asn(rejected, 1).is_none(),
+                "{rejected} is excluded by the statement and must not map"
+            );
+        }
+
+        // A page of only-invalid rows no longer exists: the same limit is
+        // applied to the already-filtered aggregate.
+        assert!(
+            sql.ends_with("ORDER BY requests DESC, asn ASC LIMIT $3"),
+            "{sql}"
+        );
+    }
+
+    /// An empty window answers an empty list — not an error and not a
+    /// placeholder row.
+    #[test]
+    fn top_asn_rows_is_empty_for_an_empty_window() {
+        assert!(top_asn_rows([]).is_empty());
+        assert!(top_asn_rows(Vec::<(i64, i64)>::new()).is_empty());
     }
 
     #[test]

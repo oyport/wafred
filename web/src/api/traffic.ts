@@ -91,7 +91,7 @@ export async function fetchTrafficOverview(
   range: TrafficRange = '24h',
 ): Promise<TrafficOverview> {
   const params: RangeQuery = { ...(siteId ? { site_id: siteId } : {}), ...rangeQueryFor(range) }
-  const [summary, series, egress, topPaths, topIps, topRules, statusCodes] =
+  const [summary, series, egress, topPaths, topIps, topRules, topAsns, statusCodes] =
     await Promise.all([
       analyticsApi.summary(params),
       analyticsApi.requestsOverTime(params),
@@ -99,9 +99,19 @@ export async function fetchTrafficOverview(
       analyticsApi.topPaths({ ...params, limit: 10 }),
       analyticsApi.topIps({ ...params, limit: 10 }),
       analyticsApi.topRules({ ...params, limit: 10 }),
+      analyticsApi.topAsns({ ...params, limit: 10 }),
       analyticsApi.statusCodes(params),
     ])
-  return { summary, series, egress, topPaths, topIps, topRules, statusCodes }
+  return {
+    summary,
+    series,
+    egress,
+    topPaths,
+    topIps,
+    topRules,
+    topAsns,
+    statusCodes,
+  }
 }
 
 /**

@@ -40,8 +40,9 @@ pub(crate) const MAX_PEM_LEN: usize = 1024 * 1024;
 
 /// Validates a rule expression with the same parser the data plane uses.
 ///
-/// Rejects an empty expression, anything over [`MAX_EXPRESSION_LEN`] and any
-/// expression that does not parse. The data plane drops a rule whose
+/// Rejects an empty expression, anything over [`MAX_EXPRESSION_LEN`], any
+/// expression that does not parse and any that references a field the engine
+/// does not know. The data plane drops a rule whose
 /// expression fails to parse, so without this check a rule looks enabled in
 /// the console while enforcing nothing.
 pub(crate) fn validate_expression(expression: &str) -> Result<(), ApiError> {
@@ -61,12 +62,22 @@ pub(crate) fn validate_expression(expression: &str) -> Result<(), ApiError> {
         ))
         .with_code(EXPRESSION_INVALID_CODE));
     }
-    pingwaf_waf::rules::expression::parse_expression(expression).map_err(
-        |err| {
-            ApiError::BadRequest(format!("expression is not valid: {err}"))
-                .with_code(EXPRESSION_INVALID_CODE)
-        },
-    )?;
+    let parsed = pingwaf_waf::rules::expression::parse_expression(expression)
+        .map_err(|err| {
+        ApiError::BadRequest(format!("expression is not valid: {err}"))
+            .with_code(EXPRESSION_INVALID_CODE)
+    })?;
+    // The parser keeps unknown field names so the edge still loads old rows,
+    // but a comparison on one is constant — never true, or always true under
+    // a negated operator. Neither is what the operator wrote.
+    let unknown = parsed.unknown_fields();
+    if !unknown.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "expression is not valid: unknown field {}",
+            unknown.join(", ")
+        ))
+        .with_code(EXPRESSION_INVALID_CODE));
+    }
     Ok(())
 }
 
@@ -316,6 +327,26 @@ mod tests {
         assert!(validate_expression("").is_err());
         assert!(validate_expression("   ").is_err());
         assert!(validate_expression("(http.host eq \"x\"").is_err());
+    }
+
+    /// A field the engine does not know parses, but compares as a constant:
+    /// the response status is not available to a request-phase rule, and a
+    /// misspelt path field never matches (or, negated, always does).
+    #[test]
+    fn expressions_must_only_reference_known_fields() {
+        for bad in [
+            r#"http.response.status eq "404""#,
+            r#"http.request.path contains "/admin""#,
+            r#"http.host eq "a" and http.response.status ne "200""#,
+        ] {
+            let err = validate_expression(bad).expect_err("must be rejected");
+            assert_eq!(err.code(), EXPRESSION_INVALID_CODE, "{bad:?}");
+            assert!(err.to_string().contains("unknown field"), "{err}");
+        }
+        // The console's header aliases are fields, not unknowns.
+        assert!(validate_expression(r#"http.referer contains "x""#).is_ok());
+        assert!(validate_expression(r#"http.cookie contains "x""#).is_ok());
+        assert!(validate_optional_expression(r#"bogus eq "x""#).is_err());
     }
 
     /// The console maps this specific code to its localised hint; status and

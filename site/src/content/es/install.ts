@@ -46,7 +46,7 @@ const install = {
       {
         id: "agent",
         label: "Agent",
-        body: "Un nodo del plano de datos que proxifica el tráfico y se conecta al plano de control por gRPC. No guarda base de datos; necesita --server-url y una clave de alta.",
+        body: "Un nodo del plano de datos que proxifica el tráfico y se conecta al plano de control por gRPC. El instalador descarga la compilación solo-agente (sin base de datos, API REST ni panel); necesita --server-url y una clave de alta.",
         flags: ["--mode agent", "--server-url https://cp:9090", "--api-key pwk_…"],
       },
     ],
@@ -202,7 +202,9 @@ const install = {
       upgradeCommand: "docker compose pull && docker compose up -d",
       requirements: [
         "Docker Engine 24+ con el plugin Compose v2 (docker compose, no el binario antiguo docker-compose).",
+        "Permisos de Docker: sin sudo (y fuera del grupo docker), compose falla con permission denied … docker.sock. Los usuarios del grupo docker pueden omitir el sudo.",
         "Puertos 80, 443, 9080 y 9090 libres en el host — o cámbialos en los campos de abajo.",
+        "Si un PostgreSQL local ya ocupa el 5432, el instalador elige automáticamente un puerto libre a partir de 55432 (o --db-port) y lo escribe en POSTGRES_PORT del .env.",
         "No hace falta una base de datos externa: el archivo compose incluye su propio contenedor PostgreSQL 16 con volúmenes con nombre.",
         "El panel sirve HTTPS con un certificado autofirmado en el primer arranque. Sube uno real en Ajustes → Control plane HTTPS, o pon TLS_ENABLED=false para HTTP plano.",
       ],

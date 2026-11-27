@@ -225,6 +225,9 @@ pub mod site_upstream_pools {
         /// origin ignores it. The DB CHECK constraint accepts exactly these
         /// three values.
         pub address_family: String,
+        /// Tunnel connector that reaches this pool's origins. `None` keeps
+        /// them direct: the edge dials the address itself.
+        pub tunnel_id: Option<Uuid>,
         pub is_default: bool,
         pub created_at: DateTimeUtc,
     }

@@ -12,10 +12,14 @@ VERSION := $(shell awk '/^\[workspace\.package\]/{f=1;next} \
 lint:
 	typos
 	cargo clippy --features=full --all-targets --all -- --deny=warnings
+	# The agent-only target is gated on `edge`, so `--all-targets` above skips
+	# it; lint it explicitly (it is a shipped release artifact).
+	cargo clippy --bin wafred-agent --features=full,edge -- --deny=warnings
 
 # Same gate for the rustls TLS backend
 lint-rustls:
 	cargo clippy --no-default-features --features=tls-rustls,full --all-targets --all -- --deny=warnings
+	cargo clippy --no-default-features --features=tls-rustls,full,edge --bin wafred-agent -- --deny=warnings
 	# `geo` is not part of `full`, so it needs its own pass or it silently rots.
 	cargo clippy -p pingap-plugin --features=geo --all-targets -- --deny=warnings
 
@@ -47,8 +51,8 @@ TARGET_SWEEP_DAYS ?= 3
 
 GUARDED := lint lint-rustls test test-rustls cov bench bench-all bloat \
 	build check waf-bench-smoke \
-	release release-full release-rustls-full release-all release-perf \
-	release-pyro
+	release release-full release-rustls-full release-all release-agent \
+	release-perf release-pyro
 
 .PHONY: $(GUARDED) check-target sweep sweep-dry
 
@@ -84,7 +88,7 @@ check:
 	cargo check --features=full --all-targets
 
 # Removes the build cache and the copied root `dist/`; `web/dist` is kept
-# because pingwaf-server embeds it at compile time.
+# because wafred-server embeds it at compile time.
 clean:
 	cargo clean
 	rm -rf dist
@@ -163,11 +167,25 @@ release-full:
 	cargo build --release --features=full
 	ls -lh target/release
 
+# The agent-only binary: the data plane without the control plane or the
+# embedded dashboard. This is the artifact install.sh --mode agent downloads;
+# `edge` only gates code, so it shares the cargo cache with the full build.
+release-agent:
+	cargo build --release --bin wafred-agent --features=tracing,edge
+	ls -lh target/release/wafred-agent
+
 # The full feature set on the rustls TLS backend (no OpenSSL in the binary)
 release-rustls-full:
 	cargo build --release --no-default-features --features=tls-rustls,full
 	ls -lh target/release
 
+
+# The standalone tunnel connector: the binary installed inside a private
+# network (`install.sh --mode tunnel`). It has no TLS-backend feature matrix of
+# its own — it always speaks rustls — so no `--features` is needed.
+release-tunnel:
+	cargo build --release -p wafred-tunnel --bin wafred-tunnel
+	ls -lh target/release/wafred-tunnel
 
 release-all:
 	cargo build --release --features=full --bin wafred

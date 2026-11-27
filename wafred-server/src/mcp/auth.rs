@@ -164,7 +164,8 @@ fn key_principal(
     // owner is an administrator. Everything else is narrowed to the owner's
     // own sites (`is_admin == false` → `visible_site_ids` returns the owned
     // set instead of `None`).
-    let fleet_wide = has_write && owner.role == role::ADMIN;
+    let fleet_wide =
+        has_write && owner.role == role::ADMIN && !owner.is_demo;
     Ok(McpPrincipal {
         subject: owner.id,
         email: owner.email.clone(),
@@ -173,8 +174,8 @@ fn key_principal(
         // Admission above already requires `read` or `write`; a writer can
         // always read, so every accepted key is readable.
         can_read: true,
-        can_write: fleet_wide && !owner.is_demo,
-        is_admin: fleet_wide && !owner.is_demo,
+        can_write: fleet_wide,
+        is_admin: fleet_wide,
     })
 }
 
@@ -365,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn showcase_account_has_read_only_mcp_access() {
+    fn demo_jwt_has_read_only_mcp_access() {
         let mut demo =
             AuthUser::new(Uuid::new_v4(), "demo@example.com", role::AUDITOR);
         demo.is_demo = true;

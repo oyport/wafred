@@ -1,0 +1,97 @@
+[package]
+name = "wafred-tunnel"
+version.workspace = true
+edition = "2024"
+license = "Apache-2.0"
+description = "WAFred tunnel: an outbound-only connector and the edge-side acceptor that lets a NATed origin be served through the data plane without any inbound port."
+
+[features]
+# The edge side (acceptor, loopback bridge, certificate) is always compiled;
+# `connector` adds the outbound client, the control-plane pairing RPC and the
+# CLI, and is enabled by the `wafred-tunnel` binary only. An agent build takes
+# this crate with `default-features = false`, so it never links tonic/clap.
+default = ["connector"]
+connector = [
+    "dep:clap",
+    "dep:pingwaf-proto",
+    "dep:toml",
+    "dep:tracing-subscriber",
+    "dep:tonic",
+]
+
+[[bin]]
+name = "wafred-tunnel"
+path = "src/main.rs"
+required-features = ["connector"]
+
+# The data-path test drives the production connector, so it needs the feature.
+# Without this the rustls CI leg (`--no-default-features --all-targets`) would
+# try to compile it against a server-only library and fail.
+[[test]]
+name = "data_path"
+path = "tests/data_path.rs"
+required-features = ["connector"]
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+rcgen = { workspace = true }
+# Ed25519 verification of the control plane's session tokens.
+ring = { workspace = true }
+# The same requirement the host binary uses: the crate must not install a
+# crypto provider of its own, it uses the one the process installed (ring).
+rustls = { workspace = true, features = ["ring"] }
+rustls-pemfile = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+# Certificate validity windows and the expiry check of the edge's own tunnel
+# certificate (`rcgen` takes `time::OffsetDateTime`).
+time = { workspace = true }
+x509-parser = { workspace = true }
+tokio = { workspace = true, features = [
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "macros",
+    "signal",
+] }
+tokio-rustls = { workspace = true }
+tokio-util = { workspace = true }
+# `service_fn` for tonic's custom connector (the SOCKS5 dial), and the
+# `TokioIo` adapter that turns the dialed TcpStream into the hyper IO type
+# tonic's connector expects.
+tower = { workspace = true }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tracing = { workspace = true }
+yamux = { workspace = true }
+
+# Connector-only: pairing and the long-lived control stream to the control
+# plane.
+clap = { version = "4.6.6", features = [
+    "derive",
+    "std",
+    "help",
+    "usage",
+    "env",
+], default-features = false, optional = true }
+pingwaf-proto = { path = "../wafred-proto", optional = true }
+# The connector's configuration file and its logging setup are CLI concerns,
+# so they stay behind the same feature.
+toml = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+tonic = { workspace = true, features = [
+    "tls-ring",
+    "tls-webpki-roots",
+], optional = true }
+
+[dev-dependencies]
+# The data-path test mints a session token exactly as the control plane does.
+ring = { workspace = true }
+tempfile = { workspace = true }

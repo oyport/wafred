@@ -1,3 +1,5 @@
+> This is an earlier test run associated with the PingWAF 0.32.4 baseline. For WAFred 1.0.4 results with corrected request framing and the side-by-side P13 comparison, see [the full report](../../../docs/wafred-baseline-test-report-2026-11-22.md) and [the benchmark report](../../../docs/waf-benchmark-report.md).
+
 # waf-bench summary
 
 ## Overall (per group)

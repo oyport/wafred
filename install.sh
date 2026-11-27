@@ -6,7 +6,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/oyport/wafred/main/install.sh | bash
 #   curl -fsSL https://raw.githubusercontent.com/oyport/wafred/main/install.sh | bash -s -- --mode agent --server-url https://... --api-key pwk_...
 #   ./install.sh                     # interactive prompts (needs a terminal)
-#   ./install.sh [--version X.Y.Z] [--mode all-in-one|server|agent]
+#   ./install.sh [--version X.Y.Z] [--mode all-in-one|server|agent|tunnel]
 #
 # Options:
 #   --version         Install a specific version (default: latest)
@@ -15,10 +15,18 @@
 #   --mode            Operating mode: all-in-one, server, agent (default: all-in-one)
 #   --server-url      Control plane gRPC URL (agent mode)
 #   --api-key         Agent enrollment token (agent mode)
+#   --token           One-time tunnel pairing token (tunnel mode), shown in the
+#                     console's Edge Agents -> Tunnels tab
+#   --token-file      Read the pairing token from a file instead (keeps it out
+#                     of the process list)
+#   --socks5-proxy    Reach the control plane and the edge ingresses through a
+#                     SOCKS5 proxy (a host with no direct egress)
 #   --admin-email     Seed administrator e-mail (server / all-in-one)
 #   --admin-password  Seed administrator password (omit to generate a random one)
 #   --tls-sans        Comma separated names of the dashboard certificate
-#   --listen-public   Bind the admin API and gRPC on 0.0.0.0 instead of 127.0.0.1
+#   --listen-public   Also bind the agent gRPC endpoint on 0.0.0.0 (the admin
+#                     API already listens on every interface; gRPC defaults to
+#                     127.0.0.1 and only remote agents need it opened)
 #   --no-systemd      Skip systemd service creation
 #   --interactive     Prompt even when the flags would normally skip the questions
 #   --non-interactive Run with the given values and defaults, never prompt
@@ -211,6 +219,12 @@ SERVER_URL=""
 SERVER_CA_CERT=""
 SERVER_TLS_NAME=""
 API_KEY=""
+# One-time tunnel pairing token (tunnel mode). Never echoed back.
+TUNNEL_TOKEN=""
+TUNNEL_TOKEN_FILE=""
+SOCKS5_PROXY=""
+SOCKS5_USERNAME=""
+SOCKS5_PASSWORD=""
 ADMIN_EMAIL=""
 ADMIN_PASSWORD=""
 TLS_SANS=""
@@ -254,16 +268,24 @@ Options:
                            the certificate has no SAN for the URL host (agent
                            mode, requires a release that knows the flag)
   --api-key KEY            Agent enrollment token (agent mode)
+  --token TOKEN            One-time tunnel pairing token (tunnel mode)
+  --token-file PATH        Read the pairing token from a file instead of
+                           --token (keeps it out of `ps`)
+  --socks5-proxy ADDR      SOCKS5 proxy for a host with no direct egress
+                           (`host:port` or `socks5://user:pass@host:port`)
+  --socks5-username USER   SOCKS5 username (wins over embedded userinfo)
+  --socks5-password PASS   SOCKS5 password (prefer WAFRED_TUNNEL_SOCKS5_PASSWORD)
   --db-url URL             PostgreSQL connection string
   --admin-email EMAIL      Seed administrator e-mail (server / all-in-one)
   --admin-password PASS    Seed administrator password. When omitted (and no
                            WAFRED_ADMIN_PASSWORD) a random password is
                            generated and printed exactly once at the end.
   --tls-sans NAMES         Comma separated dashboard certificate names
-  --listen-public          Bind the dashboard/REST API (9080) and the agent
-                           gRPC endpoint (9090) on 0.0.0.0. The default is
-                           127.0.0.1: expose them only through a reverse proxy
-                           or after changing the administrator password.
+  --listen-public          Also bind the agent gRPC endpoint (9090) on
+                           0.0.0.0. The dashboard/REST API (9080) already
+                           listens on every interface; gRPC stays on
+                           127.0.0.1 unless this is given, and only remote
+                           agents need it.
   --no-systemd             Skip systemd service file creation
   --interactive            Ask the questions even when options were given
   --non-interactive, --yes Never prompt; use the given values and defaults
@@ -328,6 +350,11 @@ while [[ $# -gt 0 ]]; do
         --server-ca-cert) require_value "$1" "${2:-}"; SERVER_CA_CERT="$2"; PARAMS_GIVEN=true; shift 2 ;;
         --server-tls-name) require_value "$1" "${2:-}"; SERVER_TLS_NAME="$2"; PARAMS_GIVEN=true; shift 2 ;;
         --api-key)        require_value "$1" "${2:-}"; API_KEY="$2"; PARAMS_GIVEN=true; shift 2 ;;
+        --token)          require_value "$1" "${2:-}"; TUNNEL_TOKEN="$2"; PARAMS_GIVEN=true; shift 2 ;;
+        --token-file)     require_value "$1" "${2:-}"; TUNNEL_TOKEN_FILE="$2"; PARAMS_GIVEN=true; shift 2 ;;
+        --socks5-proxy)   require_value "$1" "${2:-}"; SOCKS5_PROXY="$2"; PARAMS_GIVEN=true; shift 2 ;;
+        --socks5-username) require_value "$1" "${2:-}"; SOCKS5_USERNAME="$2"; PARAMS_GIVEN=true; shift 2 ;;
+        --socks5-password) require_value "$1" "${2:-}"; SOCKS5_PASSWORD="$2"; PARAMS_GIVEN=true; shift 2 ;;
         --admin-email)    require_value "$1" "${2:-}"; ADMIN_EMAIL="$2"; PARAMS_GIVEN=true; shift 2 ;;
         --admin-password) require_value "$1" "${2:-}"; ADMIN_PASSWORD="$2"; PARAMS_GIVEN=true; shift 2 ;;
         --tls-sans)       require_value "$1" "${2:-}"; TLS_SANS="$2"; PARAMS_GIVEN=true; shift 2 ;;
@@ -433,7 +460,8 @@ validate_mode_input() {
         1) REPLY="all-in-one" ;;
         2) REPLY="server" ;;
         3) REPLY="agent" ;;
-        all-in-one|server|agent) ;;
+        4) REPLY="tunnel" ;;
+        all-in-one|server|agent|tunnel) ;;
         *) return 1 ;;
     esac
     return 0
@@ -477,6 +505,90 @@ systemd_env() { # $1 variable name, $2 value -> Environment="NAME=value"
     printf 'Environment="%s=%s"' "$1" "$value"
 }
 
+# ─── mimalloc arena sizing ────────────────────────────────────────────────────
+# mimalloc creates its first arena at load time, before `allocator_tune::apply()`
+# can call `mi_option_set`; an arena that already exists cannot be shrunk. On a
+# small host the default 1 GiB reserve is therefore what the process keeps (and
+# what `pmap` shows), even though the startup log prints the adaptive value.
+# The unit must carry the reserve in its **process environment**, which mimalloc
+# parses in `_mi_options_init` before the first arena.
+#
+# The buckets mirror `src/allocator_tune.rs` (`arena_reserve_for` /
+# `eager_commit_for`) and use the same memory ceiling: cgroup v2 limit, then
+# cgroup v1, then host `MemTotal`. Unknown/failed detection takes the small-host
+# bucket (64 MiB, eager commit off), the safe direction.
+detect_memory_ceiling_bytes() {
+    local raw=""
+
+    # cgroup v2: "max" means no limit; fall through to the host total.
+    if [[ -r /sys/fs/cgroup/memory.max ]]; then
+        raw="$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)"
+        if [[ "$raw" =~ ^[0-9]+$ ]] && (( raw > 0 )); then
+            printf '%s' "$raw"
+            return 0
+        fi
+    fi
+
+    # cgroup v1: "infinity" is the huge sentinel, not a real limit.
+    if [[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+        raw="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || true)"
+        if [[ "$raw" =~ ^[0-9]+$ ]] && (( raw > 0 && raw < 1152921504606846976 )); then
+            printf '%s' "$raw"
+            return 0
+        fi
+    fi
+
+    # Host total. `MemAvailable` is deliberately not used here: it fluctuates
+    # with the install-time workload, while the arena is a virtual reserve that
+    # should follow the same ceiling `allocator_tune` reads at runtime.
+    if [[ -r /proc/meminfo ]]; then
+        local kb
+        kb="$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+        if [[ "$kb" =~ ^[0-9]+$ ]] && (( kb > 0 )); then
+            printf '%s' "$((kb * 1024))"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# 64 MiB below 1 GiB, 256 MiB below 4 GiB, 512 MiB up to 16 GiB, else 1 GiB.
+allocator_arena_reserve_for() {
+    local total="${1:-0}" mib
+    mib=$(( total / 1048576 ))
+    if (( mib < 1024 )); then
+        printf '%s' "$((64 * 1024 * 1024))"
+    elif (( mib < 4096 )); then
+        printf '%s' "$((256 * 1024 * 1024))"
+    elif (( mib < 16384 )); then
+        printf '%s' "$((512 * 1024 * 1024))"
+    else
+        printf '%s' "$((1024 * 1024 * 1024))"
+    fi
+}
+
+# Eager commit is only worth it when the ceiling is at least 4 GiB; below that
+# the reservation must not be committed up front.
+allocator_eager_commit_for() {
+    local total="${1:-0}"
+    if (( total / 1048576 >= 4096 )); then
+        printf '1'
+    else
+        printf '0'
+    fi
+}
+
+# Two `Environment=` lines for the unit, computed from the same ceiling.
+allocator_env_lines() {
+    local ceiling reserve eager
+    ceiling="$(detect_memory_ceiling_bytes || true)"
+    reserve="$(allocator_arena_reserve_for "$ceiling")"
+    eager="$(allocator_eager_commit_for "$ceiling")"
+    printf '%s\n' "$(systemd_env MIMALLOC_ARENA_RESERVE "$reserve")"
+    printf '%s\n' "$(systemd_env MIMALLOC_ARENA_EAGER_COMMIT "$eager")"
+}
+
 validate_install_values() {
     reject_control_chars "mode" "$MODE"
     reject_control_chars "--version" "$VERSION"
@@ -485,6 +597,9 @@ validate_install_values() {
     reject_control_chars "--server-ca-cert" "$SERVER_CA_CERT"
     reject_control_chars "--server-tls-name" "$SERVER_TLS_NAME"
     reject_control_chars "--api-key" "$API_KEY"
+    reject_control_chars "--token" "$TUNNEL_TOKEN"
+    reject_control_chars "--token-file" "$TUNNEL_TOKEN_FILE"
+    reject_control_chars "--socks5-proxy" "$SOCKS5_PROXY"
     reject_control_chars "--admin-email" "$ADMIN_EMAIL"
     reject_control_chars "--admin-password" "$ADMIN_PASSWORD"
     reject_control_chars "--tls-sans" "$TLS_SANS"
@@ -522,6 +637,17 @@ mask_db_url() {
     printf '%s' "$1" | sed -E 's#^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/]*@#\1***@#'
 }
 
+# The release asset to fetch for a mode: agent mode has its own build, the
+# other modes share the full binary. Kept as a function so the dry-run summary
+# (which runs before the final mode validation) and the download agree.
+asset_prefix() {
+    case "${1:-}" in
+        agent) printf 'wafred-agent' ;;
+        tunnel) printf 'wafred-tunnel' ;;
+        *) printf 'wafred' ;;
+    esac
+}
+
 print_plan_summary() {
     local systemd_state="no"
     local password_state="default (wafred123)"
@@ -552,9 +678,28 @@ print_plan_summary() {
     echo "  config:      ${CONFIG_DIR}/wafred.toml"
     echo "  data:        ${DATA_DIR}"
     echo "  systemd:     ${systemd_state}"
-    if [[ "${MODE:-all-in-one}" == "agent" ]]; then
+    if [[ "${MODE:-all-in-one}" == "tunnel" ]]; then
         echo "  control:     ${SERVER_URL}"
-        echo "  control CA:  ${SERVER_CA_CERT:-none (bundled webpki roots)}"
+        if [[ -n "$SERVER_CA_CERT" ]]; then
+            echo "  control CA:  ${SERVER_CA_CERT} -> ${CONFIG_DIR}/tunnel-ca.pem"
+        else
+            echo "  control CA:  none (bundled webpki roots)"
+        fi
+        echo "  tls name:    ${SERVER_TLS_NAME:-URL host}"
+        echo "  socks5:      ${SOCKS5_PROXY:-none (direct egress)}"
+        if [[ -n "$TUNNEL_TOKEN_FILE" ]]; then
+            echo "  token:       from ${TUNNEL_TOKEN_FILE}"
+        else
+            echo "  token:       set (${#TUNNEL_TOKEN} chars)"
+        fi
+        echo "  service:     ${SERVICE_NAME}"
+    elif [[ "${MODE:-all-in-one}" == "agent" ]]; then
+        echo "  control:     ${SERVER_URL}"
+        if [[ -n "$SERVER_CA_CERT" ]]; then
+            echo "  control CA:  ${SERVER_CA_CERT} -> ${CONFIG_DIR}/grpc-ca.pem"
+        else
+            echo "  control CA:  none (bundled webpki roots)"
+        fi
         echo "  tls name:    ${SERVER_TLS_NAME:-URL host}"
         echo "  api key:     ${api_key_state}"
     else
@@ -577,8 +722,9 @@ run_interactive_prompts() {
     echo "  1) all-in-one  control plane and agent in one process (needs PostgreSQL)"
     echo "  2) server      control plane only"
     echo "  3) agent       data-plane node, connects to a control plane"
+    echo "  4) tunnel      tunnel connector for a service inside a private network"
     echo ""
-    prompt_until "Mode [1-3 or name]" "all-in-one" false validate_mode_input
+    prompt_until "Mode [1-4 or name]" "all-in-one" false validate_mode_input
     MODE="$REPLY"
 
     if [[ "$MODE" == "agent" ]]; then
@@ -641,17 +787,36 @@ TLS_SANS="${TLS_SANS// /}"
 
 # Validate mode
 case "$MODE" in
-    all-in-one|server|agent) ;;
-    *) fatal "Invalid mode: $MODE (must be: all-in-one, server, agent)" ;;
+    all-in-one|server|agent|tunnel) ;;
+    *) fatal "Invalid mode: $MODE (must be: all-in-one, server, agent, tunnel)" ;;
 esac
+
+# The tunnel connector is its own binary with its own unit and config: it
+# serves no sites, holds no database and must not replace the data-plane
+# binary an edge already runs.
+if [[ "$MODE" == "tunnel" ]]; then
+    BINARY_NAME="wafred-tunnel"
+    SERVICE_NAME="wafred-tunnel"
+fi
+
+# Agent mode installs the data-plane-only build; the binary keeps the name
+# `pingwaf` on disk so the unit and upgrade path do not change.
+ASSET_PREFIX="$(asset_prefix "$MODE")"
+ARCHIVE_BINARY="$ASSET_PREFIX"
 
 validate_install_values
 
-# Agents talk to the control plane, never to PostgreSQL.
-if [[ "$MODE" == "agent" ]]; then
+# Agents and tunnel connectors talk to the control plane, never to PostgreSQL.
+if [[ "$MODE" == "agent" || "$MODE" == "tunnel" ]]; then
     SERVER_URL="${SERVER_URL:-http://127.0.0.1:9090}"
     if [[ -z "$API_KEY" ]]; then
         warn "No --api-key given: set WAFRED_API_KEY or pass --api-key, or the agent cannot register."
+    fi
+    if [[ "$MODE" == "tunnel" && -z "$TUNNEL_TOKEN" && -z "$TUNNEL_TOKEN_FILE" ]]; then
+        fatal "--mode tunnel needs --token (or --token-file): the one-time pairing token from Edge Agents -> Tunnels."
+    fi
+    if [[ -n "$TUNNEL_TOKEN_FILE" && ! -r "$TUNNEL_TOKEN_FILE" ]]; then
+        fatal "--token-file ${TUNNEL_TOKEN_FILE} is not readable."
     fi
     # Schemes are case-insensitive; `HTTP://` must not slip past the warning.
     # `tr` rather than `${var,,}`: macOS ships bash 3.2, which lacks it.
@@ -816,30 +981,50 @@ fetch_asset() {
                 && curl -fsSL --proto '=https' "$checksum_url" -o "${TMPDIR}/${ASSET_NAME}.sha256"; then
                 downloaded=true
             fi
-        elif has wget; then
-            if wget -q "$url" -O "${TMPDIR}/${ASSET_NAME}" \
-                && wget -q "$checksum_url" -O "${TMPDIR}/${ASSET_NAME}.sha256"; then
-                downloaded=true
+            ASSET_NAME="${prefix}-${OS}-${ARCH}.${ext}"
+            url="https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET_NAME}"
+            checksum_url="${url}.sha256"
+            info "Downloading ${ASSET_NAME}..."
+            info "URL: ${url}"
+            downloaded=false
+            if has curl; then
+                if curl -fsSL --proto '=https' "$url" -o "${TMPDIR}/${ASSET_NAME}" \
+                    && curl -fsSL --proto '=https' "$checksum_url" -o "${TMPDIR}/${ASSET_NAME}.sha256"; then
+                    downloaded=true
+                fi
+            elif has wget; then
+                if wget -q "$url" -O "${TMPDIR}/${ASSET_NAME}" \
+                    && wget -q "$checksum_url" -O "${TMPDIR}/${ASSET_NAME}.sha256"; then
+                    downloaded=true
+                fi
+            else
+                fatal "Neither curl nor wget found. Please install one of them."
             fi
-        else
-            fatal "Neither curl nor wget found. Please install one of them."
-        fi
-        if [[ "$downloaded" != "true" ]]; then
-            warn "Download failed for ${ASSET_NAME} (asset or its .sha256) — trying the next format."
-            continue
-        fi
-        # Every release ships a .sha256 sidecar; a missing, malformed or
-        # mismatching one is fatal. Nothing is extracted or executed before
-        # this check passes.
-        expected="$(awk 'NR == 1 { print $1 }' "${TMPDIR}/${ASSET_NAME}.sha256")"
-        if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
-            fatal "The .sha256 sidecar for ${ASSET_NAME} is missing or malformed; refusing to install."
-        fi
-        if ! verify_checksum "${TMPDIR}/${ASSET_NAME}" "${TMPDIR}/${ASSET_NAME}.sha256"; then
-            fatal "Checksum mismatch for ${ASSET_NAME} (published: ${expected}). Refusing to install."
-        fi
-        success "Verified the sha256 of ${ASSET_NAME}."
-        return 0
+            if [[ "$downloaded" != "true" ]]; then
+                warn "Download failed for ${ASSET_NAME} (asset or its .sha256) — trying the next format."
+                continue
+            fi
+            # Every release ships a .sha256 sidecar; a missing, malformed or
+            # mismatching one is fatal. Nothing is extracted or executed before
+            # this check passes.
+            expected="$(awk 'NR == 1 { print $1 }' "${TMPDIR}/${ASSET_NAME}.sha256")"
+            if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+                fatal "The .sha256 sidecar for ${ASSET_NAME} is missing or malformed; refusing to install."
+            fi
+            if ! verify_checksum "${TMPDIR}/${ASSET_NAME}" "${TMPDIR}/${ASSET_NAME}.sha256"; then
+                fatal "Checksum mismatch for ${ASSET_NAME} (published: ${expected}). Refusing to install."
+            fi
+            if [[ "$prefix" != "$ASSET_PREFIX" ]]; then
+                warn "No agent-only build in v${VERSION}; falling back to the full binary (larger footprint)."
+                ASSET_PREFIX="$prefix"
+                ARCHIVE_BINARY="$prefix"
+            fi
+            if [[ "$MODE" == "agent" && "$ASSET_PREFIX" == "wafred-agent" ]]; then
+                AGENT_ONLY_BUILD=true
+            fi
+            success "Verified the sha256 of ${ASSET_NAME}."
+            return 0
+        done
     done
     fatal "Download failed. Check that version v${VERSION} exists and has a wafred-${OS}-${ARCH} asset."
 }
@@ -867,7 +1052,7 @@ esac
 # invitation to install an arbitrary file.
 BINARY_PATH="$(find "${TMPDIR}/wafred-${OS}-${ARCH}" -name "$BINARY_NAME" -type f | head -n1)"
 if [[ -z "$BINARY_PATH" ]]; then
-    fatal "Binary '${BINARY_NAME}' not found in the verified archive."
+    fatal "Binary '${ARCHIVE_BINARY}' not found in the verified archive."
 fi
 
 chmod +x "$BINARY_PATH"
@@ -882,6 +1067,17 @@ if ! "$BINARY_PATH" --version >/dev/null 2>&1; then
        Release assets are built on Ubuntu 24.04 and need glibc 2.39 or newer.
        On older distributions (CentOS/RHEL, Debian 11, Ubuntu 20.04, Alpine,
        ...) build from source instead: https://github.com/${REPO}/blob/main/docs/quick-start.md#path-2-build-from-source"
+fi
+# The agent archive must actually contain the agent-only build. The version
+# banner marks it with `edge`; a wrongly packaged (or swapped) artifact would
+# otherwise be installed silently and bring the control plane back.
+if [[ "$AGENT_ONLY_BUILD" == "true" ]]; then
+    # stdout only: the allocator's startup notice goes to stderr and would
+    # otherwise be the first line captured here.
+    agent_version="$("$BINARY_PATH" --version 2>/dev/null | head -n1 || true)"
+    if [[ "$agent_version" != *"edge"* ]]; then
+        fatal "The agent-only archive does not contain an agent-only binary: ${agent_version}"
+    fi
 fi
 
 info "Installing binary to ${INSTALL_DIR}/${BINARY_NAME}..."
@@ -904,7 +1100,154 @@ else
     fatal "No write permission to ${INSTALL_DIR} and sudo not available."
 fi
 
+# Installs the tunnel connector: pairs it with the control plane and registers
+# it as its own unit. Nothing here touches PostgreSQL, the dashboard or the
+# data-plane binary an edge already runs.
+install_tunnel_connector() {
+    local cmd="" config_file="${CONFIG_DIR}/tunnel.toml"
+    local ca_dest="${CONFIG_DIR}/tunnel-ca.pem"
+    if [[ -w "/" ]]; then
+        cmd=""
+    elif has sudo; then
+        cmd="sudo"
+    else
+        fatal "Cannot write ${CONFIG_DIR} without sudo."
+    fi
+    $cmd mkdir -p "$CONFIG_DIR" "${DATA_DIR}/tunnel"
+    if [[ "$OS" == "linux" ]] && ! id -u pingwaf >/dev/null 2>&1; then
+        $cmd useradd -r -m -d "$DATA_DIR" -s /usr/sbin/nologin pingwaf 2>/dev/null || true
+    fi
+    if [[ "$OS" == "linux" ]]; then
+        $cmd chown -R wafred:wafred "${DATA_DIR}/tunnel" 2>/dev/null || true
+        $cmd chmod 0750 "${DATA_DIR}/tunnel" 2>/dev/null || true
+    fi
+
+    # The control-plane CA, if one was supplied, is copied to a durable path:
+    # the pairing command references it and the unit must keep working after
+    # the operator's download directory is gone.
+    local ca_args=()
+    if [[ -n "$SERVER_CA_CERT" ]]; then
+        $cmd cp "$SERVER_CA_CERT" "$ca_dest" || fatal "Could not copy ${SERVER_CA_CERT} to ${ca_dest}."
+        $cmd chmod 0644 "$ca_dest" 2>/dev/null || true
+        ca_args=(--server-ca-cert "$ca_dest")
+    fi
+    local tls_args=()
+    if [[ -n "$SERVER_TLS_NAME" ]]; then
+        tls_args=(--server-tls-name "$SERVER_TLS_NAME")
+    fi
+
+    info "Pairing the tunnel connector with ${SERVER_URL}..."
+    # The token is on the command line because it is a one-time secret the
+    # operator just pasted; it is redeemed immediately and never stored (the
+    # long-lived credential it returns goes into the 0600 config file).
+    local token_args=(--token "$TUNNEL_TOKEN")
+    if [[ -n "$TUNNEL_TOKEN_FILE" ]]; then
+        token_args=(--token-file "$TUNNEL_TOKEN_FILE")
+    fi
+    local proxy_args=()
+    if [[ -n "$SOCKS5_PROXY" ]]; then
+        proxy_args=(--socks5-proxy "$SOCKS5_PROXY")
+        [[ -n "$SOCKS5_USERNAME" ]] && proxy_args+=(--socks5-username "$SOCKS5_USERNAME")
+        # The password is not echoed: it is already on this command line only
+        # because the operator passed it, and it is written to the 0600 config.
+        [[ -n "$SOCKS5_PASSWORD" ]] && proxy_args+=(--socks5-password "$SOCKS5_PASSWORD")
+    fi
+    if ! $cmd "${INSTALL_DIR}/${BINARY_NAME}" pair \
+        --config "$config_file" \
+        ${token_args[@]+"${token_args[@]}"} \
+        ${proxy_args[@]+"${proxy_args[@]}"} \
+        --server-url "$SERVER_URL" \
+        ${ca_args[@]+"${ca_args[@]}"} \
+        ${tls_args[@]+"${tls_args[@]}"}; then
+        fatal "Pairing failed. Check --server-url/--server-ca-cert, and mint a fresh token in Edge Agents -> Tunnels."
+    fi
+    $cmd chown root:pingwaf "$config_file" 2>/dev/null || true
+    $cmd chmod 0640 "$config_file" 2>/dev/null || true
+    success "Paired; configuration written to ${config_file}"
+
+    if [[ "$SKIP_SYSTEMD" == "true" ]]; then
+        info "Skipping the systemd unit (--no-systemd)."
+    elif [[ "$OS" != "linux" ]]; then
+        info "Not Linux — run it with: ${INSTALL_DIR}/${BINARY_NAME} run --config ${config_file}"
+    elif ! has systemctl; then
+        warn "systemctl not found — run it with: ${INSTALL_DIR}/${BINARY_NAME} run --config ${config_file}"
+    else
+        local service_file="/etc/systemd/system/${SERVICE_NAME}.service"
+        info "Creating systemd service ${SERVICE_NAME}..."
+        (umask 077; $cmd tee "$service_file" >/dev/null <<EOF
+[Unit]
+Description=WAFred tunnel connector
+Documentation=https://github.com/${REPO}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pingwaf
+Group=pingwaf
+ExecStart=${INSTALL_DIR}/${BINARY_NAME} run --config ${config_file}
+# The connector retries network and control-plane failures internally, so it
+# only exits when it was revoked or told to stop. `on-failure` keeps a revoked
+# connector stopped instead of restart-looping against a dead credential.
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+# The connector only dials out and needs no privilege of its own.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${DATA_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+)
+        $cmd systemctl daemon-reload
+        # `restart` rather than `enable --now`: a re-run pairs a NEW credential,
+        # and an already-running unit would keep using the old one (the config
+        # file is only read at startup) until someone restarted it by hand.
+        if $cmd systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 \
+            && $cmd systemctl restart "$SERVICE_NAME"; then
+            success "Service ${SERVICE_NAME} is running"
+        else
+            warn "Could not start ${SERVICE_NAME}; check: journalctl -u ${SERVICE_NAME} -n 50"
+        fi
+    fi
+
+    echo ""
+    echo "${BOLD}Tunnel connector installed${NO_COLOR}"
+    echo "  Binary:   ${INSTALL_DIR}/${BINARY_NAME}"
+    echo "  Config:   ${config_file}"
+    echo "  Control:  ${SERVER_URL}"
+    echo "  Socks5:   ${SOCKS5_PROXY:-none}"
+    echo "  Status:   ${INSTALL_DIR}/${BINARY_NAME} status --config ${config_file}"
+    if [[ "$OS" == "linux" && "$SKIP_SYSTEMD" != "true" ]]; then
+        echo "  Logs:     journalctl -u ${SERVICE_NAME} -f"
+    fi
+    echo ""
+    if grep -q '^\[\[ingress\]\]' "$config_file" 2>/dev/null; then
+        echo "  Ingress endpoints were advertised by the control plane."
+    else
+        echo "  ${YELLOW}! No ingress endpoint was advertised.${NO_COLOR}"
+        echo "    On the edge that should terminate this tunnel: set"
+        echo "    agent.tunnel_addr (e.g. 0.0.0.0:9443) and firewall the port, then"
+        echo "    fill in that node's Tunnel ingress address in the console"
+        echo "    (Agents -> [node] -> Tunnel ingress) and restart the connector:"
+        echo "      sudo systemctl restart ${SERVICE_NAME}"
+    fi
+    echo ""
+    echo "  Next: bind an origin pool to this tunnel in the site's origin pool"
+    echo "  settings; until then it advertises no targets."
+    echo ""
+}
+
 success "Binary installed: ${INSTALL_DIR}/${BINARY_NAME}"
+
+if [[ "$MODE" == "tunnel" ]]; then
+    install_tunnel_connector
+    exit 0
+fi
 
 # ─── Create Directories ───────────────────────────────────────────────────────
 create_dirs() {
@@ -935,6 +1278,36 @@ if [[ "$OS" == "linux" ]]; then
     create_dirs
     success "Created ${CONFIG_DIR} and ${DATA_DIR}"
 fi
+
+# Copies the control-plane CA the operator pointed at into /etc/wafred. The
+# generated unit and [agent] table must reference a durable path: a CA kept in
+# /tmp or a release download directory disappears on the next reboot, and the
+# agent then fails every gRPC handshake with an opaque certificate error.
+install_agent_ca() {
+    [[ "$MODE" == "agent" ]] || return 0
+    [[ -n "$SERVER_CA_CERT" ]] || return 0
+
+    local dest="${CONFIG_DIR}/grpc-ca.pem"
+    if [[ "$SERVER_CA_CERT" == "$dest" ]]; then
+        return 0
+    fi
+    if [[ "$(readlink -f "$SERVER_CA_CERT" 2>/dev/null || printf '%s' "$SERVER_CA_CERT")" == \
+          "$(readlink -f "$dest" 2>/dev/null || printf '%s' "$dest")" ]]; then
+        SERVER_CA_CERT="$dest"
+        return 0
+    fi
+
+    local cmd=""
+    [[ -w "$CONFIG_DIR" ]] || cmd="sudo"
+    $cmd cp "$SERVER_CA_CERT" "$dest" || \
+        fatal "Could not copy the control-plane CA to ${dest}."
+    $cmd chmod 0644 "$dest" 2>/dev/null || true
+    $cmd chown root:pingwaf "$dest" 2>/dev/null || true
+    SERVER_CA_CERT="$dest"
+    success "Control-plane CA installed at ${dest}"
+}
+
+install_agent_ca
 
 # ─── Write Default Configuration ─────────────────────────────────────────────
 write_config() {
@@ -984,13 +1357,18 @@ write_config() {
         fi
     fi
 
-    # Loopback by default: a fresh install still has the seeded administrator
-    # account, so the API/gRPC must not be reachable from the network until the
-    # password has been changed (or the operator opts into --listen-public /
-    # puts the console behind a reverse proxy).
-    local admin_addr="127.0.0.1:9080" grpc_addr="127.0.0.1:9090"
+    # The console listens on every interface. A loopback bind made a fresh
+    # install look unreachable from the operator's browser — nothing answered on
+    # the host's address, so the install itself appeared to have failed. The
+    # exposure is acceptable because the installer generates a random
+    # administrator password and a fresh database answers every write with 403
+    # `password_change_required` until it is changed; restricting 9080 to the
+    # admin network (or fronting it with a reverse proxy) is still recommended.
+    #
+    # gRPC stays on loopback: only remote agents need it, and they are the
+    # deployment that can actually firewall it (`--listen-public` opens it).
+    local admin_addr="0.0.0.0:9080" grpc_addr="127.0.0.1:9090"
     if [[ "$LISTEN_PUBLIC" == "true" ]]; then
-        admin_addr="0.0.0.0:9080"
         grpc_addr="0.0.0.0:9090"
     fi
 
@@ -1022,8 +1400,10 @@ write_config() {
 
 [server]
 db_url = "$(toml_string "$DB_URL")"
-# Admin API + gRPC listen on loopback unless --listen-public was given; agents
-# on other hosts and remote dashboards need an explicit choice (or a proxy).
+# The console listens on every interface so a fresh install is reachable from
+# the operator's browser; restrict 9080 to your admin network or put it behind
+# a reverse proxy. gRPC (agent connections) stays on loopback unless
+# --listen-public was given, which only remote agents need.
 admin_addr = "${admin_addr}"
 grpc_addr = "${grpc_addr}"
 # gRPC control plane TLS: "tls" (default) serves agents over TLS, reusing the
@@ -1225,6 +1605,13 @@ $(systemd_env WAFRED_SERVER_TLS_NAME "$SERVER_TLS_NAME")"
 $(systemd_env WAFRED_TLS_ENABLED "true")"
     fi
 
+    # mimalloc parses these in `_mi_options_init`, before the first arena is
+    # created; setting them from `allocator_tune::apply()` is too late on a
+    # small host (the default 1 GiB arena cannot be shrunk). The values mirror
+    # the Rust buckets, see `allocator_env_lines`.
+    local allocator_env
+    allocator_env="$(allocator_env_lines)"
+
     info "Creating systemd service..."
 
     local cmd=""
@@ -1248,6 +1635,10 @@ Restart=always
 RestartSec=5
 LimitNOFILE=65536
 ${agent_env}
+# mimalloc's first arena is created before allocator_tune::apply(); without
+# these a small host keeps the 1 GiB default even though the startup log
+# prints the adaptive value.
+${allocator_env}
 # Log level; the default keeps sqlx's per-statement log out of the way:
 Environment=RUST_LOG=info,sqlx=warn
 # Allocator startup defaults; override in wafred.env when load testing.
@@ -1294,11 +1685,40 @@ EOF
     # first boot.
     if [[ "$MODE" == "agent" ]]; then
         info "Starting the agent service..."
-        if $cmd systemctl enable --now "$SERVICE_NAME"; then
-            success "Service enabled and started: ${SERVICE_NAME}"
+        # `enable --now` does not restart an already-running unit, so an
+        # upgrade would install the new binary and keep the old process (and
+        # the old config) alive until the next manual restart. Always restart.
+        if $cmd systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 && \
+           $cmd systemctl restart "$SERVICE_NAME"; then
+            success "Service enabled and restarted: ${SERVICE_NAME}"
         else
             warn "The service did not start — inspect: journalctl -u ${SERVICE_NAME} -e"
             warn "After fixing, start it with: sudo systemctl enable --now ${SERVICE_NAME}"
+            return 1
+        fi
+
+        # An active unit is not a working node: a wrong key, URL or CA leaves
+        # the agent retrying forever while the installer still prints success.
+        # Wait for the registration line before claiming the install worked.
+        info "Waiting for the agent to register..."
+        local start_epoch registered=false
+        start_epoch=$(( $(date +%s) - 2 ))
+        for _ in $(seq 1 60); do
+            if $cmd journalctl -u "$SERVICE_NAME" -b --no-pager \
+                --since "@${start_epoch}" 2>/dev/null \
+                | grep -q "Registered with control plane"; then
+                registered=true
+                break
+            fi
+            sleep 1
+        done
+        if [[ "$registered" == "true" ]]; then
+            success "Agent registered with the control plane."
+        else
+            warn "The agent service is active but did not register within 60s."
+            warn "Check the control-plane URL, API key and CA:"
+            warn "  journalctl -u ${SERVICE_NAME} -e"
+            return 1
         fi
         return
     fi
@@ -1308,21 +1728,50 @@ EOF
     echo "  sudo systemctl status ${SERVICE_NAME}"
 }
 
-install_systemd
+if ! install_systemd; then
+    error "Installation stopped before the node was verified."
+    exit 1
+fi
+
+# The package name moves with the distribution: Ubuntu 24.04 ships
+# postgresql-16, 26.04 ships 18, Debian tracks its own numbering. Printing the
+# one name that only worked on the machine the message was written on sends the
+# operator into "Unable to locate package".
+postgres_pkg_hint() {
+    local pkg=""
+    if has apt-get; then
+        pkg="$(apt-cache search --names-only '^postgresql-[0-9]+$' 2>/dev/null \
+            | awk '{print $1}' | sort -V | tail -n1)"
+        echo "sudo apt install ${pkg:-postgresql}"
+    elif has dnf; then
+        echo "sudo dnf install postgresql-server"
+    elif has yum; then
+        echo "sudo yum install postgresql-server"
+    elif has apk; then
+        echo "sudo apk add postgresql"
+    else
+        echo "(install PostgreSQL from your distribution's package manager)"
+    fi
+}
 
 # ─── PostgreSQL Check ─────────────────────────────────────────────────────────
+# Sets DB_READY so the caller can refuse to report a successful install on a
+# machine that cannot reach a database: exit 0 with an inactive service is
+# exactly what automation reads as "ready".
+DB_READY=false
 check_postgres() {
     info "Checking PostgreSQL availability..."
 
     if has psql; then
         if postgres_reachable "$DB_URL"; then
             success "PostgreSQL connection successful."
+            DB_READY=true
         else
             # Never echo the connection string: it carries the DB password.
             warn "psql found but cannot connect to: $(mask_db_url "$DB_URL")"
             echo ""
             echo "  To set up PostgreSQL:"
-            echo "    1. Install: sudo apt install postgresql-16"
+            echo "    1. Install: $(postgres_pkg_hint)"
             echo "    2. Create user & database:"
             echo "       sudo -u postgres createuser wafred"
             echo "       sudo -u postgres createdb -O wafred wafred"
@@ -1335,17 +1784,9 @@ check_postgres() {
         echo "  WAFred requires PostgreSQL 14+. Install it with:"
         echo ""
         if [[ "$OS" == "linux" ]]; then
-            if has apt-get; then
-                echo "    sudo apt install postgresql-16"
-            elif has dnf; then
-                echo "    sudo dnf install postgresql-server"
-            elif has yum; then
-                echo "    sudo yum install postgresql-server"
-            else
-                echo "    (install PostgreSQL from your distribution's package manager)"
-            fi
+            echo "    $(postgres_pkg_hint)"
         else
-            echo "    brew install postgresql@16"
+            echo "    brew install postgresql"
         fi
         echo ""
         echo "  Then create the database:"
@@ -1358,8 +1799,16 @@ check_postgres() {
 
 if [[ "$MODE" == "agent" ]]; then
     info "Agent mode: skipping the PostgreSQL check, nodes keep no database."
+    DB_READY=true
 else
     check_postgres
+    if [[ "$DB_READY" != "true" ]]; then
+        echo ""
+        warn "Installation files are in place, but WAFred cannot start without a database."
+        warn "Fix PostgreSQL as shown above, then: sudo systemctl enable --now ${SERVICE_NAME}"
+        echo ""
+        exit 1
+    fi
 fi
 
 # ─── Firewall Hints ───────────────────────────────────────────────────────────
@@ -1385,12 +1834,14 @@ print_firewall_hints() {
     info "Firewall ports:"
     echo "    80/tcp   — HTTP traffic (proxied sites)"
     echo "    443/tcp  — HTTPS traffic (proxied sites)"
-    echo "    9080/tcp — Admin dashboard & REST API (HTTPS) — management network only"
-    echo "    9090/tcp — gRPC control plane (agent connections) — only if agents are remote"
+    echo "    9080/tcp — Admin dashboard & REST API (HTTPS) — open by default; restrict it to the admin network"
+    echo "    9090/tcp — gRPC control plane (agent connections) — loopback unless --listen-public"
     echo ""
-    echo "  Do NOT expose 9080/9090 before the administrator password has been"
-    echo "  changed. The generated config binds both to 127.0.0.1 by default;"
-    echo "  reinstall with --listen-public only when a proxy/remote agents need it."
+    echo "  The console binds 0.0.0.0 so a fresh install is reachable. Its"
+    echo "  administrator password is generated at install time and a fresh"
+    echo "  database refuses every write until it is changed — but restrict 9080"
+    echo "  to your admin network (or front it with a reverse proxy), and change"
+    echo "  the password at the first sign-in."
     echo ""
     if has ufw; then
         echo "  With UFW (business ports):"
@@ -1411,6 +1862,9 @@ echo "${BOLD}${GREEN}  WAFred v${VERSION} installed successfully!${NO_COLOR}"
 echo "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════${NO_COLOR}"
 echo ""
 echo "  Binary:    ${INSTALL_DIR}/${BINARY_NAME}"
+if [[ "$AGENT_ONLY_BUILD" == "true" ]]; then
+    echo "  Build:     agent-only (data plane; no control plane, REST API or dashboard)"
+fi
 if [[ "$OS" == "linux" ]]; then
     echo "  Config:    ${CONFIG_DIR}/wafred.toml"
     echo "  Data:      ${DATA_DIR}/"
@@ -1433,11 +1887,14 @@ else
     echo "  Quick start:"
     echo "    ${BINARY_NAME} ${MODE} --db-url \"${DB_URL}\""
     echo ""
-    echo "  Dashboard: https://localhost:9080  (self-signed certificate)"
+    echo "  Dashboard: https://<this-host>:9080  (self-signed certificate)"
+    echo "  Listen:    admin 0.0.0.0:9080 — restrict it to your admin network"
     if [[ "$LISTEN_PUBLIC" == "true" ]]; then
-        echo "  ${YELLOW}⚠ Admin/gRPC listen on 0.0.0.0 — change the password and restrict 9080/9090 to an admin network before exposing them.${NO_COLOR}"
+        echo "             gRPC 0.0.0.0:9090 (remote agents enabled)"
+        echo "  ${YELLOW}⚠ Both ports are open: change the administrator password and firewall 9080/9090 to the admin and agent networks.${NO_COLOR}"
     else
-        echo "  Listen:    127.0.0.1 only (admin 9080 / gRPC 9090); use --listen-public for remote agents or a dashboard proxy"
+        echo "             gRPC 127.0.0.1:9090 — add --listen-public for remote agents"
+        echo "  ${YELLOW}⚠ The console is reachable from the network: change the administrator password at the first sign-in and firewall 9080 to your admin network.${NO_COLOR}"
     fi
     if [[ "$CONFIG_PRESENT" == "true" ]]; then
         echo "  Administrator: unchanged — ${CONFIG_DIR}/wafred.toml was left as it was."
@@ -1469,7 +1926,10 @@ else
     echo "    1. Ensure PostgreSQL is running and accessible"
     echo "    2. Edit ${CONFIG_DIR}/wafred.toml, then: sudo systemctl restart ${SERVICE_NAME}"
     echo "    3. Start the service: sudo systemctl enable --now ${SERVICE_NAME}"
-    echo "    4. Open the dashboard and add your first site"
+    echo "    4. Sign in and CHANGE the administrator password: a fresh database"
+    echo "       answers every write with 403 password_change_required until it is"
+    echo "       changed (console: Settings -> Account; API: PUT /api/v1/auth/password)"
+    echo "    5. Open the dashboard and add your first site"
     echo ""
     echo "  Upgrade / rollback / uninstall:"
     echo "    Upgrade:   re-run this installer with --version <new>; the config and the"

@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+## [WAFred 1.0.5] - 2026-11-27
+
+### Security and stability
+
+- Integrated upstream fixes for request-body truncation handling, WAF rule
+  evaluation, backup validation, challenge limits and agent configuration sync.
+- Improved agent health reporting, scoped site delivery and controlled
+  self-upgrade status.
+
+### Added
+
+- Added outbound-only tunnels for private origins, Amazon Route 53 DNS-01
+  issuance, ASN-aware traffic analytics and site certificate renewal support.
+- Updated dashboard analytics, traffic visualizations and accessibility.
+
 ## [WAFred 1.0.4] - 2026-11-21
 
 ### Added
@@ -152,7 +169,7 @@ for setup and compatibility details.
 
 - **Agent mode: the configuration file now wins over the environment.**
   `server_url`, `api_key` and `cache_dir` come from
-  `/etc/pingwaf/pingwaf.toml` first (command-line flags still win), because
+  `/etc/wafred/wafred.toml` first (command-line flags still win), because
   `install.sh` no longer mirrors the agent keys into the systemd unit's
   `Environment=` lines — a fresh unit keeps only `PINGWAF_CONFIG` and
   `RUST_LOG`, and the API key lives solely in the 0600/0640 configuration
@@ -858,9 +875,9 @@ that table up if you may need to roll back.
   `--no-systemd` or apply the snippet, then verify with
   `systemctl show pingwaf -p AmbientCapabilities`.
 - **The generated configuration file is no longer world-readable.** Root
-  installs left `/etc/pingwaf/pingwaf.toml` at mode 644 owned by root, so the
+  installs left `/etc/wafred/wafred.toml` at mode 644 owned by root, so the
   seeded admin password and the JWT secret were readable by every local user.
-  The file is now unconditionally `chown`ed to `pingwaf:pingwaf` and `chmod`
+  The file is now unconditionally `chown`ed to `wafred:wafred` and `chmod`
   640.
 - **`GET /api/v1/analytics/top-ips` accepts `blocked_only`.** When truthy
   (`true`/`1`/`yes`, case-insensitive) the ranking is restricted to IPs with
@@ -900,9 +917,9 @@ that table up if you may need to roll back.
   `--no-systemd` or apply the snippet, then verify with
   `systemctl show pingwaf -p AmbientCapabilities`.
 - **The generated configuration file is no longer world-readable.** Root
-  installs left `/etc/pingwaf/pingwaf.toml` at mode 644 owned by root, so the
+  installs left `/etc/wafred/wafred.toml` at mode 644 owned by root, so the
   seeded admin password and the JWT secret were readable by every local user.
-  The file is now unconditionally `chown`ed to `pingwaf:pingwaf` and `chmod`
+  The file is now unconditionally `chown`ed to `wafred:wafred` and `chmod`
   640.
 - **`GET /api/v1/analytics/top-ips` accepts `blocked_only`.** When truthy
   (`true`/`1`/`yes`, case-insensitive) the ranking is restricted to IPs with
@@ -918,12 +935,12 @@ that table up if you may need to roll back.
   built from `site/` (Astro), whose deployment pages now document both install
   modes.
 
-## [PingWAF 0.33.0] — 2026-10-31
+### Also in this release
 
-Feature release: static-asset access-log filtering, AI bots as a first-class
-client type, and regex support in rewrite body replacement. One migration
-ships automatically; the `RuleBundle` proto gains an optional field, so old
-agents keep working against a new control plane.
+Static-asset access-log filtering, AI bots as a first-class client type, and
+regex support in rewrite body replacement. One migration ships automatically;
+the `RuleBundle` proto gains an optional field, so old agents keep working
+against a new control plane.
 
 ### Added
 
@@ -1859,7 +1876,7 @@ entry. Sites that configure none of it behave exactly as they did on 0.29.x:
   heavy rust/web jobs but keep the `docs` job; `web-dist` and
   `release-binary` jobs were added; the release workflow builds the web
   frontend once; Docker arm64 builds are pinned to `ubuntu-24.04-arm`.
-  Releases now ship **both** `pingwaf-linux-{amd64,arm64}.tar.xz`
+  Releases now ship **both** `wafred-linux-{amd64,arm64}.tar.xz`
   (primary) and `.tar.gz` (compatibility fallback) with `.sha256`
   sidecars; `install.sh` prefers xz and falls back to gz, asset names are
   unchanged.
@@ -2225,7 +2242,7 @@ entry. Sites that configure none of it behave exactly as they did on 0.29.x:
   `must_change_password` is set, every endpoint except `/api/v1/auth/*`
   answers `403 password_change_required`; previously such a session could
   read all sites and logs. Automation that relies on the shipped
-  `pingwaf123` password must change it first.
+  `wafred123` password must change it first.
 - **New sites now enforce the built-in WAF rules.** `seed_site_defaults`
   creates the 11 built-in rules with `mode: "block"` instead of `"monitor"`, so
   "WAF enabled" means SQLi/XSS/reconnaissance payloads are actually stopped
@@ -3703,7 +3720,7 @@ after 0.24.0.
   or by an administrator from the user management table. Changing it revokes
   every outstanding session, since tokens carry the login name as a claim,
   so holders must sign in again with the new name. This also removes the
-  brute-force exposure of the fixed `admin@pingwaf.local` default on docker
+  brute-force exposure of the fixed `admin@wafred.local` default on docker
   installs.
 
 ### 🐛 Bug Fixes
@@ -3758,7 +3775,7 @@ plane / agent / deployment audit.
   password changes/min (passkey logins share the login bucket) — answering
   `429` with `Retry-After` when exceeded.
 - *(server)* Startup warns while the default administrator password
-  (`pingwaf123`) is still active, next to the forced first-login password
+  (`wafred123`) is still active, next to the forced first-login password
   change.
 - *(server)* `PINGWAF_PUBLIC_HOST` (or `--public-host`, or the `public_host`
   file key) pins the cleartext-to-HTTPS redirect target instead of building
@@ -4165,9 +4182,9 @@ plane / agent / deployment audit.
   `server` and `agent` read only their own. Precedence is file, then
   environment, then command line, unknown keys are reported and skipped instead
   of silently ignored, and the effective count is logged at startup. The
-  shipped [`pingwaf.toml`](./pingwaf.toml) and `pingwaf.service` are now real,
+  shipped [`wafred.toml`](./wafred.toml) and `wafred.service` are now real,
   loadable configuration, and `install.sh` points the unit at
-  `/etc/pingwaf/pingwaf.toml`.
+  `/etc/wafred/wafred.toml`.
 - *(config)* Boolean flags can be turned off again. `--serve-frontend` and
   `--fail-open` were declared as value-less flags, so neither the command line
   nor the environment could set them to `false`; they now take an optional
@@ -4194,7 +4211,7 @@ plane / agent / deployment audit.
 ### ⚠️ Breaking Changes
 
 - The configuration file is no longer inert. A deployment that kept unrelated
-  content in `/etc/pingwaf/pingwaf.toml` will now see its `[server]` /
+  content in `/etc/wafred/wafred.toml` will now see its `[server]` /
   `[agent]` tables applied (unrecognised keys are only warned about), and a
   path named by `--config`/`PINGWAF_CONFIG` that cannot be read stops startup
   instead of being ignored.
@@ -4379,7 +4396,7 @@ plane / agent / deployment audit.
   message, which the agent only sent after awaiting those headers — heartbeats
   never flowed, every agent drifted offline and server commands (rule updates,
   IP bans, cache purge) never reached the data plane. Also run the runtime
-  images with a writable working directory (`/var/lib/pingwaf`) so agent cache
+  images with a writable working directory (`/var/lib/wafred`) so agent cache
   persistence and ACME state survive restarts.
 - *(agent)* Adopt the server-issued agent id on every gRPC stream. The client
   presented a locally generated UUID, so the control plane rejected each
@@ -4392,7 +4409,7 @@ plane / agent / deployment audit.
   plaintext HTTP in TLS handshakes — browsers to port 80 died with
   `tls_validate_record_header` errors and ACME HTTP-01 challenges never
   arrived. Port 80 now serves plaintext HTTP while 443 keeps TLS.
-- *(server)* Persist the bootstrap API key to `/var/lib/pingwaf/bootstrap_api_key`
+- *(server)* Persist the bootstrap API key to `/var/lib/wafred/bootstrap_api_key`
   (0600) and verify it against the database hash on startup, so the all-in-one
   agent keeps its key — and its agent row — across control plane restarts
   instead of minting a ghost row on every boot.
@@ -4485,7 +4502,7 @@ The first PingWAF release line. Version numbering continues from `pingap`
   runtime) and `docker-compose.yml` with `pingwaf` (all-in-one) plus
   `postgres:16-alpine`, health checks and a commented distributed `pingwaf-agent`
   service.
-- *(deploy)* `pingwaf.service` systemd unit with security hardening
+- *(deploy)* `wafred.service` systemd unit with security hardening
   (`NoNewPrivileges`, `ProtectSystem=strict`, `ReadWritePaths`) and
   `install.sh` provisioning script.
 
@@ -4517,10 +4534,10 @@ The first PingWAF release line. Version numbering continues from `pingap`
 ### ⚠️ Known Limitations
 
 - Prebuilt release binaries are **not published yet**, so `install.sh` /
-  `https://raw.githubusercontent.com/shuaiZend/PingWAF/main/install.sh` cannot download an artifact. Use Docker Compose or
+  `https://raw.githubusercontent.com/oyport/wafred/main/install.sh` cannot download an artifact. Use Docker Compose or
   `cargo build --release --bin pingwaf --features full`.
 - The `pingwaf` binary is configured through CLI flags and `PINGWAF_*`
-  environment variables only; `pingwaf.toml` (upstream pingap proxy
+  environment variables only; `wafred.toml` (upstream pingap proxy
   configuration) is not loaded by the control plane.
 - Proxy ports `80`/`443` start listening only after at least one site exists.
 

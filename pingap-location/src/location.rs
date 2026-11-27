@@ -280,10 +280,10 @@ pub enum HostIndexEntry {
 static DEFAULT_PROXY_SET_HEADERS: LazyLock<Vec<HttpHeader>> =
     LazyLock::new(|| {
         convert_headers(&[
-            "x-real-ip:$remote_addr".to_string(),
-            "x-forwarded-for:$proxy_add_x_forwarded_for".to_string(),
-            "x-forwarded-proto:$scheme".to_string(),
-            "x-forwarded-host:$host".to_string(),
+            "x-real-ip:$proxy_client_ip".to_string(),
+            "x-forwarded-for:$proxy_client_chain".to_string(),
+            "x-forwarded-proto:$proxy_client_scheme".to_string(),
+            "x-forwarded-host:$proxy_request_host".to_string(),
             "x-forwarded-port:$server_port".to_string(),
         ])
         .expect("Failed to convert default proxy set headers")
@@ -569,7 +569,7 @@ pub struct Location {
 
     /// Whether to automatically add standard reverse proxy headers like:
     /// X-Forwarded-For, X-Real-IP, X-Forwarded-Proto, etc.
-    // pub enable_reverse_proxy_headers: bool,
+    pub enable_reverse_proxy_headers: bool,
 
     /// Per-site downstream read/write timeout; `None` keeps the listener
     /// default. Stored as a Duration so the request path never parses strings.
@@ -659,7 +659,18 @@ impl Location {
         let ip_conditions = parse_ip_conditions(&conf.match_ip_ranges)?;
 
         let mut headers: Vec<(HeaderName, HeaderValue, bool)> = vec![];
-        if conf.enable_reverse_proxy_headers.unwrap_or_default() {
+        let enable_reverse_proxy_headers =
+            conf.enable_reverse_proxy_headers.unwrap_or_else(|| {
+                std::env::var("WAFRED_ENABLE_REVERSE_PROXY_HEADERS").is_ok_and(
+                    |v| {
+                        matches!(
+                            v.trim().to_ascii_lowercase().as_str(),
+                            "1" | "true" | "yes" | "on"
+                        )
+                    },
+                )
+            });
+        if enable_reverse_proxy_headers {
             for (name, value) in DEFAULT_PROXY_SET_HEADERS.iter() {
                 headers.push((name.clone(), value.clone(), false));
             }
@@ -769,9 +780,7 @@ impl Location {
                 .client_max_body_size
                 .unwrap_or_default()
                 .as_u64() as usize,
-            // enable_reverse_proxy_headers: conf
-            //     .enable_reverse_proxy_headers
-            //     .unwrap_or_default(),
+            enable_reverse_proxy_headers,
             downstream_timeout: conf.downstream_timeout_secs.map(|secs| {
                 Duration::from_secs(u64::from(secs.clamp(1, 3600)))
             }),
@@ -1014,7 +1023,7 @@ impl Location {
             )
         }) && self.cookie_conditions.iter().all(|(name, expected)| {
             condition_met(
-                pingap_core::get_cookie_value(req_header, name),
+                pingap_core::get_cookie_value(req_header, name).as_deref(),
                 expected,
             )
         })
@@ -1029,6 +1038,10 @@ impl Location {
 }
 
 impl LocationInstance for Location {
+    fn standard_proxy_headers(&self) -> bool {
+        self.enable_reverse_proxy_headers
+    }
+
     fn upstream_host(&self) -> Option<&HeaderValue> {
         self.upstream_host.as_ref()
     }

@@ -25,8 +25,9 @@ tls_enabled = true
 # Host the dashboard is reached under from the outside (optionally with port).
 # Pinned into the HTTP-to-HTTPS redirect instead of the client's Host header.
 # public_host = "waf.example.com"
-# gRPC control plane listen address (agents connect here)
-grpc_addr = "0.0.0.0:9090"
+# gRPC control plane listen address (agents connect here). Loopback by default;
+# set 0.0.0.0 for remote agents (keep gRPC TLS on).
+grpc_addr = "127.0.0.1:9090"
 # TLS for the gRPC control plane: "tls" (default) serves agents over TLS,
 # reusing the dashboard certificate — self-signed on first boot unless the
 # optional grpc_tls_cert/key below are configured. "off" serves plaintext
@@ -61,7 +62,11 @@ serve_frontend = true
 # server_ca_cert = "/etc/wafred/certs/grpc-ca.pem"
 # API key for agent authentication (generated on first registration)
 api_key = ""
-# Local rule cache directory (persisted across restarts)
+# Local rule cache directory (persisted across restarts). Relative paths are
+# resolved against the process working directory; the shipped systemd unit sets
+# WorkingDirectory=/var/lib/wafred, so this lands in
+# /var/lib/wafred/data/cache. Use an absolute path when running without the
+# unit (the installer writes /var/lib/wafred/cache).
 cache_dir = "./data/cache"
 # Heartbeat interval in seconds — fallback only: the control plane hands
 # agents its own interval at registration and that value takes precedence
@@ -78,6 +83,12 @@ max_body_log_size = 8192
 fail_open = true
 # Metrics shipping interval in seconds (0 disables metric shipping)
 metrics_ship_interval_secs = 30
+# Tunnel listener (`agent`, `all-in-one`). Empty — the default — disables it.
+# A tunnel connector inside a private network dials this address outbound, so
+# only an edge that should terminate tunnels sets it, and its firewall opens
+# the port to where the connectors run. The edge generates and rotates its own
+# certificate; connectors pin its SHA-256. See docs/user-guide.md -> Tunnels.
+# tunnel_addr = "0.0.0.0:9443"
 
 # ─── Proxy configuration (pingap mode) ───────────────────────────────────
 # The sections below are read by the same binary when it runs as pingap —

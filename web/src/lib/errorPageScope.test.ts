@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  CHALLENGE_STATUS_CODES,
   UNMATCHED_HOST_STATUS_CODES,
   asErrorPageScope,
   defaultStatusCodeForScope,
@@ -30,6 +31,10 @@ describe('asErrorPageScope', () => {
   it('accepts unmatched_host', () => {
     expect(asErrorPageScope('unmatched_host')).toBe('unmatched_host')
   })
+
+  it('accepts challenge', () => {
+    expect(asErrorPageScope('challenge')).toBe('challenge')
+  })
 })
 
 describe('filterErrorPagesByScope', () => {
@@ -38,6 +43,7 @@ describe('filterErrorPagesByScope', () => {
     row('b', 404, 'unmatched_host'),
     row('c', 503, 'unmatched_host'),
     row('d', 429), // legacy row without scope → site
+    row('e', 503, 'challenge'),
   ]
 
   it('keeps only site rows (including legacy rows without scope)', () => {
@@ -49,6 +55,10 @@ describe('filterErrorPagesByScope', () => {
       'b',
       'c',
     ])
+  })
+
+  it('keeps only challenge rows', () => {
+    expect(filterErrorPagesByScope(items, 'challenge').map((r) => r.id)).toEqual(['e'])
   })
 })
 
@@ -72,6 +82,13 @@ describe('unmatched_host status-code restriction', () => {
   it('offers a separate card grid per scope', () => {
     expect(statusCodesForScope('site')).toEqual([403, 429, 502, 503, 504])
     expect(statusCodesForScope('unmatched_host')).toEqual([404, 421, 503])
+    expect(statusCodesForScope('challenge')).toEqual(CHALLENGE_STATUS_CODES)
+  })
+
+  it('restricts challenge to 503', () => {
+    expect(statusCodeAllowedForScope('challenge', 503)).toBe(true)
+    expect(statusCodeAllowedForScope('challenge', 502)).toBe(false)
+    expect(defaultStatusCodeForScope('challenge', 403)).toBe(503)
   })
 
   it('falls back to 404 when switching scope makes the current code invalid', () => {

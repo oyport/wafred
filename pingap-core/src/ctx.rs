@@ -116,6 +116,7 @@ pub trait ModifyResponseBody: Sync + Send {
 /// Information about a single client connection.
 #[derive(Default)]
 pub struct ConnectionInfo {
+    pub forwarded: Option<crate::ForwardedIdentity>,
     /// A unique identifier for the connection.
     pub id: usize,
     /// The IP address of the client.
@@ -238,6 +239,9 @@ pub trait LocationInstance: Send + Sync {
     /// stripping an already stripped path. The default forwards the path as is
     /// and costs nothing.
     fn rewrite_upstream_path(&self, _header: &mut RequestHeader) {}
+    fn standard_proxy_headers(&self) -> bool {
+        false
+    }
     /// Returns the proxy header to upstream
     fn headers(&self) -> Option<&Vec<(HeaderName, HeaderValue, bool)>>;
     /// Host header to send upstream. `None` (the default) keeps the client's

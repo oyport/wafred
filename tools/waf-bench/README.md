@@ -8,7 +8,7 @@ WAFred 数据面，量化默认规则的真实拦截率与误报率。
 
 | 文件 | 用途 |
 | --- | --- |
-| `replay.py` | 样本回放器：raw socket 逐字节发送（保真畸形样本），逐样本判定与攻击类别归因，输出 JSONL |
+| `replay.py` | 样本回放器：raw socket 逐条发送；补齐缺失的 body framing、按单个合法 `Content-Length` 截断多余尾字节，保留歧义/非法 framing；逐样本判定并输出 JSONL |
 | `summarize.py` | 汇总 JSONL：总体指标（双口径）、类别交叉表、漏报/误报样本清单（markdown） |
 | `mock_origin.py` | echo 上游：所有方法/路径一律 200，保证非 200/503 响应只可能来自 WAF 或协议层 |
 | `suites.json` | 套件清单：选取规则、类目顺序、显式 pin 样本、工件（artefact）排除口径 |
@@ -18,6 +18,8 @@ WAFred 数据面，量化默认规则的真实拦截率与误报率。
 | `conf/*.toml` | 静态模式（`wafred -c`）矩阵配置，监听 `127.0.0.1:6188`，上游 `127.0.0.1:6199` |
 
 测试分层、选取规则与验收门槛见 `docs/waf-test-plan.md`（英文）/ `docs/zh/waf-test-plan.md`（中文）。
+
+回放器每个 TCP 连接只发送一条请求：body 非空但没有 `Content-Length` / `Transfer-Encoding` 时补 `Content-Length`；有一个合法长度时，长度后的尾字节不属于该请求 body，会被丢弃。多长度、非法长度和 `Transfer-Encoding` 保留原报文，因此 request-smuggling 或多请求流水线需要单独的协议测试。
 
 ## 套件与清单
 

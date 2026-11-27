@@ -22,6 +22,18 @@ use persist::{
     CacheHealth, LoadSource, CACHE_FORMAT_VERSION,
 };
 
+/// Caps a status detail shipped in the heartbeat, so one long error cannot
+/// bloat every frame and every control-plane log line.
+fn bounded_reason(reason: String) -> String {
+    const MAX_CHARS: usize = 300;
+    if reason.chars().count() <= MAX_CHARS {
+        reason
+    } else {
+        let cut: String = reason.chars().take(MAX_CHARS).collect();
+        format!("{cut}…")
+    }
+}
+
 /// Creates the rule-cache directory owner-only (`0700`) on Unix.
 ///
 /// The snapshot under it carries site TLS private keys, OIDC client secrets,
@@ -71,7 +83,7 @@ pub struct CachedRules {
     /// (`get_site_rules`) return a pointer instead of deep-cloning every
     /// rule the site carries. Updates build a new map but reuse the
     /// `Arc`s of untouched sites.
-    pub sites: HashMap<String, Arc<SiteRules>>,
+    pub sites: HashMap<Arc<str>, Arc<SiteRules>>,
     /// Domain → site_id index for fast lookup
     ///
     /// Keys and values are shared via `Arc<str>` so the copy-on-write
@@ -110,11 +122,30 @@ pub struct CachedRules {
     /// server never sent it (old control plane) — nothing is then skipped.
     #[serde(default)]
     pub log_settings: Option<Arc<LogSettings>>,
+    /// Tunnel connectors this edge may accept sessions from. Every bundle
+    /// carries the complete set (like the failover registry), so the last one
+    /// wins wholesale and a deleted tunnel disappears with one push.
+    #[serde(default)]
+    pub tunnels: Arc<Vec<TunnelConfig>>,
+    /// Deployment-wide tunnel limits; `None` on an old control plane, which
+    /// leaves the edge on its built-in defaults.
+    #[serde(default)]
+    pub tunnel_settings: Option<TunnelSettings>,
     /// When the cache was last updated from the server
     pub updated_at: DateTime<Utc>,
     /// Hash of the configuration (for delta sync). An `Arc` so the hot path
     /// reads it without a heap copy.
     pub config_hash: Arc<str>,
+}
+
+/// Reuse an already-normalized domain `Arc` as the index key; only allocate
+/// when normalization actually changes the string.
+fn domain_index_key(domain: &Arc<str>) -> Arc<str> {
+    if normalize_host(domain) == **domain {
+        Arc::clone(domain)
+    } else {
+        Arc::from(normalize_host(domain))
+    }
 }
 
 impl Default for CachedRules {
@@ -126,9 +157,41 @@ impl Default for CachedRules {
             global_fail_open: None,
             global_cache: None,
             origin_verify_cert: None,
+            tunnels: Arc::new(Vec::new()),
+            tunnel_settings: None,
             log_settings: None,
             updated_at: Utc::now(),
             config_hash: Arc::from(""),
+        }
+    }
+}
+
+/// Lifecycle state of a site as the data plane sees it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum SiteStatus {
+    #[default]
+    Active,
+    Paused,
+    Pending,
+}
+
+impl SiteStatus {
+    pub fn from_proto(value: i32) -> Self {
+        match value {
+            1 => Self::Paused,
+            2 => Self::Pending,
+            _ => Self::Active,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => site_status::ACTIVE,
+            Self::Paused => site_status::PAUSED,
+            Self::Pending => site_status::PENDING,
         }
     }
 }
@@ -145,8 +208,8 @@ pub struct SiteRules {
     pub host_bindings: Vec<HostPortBinding>,
     /// Lifecycle status (`active`/`paused`/`pending`); caches written before
     /// the edge consumed it default to `active`.
-    #[serde(default = "default_site_status")]
-    pub status: String,
+    #[serde(default)]
+    pub status: SiteStatus,
     /// Per-site downstream read/write timeout in seconds; 60 for old caches.
     #[serde(default = "default_downstream_timeout_secs")]
     pub downstream_timeout_secs: u32,
@@ -405,13 +468,13 @@ fn path_match_type(value: i32) -> String {
 impl SiteRules {
     /// All domains this site responds to.
     pub fn all_domains(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.domain.as_str())
-            .chain(self.alternate_domains.iter().map(|s| s.as_str()))
+        std::iter::once(&*self.domain)
+            .chain(self.alternate_domains.iter().map(|s| s.as_ref()))
     }
 
     /// Whether the control plane has paused the site.
     pub fn is_paused(&self) -> bool {
-        self.status == site_status::PAUSED
+        self.status == SiteStatus::Paused
     }
 }
 
@@ -543,8 +606,8 @@ fn default_downstream_timeout_secs() -> u32 {
     60
 }
 
-fn default_site_status() -> String {
-    site_status::ACTIVE.to_string()
+fn default_site_status() -> SiteStatus {
+    SiteStatus::Active
 }
 
 /// Maps a `wafred.SiteStatusEnum` value onto the persisted string form; the
@@ -907,6 +970,17 @@ impl CacheTypePolicy {
 
 // ─── Challenge ──────────────────────────────────────────────
 
+/// Difficulty a site runs with when the control plane states none: the value
+/// every deployment used before difficulty became configurable.
+pub const DEFAULT_CHALLENGE_BASE_DIFFICULTY: u32 = 20;
+/// Ceiling adaptive difficulty may reach when none is configured.
+pub const DEFAULT_CHALLENGE_MAX_DIFFICULTY: u32 = 24;
+/// Challenge pages issued per host+IP per minute when none is configured.
+pub const DEFAULT_CHALLENGE_ISSUE_LIMIT_PER_MINUTE: u32 = 120;
+/// Solution submissions accepted per host+IP per minute when none is
+/// configured.
+pub const DEFAULT_CHALLENGE_VERIFY_LIMIT_PER_MINUTE: u32 = 300;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChallengeConfig {
     pub enabled: bool,
@@ -917,6 +991,30 @@ pub struct ChallengeConfig {
     pub request_threshold: u32,
     pub browser_integrity_check: bool,
     pub tls_fingerprint_check: bool,
+    /// Proof-of-work difficulty a normal visitor solves (leading zero bits).
+    /// Zero in the stored JSON means "unset" — an older snapshot written
+    /// before the field existed — and is read as
+    /// [`DEFAULT_CHALLENGE_BASE_DIFFICULTY`].
+    #[serde(default)]
+    pub base_difficulty: u32,
+    /// Ceiling adaptive difficulty may raise the work to.
+    #[serde(default)]
+    pub max_difficulty: u32,
+    /// Challenge pages issued per host+IP per 60-second window.
+    #[serde(default)]
+    pub issue_limit_per_minute: u32,
+    /// Solution submissions accepted per host+IP per 60-second window.
+    #[serde(default)]
+    pub verify_limit_per_minute: u32,
+}
+
+/// A proto3 scalar of `0` means "unset"; fall back to the documented default.
+fn or_default(value: u32, default: u32) -> u32 {
+    if value == 0 {
+        default
+    } else {
+        value
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1247,6 +1345,10 @@ pub struct UpstreamConfig {
     /// does not send it.
     #[serde(default = "default_address_family")]
     pub address_family: String,
+    /// Tunnel connector that reaches this pool's origins. Empty keeps them
+    /// direct (the edge dials the address itself).
+    #[serde(default)]
+    pub tunnel_id: String,
     #[serde(default)]
     pub is_default: bool,
 }
@@ -1262,6 +1364,37 @@ pub struct UpstreamPeer {
     pub address: String,
     pub weight: u32,
     pub tls: bool,
+}
+
+/// One tunnel as the control plane distributes it to the edges.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelConfig {
+    pub tunnel_id: String,
+    pub name: String,
+    /// Lower-case hex Ed25519 public key the connector's session token must
+    /// verify against; empty = unpaired.
+    #[serde(default)]
+    pub session_public_key: String,
+    #[serde(default)]
+    pub enabled: bool,
+    /// Internal `host:port` origins the connector serves.
+    #[serde(default)]
+    pub targets: Vec<String>,
+}
+
+/// Deployment-wide tunnel limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelSettings {
+    pub max_streams: u32,
+    pub idle_timeout_secs: u32,
+    pub heartbeat_secs: u32,
+    /// Lifetime of a connector session token (bounded by the edge anyway).
+    #[serde(default = "default_session_token_ttl")]
+    pub session_token_ttl_secs: u32,
+}
+
+fn default_session_token_ttl() -> u32 {
+    3600
 }
 
 /// A path-based route directing matching requests to an origin pool.
@@ -1411,12 +1544,13 @@ fn now_unix_ms() -> u64 {
 // RuleCache — the main public interface
 // ─────────────────────────────────────────────────────────────
 
-/// Minimum spacing between two rule-snapshot writes caused by control-plane
-/// updates. A full sync pushes one bundle per site; rewriting (and fsyncing)
-/// the whole snapshot per bundle is O(S²) bytes for S sites. The first update
-/// after the interval still writes synchronously, so a single change is
-/// durable immediately; a burst marks the cache dirty and the background
-/// flush loop writes it once.
+/// Minimum spacing between two synchronous rule-snapshot writes caused by
+/// control-plane updates. A full sync pushes one bundle per site; rewriting
+/// (and fsyncing) the whole snapshot per bundle is O(S²) bytes for S sites.
+/// The first update after this window still writes synchronously, so a single
+/// change is durable immediately; a burst marks the cache dirty and the
+/// background flush loop (ticking every 5s, see `BLOCK_FLUSH_INTERVAL_SECS`
+/// in the gRPC client) writes the pending state once.
 const RULE_FLUSH_DEBOUNCE_MS: u64 = 1000;
 
 /// Upper bound on dynamically blocked addresses and ranges (single IPs and
@@ -1478,6 +1612,10 @@ pub struct RuleCache {
     /// Outcome of the latest disk load / persist cycle, reported by the
     /// heartbeat so a silently degraded cache is visible to the operator.
     health: CacheHealth,
+    /// Why the data plane's last reload of this cache did not apply in full;
+    /// `None` when it did. Written by the hot-reload watcher, read by the
+    /// heartbeat: `config_hash` alone only says what was received.
+    config_apply_error: Mutex<Option<String>>,
 }
 
 impl RuleCache {
@@ -1497,6 +1635,7 @@ impl RuleCache {
             last_policy_sync_at: AtomicI64::new(0),
             persist_lock: Mutex::new(()),
             health: CacheHealth::new(),
+            config_apply_error: Mutex::new(None),
             blocked_dirty: AtomicBool::new(false),
             rules_dirty: AtomicBool::new(false),
             last_rules_persist_ms: AtomicU64::new(0),
@@ -1645,10 +1784,10 @@ impl RuleCache {
                 quota_mb = quota_mb
                     .max(quota::configured_quota_mb(domain).unwrap_or(0));
             }
-            let status = ssl.get(site_id);
+            let status = ssl.get(site_id.as_ref());
             out.push(proto::SiteStatus {
-                site_id: site_id.clone(),
-                domain: site.domain.clone(),
+                site_id: site_id.to_string(),
+                domain: site.domain.to_string(),
                 requests_total: 0,
                 requests_blocked: 0,
                 cache_hits: 0,
@@ -1740,7 +1879,7 @@ impl RuleCache {
             .inner
             .load()
             .sites
-            .get(&site_id)
+            .get(site_id.as_str())
             .map(|site| site.downstream_timeout_secs);
         let previous_host_bindings = self
             .inner
@@ -1768,7 +1907,7 @@ impl RuleCache {
             .inner
             .load()
             .sites
-            .get(&site_id)
+            .get(site_id.as_str())
             .map(|s| site_enforcement(Some(s)));
 
         // Built once here and shared into the snapshot by pointer: the rcu
@@ -1788,7 +1927,7 @@ impl RuleCache {
             // Remove old domain index entries for this site. Removal keys
             // are normalised the same way as insertion keys below, so an
             // entry written as `EXAMPLE.com` is still findable for cleanup.
-            if let Some(old_site) = updated.sites.get(&site_id) {
+            if let Some(old_site) = updated.sites.get(site_id.as_str()) {
                 // A domain can be shared by several sites; only drop the
                 // index entry when it still points at *this* site, otherwise
                 // updating one site silently unhooks the other.
@@ -1821,7 +1960,7 @@ impl RuleCache {
             }
             updated
                 .sites
-                .insert(site_id.clone(), Arc::clone(&site_rules));
+                .insert(Arc::clone(&site_id_key), Arc::clone(&site_rules));
             // Every bundle carries the complete failover registry, so one
             // push refreshes it wholesale — including wholesale deletions
             // (an empty registry must replace a stale non-empty one).
@@ -1846,6 +1985,24 @@ impl RuleCache {
                 updated.log_settings =
                     Some(Arc::new(Self::convert_log_settings(ls)));
             }
+            // The tunnel policy is complete in every bundle, exactly like the
+            // failover registry: an empty list is authoritative and removes a
+            // tunnel that was deleted.
+            updated.tunnels = Arc::new(
+                bundle
+                    .tunnels
+                    .iter()
+                    .map(Self::convert_tunnel_config)
+                    .collect(),
+            );
+            if let Some(settings) = &bundle.tunnel_settings {
+                updated.tunnel_settings = Some(TunnelSettings {
+                    max_streams: settings.max_streams,
+                    idle_timeout_secs: settings.idle_timeout_secs,
+                    heartbeat_secs: settings.heartbeat_secs,
+                    session_token_ttl_secs: settings.session_token_ttl_secs,
+                });
+            }
             updated.config_hash = bundle.config_hash.as_str().into();
             updated.updated_at = Utc::now();
             Arc::new(updated)
@@ -1864,7 +2021,7 @@ impl RuleCache {
             .inner
             .load()
             .sites
-            .get(&site_id)
+            .get(site_id.as_str())
             .map(|s| site_enforcement(Some(s)));
         if previous.is_some_and(waf_enforcing)
             && !current.is_some_and(waf_enforcing)
@@ -1884,6 +2041,13 @@ impl RuleCache {
     }
 
     /// Update cache from a full SiteConfig (used on initial registration).
+    ///
+    /// The expensive part — converting every proto bundle into the local
+    /// `SiteRules` mirror and building the domain index — happens **before**
+    /// the RCU closure. `rcu` may retry under reader contention; doing the
+    /// conversion inside it repeated every allocation and held two full
+    /// generations of converted rules at once. The closure now only clones
+    /// the prepared maps and swaps them in.
     pub fn update_from_site_config(
         &self,
         config: &proto::SiteConfig,
@@ -1896,7 +2060,7 @@ impl RuleCache {
             .load()
             .sites
             .iter()
-            .map(|(id, s)| (id.clone(), site_enforcement(Some(s))))
+            .map(|(id, s)| (id.to_string(), site_enforcement(Some(s))))
             .collect();
 
         // The bundles embed the same registry in every site; one pass over
@@ -1910,8 +2074,24 @@ impl RuleCache {
         let mut global_cache = None;
         let mut origin_verify_cert = None;
         let mut log_settings = None;
+        // The tunnel policy rides in every bundle exactly like the failover
+        // registry, but it used to be merged only by `update_from_bundle`.
+        // The registration path (`GetSiteConfig` → this function) therefore
+        // left a brand-new agent with no tunnels at all, and the connector it
+        // fronts was refused with `Unauthenticated` until some unrelated
+        // per-site push happened to arrive.
+        let mut tunnels: Option<Arc<Vec<TunnelConfig>>> = None;
+        let mut tunnel_settings = None;
+        let mut prepared_sites: HashMap<Arc<str>, Arc<SiteRules>> =
+            HashMap::with_capacity(config.sites.len());
+        let mut prepared_domain_index: HashMap<Arc<str>, Arc<str>> =
+            HashMap::with_capacity(config.sites.len() * 2);
+
         for site in &config.sites {
-            if let Some(ref bundle) = site.rules {
+            let Some(ref bundle) = site.rules else {
+                continue;
+            };
+            if failover_registry.is_none() {
                 failover_registry = Some(Arc::new(failover_registry_from(
                     &bundle.site_policies,
                 )));
@@ -1925,8 +2105,60 @@ impl RuleCache {
                     .log_settings
                     .as_ref()
                     .map(|ls| Arc::new(Self::convert_log_settings(ls)));
-                break;
+                tunnels = Some(Arc::new(
+                    bundle
+                        .tunnels
+                        .iter()
+                        .map(Self::convert_tunnel_config)
+                        .collect(),
+                ));
+                tunnel_settings =
+                    bundle.tunnel_settings.as_ref().map(|s| TunnelSettings {
+                        max_streams: s.max_streams,
+                        idle_timeout_secs: s.idle_timeout_secs,
+                        heartbeat_secs: s.heartbeat_secs,
+                        session_token_ttl_secs: s.session_token_ttl_secs,
+                    });
             }
+
+            let mut site_rules = Self::convert_bundle(bundle);
+            // Override domain from site-level field
+            if !site.domain.is_empty() {
+                site_rules.domain = Arc::from(site.domain.as_str());
+            }
+            site_rules.site_id = Arc::from(site.id.as_str());
+            site_rules.alternate_domains = site
+                .alternate_domains
+                .iter()
+                .map(|domain| Arc::from(domain.as_str()))
+                .collect();
+            site_rules.status = SiteStatus::from_proto(site.status);
+            site_rules.downstream_timeout_secs =
+                if site.downstream_timeout_secs == 0 {
+                    default_downstream_timeout_secs()
+                } else {
+                    site.downstream_timeout_secs
+                };
+            site_rules.proxy_trust = ProxyTrustConfig {
+                enabled: site.trust_proxy_headers,
+                header: site.trusted_header.clone(),
+                last_hop_only: site.trust_last_hop,
+                trusted_ranges: site.trusted_proxy_ranges.clone(),
+            };
+
+            // The domain index shares the site id Arc across all of the
+            // site's domains instead of duplicating it per entry.
+            let site_id_key: Arc<str> = Arc::clone(&site_rules.site_id);
+            prepared_domain_index.insert(
+                domain_index_key(&site_rules.domain),
+                Arc::clone(&site_id_key),
+            );
+            for alt in &site_rules.alternate_domains {
+                prepared_domain_index
+                    .insert(domain_index_key(alt), Arc::clone(&site_id_key));
+            }
+            prepared_sites
+                .insert(Arc::clone(&site_rules.site_id), Arc::new(site_rules));
         }
 
         self.inner.rcu(|current| {
@@ -2024,31 +2256,11 @@ impl RuleCache {
                 }
             }
 
-            // A full site config is authoritative: sites the control plane
-            // no longer lists are dropped here together with their domain
-            // index entries, so a deleted site stops being served from
-            // stale cached rules (they would otherwise survive every sync
-            // and even a restart via the disk cache).
-            let known: std::collections::HashSet<&String> =
-                config.sites.iter().map(|s| &s.id).collect();
-            let ghost_ids: Vec<String> = updated
-                .sites
-                .keys()
-                .filter(|id| !known.contains(*id))
-                .cloned()
-                .collect();
-            for id in &ghost_ids {
-                if let Some(old) = updated.sites.remove(id) {
-                    updated
-                        .domain_index
-                        .remove(normalize_host(&old.domain).as_str());
-                    for alt in &old.alternate_domains {
-                        updated
-                            .domain_index
-                            .remove(normalize_host(alt).as_str());
-                    }
-                }
-            }
+            // A full site config is authoritative: replace both maps with
+            // the prepared generation. Sites the control plane no longer
+            // lists (and their domain index entries) disappear here.
+            updated.sites = prepared_sites.clone();
+            updated.domain_index = prepared_domain_index.clone();
 
             Arc::new(updated)
         });
@@ -2064,7 +2276,7 @@ impl RuleCache {
         // entries would otherwise linger until expiry and reload from disk.
         let current = self.inner.load();
         for id in previous.keys() {
-            if !current.sites.contains_key(id) {
+            if !current.sites.contains_key(id.as_str()) {
                 self.clear_site_blocks(id);
             }
         }
@@ -2077,7 +2289,7 @@ impl RuleCache {
                 .inner
                 .load()
                 .sites
-                .get(&site.id)
+                .get(site.id.as_str())
                 .map(|s| site_enforcement(Some(s)));
             if previous.get(&site.id).copied().is_some_and(waf_enforcing)
                 && !current.is_some_and(waf_enforcing)
@@ -2216,31 +2428,66 @@ impl RuleCache {
         ip: &str,
         extract: impl Fn(&BlockedIpEntry) -> T,
     ) -> Option<T> {
-        // Fast path: an exact single-address (or exact CIDR-string) entry.
-        let key = format!("{}:{}", site_id, ip);
-        if let Some(entry) = self.blocked_ips.get(&key) {
+        use std::cell::RefCell;
+        use std::fmt::Write as _;
+        thread_local! {
+            /// Per-thread key buffer reused across block lookups, eliminating
+            /// the per-request `format!` heap allocation on the hot path.
+            static BLOCK_LOOKUP_KEY: RefCell<String> =
+                RefCell::new(String::with_capacity(96));
+        }
+        // `try_borrow_mut` keeps this re-entrant-safe: if an `extract` closure
+        // (or any nested lookup) already holds the buffer, fall back to an
+        // owned buffer instead of panicking on the `RefCell` borrow.
+        BLOCK_LOOKUP_KEY.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut key) => {
+                key.clear();
+                let _ = write!(key, "{}:{}", site_id, ip);
+                self.blocked_lookup_with_key(site_id, ip, key, extract)
+            },
+            Err(_) => {
+                let owned = RefCell::new(String::with_capacity(96));
+                let mut key = owned.borrow_mut();
+                let _ = write!(key, "{}:{}", site_id, ip);
+                self.blocked_lookup_with_key(site_id, ip, key, extract)
+            },
+        })
+    }
+
+    fn blocked_lookup_with_key<T>(
+        &self,
+        site_id: &str,
+        ip: &str,
+        mut key: std::cell::RefMut<'_, String>,
+        extract: impl Fn(&BlockedIpEntry) -> T,
+    ) -> Option<T> {
+        use std::fmt::Write as _;
+        // Fast path: an exact single-address (or exact CIDR-string) entry. The
+        // key was written by the caller into the shared buffer.
+        if let Some(entry) = self.blocked_ips.get(key.as_str()) {
             if entry.is_expired() {
                 drop(entry);
-                self.blocked_ips.remove(&key);
-                self.index_remove_key(&key);
+                self.blocked_ips.remove(key.as_str());
+                self.index_remove_key(key.as_str());
             } else {
                 return Some(extract(&entry));
             }
         }
 
         // The control plane stores mapped-v6 client addresses collapsed to
-        // their IPv4 form; probe that spelling too, so `::ffff:203.0.113.5`
-        // hits the entry stored as `203.0.113.5`.
+        // their IPv4 form; probe that spelling too, reusing the same buffer,
+        // so `::ffff:203.0.113.5` hits the entry stored as `203.0.113.5`.
         let parsed = ip.parse::<std::net::IpAddr>().ok();
         if let Some(addr) = parsed.map(normalize_mapped) {
             let normalized = addr.to_string();
             if normalized != ip {
-                let key = format!("{}:{}", site_id, normalized);
-                if let Some(entry) = self.blocked_ips.get(&key) {
+                key.clear();
+                let _ = write!(key, "{}:{}", site_id, normalized);
+                if let Some(entry) = self.blocked_ips.get(key.as_str()) {
                     if entry.is_expired() {
                         drop(entry);
-                        self.blocked_ips.remove(&key);
-                        self.index_remove_key(&key);
+                        self.blocked_ips.remove(key.as_str());
+                        self.index_remove_key(key.as_str());
                     } else {
                         return Some(extract(&entry));
                     }
@@ -2248,12 +2495,16 @@ impl RuleCache {
             }
         }
 
-        // Slow path: any CIDR entry of this site covering the address.
+        // Slow path: any CIDR entry of this site covering the address. Uses
+        // each entry's stored `key` String, so the shared buffer is untouched
+        // here and cannot be clobbered mid-iteration. The current time is read
+        // once for the whole scan instead of once per entry.
         let addr = normalize_mapped(parsed?);
         let index = self.cidr_index.get(site_id)?;
+        let now = Utc::now();
         for entry in index.iter() {
             if let Some(exp) = entry.expires_at {
-                if Utc::now() >= exp {
+                if now >= exp {
                     continue;
                 }
             }
@@ -2524,6 +2775,61 @@ impl RuleCache {
             .collect()
     }
 
+    /// Page of at most `limit` unexpired blocks in deterministic
+    /// `(site_id, ip)` order, plus whether any live block was dropped.
+    ///
+    /// Unlike [`Self::blocked_ips_snapshot`] (clone-everything then let the
+    /// caller sort + truncate), this uses a bounded max-heap of size `limit`
+    /// so only entries that can make the cut are ever cloned. The whole map is
+    /// never cloned: cost is `O(B log limit)` comparisons with `O(limit)`
+    /// retained keys instead of `O(B log B)` and `O(B)` clones.
+    pub fn blocked_ips_page(
+        &self,
+        limit: usize,
+    ) -> (Vec<BlockedIpEntry>, bool) {
+        use std::collections::BinaryHeap;
+        // Max-heap on (site_id, ip): retain the `limit` lexicographically
+        // smallest live entries.
+        let mut heap: BinaryHeap<(String, String)> = BinaryHeap::new();
+        let mut alive = 0usize;
+        for e in self.blocked_ips.iter() {
+            let v = e.value();
+            if v.is_expired() {
+                continue;
+            }
+            alive += 1;
+            if heap.len() == limit {
+                if let Some(max) = heap.peek() {
+                    // Compare without cloning; skip entries that cannot
+                    // displace the current maximum.
+                    if (v.site_id.as_str(), v.ip.as_str())
+                        >= (max.0.as_str(), max.1.as_str())
+                    {
+                        continue;
+                    }
+                }
+            }
+            heap.push((v.site_id.clone(), v.ip.clone()));
+            if heap.len() > limit {
+                heap.pop();
+            }
+        }
+        let mut keys: Vec<(String, String)> = heap.into_vec();
+        keys.sort();
+        // Invariant: the map key is always `format!("{}:{}", site_id, ip)`
+        // (every writer — `block_ip`, `load_blocked_ips` — builds it the same
+        // way), so the rebuilt key resolves. An entry that vanished between
+        // selection and read is skipped (concurrent unblock/expiry).
+        let entries = keys
+            .iter()
+            .filter_map(|(site, ip)| {
+                let key = format!("{}:{}", site, ip);
+                self.blocked_ips.get(&key).map(|e| e.value().clone())
+            })
+            .collect::<Vec<_>>();
+        (entries, alive > limit)
+    }
+
     // ─── Disk Persistence ───────────────────────────────────
 
     /// Outcome of the latest cache load, for the heartbeat report.
@@ -2539,14 +2845,28 @@ impl RuleCache {
     /// Degraded-state detail for the heartbeat; empty when all is well.
     /// Truncated to keep heartbeat frames and control-plane logs bounded.
     pub fn cache_status_reason(&self) -> String {
-        const MAX_CHARS: usize = 300;
-        let reason = self.health.status().reason.unwrap_or_default();
-        if reason.chars().count() <= MAX_CHARS {
-            reason
-        } else {
-            let cut: String = reason.chars().take(MAX_CHARS).collect();
-            format!("{cut}…")
-        }
+        bounded_reason(self.health.status().reason.unwrap_or_default())
+    }
+
+    /// Records the outcome of the data plane's latest reload: the failure
+    /// detail, or `None` once a reload applied in full.
+    pub fn set_config_apply_error(&self, error: Option<String>) {
+        *self
+            .config_apply_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = error;
+    }
+
+    /// Why the data plane is not running this cache's configuration; empty
+    /// when the last reload applied in full. Bounded like
+    /// [`Self::cache_status_reason`].
+    pub fn config_apply_error(&self) -> String {
+        let error = self
+            .config_apply_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        bounded_reason(error.unwrap_or_default())
     }
 
     /// Persist current rules to disk, feeding the outcome back into the
@@ -2573,14 +2893,21 @@ impl RuleCache {
         outcome
     }
 
-    /// Persist after a control-plane update, debounced to at most one write
-    /// per [`RULE_FLUSH_DEBOUNCE_MS`].
+    /// Persist after a control-plane update, debounced: synchronous writes
+    /// are spaced at least [`RULE_FLUSH_DEBOUNCE_MS`] apart, and an update
+    /// inside that window only marks the cache dirty. The dirty state is
+    /// flushed by the background loop, which ticks every 5s — so the
+    /// worst-case durability delay for a debounced update is ~5s, not the
+    /// 1s debounce window.
     ///
-    /// A full sync sends one bundle per site. Persisting each one rewrites and
-    /// fsyncs the entire snapshot (O(S²) bytes for S sites), so a burst only
-    /// marks the cache dirty; the first update after the interval writes
+    /// A full sync sends one bundle per site. Persisting each one rewrites
+    /// and fsyncs the entire snapshot (O(S²) bytes for S sites), so a burst
+    /// only marks the cache dirty; the first update after the window writes
     /// synchronously, and the background flush loop (plus shutdown) covers
-    /// the rest.
+    /// the rest. The 5s loop period is a deliberate write-amplification
+    /// trade-off: it caps persist frequency well below the bundle rate while
+    /// keeping crash-loss of a debounced update bounded to a few seconds of
+    /// state that the control plane re-pushes on reconnect anyway.
     fn persist_after_update(&self) -> anyhow::Result<()> {
         let now = now_unix_ms();
         let last = self.last_rules_persist_ms.load(Ordering::Relaxed);
@@ -2657,8 +2984,24 @@ impl RuleCache {
         let meta_json = serde_json::to_string(&metadata)?;
         write_atomic(&metadata_path, meta_json.as_bytes())?;
 
-        // Caller holds the lock; the inner variant must not re-lock.
-        self.persist_blocked_ips_inner()?;
+        // Rewrite blocked_ips.json when the map changed since the last
+        // successful write (dirty), OR when the snapshot file is missing so a
+        // deleted/lost file is still rebuilt on rule persist (preserving the
+        // old unconditional behavior). Only unchanged persists with an intact
+        // snapshot skip the full-table clone + pretty-JSON serialization. The
+        // 5s `flush_blocked_ips` loop and the shutdown path gate on the same
+        // flag. Caller holds the lock; the inner variant must not re-lock.
+        let blocked_path = self.cache_dir.join("blocked_ips.json");
+        if self.blocked_dirty.swap(false, Ordering::AcqRel)
+            || !blocked_path.exists()
+        {
+            if let Err(e) = self.persist_blocked_ips_inner() {
+                // Restore the flag so the next flush retries the pending
+                // write instead of silently dropping it.
+                self.blocked_dirty.store(true, Ordering::Release);
+                return Err(e);
+            }
+        }
 
         debug!("Persisted rule cache to disk");
         Ok(())
@@ -2802,8 +3145,16 @@ impl RuleCache {
             },
             Err(primary_err) => {
                 let backup = sites_path.with_extension("json.bak");
+                let backup_metadata = metadata_path.with_extension("json.bak");
                 if backup.exists() {
-                    match self.read_snapshot_unstamped(&backup) {
+                    // The backup is validated with the exact same check as
+                    // the primary: its `metadata.json.bak` stamp carries the
+                    // CRC32/length of the snapshot that was rolled, so a
+                    // half-written or bit-rotted backup is discarded instead
+                    // of loaded. A pre-stamp cache has no stamped backup
+                    // metadata, which downgrades to parse validation (the
+                    // legacy behaviour inside `read_snapshot`).
+                    match self.read_snapshot(&backup, &backup_metadata) {
                         Ok(cached) => {
                             self.inner.store(Arc::new(cached));
                             let reason = format!(
@@ -2854,10 +3205,13 @@ impl RuleCache {
         }
     }
 
-    /// Reads and validates a primary snapshot: JSON parse, format version,
-    /// and — when the metadata stamps them — the CRC32 + length of the
-    /// payload. A missing or unreadable metadata file downgrades to parse
-    /// validation only and says so, so pre-integrity snapshots still load.
+    /// Reads and validates a snapshot: JSON parse, format version, and —
+    /// when the paired metadata stamps them — the CRC32 + length of the
+    /// payload. Shared by the primary (`sites.json` + `metadata.json`) and
+    /// the backup (`sites.json.bak` + `metadata.json.bak`) fallback, so a
+    /// backup can never load with less scrutiny than the file it replaces.
+    /// A missing or unreadable metadata file downgrades to parse validation
+    /// only and says so, so pre-integrity snapshots still load.
     fn read_snapshot(
         &self,
         sites_path: &Path,
@@ -2869,12 +3223,18 @@ impl RuleCache {
                 Ok(metadata) => {
                     check_format_version(metadata.version)
                         .map_err(anyhow::Error::msg)?;
-                    if let (Some(crc), Some(len)) =
+                    if let (Some(expected_crc), Some(expected_len)) =
                         (metadata.sites_crc32, metadata.sites_len)
                     {
-                        if !content_matches(&bytes, crc, len) {
+                        if !content_matches(&bytes, expected_crc, expected_len)
+                        {
+                            let actual_crc = content_crc32(&bytes);
                             anyhow::bail!(
-                                "sites.json failed its integrity check (crc32/length mismatch against metadata.json)"
+                                "{} failed its integrity check (crc32/length mismatch against {}: expected crc32 {expected_crc:#010x}/{} bytes, got crc32 {actual_crc:#010x}/{} bytes)",
+                                sites_path.display(),
+                                metadata_path.display(),
+                                expected_len,
+                                bytes.len()
                             );
                         }
                     }
@@ -2889,17 +3249,6 @@ impl RuleCache {
         }
         serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing {:?}", sites_path))
-    }
-
-    /// Backup validation: the JSON must parse. A slightly stale backup is
-    /// still better than empty rules, so no integrity stamp is required.
-    fn read_snapshot_unstamped(
-        &self,
-        path: &Path,
-    ) -> anyhow::Result<CachedRules> {
-        let bytes = std::fs::read(path)?;
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("parsing {:?}", path))
     }
 
     /// Loads blocked IPs, dropping entries that expired while persisted.
@@ -2969,8 +3318,8 @@ impl RuleCache {
     /// Convert a proto RuleBundle into local SiteRules.
     fn convert_bundle(bundle: &proto::RuleBundle) -> SiteRules {
         SiteRules {
-            site_id: bundle.site_id.clone(),
-            domain: String::new(), // Will be set from Site if available
+            site_id: Arc::from(bundle.site_id.as_str()),
+            domain: Arc::from(""), // Will be set from Site if available
             alternate_domains: Vec::new(),
             host_bindings: Vec::new(),
             // Set from the owning `Site` in `update_from_site_config`.
@@ -3287,6 +3636,31 @@ impl RuleCache {
             request_threshold: c.request_threshold,
             browser_integrity_check: c.browser_integrity_check,
             tls_fingerprint_check: c.tls_fingerprint_check,
+            // Proto3 scalars default to 0, which is also how an older control
+            // plane that predates these fields encodes them. Treat 0 as
+            // "unset" so such a control plane keeps the historical behaviour
+            // (difficulty 20, no adaptive headroom below the default) instead
+            // of shipping a site that issues difficulty-0 challenges.
+            base_difficulty: or_default(
+                c.base_difficulty,
+                DEFAULT_CHALLENGE_BASE_DIFFICULTY,
+            ),
+            max_difficulty: or_default(
+                c.max_difficulty,
+                DEFAULT_CHALLENGE_MAX_DIFFICULTY,
+            )
+            .max(or_default(
+                c.base_difficulty,
+                DEFAULT_CHALLENGE_BASE_DIFFICULTY,
+            )),
+            issue_limit_per_minute: or_default(
+                c.issue_limit_per_minute,
+                DEFAULT_CHALLENGE_ISSUE_LIMIT_PER_MINUTE,
+            ),
+            verify_limit_per_minute: or_default(
+                c.verify_limit_per_minute,
+                DEFAULT_CHALLENGE_VERIFY_LIMIT_PER_MINUTE,
+            ),
         }
     }
 
@@ -3514,7 +3888,24 @@ impl RuleCache {
             } else {
                 u.address_family.clone()
             },
+            tunnel_id: u.tunnel_id.clone(),
             is_default: u.is_default,
+        }
+    }
+
+    fn convert_tunnel_config(t: &proto::TunnelConfig) -> TunnelConfig {
+        TunnelConfig {
+            tunnel_id: t.tunnel_id.clone(),
+            name: t.name.clone(),
+            session_public_key: t.session_public_key.clone(),
+            enabled: t.enabled,
+            targets: t
+                .targets
+                .iter()
+                .filter_map(|target| {
+                    wafred_tunnel::protocol::normalize_target(target)
+                })
+                .collect(),
         }
     }
 
@@ -3704,6 +4095,8 @@ mod tests {
     #[test]
     fn cached_rules_clone_shares_the_heavy_fields() {
         let rules = CachedRules {
+            tunnels: Arc::new(Vec::new()),
+            tunnel_settings: None,
             sites: HashMap::new(),
             domain_index: HashMap::from([
                 (Arc::from("example.com"), Arc::from("site-1")),
@@ -3759,6 +4152,26 @@ mod tests {
         assert_eq!(registry.get("example.com"), Some(&FailoverMode::Closed));
         assert_eq!(registry.get("m.example.com"), Some(&FailoverMode::Closed));
         assert_eq!(registry.get("other.example.com"), None);
+    }
+
+    /// The watcher records why a reload failed and clears it when one goes
+    /// through; the heartbeat ships the detail bounded.
+    #[test]
+    fn config_apply_error_is_recorded_bounded_and_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            RuleCache::new(dir.path().to_path_buf(), "test".to_string())
+                .unwrap();
+        assert_eq!(cache.config_apply_error(), "");
+
+        cache.set_config_apply_error(Some("upstreams: no such host".into()));
+        assert_eq!(cache.config_apply_error(), "upstreams: no such host");
+
+        cache.set_config_apply_error(Some("x".repeat(1000)));
+        assert_eq!(cache.config_apply_error().chars().count(), 301);
+
+        cache.set_config_apply_error(None);
+        assert_eq!(cache.config_apply_error(), "");
     }
 
     #[test]
@@ -3836,6 +4249,142 @@ mod tests {
             RuleCache::new(dir.path().to_path_buf(), "test".to_string())
                 .unwrap();
         assert_eq!(reloaded.blocked_reason("site-1", "203.0.113.7"), None);
+    }
+
+    #[test]
+    fn rule_persist_skips_blocked_write_when_not_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            RuleCache::new(dir.path().to_path_buf(), "test".to_string())
+                .unwrap();
+        let blocked_path = dir.path().join("blocked_ips.json");
+
+        // Block then flush: the map is clean (dirty=false) and the file exists.
+        cache.block_ip("site-1", "203.0.113.7", None, "waf: sqli");
+        cache.flush_blocked_ips();
+        let before =
+            std::fs::read(&blocked_path).expect("flush wrote the file");
+
+        // A rule persist with no blocked change must NOT rewrite the file.
+        cache.persist_to_disk().unwrap();
+        let after = std::fs::read(&blocked_path).unwrap();
+        assert_eq!(
+            before, after,
+            "an unchanged blocked map must not be rewritten on rule persist"
+        );
+
+        // A new block marks dirty; the next rule persist rewrites the file.
+        cache.block_ip("site-1", "203.0.113.9", None, "waf: xss");
+        cache.persist_to_disk().unwrap();
+        let entries: Vec<BlockedIpEntry> =
+            serde_json::from_slice(&std::fs::read(&blocked_path).unwrap())
+                .unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "a dirty blocked map must be persisted on rule persist"
+        );
+    }
+
+    #[test]
+    fn rule_persist_rebuilds_missing_blocked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            RuleCache::new(dir.path().to_path_buf(), "test".to_string())
+                .unwrap();
+        let blocked_path = dir.path().join("blocked_ips.json");
+
+        cache.block_ip("site-1", "203.0.113.7", None, "waf: sqli");
+        cache.flush_blocked_ips();
+        assert!(blocked_path.exists());
+
+        // Delete the snapshot out from under the cache: the map is clean
+        // (dirty=false) but the next rule persist must rebuild the file.
+        std::fs::remove_file(&blocked_path).unwrap();
+        cache.persist_to_disk().unwrap();
+        assert!(
+            blocked_path.exists(),
+            "a missing snapshot must be rebuilt even when not dirty"
+        );
+        let entries: Vec<BlockedIpEntry> =
+            serde_json::from_slice(&std::fs::read(&blocked_path).unwrap())
+                .unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn blocked_page_matches_sorted_snapshot_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            RuleCache::new(dir.path().to_path_buf(), "test".to_string())
+                .unwrap();
+        for i in 0..50 {
+            cache.block_ip("site-a", &format!("203.0.113.{}", i), None, "waf");
+            cache.block_ip("site-b", &format!("198.51.100.{}", i), None, "waf");
+        }
+
+        let limit = 10;
+        let (page, truncated) = cache.blocked_ips_page(limit);
+        assert!(
+            truncated,
+            "more live blocks than the limit must mark truncated"
+        );
+        assert_eq!(page.len(), limit);
+
+        // Reference: the full snapshot sorted by (site_id, ip), truncated.
+        let mut all = cache.blocked_ips_snapshot();
+        all.sort_by(|a, b| {
+            (a.site_id.as_str(), a.ip.as_str())
+                .cmp(&(b.site_id.as_str(), b.ip.as_str()))
+        });
+        all.truncate(limit);
+
+        let page_ids: Vec<(&str, &str)> = page
+            .iter()
+            .map(|e| (e.site_id.as_str(), e.ip.as_str()))
+            .collect();
+        let all_ids: Vec<(&str, &str)> = all
+            .iter()
+            .map(|e| (e.site_id.as_str(), e.ip.as_str()))
+            .collect();
+        assert_eq!(
+            page_ids, all_ids,
+            "the page must equal the sorted snapshot prefix"
+        );
+
+        // A limit larger than the live set returns everything, not truncated.
+        let (all_page, all_truncated) = cache.blocked_ips_page(1000);
+        assert!(!all_truncated);
+        assert_eq!(all_page.len(), 100);
+    }
+
+    #[test]
+    fn blocked_lookup_semantics_and_reentrancy() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            RuleCache::new(dir.path().to_path_buf(), "test".to_string())
+                .unwrap();
+        cache.block_ip("site-1", "203.0.113.7", None, "waf: sqli");
+        cache.block_ip("site-1", "10.3.0.0/16", None, "manual: range");
+
+        // Fast-path hit, plain miss, mapped-v6 hit, and CIDR slow-path hit.
+        assert_eq!(
+            cache.blocked_reason("site-1", "203.0.113.7").as_deref(),
+            Some("waf: sqli")
+        );
+        assert_eq!(cache.blocked_reason("site-1", "203.0.113.200"), None);
+        assert!(cache.is_ip_blocked("site-1", "::ffff:203.0.113.7"));
+        assert_eq!(
+            cache.blocked_reason("site-1", "10.3.44.5").as_deref(),
+            Some("manual: range")
+        );
+
+        // Re-entrancy: an `extract` closure that itself performs a lookup must
+        // not panic on the shared key buffer (it falls back to an owned one).
+        let nested = cache.blocked_lookup("site-1", "203.0.113.7", |_e| {
+            cache.is_ip_blocked("site-1", "10.3.44.5")
+        });
+        assert_eq!(nested, Some(true));
     }
 
     #[test]
@@ -4036,6 +4585,106 @@ mod tests {
     }
 
     #[test]
+    fn full_sync_interns_site_and_domain_identifiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            RuleCache::new(dir.path().to_path_buf(), "test".to_string())
+                .unwrap();
+        cache
+            .update_from_site_config(&proto::SiteConfig {
+                sites: vec![proto::Site {
+                    id: "site-1".to_string(),
+                    name: "site".to_string(),
+                    domain: "example.com".to_string(),
+                    alternate_domains: vec!["alt.example.com".to_string()],
+                    status: 0,
+                    rules: Some(proto::RuleBundle {
+                        site_id: "site-1".to_string(),
+                        config_hash: "hash".to_string(),
+                        ..Default::default()
+                    }),
+                    trust_proxy_headers: false,
+                    trusted_header: String::new(),
+                    trust_last_hop: false,
+                    trusted_proxy_ranges: Vec::new(),
+                    downstream_timeout_secs: 0,
+                }],
+                config_hash: "hash".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let rules = cache.inner.load();
+        let site = rules.sites.get("site-1").expect("site");
+        let key = rules.sites.keys().next().expect("site key");
+        assert!(Arc::ptr_eq(key, &site.site_id));
+        let index =
+            rules.domain_index.get("example.com").expect("domain index");
+        assert!(Arc::ptr_eq(index, &site.site_id));
+        let (domain_key, _) = rules
+            .domain_index
+            .iter()
+            .find(|(domain, id)| {
+                domain.as_ref() == "example.com" && id.as_ref() == "site-1"
+            })
+            .expect("domain entry");
+        assert!(Arc::ptr_eq(domain_key, &site.domain));
+        assert_eq!(site.status, SiteStatus::Active);
+    }
+
+    #[test]
+    fn the_registration_site_config_carries_the_tunnel_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            RuleCache::new(dir.path().to_path_buf(), "test".to_string())
+                .unwrap();
+        // The agent's first contact is `GetSiteConfig`, not a per-site bundle:
+        // if that path dropped `tunnels`, a fresh edge would refuse every
+        // connector with `Unauthenticated` and never recover on its own.
+        cache
+            .update_from_site_config(&proto::SiteConfig {
+                sites: vec![proto::Site {
+                    id: "site-1".to_string(),
+                    name: "site-1".to_string(),
+                    domain: "a.example.com".to_string(),
+                    status: 0,
+                    rules: Some(proto::RuleBundle {
+                        site_id: "site-1".to_string(),
+                        tunnels: vec![proto::TunnelConfig {
+                            tunnel_id: "tunnel-1".to_string(),
+                            name: "branch".to_string(),
+                            session_public_key: "ab".repeat(32),
+                            enabled: true,
+                            targets: vec!["10.0.0.5:8080".to_string()],
+                        }],
+                        tunnel_settings: Some(proto::TunnelSettings {
+                            max_streams: 64,
+                            idle_timeout_secs: 60,
+                            heartbeat_secs: 15,
+                            session_token_ttl_secs: 600,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let cached = cache.all_sites();
+        assert_eq!(cached.tunnels.len(), 1);
+        assert_eq!(cached.tunnels[0].tunnel_id, "tunnel-1");
+        assert!(cached.tunnels[0].enabled);
+        assert_eq!(
+            cached.tunnels[0].targets,
+            vec!["10.0.0.5:8080".to_string()]
+        );
+        let settings = cached.tunnel_settings.expect("settings");
+        assert_eq!(settings.max_streams, 64);
+        assert_eq!(settings.heartbeat_secs, 15);
+    }
+
+    #[test]
     fn update_from_site_config_removes_deleted_sites() {
         let dir = tempfile::tempdir().unwrap();
         let cache =
@@ -4096,6 +4745,21 @@ mod tests {
                 .downstream_timeout_secs,
             60
         );
+
+        // A payload listing no site is authoritative too: it is what the
+        // control plane sends once the agent's last site is deleted.
+        let hash_before = cache.config_hash();
+        cache
+            .update_from_site_config(&proto::SiteConfig {
+                config_hash: "empty".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(cache.get_site_rules_by_id("site-1").is_none());
+        assert!(cache.get_site_rules("a.example.com").is_none());
+        assert!(cache.all_sites().sites.is_empty());
+        // The data plane reloads on a hash change, so the hash must move.
+        assert_ne!(cache.config_hash(), hash_before);
     }
 
     #[test]
@@ -4292,11 +4956,13 @@ mod tests {
     #[test]
     fn new_format_roundtrips() {
         let cached = CachedRules {
+            tunnels: Arc::new(Vec::new()),
+            tunnel_settings: None,
             sites: [(
-                "site-1".to_string(),
+                "site-1".into(),
                 Arc::new(SiteRules {
-                    site_id: "site-1".to_string(),
-                    domain: "example.com".to_string(),
+                    site_id: "site-1".into(),
+                    domain: "example.com".into(),
                     alternate_domains: Vec::new(),
                     host_bindings: Vec::new(),
                     status: site_status::PAUSED.to_string(),
@@ -4318,6 +4984,7 @@ mod tests {
                     path_exceptions: Vec::new(),
                     path_restrictions: Vec::new(),
                     upstreams: vec![UpstreamConfig {
+                        tunnel_id: String::new(),
                         name: "default".to_string(),
                         peers: Vec::new(),
                         algorithm: "LbRoundRobin".to_string(),
@@ -4386,7 +5053,7 @@ mod tests {
         assert_eq!(site.routes[0].path, "/api");
         assert_eq!(site.routes[0].ip_ranges, vec!["10.0.0.0/8"]);
         assert!(site.is_paused());
-        assert_eq!(site.status, site_status::PAUSED);
+        assert_eq!(site.status, SiteStatus::Paused);
         assert_eq!(site.upstreams[0].algo, "hash:header:x-user");
         assert_eq!(site.upstreams[0].sni, "origin.example.com");
     }
@@ -4443,7 +5110,7 @@ mod tests {
         let cached: CachedRules =
             serde_json::from_str(&old.to_string()).expect("old format loads");
         let site = cached.sites.get("site-1").expect("site present");
-        assert_eq!(site.status, site_status::ACTIVE);
+        assert_eq!(site.status, SiteStatus::Active);
         assert!(!site.is_paused());
         assert!(site.routes[0].ip_ranges.is_empty());
         let ssl = site.ssl_config.as_ref().expect("ssl config");
@@ -4465,8 +5132,8 @@ mod tests {
 
         let site = |quota_mb: u32| {
             Arc::new(SiteRules {
-                site_id: "site-1".to_string(),
-                domain: DOMAIN.to_string(),
+                site_id: "site-1".into(),
+                domain: DOMAIN.into(),
                 alternate_domains: Vec::new(),
                 host_bindings: Vec::new(),
                 status: site_status::ACTIVE.to_string(),
@@ -4508,9 +5175,9 @@ mod tests {
         };
         let store = |global_space_mb: Option<u32>, quota_mb: u32| {
             cache.inner.store(Arc::new(CachedRules {
-                sites: [(DOMAIN.to_string(), site(quota_mb))]
-                    .into_iter()
-                    .collect(),
+                tunnels: Arc::new(Vec::new()),
+                tunnel_settings: None,
+                sites: [(DOMAIN.into(), site(quota_mb))].into_iter().collect(),
                 domain_index: HashMap::new(),
                 failover_registry: Arc::new(HashMap::new()),
                 global_fail_open: None,
@@ -4578,7 +5245,7 @@ mod tests {
             trusted_proxy_ranges: Vec::new(),
             downstream_timeout_secs: 60,
         };
-        assert_eq!(site_status_str(site.status), site_status::PAUSED);
+        assert_eq!(SiteStatus::from_proto(site.status), SiteStatus::Paused);
         let rules =
             RuleCache::convert_bundle(site.rules.as_ref().expect("bundle"));
         let ssl = rules.ssl_config.as_ref().expect("ssl config");
@@ -4756,6 +5423,83 @@ mod tests {
         let health = third.health_status();
         assert_eq!(health.source, LoadSource::Disk);
         assert!(health.healthy);
+    }
+
+    /// A backup whose bytes still match its `metadata.json.bak` CRC stamp
+    /// loads normally (DR32-06): the restore path must accept the good
+    /// backup, not just reject the bad one.
+    #[test]
+    fn valid_crc_backup_restores_on_primary_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let cache = RuleCache::new(root.clone(), "test".to_string()).unwrap();
+        cache.persist_to_disk().unwrap(); // first snapshot, no backup yet
+        cache.persist_to_disk().unwrap(); // rolls snapshot #1 to .bak
+
+        // Corrupt the primary with still-valid JSON so only the CRC check
+        // can tell it apart from a good snapshot.
+        let sites = root.join("sites.json");
+        let bytes = std::fs::read(&sites).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap();
+        value["config_hash"] = serde_json::Value::String("tampered".into());
+        std::fs::write(&sites, serde_json::to_string(&value).unwrap()).unwrap();
+
+        let reloaded = RuleCache::new(root, "test".to_string()).unwrap();
+        let health = reloaded.health_status();
+        assert_eq!(health.source, LoadSource::Backup);
+        assert!(health.healthy, "good backup keeps the agent functional");
+        // The restored rules come from the backup, not the tampered primary.
+        assert_eq!(
+            reloaded.all_sites().config_hash.to_string(),
+            "",
+            "restored snapshot must be the rolled backup, not the tampered primary"
+        );
+    }
+
+    /// A tampered backup (valid JSON, wrong CRC against `metadata.json.bak`)
+    /// must be discarded, not loaded (DR32-06): the agent falls back to the
+    /// no-cache path (empty rules + unhealthy) and re-pulls from the control
+    /// plane instead of trusting an unverified snapshot.
+    #[test]
+    fn tampered_backup_is_rejected_and_degrades_to_no_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let cache = RuleCache::new(root.clone(), "test".to_string()).unwrap();
+        cache.persist_to_disk().unwrap();
+        cache.persist_to_disk().unwrap(); // ensure a stamped backup exists
+
+        // Flip one logical byte in the backup while keeping it valid JSON:
+        // under parse-only validation this tampered snapshot would load.
+        let backup = root.join("sites.json.bak");
+        let bytes = std::fs::read(&backup).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap();
+        value["config_hash"] =
+            serde_json::Value::String("tampered-backup".into());
+        std::fs::write(&backup, serde_json::to_string(&value).unwrap())
+            .unwrap();
+
+        // Tear the primary too, so the load path actually reaches the
+        // (now-tampered) backup fallback.
+        let sites = root.join("sites.json");
+        let bytes = std::fs::read(&sites).unwrap();
+        std::fs::write(&sites, &bytes[..bytes.len() / 2]).unwrap();
+
+        let reloaded = RuleCache::new(root, "test".to_string()).unwrap();
+        let health = reloaded.health_status();
+        assert!(
+            !health.healthy,
+            "a backup failing its CRC check must not be loaded"
+        );
+        assert_eq!(health.source, LoadSource::Fresh, "no-cache fallback path");
+        let reason = health.reason.unwrap_or_default();
+        assert!(
+            reason.contains("sites.json.bak") && reason.contains("crc32"),
+            "reason must name the backup and the expected/actual crc32: {reason}"
+        );
     }
 
     /// A tampered (valid JSON, wrong CRC) primary must not be rolled into

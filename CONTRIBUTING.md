@@ -355,6 +355,13 @@ skipped:
 1. `make bump-minor` (or `bump-patch` / `make bump V=1.2.3`) — moves the version
    in `[workspace.package]`, in every `pingap-*` requirement and in
    `Cargo.lock`.
+1b. **Run the schema gate** against a throwaway database:
+   `WAFRED_TEST_DB_URL=… cargo test -p pingwaf-server --test schema_matches_models -- --ignored`
+   (or `scripts/tunnel-smoke.sh`, which runs it as its first step). It applies
+   every migration and then reads every model, which is the only check that
+   catches a model column no migration creates — the 0.33.0 regression, where
+   `agents.tunnel_listener_error` was selected by the model but never added, so
+   every agent query answered 500.
 2. **Write the `CHANGELOG.md` section for that version, by hand.** Copy the
    shape of the section above it: a `## [WAFred <version>] — <date>` heading,
    then `### Added` / `### Changed` / `### Fixed` / `### Security` as they
@@ -372,6 +379,12 @@ triggers `release.yml`; pushing `main` alone publishes nothing. `release.yml`
 re-checks the section and refuses to publish without it, but it can only do that
 *after* the tag exists — so run `make version` before tagging, or a bad tag has
 to be deleted and pushed again.
+
+**Migrations are append-only.** Once a migration has shipped — even to one test
+host — never edit it: SeaORM records the version and will not run it again, so
+the change is invisible to every existing database and the model that expects it
+fails on every query. Fix a shipped migration with a new, idempotent one
+(`m20240101_000107_tunnel_listener_error` is the reference shape).
 
 The notes are the only place a user of a previous version finds out what
 changed between the release they are on and this one, which is why they are

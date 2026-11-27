@@ -83,6 +83,7 @@ The control plane and the data plane talk over the `ControlPlane` gRPC service (
 - **Request / response rewriting** — headers, paths, query strings, status codes and body search/replace.
 - **Custom error pages** rendered with Tera templates — including edge-generated responses such as WAF blocks and paused sites.
 - **Pause a site** from the console: every request gets a `503` maintenance page while the certificate keeps serving and traffic stays logged.
+- **Tunnels** — reach a service inside a private network with **no inbound port and no public IP**: a standalone `wafred-tunnel` connector dials out to an edge, and an origin pool bound to the tunnel is served through the normal request path (WAF, rate limiting, cache, logs, certificates). Pairing and management live in **Agents → Tunnels**; see [user-guide.md](docs/user-guide.md#tunnels-internal-services-without-an-inbound-port).
 
 ### 🔐 TLS & Certificates
 - **Automatic ACME / Let's Encrypt** issuance and renewal on the edge (HTTP-01 and DNS-01).
@@ -107,64 +108,42 @@ The control plane and the data plane talk over the `ControlPlane` gRPC service (
 
 ---
 
-## 📊 Historical PingWAF benchmark baseline
+## 📊 WAFred 1.0.4 benchmark results
 
-<img src="./asset/readme-effectiveness.svg" alt="Historical PingWAF 0.32.4 source baseline on the blazehttp corpus: 93.8 % full-corpus interception (96.6 % effective, 0.06 % benign affected); WAFred has not re-run this benchmark" width="1000">
+<img src="./asset/readme-effectiveness.svg" alt="WAFred 1.0.4 results on the full 33,877-request blazehttp corpus, compared with the earlier PingWAF P13 run and historical firewall references" width="1000">
 
-The figures here were measured by PingWAF 0.32.4 before WAFred became an
-independent project. WAFred has not re-run this benchmark, so these numbers are
-a **historical source-project baseline**, not a WAFred release claim.
+A locally rebuilt WAFred 1.0.4 test candidate was replayed against the public [blazehttp](https://github.com/chaitin/blazehttp) corpus (33,877 HTTP requests: 658 malicious / 33,219 benign). Interception counts WAF blocks and challenges; benign affected counts both.
 
-Measured on the public [blazehttp](https://github.com/chaitin/blazehttp) corpus
-(33 877 raw HTTP requests: 658 malicious / 33 219 benign), replayed
-byte-for-byte against a release build. Interception counts the WAF verdict
-surface — the 403 block page and the 503 challenge page — and "benign affected"
-counts both, so a challenge is never hidden inside a "blocked" number.
+| Tier | Attacks intercepted | Benign affected | Corpus replay p50 / p95 |
+|---|---:|---:|---:|
+| Normal | 397/658 (60.33%) | 4/33,219 (0.012%) | 43 / 48 ms |
+| Normal + body inspection | 494/658 (75.08%) | 12/33,219 (0.036%) | 43 / 48 ms |
+| Strict | 501/658 (76.14%; 491 blocks, 10 challenges) | 4/33,219 (0.012%) | 43 / 48 ms |
+| Strict + body inspection | **632/658 (96.05%; 622 blocks, 10 challenges)** | **19/33,219 (0.057%)** | 43 / 48 ms |
 
-On the requests a reverse-proxy WAF can actually decide, **Strict + body
-inspection intercepts 96.6 % (616/638)**, with **0.06 % (19/33 219)** of benign
-traffic affected and **99.82 % accuracy**. Of the 658 malicious samples, 20
-never reach a detection surface and are excluded from that figure: 19 are
-`POST`/`PUT` requests without `Content-Length` or `Transfer-Encoding` (an empty
-body under RFC 7230), and 1 hides its payload in a URL fragment that the HTTP
-parser strips before the request line is built. Every reverse-proxy WAF passes
-those 20 by construction — counting them as misses understates detection.
+### Cross-vendor reference
 
-| Tier | Attack interception (full corpus) | Benign affected | p95 |
-| --- | --- | --- | --- |
-| Normal (default, no body inspection) | 60.2 % | 0.01 % | 1 ms |
-| Normal + body inspection | 71.9 % | 0.04 % | 1 ms |
-| Strict | 76.0 % | 0.01 % | 1 ms |
-| Strict + body inspection | **93.8 %** | **0.06 %** | 2 ms |
+| Product / mode | Malicious set | Intercepted | Benign set | Affected | Reported p95 |
+|---|---:|---:|---:|---:|---:|
+| WAFred Normal | 658 | 397 (60.33%) | 33,219 | 4 (0.012%) | 48 ms* |
+| WAFred Normal + body | 658 | 494 (75.08%) | 33,219 | 12 (0.036%) | 48 ms* |
+| WAFred Strict | 658 | 501 (76.14%) | 33,219 | 4 (0.012%) | 48 ms* |
+| WAFred Strict + body | 658 | **632 (96.05%)** | 33,219 | **19 (0.057%)** | 48 ms* |
+| PingWAF prior P13 · Normal | 658 | 396 (60.2%) | 33,219 | 5 (0.015%) | 5 ms‡ |
+| PingWAF prior P13 · Normal + body | 658 | 473 (71.9%) | 33,219 | 14 (0.042%) | ~3 s‡ |
+| PingWAF prior P13 · Strict | 658 | 500 (76.0%) | 33,219 | 5 (0.015%) | 4 ms‡ |
+| PingWAF prior P13 · Strict + body | 658 | 617 (93.8%) | 33,219 | 21 (0.063%) | ~3 s‡ |
+| SafeLine free · strict | 575 | 438 (76.17%) | 33,094 | 73 (0.22%) | 64.34 ms† |
+| SafeLine free · balanced | 575 | 412 (71.65%) | 33,094 | 23 (0.07%) | 70.05 ms† |
+| ModSecurity PL4 | 575 | 544 (94.61%) | 33,094 | 17,362 (52.46%) | 28.89 ms† |
+| ModSecurity PL1 | 575 | 401 (69.74%) | 33,094 | 5,819 (17.58%) | 31.15 ms† |
+| Cloudflare free | 570 | 61 (10.70%) | 32,780 | 23 (0.07%) | 288.96 ms† |
 
-The full-corpus figure (93.8 %, 617/658) is kept for direct comparison with
-other measurements; the effective figure is given above.
+WAFred rows are the 2026-11-22 corrected local replay. PingWAF prior P13 rows are from the earlier version run on the same nominal corpus; its body framing was incomplete and produced 15 framing-related HTTP 500 responses, while this run uses corrected request framing. Treat these as recorded version results, not a controlled before/after comparison. SafeLine, ModSecurity and Cloudflare figures are historical values from the [blazehttp benchmark](https://github.com/chaitin/blazehttp) and were not retested. *WAFred p95 includes the test VM, proxy and mock origin. †Other reported p95 values use different paths and are not directly comparable. ‡PingWAF p95 comes from its earlier replay environment; body-tier p95 includes client upload effects.
 
-### Cross-vendor comparison
+The corrected replay harness now frames body-bearing fixtures with an accurate `Content-Length` and drops bytes beyond one valid declared body length. This removed 15 misleading HTTP 500 results caused by malformed fixture framing. The test candidate also adds bounded form/multipart body parsing and Base64 path-segment scanning; gzip tests intercepted 0/8 attacks without body inspection, 7/8 with Normal + body, and 8/8 with Strict + body.
 
-| Product / mode | Malicious | Interception | Benign | False positives | Accuracy |
-|---|---|---|---|---|---|
-| **PingWAF 0.32.4 · Strict + body** | 658 | **93.8 %** (617) | 33 219 | **0.06 %** (19) | **99.82 %** |
-| **PingWAF 0.32.4 · Normal** | 658 | **60.2 %** (396) | 33 219 | **0.01 %** (4) | **99.21 %** |
-| SafeLine free · strict | 575 | 76.17 % (438) | 33 094 | 0.22 % (73) | 99.38 % |
-| SafeLine free · balanced | 575 | 71.65 % (412) | 33 094 | 0.07 % (23) | 99.45 % |
-| ModSecurity PL4 | 575 | 94.61 % (544) | 33 094 | 52.46 % (17 362) | 48.34 % |
-| ModSecurity PL1 | 575 | 69.74 % (401) | 33 094 | 17.58 % (5 819) | 82.20 % |
-| Cloudflare free | 570 | 10.70 % (61) | 32 780 | 0.07 % (23) | 98.40 % |
-
-The PingWAF rows are the source project's replay (effective interception
-96.6 %, see above); WAFred has not independently re-run them. The other rows
-are quoted from the blazehttp project README and were not re-run here. The two datasets are close but not identical (33 877 vs
-33 669; 658 vs 570–575 malicious samples), and third-party latency includes
-public-network round trips while PingWAF's p95 is a loopback verdict latency —
-compare detection and false positives, not milliseconds.
-
-The source project's suite definitions, replay harness and raw metrics live in
-[`tools/waf-bench/`](./tools/waf-bench). The
-**[test plan](./docs/waf-test-plan.md)** documents the methodology and the
-**[test report](./docs/waf-test-report.md)** the conclusions, per-category
-tables, the cross-vendor comparison with Cloudflare / SafeLine / ModSecurity
-(quoted from the blazehttp benchmark) and known limits.
+The separate three-minute Strict + body soak at 256 concurrent requests completed 931,266 2 KiB POSTs at 5,172 RPS with no errors. At 512 concurrency, the deployed process's soft file-descriptor limit (1,024) caused 30 GET and 68 POST 502s; an isolated test copy at 65,536 completed without 502s. The replay latency is not standalone WAF processing time. See the **[full WAFred test report](./docs/wafred-baseline-test-report-2026-11-22.md)** and the [benchmark appendix](./docs/waf-benchmark-report.md) for the earlier PingWAF P13 measurements alongside the current WAFred results.
 
 ## 🧱 Tech Stack
 
@@ -183,7 +162,7 @@ tables, the cross-vendor comparison with Cloudflare / SafeLine / ModSecurity
 | --- | --- |
 | [`pingwaf-proto`](./wafred-proto) | Control-plane gRPC protocol definitions (single source: `control_plane.proto`) |
 | [`pingwaf-server`](./wafred-server) | Control plane: Axum REST + tonic gRPC + SeaORM/PostgreSQL + ES logs + embedded frontend + agent health monitoring |
-| [`pingwaf-agent`](./wafred-agent) | Data-plane agent: connects to the control plane, caches rules with disk persistence, ships logs/metrics, receives commands |
+| [`wafred-agent`](./wafred-agent) | Data-plane agent: connects to the control plane, caches rules with disk persistence, ships logs/metrics, receives commands |
 | [`pingwaf-waf`](./wafred-waf) | Detection engine: normalize → signatures → expression → anomaly score |
 | [`pingwaf-challenge`](./wafred-challenge) | Dynamic challenges: JS 5-second shield, interactive challenge, PoW, fingerprinting, HMAC clearance cookies |
 | `pingwaf-profiler` / `pingwaf-system` (no README) | In-process CPU/memory attribution and snapshots served at `/api/v1/system/profile` and `/api/v1/system/metrics` |
@@ -302,8 +281,9 @@ WAFRED_CONFIG=/etc/wafred/wafred.toml wafred all-in-one   # equivalent
 | [docs/http-lifecycle.md](./docs/http-lifecycle.md) | Where every feature acts in the request pipeline (WAF check order, caching, error pages) and how to debug with it |
 | [docs/e2e-test-plan.md](./docs/e2e-test-plan.md) | Product E2E test plan — scenarios, environments, execution tiers, defect and regression flow, release gates (incl. UI/UE, accessibility) |
 | [docs/waf-test-plan.md](./docs/waf-test-plan.md) | WAF test plan — layers, blazehttp suite selection, calibres and acceptance gates |
-| [docs/waf-test-report.md](./docs/waf-test-report.md) | Measured WAF effectiveness (0.32.4) — interception, false positives, attribution, limits |
-| [docs/waf-benchmark-report.md](./docs/waf-benchmark-report.md) | Per-round benchmark appendix (P0 → P14 iteration history) |
+| [docs/waf-test-report.md](./docs/waf-test-report.md) | Current WAFred 1.0.4 measured effectiveness — interception, false positives, performance, limits |
+| [docs/wafred-baseline-test-report-2026-11-22.md](./docs/wafred-baseline-test-report-2026-11-22.md) | Full WAFred 1.0.4 lab report and archived result checksums |
+| [docs/waf-benchmark-report.md](./docs/waf-benchmark-report.md) | Current WAFred 1.0.4 profile summary and earlier PingWAF test context |
 | [docs/api.md](./docs/api.md) | REST API reference (`https://<host>:9080/api/v1`) |
 | [docs/README.md](./docs/README.md) | Full documentation index |
 | [CONTRIBUTING.md](./CONTRIBUTING.md) | How to contribute |

@@ -15,6 +15,7 @@ import { AssistantChatPanel } from './AssistantChatPanel'
 import { AssistantBall } from './AssistantBall'
 import { ConversationList } from './ConversationList'
 import { cn } from '@/lib/utils'
+import { hasAdminViewAccess } from '@/lib/permissions'
 
 /**
  * The floating AI assistant: a bottom-right ball and a right-hand sliding
@@ -30,7 +31,8 @@ export function AssistantWidget() {
   const { t } = useTranslation()
   const location = useLocation()
   const navigate = useNavigate()
-  const isAdmin = useAuthStore((s) => s.user?.role) === 'admin'
+  const user = useAuthStore((s) => s.user)
+  const isAdmin = hasAdminViewAccess(user)
   const open = useAssistantWidgetStore((s) => s.open)
   const toggle = useAssistantWidgetStore((s) => s.toggle)
   const close = useAssistantWidgetStore((s) => s.close)

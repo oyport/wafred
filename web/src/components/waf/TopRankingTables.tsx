@@ -1,6 +1,6 @@
 import { useMemo, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Lightning, ShieldSlash } from '@phosphor-icons/react'
+import { Globe, Lightning, ShieldSlash } from '@phosphor-icons/react'
 import { countryFlag } from '@/api/geo'
 import { IpQuickActions } from '@/components/waf/IpQuickActions'
 import { Badge } from '@/components/ui/Badge'
@@ -8,10 +8,16 @@ import { EmptyState } from '@/components/ui/EmptyState'
 import { ErrorState } from '@/components/ErrorState'
 import { SkeletonRows } from '@/components/ui/Skeleton'
 import { Table, type Column } from '@/components/ui/Table'
-import { formatNumber } from '@/lib/format'
+import { formatNumber, formatPercent } from '@/lib/format'
 import { ruleActionTone } from '@/lib/logDrillDown'
+import {
+  asnTrafficRows,
+  formatAsn,
+  isUnknownAsnName,
+  type AsnTrafficRow,
+} from '@/lib/asnRanking'
 import { rankingView } from './rankingView'
-import type { TopIp, TopRule } from '@/api/types'
+import type { TopAsn, TopIp, TopRule } from '@/api/types'
 
 /**
  * 「威胁 IP 排行 / 触发规则排行」的唯一实现。
@@ -73,6 +79,12 @@ export interface TopIpsTableProps extends RankingState {
   /** 空态文案按页给（Dashboard 讲威胁，流量页只是没数据）。 */
   emptyTitle?: string
   emptyDescription?: string
+  /**
+   * 是否展示「网络归属」列（AS 号 + 组织名）。Dashboard 的威胁表要用它判断
+   * 攻击来源是不是同一个自治系统；站点流量页的「热门 IP」不要求，因此由调用方
+   * 开关，列定义仍然只有这一份（两张表不允许各自重写）。
+   */
+  showAsn?: boolean
 }
 
 /** 威胁/热门客户端 IP：国旗 + IP、请求数、拦截徽章、快捷操作。 */
@@ -85,6 +97,7 @@ export function TopIpsTable({
   onRowClick,
   emptyTitle,
   emptyDescription,
+  showAsn = false,
 }: TopIpsTableProps) {
   const { t } = useTranslation()
 
@@ -101,6 +114,20 @@ export function TopIpsTable({
           </div>
         ),
       },
+      ...(showAsn
+        ? [
+            {
+              key: 'asn',
+              header: t('pages.dashboard.asn'),
+              accessor: (r: TopIp) => r.asn ?? 0,
+              width: '1%',
+              nowrap: true,
+              cell: (r: TopIp) => (
+                <IpAsnCell asn={r.asn} name={r.asn_name} />
+              ),
+            } satisfies Column<TopIp>,
+          ]
+        : []),
       {
         key: 'requests',
         header: t('pages.traffic.requests'),
@@ -269,5 +296,157 @@ export function TopRulesTable({
         onRowClick={onRowClick}
       />
     </RankingBody>
+  )
+}
+export interface TopAsnsTableProps extends RankingState {
+  rows: TopAsn[] | undefined
+  /**
+   * Requests in the window, used as the share denominator. Without it the
+   * share is computed over the listed networks (see `asnTrafficRows`).
+   */
+  totalRequests?: number
+  emptyTitle?: string
+  emptyDescription?: string
+}
+
+/**
+ * ASN 排行：网络名称、AS 号、请求数、占比。
+ *
+ * 与 IP/规则排行共用同一套加载/错误/空态外壳。这里**没有**行点击下钻：
+ * 日志页的检索语法支持 `country:` / `client_ip:` / `rule:`，但后端 `logs`
+ * 接口没有 ASN 过滤参数，加一个只有前端认识的关键词只会得到空结果。
+ * 等 `GET /logs/*` 接受 `asn` 时再补下钻。
+ */
+export function TopAsnsTable({
+  rows,
+  totalRequests,
+  loading,
+  error,
+  onRetry,
+  emptyTitle,
+  emptyDescription,
+}: TopAsnsTableProps) {
+  const { t } = useTranslation()
+
+  const data = useMemo(
+    () => asnTrafficRows(rows ?? [], totalRequests),
+    [rows, totalRequests],
+  )
+
+  const columns = useMemo<Column<AsnTrafficRow>[]>(
+    () => [
+      {
+        key: 'asn_name',
+        header: t('pages.traffic.asnName'),
+        accessor: (r) => (isUnknownAsnName(r.name) ? '' : r.name),
+        sortable: true,
+        cell: (r) => (
+          <span className="text-[13px] font-medium text-fg-strong">
+            {isUnknownAsnName(r.name)
+              ? t('pages.traffic.asnUnknown', { asn: r.asn })
+              : r.name}
+          </span>
+        ),
+      },
+      {
+        key: 'asn',
+        header: t('pages.traffic.asnNumber'),
+        accessor: (r) => r.asn,
+        width: '1%',
+        nowrap: true,
+        sortable: true,
+        cell: (r) => (
+          <span className="pw-mono text-[13px] text-fg-subtle">{formatAsn(r.asn)}</span>
+        ),
+      },
+      {
+        key: 'requests',
+        header: t('pages.traffic.requests'),
+        accessor: (r) => r.requests,
+        align: 'right',
+        width: '1%',
+        nowrap: true,
+        sortable: true,
+        cell: (r) => (
+          <span className="tabular-nums text-[13px] text-fg">{formatNumber(r.requests)}</span>
+        ),
+      },
+      {
+        key: 'share',
+        header: t('pages.traffic.share'),
+        accessor: (r) => r.share,
+        align: 'right',
+        width: '1%',
+        nowrap: true,
+        sortable: true,
+        cell: (r) => (
+          <span className="tabular-nums text-[13px] text-fg-subtle">
+            {formatPercent(r.share)}
+          </span>
+        ),
+      },
+    ],
+    [t],
+  )
+
+  return (
+    <RankingBody
+      rows={data}
+      loading={loading}
+      error={error}
+      onRetry={onRetry}
+      empty={
+        <EmptyState
+          className="border-0 py-10"
+          icon={<Globe weight="duotone" className="h-7 w-7" />}
+          title={emptyTitle ?? t('common.noData')}
+          description={emptyDescription}
+        />
+      }
+    >
+      <Table
+        columns={columns}
+        data={data}
+        rowKey={(r) => String(r.asn)}
+        dense
+        scrollLabel={t('pages.traffic.topAsns')}
+      />
+    </RankingBody>
+  )
+}
+
+/**
+ * 「网络归属」单元格：组织名 + `AS<号>`。
+ *
+ * 地址没有解析结果时给 `—`（不是空单元格），它同时说明「这条日志没有 ASN」；
+ * 完整 `组织 · AS<号>` 放进 `title`，窄屏截断后悬停仍能看到全名。
+ */
+function IpAsnCell({
+  asn,
+  name,
+}: {
+  asn?: number | null
+  name?: string | null
+}) {
+  const { t } = useTranslation()
+  const value = Math.trunc(Number(asn))
+  if (!Number.isFinite(value) || value <= 0) {
+    return (
+      <span
+        className="text-[13px] text-fg-subtle"
+        title={t('pages.dashboard.asnUnresolved')}
+      >
+        —
+      </span>
+    )
+  }
+  const label = isUnknownAsnName(name)
+    ? t('pages.traffic.asnUnknown', { asn: value })
+    : (name ?? '').trim()
+  return (
+    <div className="max-w-40" title={`${label} · ${formatAsn(value)}`}>
+      <p className="truncate text-[13px] text-fg">{label}</p>
+      <p className="pw-mono text-[11px] text-fg-subtle">{formatAsn(value)}</p>
+    </div>
   )
 }

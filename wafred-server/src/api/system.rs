@@ -35,7 +35,7 @@ use crate::api::error::ApiError;
 use crate::api::state::AppState;
 use crate::auth::AdminUser;
 use crate::grpc::registry::{AgentRegistry, HeartbeatMetrics};
-use crate::models::{agent, api_key, control_plane_boot, site};
+use crate::models::{agent, agent_sites, api_key, control_plane_boot, site};
 
 /// `GET /api/v1/system/metrics` — process/host CPU and memory snapshots.
 #[derive(Debug, Serialize)]
@@ -220,6 +220,9 @@ pub struct AgentNode {
     /// connected, so nothing retained this counter: unlike CPU and memory it is
     /// stored nowhere else.
     pub rps: Option<u64>,
+    /// RSS of the agent process itself, in bytes. `None` = never reported
+    /// (an agent build older than the field), not zero.
+    pub process_rss_bytes: Option<u64>,
     /// Sites this agent serves: `1` for a bound agent, and for a global
     /// (unbound) agent every site of its API key's owner — the same
     /// visibility the config push uses.
@@ -266,6 +269,9 @@ pub struct NodeCounters {
     pub total_memory_bytes: Option<u64>,
     pub connections: Option<u64>,
     pub rps: Option<u64>,
+    /// RSS of the agent process itself, in bytes. Tri-state: `None` = the
+    /// agent never reported it, which is distinct from a reported zero.
+    pub process_rss_bytes: Option<u64>,
 }
 
 impl Default for NodeCounters {
@@ -281,6 +287,7 @@ impl Default for NodeCounters {
             total_memory_bytes: None,
             connections: None,
             rps: None,
+            process_rss_bytes: None,
         }
     }
 }
@@ -464,6 +471,10 @@ fn merge_counters(
         total_memory_bytes: stored.total_memory_bytes,
         connections: Some(live.connections),
         rps: Some(live.rps),
+        // Tri-state: the live None means the agent never reported the field,
+        // so the stored sample covers an agent that reported once and then
+        // upgraded backwards — anything beats rewriting unknown.
+        process_rss_bytes: live.process_rss_bytes.or(stored.process_rss_bytes),
     }
 }
 
@@ -504,6 +515,7 @@ fn agent_node(
             .and_then(|bytes| u64::try_from(bytes).ok())),
         connections: counters.connections,
         rps: counters.rps,
+        process_rss_bytes: counters.process_rss_bytes,
         sites,
         version: row.version.clone(),
         last_seen: row.last_heartbeat,
@@ -526,7 +538,8 @@ fn agent_node(
 /// still supplies `(agent_id, sampled_at DESC)`, and the extra key is resolved
 /// by an incremental sort inside each group — never over the table.
 const LATEST_SAMPLES_SQL: &str = "SELECT DISTINCT ON (agent_id) agent_id, \
-     cpu_usage_percent, memory_used_bytes, memory_total_bytes \
+     cpu_usage_percent, memory_used_bytes, memory_total_bytes, \
+     process_rss_bytes \
      FROM host_samples \
      WHERE agent_id = ANY($1) \
      ORDER BY agent_id, sampled_at DESC, id DESC";
@@ -559,6 +572,8 @@ async fn latest_samples(
             .and_then(|bytes| u64::try_from(bytes).ok());
         let total_memory_bytes = optional::<i64>(&row, "memory_total_bytes")?
             .and_then(|bytes| u64::try_from(bytes).ok());
+        let process_rss_bytes = optional::<i64>(&row, "process_rss_bytes")?
+            .and_then(|bytes| u64::try_from(bytes).ok());
         out.insert(
             agent_id,
             NodeCounters {
@@ -566,6 +581,7 @@ async fn latest_samples(
                 cpu_source,
                 used_memory_bytes,
                 total_memory_bytes,
+                process_rss_bytes,
                 ..Default::default()
             },
         );
@@ -705,9 +721,28 @@ async fn agent_site_counts(
         })
         .collect();
 
+    let selected_ids: Vec<Uuid> = rows
+        .iter()
+        .filter(|row| row.site_scope == "selected")
+        .map(|row| row.id)
+        .collect();
+    let per_agent: HashMap<Uuid, u64> = if selected_ids.is_empty() {
+        HashMap::new()
+    } else {
+        let mut counts: HashMap<Uuid, u64> = HashMap::new();
+        for assignment in agent_sites::Entity::find()
+            .filter(agent_sites::Column::AgentId.is_in(selected_ids))
+            .all(db)
+            .await?
+        {
+            *counts.entry(assignment.agent_id).or_default() += 1;
+        }
+        counts
+    };
+
     let key_ids: Vec<Uuid> = rows
         .iter()
-        .filter(|row| row.site_id.is_none())
+        .filter(|row| row.site_scope != "selected" && row.site_id.is_none())
         .filter_map(|row| row.api_key_id)
         .collect();
     let owner_of_key: HashMap<Uuid, Uuid> = if key_ids.is_empty() {
@@ -728,15 +763,19 @@ async fn agent_site_counts(
     Ok(rows
         .iter()
         .map(|row| {
-            let count = match row.site_id {
-                Some(_) => 1,
-                // An unbound agent whose key is gone owns nothing: the row is
-                // still listed, its site count is honestly zero.
-                None => row
-                    .api_key_id
-                    .and_then(|key_id| owner_of_key.get(&key_id).copied())
-                    .and_then(|owner| per_owner.get(&owner).copied())
-                    .unwrap_or(0),
+            let count = if row.site_scope == "selected" {
+                per_agent.get(&row.id).copied().unwrap_or(0)
+            } else {
+                match row.site_id {
+                    Some(_) => 1,
+                    // An unbound agent whose key is gone owns nothing: the row
+                    // is still listed, its site count is honestly zero.
+                    None => row
+                        .api_key_id
+                        .and_then(|key_id| owner_of_key.get(&key_id).copied())
+                        .and_then(|owner| per_owner.get(&owner).copied())
+                        .unwrap_or(0),
+                }
             };
             (row.id, count)
         })
@@ -860,8 +899,14 @@ mod tests {
         last_heartbeat: Option<DateTime<Utc>>,
     ) -> agent::Model {
         agent::Model {
+            tunnel_ingress_addr: None,
+            tunnel_listener_addr: None,
+            tunnel_cert_sha256: None,
+            tunnel_listener_error: None,
             id: Uuid::new_v4(),
             site_id: None,
+            site_scope: "all".to_string(),
+            acme_issuer: false,
             hostname: hostname.to_string(),
             display_name: None,
             ip_address: "10.0.0.5".to_string(),
@@ -877,6 +922,8 @@ mod tests {
             memory_bytes: Some(8 << 30),
             total_memory_bytes: None,
             used_memory_bytes: None,
+            // `None` = never reported; the field is tri-state.
+            process_rss_bytes: None,
             status: status.to_string(),
             api_key_id: None,
             config_hash: None,
@@ -982,6 +1029,7 @@ mod tests {
             total_memory_bytes: Some(8 << 30),
             connections: Some(17),
             rps: Some(42),
+            process_rss_bytes: Some(256 << 20),
         };
 
         let node = agent_node(&row, &counters, 3);
@@ -1138,12 +1186,14 @@ mod tests {
             total_memory_bytes: Some(8 << 30),
             connections: Some(1),
             rps: None,
+            ..Default::default()
         };
         let live = HeartbeatMetrics {
             cpu_percent: 42.5,
             memory_bytes: 3 << 30,
             connections: 17,
             rps: 130,
+            process_rss_bytes: Some(256 << 20),
         };
 
         let merged = merge_counters(&stored, Some(live));
@@ -1190,6 +1240,35 @@ mod tests {
         assert_eq!(merged.rps, Some(0));
     }
 
+    /// `process_rss_bytes` is the first tri-state counter: the live report wins
+    /// verbatim — including `None`, which means "agent never reported it", not
+    /// zero — and a stored sample only covers a stream that carries nothing.
+    #[test]
+    fn process_rss_is_tri_state_through_the_merge() {
+        let stored = NodeCounters {
+            process_rss_bytes: Some(128 << 20),
+            ..Default::default()
+        };
+        // Live value wins over the stored sample.
+        let live = HeartbeatMetrics {
+            process_rss_bytes: Some(256 << 20),
+            ..Default::default()
+        };
+        let merged = merge_counters(&stored, Some(live));
+        assert_eq!(merged.process_rss_bytes, Some(256 << 20));
+
+        // A live None is "this agent does not report the field", so the last
+        // stored reading still answers.
+        let mut silent = live;
+        silent.process_rss_bytes = None;
+        let merged = merge_counters(&stored, Some(silent));
+        assert_eq!(merged.process_rss_bytes, Some(128 << 20));
+
+        // Nothing anywhere: genuinely unknown, not zero.
+        let merged = merge_counters(&NodeCounters::default(), None);
+        assert_eq!(merged.process_rss_bytes, None);
+    }
+
     /// An agent with no live stream keeps exactly the stored sample: the
     /// registry is a `None` for every offline node, not a zeroed entry.
     #[test]
@@ -1201,6 +1280,7 @@ mod tests {
             total_memory_bytes: Some(8 << 30),
             connections: Some(1),
             rps: None,
+            ..Default::default()
         };
         // The offline path hands the counters through untouched, label
         // included: an offline node still reports the probe figure it was last
@@ -1274,6 +1354,8 @@ mod tests {
             "total_memory_bytes",
             "connections",
             "rps",
+            // First tri-state counter: null = the agent never reported it.
+            "process_rss_bytes",
             "sites",
             // The console compares it with `/version` to flag an edge running
             // other rule semantics.

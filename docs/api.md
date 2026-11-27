@@ -456,8 +456,8 @@ Build metadata.
 **Response (200):**
 ```json
 {
-  "name": "pingwaf-server",
-  "version": "0.25.0",
+  "name": "wafred-server",
+  "version": "1.0.5",
   "api": "/api/v1",
   "registration_open": true
 }
@@ -544,6 +544,8 @@ List sites (paginated).
 ### POST /sites
 
 Create a new site. `upstream_address` is required: a site without an origin cannot serve traffic. The site is created with a `default` origin pool containing that origin.
+
+A new site starts with HTTPS enabled and a **self-signed certificate** the control plane issues for its `domain` and `alternate_domains` (see [PUT /sites/{site_id}/ssl](#put-sitessite_idssl)); upload a certificate, select one, or configure ACME to replace it.
 
 **Request:**
 ```json
@@ -1089,6 +1091,24 @@ Create or update SSL settings. `domain` is required; TLS switches (https, HSTS, 
 }
 ```
 
+A site is served over TLS by exactly one certificate source, in this order of
+precedence:
+
+1. a selected `certificate_id` (an uploaded or shared certificate),
+2. an uploaded `cert_pem` / `key_pem` pair,
+3. an ACME order (`acme_email`),
+4. `self_signed: true` — the control plane issues a leaf covering the site's
+   `domain` and `alternate_domains`, records `issuer: "WAFred Self-Signed"` and
+   renews it before expiry. New sites start in this mode.
+
+Setting `self_signed` clears `certificate_id` and turns HTTPS on; selecting a
+certificate, uploading a pair or configuring ACME turns `self_signed` off, and
+the generated material is removed so the new source is what the edge serves. A
+certificate delivered by ACME takes the site over the same way. `https_enabled:
+true` with none of the four sources is rejected with `400` (`HTTPS is enabled
+but the site has no certificate: ...`) instead of pushing a listener that cannot
+complete a handshake.
+
 ### DELETE /sites/{site_id}/ssl
 
 Remove SSL settings.
@@ -1285,7 +1305,28 @@ Add a certificate (manual upload or ACME request).
 }
 ```
 
-`acme_challenge_type` is `http-01` or `dns-01`; `acme_dns_provider` is one of `cloudflare`, `route53`, `digitalocean`, `aliyun`, `dnspod`, `cloudxns`, `manual`.
+`acme_challenge_type` is `http-01` or `dns-01`; `acme_dns_provider` is one of
+`cloudflare`/`cf`, `route53`, `aliyun`/`ali`, `dnspod`/`tencent`, or `huawei`
+for managed DNS-01. Unknown providers, `manual` with `dns-01`, and a Route 53
+row without `dns-01` are rejected with `400`; a migration clears provider
+values the data plane never supported (`digitalocean`, `cloudxns`, `manual`)
+and moves their DNS-01 challenge back to HTTP-01, which is what those rows
+effectively used before.
+
+With `route53`, use `dns-01` and set `acme_dns_config` to
+`{"hosted_zone_id":"Z123EXAMPLE"}` or `{}` for public hosted zone discovery.
+The issuer uses the AWS SDK credential chain (typically an EC2 instance role)
+and only needs `GetHostedZone`, `ListResourceRecordSets` and
+`ChangeResourceRecordSets` on the zone; discovery additionally needs
+`ListHostedZones`. A failed order reports the Route 53 error code in the
+certificate event.
+
+`acme_issuer_agent_id` (optional) pins the certificate to one issuer agent.
+The agent must already be marked `acme_issuer=true` and serve the
+certificate's site; only that agent then receives the ACME material and only
+its `PublishCertificate` call is accepted. Omitted or `null` keeps the
+agent-level scope (the embedded all-in-one issuer and single-agent deployments
+need no designation).
 
 The response is the saved certificate, `warnings` included (see
 [Certificate `warnings`](#certificate-warnings)).
@@ -1457,6 +1498,7 @@ Every field is optional and omitted fields keep their value.
 | `cert_pem` / `key_pem` | Replacing either half re-validates the pair **as it will be after this request** (a replacement certificate is checked against the stored key and vice versa, so a mismatched pair cannot be assembled one request at a time). Sending `key_pem` without a certificate (new or stored) is refused with `400`. |
 | `issuer`, `not_before`, `expires_at`, `auto_renew` | Metadata updates. |
 | `acme_email`, `acme_challenge_type`, `acme_dns_provider`, `acme_dns_config` | ACME settings; `acme_challenge_type` must be `http-01` or `dns-01` (`400` otherwise). An ACME order without a stored PEM for a wildcard hostname requires `dns-01` (`400` otherwise). |
+| `acme_issuer_agent_id` | Tri-state: absent keeps the designation, `null` clears it (back to the agent-level scope), an agent id sets it. The agent must be marked `acme_issuer=true` and serve the certificate's site (`400` otherwise). |
 | `status` | Must be a valid certificate status (`400` otherwise); setting it back to `pending` also clears a stored `failure_reason`. |
 
 **Permissions:** the update is authorised through the certificate's owning
@@ -1851,8 +1893,11 @@ List registered agents.
   "items": [
     {
       "id": "uuid",
-      "site_id": "uuid",
-      "site_domain": "example.com",
+      "site_id": null,
+      "site_domain": null,
+      "site_scope": "selected",
+      "site_ids": ["uuid-a", "uuid-b"],
+      "site_domains": ["a.example.com", "b.example.com"],
       "hostname": "edge-01",
       "display_name": "edge-01 (backup)",
       "name": "edge-01",
@@ -1861,11 +1906,14 @@ List registered agents.
       "private_ip": "10.0.1.5",
       "peer_ip": "203.0.113.7",
       "peer_ip_seen_at": "2024-01-01T12:00:00Z",
-      "version": "0.25.0",
+      "version": "1.0.5",
       "os_info": "Linux 6.1.0",
       "cpu_cores": 4,
       "memory_bytes": 8589934592,
+      "process_rss_bytes": 268435456,
       "status": "online",
+      "status_reason": null,
+      "logs_dropped": 0,
       "last_heartbeat": "2024-01-01T12:00:00Z",
       "last_seen": "2024-01-01T12:00:00Z",
       "registered_at": "2024-01-01T00:00:00Z",
@@ -1879,6 +1927,28 @@ List registered agents.
 }
 ```
 
+`status` is `online`, `degraded` or `offline`. A node is `degraded` while its
+data plane could not apply the configuration it last received: it keeps
+serving the previous one and retries on its own (5 s, doubling up to 5 min),
+and `status_reason` carries the failing reload step(s). `status_reason` is
+`null` once the configuration is in effect and for nodes without a live
+stream.
+
+`logs_dropped` counts the access-log and security-event entries the agent
+discarded since its process started, before the control plane stored them:
+its 2048-entry queue was full while the control plane was unreachable, or the
+control plane refused to store an entry. The agent reports the running total
+with every heartbeat, so it resets when the agent restarts; the control plane
+also writes a warning to its own log each time the total grows. `0` means
+nothing was lost, or that this control plane instance has not heard from the
+node since it started.
+
+`process_rss_bytes` is the RSS of the agent process itself — the binary's own
+memory, distinct from `memory_bytes` (whole-node usage). It is tri-state:
+`null` = the agent build predates the field and has never reported it, which is
+not the same as a reported zero. The node view (`GET /system/nodes`) carries
+the same field under the same name.
+
 `name` is the operator-facing label: it is `display_name` when one is set,
 otherwise it falls back to `hostname`. `hostname` is the identity the agent
 reports itself — registration matches on `hostname` + API key, so renaming a
@@ -1887,6 +1957,20 @@ node, and the node view (`GET /system/nodes`) names it `name`; carrying both
 keeps one shape for the console without breaking callers that read
 `hostname`. `last_seen` is likewise an alias of `last_heartbeat`
 (`null` = the agent has never heartbeated).
+
+`site_scope` controls which site configurations the agent receives:
+
+- **`all`** (legacy default) — every site owned by the agent's API key. This is
+  the highest-memory mode and the behaviour before per-agent assignment.
+- **`selected`** — only the sites in `site_ids` / `site_domains`. An empty
+  list is valid and leaves the agent with no site configuration (an idle
+  node); it still heartbeats and can be assigned later.
+
+`site_id` / `site_domain` are the legacy single-binding fields and are `null`
+for a selected agent; use `site_ids` / `site_domains`. Assignments are
+validated against the API key's owner, so one tenant's agent can never receive
+another tenant's site. `PUT /agents/{agent_id}/sites` changes the scope and
+immediately re-pushes the agent's configuration.
 
 Three address fields describe a node from different vantage points, and they
 answer different questions:
@@ -1909,7 +1993,7 @@ revoked agent is rejected even with a well-formed signature.
 **Response (200):**
 ```json
 {
-  "version": "0.32.22",
+  "version": "1.0.5",
   "sha256": "9f2c…",
   "size": 48219136,
   "url": "/api/v1/agent-upgrade/artifact"
@@ -1983,24 +2067,42 @@ Get agent details. The response carries the same `display_name` /
 
 ### PATCH /agents/{agent_id}
 
-Set or clear the operator-facing display name. Requires write access
-(non-viewer).
+Set or clear the operator-facing display name, the tunnel ingress
+address, and/or the ACME issuer scope. Requires write access (non-viewer).
 
 **Request:**
 ```json
 {
-  "display_name": "edge-01 (backup)"
+  "display_name": "edge-01 (backup)",
+  "tunnel_ingress_addr": "edge1.example.com:9443",
+  "acme_issuer": true
 }
 ```
 
 **Response (200):** the updated agent object (same shape as the list
-items), with `display_name` reflecting the new value.
+items), with `display_name` / `tunnel_ingress_addr` reflecting the new values.
 
 Rules:
 
-- The value is trimmed; `null`, an omitted field, or a string that is empty
-  after trimming clears the name — the node displays its hostname again. The
-  endpoint is single-field, so omission has no other meaning to preserve.
+- `display_name` is tri-state: **absent leaves the stored label alone**,
+  `null` (or a string that is empty after trimming) clears it — the node
+  displays its hostname again — and a string sets it. Sending only
+  `tunnel_ingress_addr` therefore no longer clears the label.
+- `tunnel_ingress_addr` is the public `host:port` a tunnel connector dials to
+  reach this node's tunnel listener; it must parse as `host:port` (a `400`
+  otherwise) and an empty string clears it (the node stops being offered as a
+  tunnel ingress). `tunnel_listener_addr`, `tunnel_cert_sha256` and
+  `tunnel_listener_error` are **reported by the agent** on every heartbeat and
+  are read-only here; the last one explains a configured listener that could
+  not bind (for example the port is taken), so the console can tell "not
+  configured" apart from "configured but failing".
+- `acme_issuer` (boolean) controls whether this agent may run ACME issuance.
+  Only an issuer receives the site's `acme_dns_config` (the DNS provider
+  token) and only an issuer opens orders; a consumer keeps serving the
+  distributed PEM and never sees the credential. The embedded all-in-one
+  issuer is marked automatically. A remote agent that should issue must be
+  marked here; a change takes effect immediately and is re-pushed to the node.
+  The response carries `acme_issuer` on every agent read.
 - At most `100` characters; control characters are rejected (`display_name
   must be at most 100 characters` / `display_name must not contain control
   characters`).
@@ -2009,9 +2111,32 @@ Rules:
   produces a duplicate node.
 - `404` when the agent does not exist.
 
+### PUT /agents/{agent_id}/sites
+
+Set the agent's site scope and replace its assignments. Requires write access.
+
+**Request:**
+```json
+{
+  "scope": "selected",
+  "site_ids": ["uuid-a", "uuid-b"]
+}
+```
+
+- `scope` is `all` or `selected`; anything else answers `400`.
+- `all` clears the assignment rows and the legacy single binding, restoring
+  "every site owned by the API key".
+- `selected` replaces the assignment set; duplicate ids are ignored, an empty
+  list is allowed, and every site must belong to the agent API key's owner
+  (otherwise `400`). Non-admin callers also need read access to each site.
+- The response is the updated agent object (same shape as the list item). The
+  control plane pushes the new configuration to a connected agent immediately;
+  an offline agent receives it on reconnect.
+
 ### GET /agents/{agent_id}/samples
 
-Host probe history (CPU, memory, network, disk), newest first. Cumulative counters (network and disk totals) are returned raw; difference consecutive rows to obtain rates.
+Host probe history (CPU, memory, network, disk, plus the agent process's own
+RSS as `process_rss_bytes`), newest first. Cumulative counters (network and disk totals) are returned raw; difference consecutive rows to obtain rates.
 
 **Query params:** `from`, `to` (RFC 3339), `page`, `page_size`.
 
@@ -2079,12 +2204,194 @@ Semantics worth knowing before you reach for it:
   logs are stored yet: the agent flushes its current batch (and up to one
   more batch drained while the RPC was in flight) asynchronously.
 - The agent's in-memory log channel holds at most 2048 entries; anything
-  dropped while the control plane was unreachable is gone for good.
-- A batch whose transport failed is kept by the agent and retried, capped at
-  one `log_batch_size` batch — the flush never turns into an unbounded send
-  loop.
+  that overflows it while the control plane was unreachable is gone for good.
+  Each lost entry is counted and reported as `logs_dropped` on
+  `GET /api/v1/agents`.
+- A batch that was not stored is kept by the agent — across reconnects too —
+  and retried on the next batch interval, whether the transport failed or the
+  control plane answered with an error. It stays capped at one
+  `log_batch_size` batch, so the flush never turns into an unbounded send
+  loop. An entry is given up only when the control plane refuses it on its
+  own while storing others from the same batch.
 
 ---
+
+## Tunnels
+
+A tunnel lets a service inside a private network be served through the data
+plane without any inbound port. The connector (`wafred-tunnel`) dials out to
+the control plane and to the edge ingresses; the edge terminates the public
+side and proxies through a loopback bridge, so the whole request path (WAF,
+rate limiting, cache, logs, TLS to the origin) is unchanged.
+
+A tunnel object carries three independent states, and the console renders all
+three:
+
+| Field | Meaning |
+|-------|---------|
+| `paired` | a credential exists — the connector *can* connect |
+| `enabled` | the deployment switch is on and the row is not `disabled` |
+| `connector_online` | the connector holds the control stream right now |
+
+`targets` is **derived**: the distinct node addresses of the origin pools whose
+`tunnel_id` points at this tunnel. `sites` names the domains of those sites —
+the blast radius of disabling or deleting the tunnel. `sessions` lists the edges
+currently holding a connector session (one per edge).
+
+### GET /tunnels
+
+List tunnels. Query: `search` (name substring), `status`
+(`pending|active|disabled`), `page`, `page_size`.
+
+An administrator sees every tunnel. A non-admin sees only the tunnels at least
+one of their own sites has an origin pool bound to — the internal addresses a
+tunnel exposes are that site's configuration, and the rule mirrors the one
+`GET /agents` applies to a node. `GET /tunnels/{id}` and
+`GET /tunnels/{id}/sessions` hide an out-of-scope tunnel behind a `404`, like
+every other resource.
+
+**Response (200):**
+```json
+{
+  "items": [
+    {
+      "id": "0f1c…",
+      "name": "branch-office",
+      "description": "NAS and intranet app",
+      "status": "active",
+      "paired": true,
+      "enabled": true,
+      "connector_online": true,
+      "connector_version": "0.32.50",
+      "connector_hostname": "nas-01",
+      "last_seen_at": "2026-11-25T02:00:00Z",
+      "targets": ["10.0.0.5:8080"],
+      "sites": ["app.example.com"],
+      "sessions": [
+        {
+          "agent_id": "…",
+          "agent_name": "edge-1",
+          "agent_status": "online",
+          "connected_at": "2026-11-25T01:59:00Z",
+          "last_seen_at": "2026-11-25T02:00:00Z",
+          "streams_active": 3,
+          "rtt_ms": 12,
+          "version": "0.32.50",
+          "hostname": "nas-01"
+        }
+      ],
+      "created_at": "2026-11-25T00:00:00Z",
+      "updated_at": "2026-11-25T00:00:00Z"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "page_size": 25
+}
+```
+
+### POST /tunnels
+
+Create a tunnel and mint its one-time pairing token. Requires write access.
+
+**Request:**
+```json
+{ "name": "branch-office", "description": "NAS and intranet app" }
+```
+
+**Response (201):**
+```json
+{
+  "tunnel": { "…": "as above" },
+  "pairing_token": "<64 hex chars>",
+  "pairing_command": "curl -fsSL …/install.sh | sudo bash -s -- --mode tunnel --server-url https://cp:9090 --token …",
+  "expires_at": "2026-11-25T02:30:00Z"
+}
+```
+
+`pairing_token` is returned **exactly once**; the control plane stores only its
+SHA-256. The token is redeemed over the `PairTunnel` gRPC RPC (not REST), is
+rate limited per peer, and expires after `tunnel_settings.pairing_ttl_seconds`.
+
+The redemption returns a long-lived **credential** (which authenticates the
+connector's control stream and never leaves the control plane/connector pair)
+and a short-lived **session token** the connector presents to the edges. Edges
+verify that token's Ed25519 signature against the public key in their rule
+bundle; they never receive the credential.
+
+### GET /tunnels/{tunnel_id}
+
+One tunnel, same shape as a list item.
+
+### PATCH /tunnels/{tunnel_id}
+
+Rename, re-describe, or enable/disable. Requires write access.
+
+```json
+{ "name": "branch-office-2", "description": null, "status": "disabled" }
+```
+
+`status` accepts `active` or `disabled` only (`pending` is managed by pairing).
+Disabling pushes a fresh rule bundle (edges drop the live session within one
+reload) and tells a connected connector it was disabled.
+
+### DELETE /tunnels/{tunnel_id}
+
+Deletes the tunnel. The connector is told to stop, its per-edge session rows are
+cleared, and the tunnel disappears from the next rule bundle.
+
+A tunnel that origin pools still reference is refused with `409` — silently
+turning those pools into **direct** origins means the edge starts dialing the
+internal addresses itself, which may either fail or reach a network the tunnel
+existed to isolate. Pass `?force=true` to clear the bindings and delete anyway;
+the response's `sites` field (from `GET /tunnels/{id}`) names what is affected.
+
+### POST /tunnels/{tunnel_id}/pairing
+
+Re-pair: rotates the credential (the running connector is disconnected) and
+mints a new pairing token. Same response shape as `POST /tunnels`.
+
+### POST /tunnels/{tunnel_id}/revoke
+
+Drops the credential and any pending pairing token; the tunnel returns to
+`pending`. Bound sites answer `503` until the connector is paired again.
+
+### GET /tunnels/{tunnel_id}/sessions
+
+The edge sessions currently serving this tunnel (`SessionView[]`, the same
+objects the list embeds).
+
+### GET /settings/tunnel
+
+Administrators only. The deployment-wide tunnel limits (single row):
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `enabled` | `true` | master switch; off refuses every new session |
+| `pairing_ttl_seconds` | `1800` | lifetime of a pairing token |
+| `max_streams_per_session` | `256` | concurrent data streams per connector session |
+| `max_targets_per_tunnel` | `256` | upper bound on a tunnel's derived target list |
+| `idle_timeout_seconds` | `300` | session liveness bound: a control stream silent for this long is closed |
+| `heartbeat_seconds` | `20` | control-frame heartbeat cadence |
+| `session_token_ttl_seconds` | `3600` | lifetime of a connector session token; also bounds how long a partitioned edge accepts a revoked tunnel |
+
+### PUT /settings/tunnel
+
+Administrators only. Accepts any subset of the fields above; values are clamped
+to what the data plane can honour (the token lifetime to 60 s – 24 h, the
+heartbeat to 5 – 300 s) and the change is pushed to every agent and connector
+immediately — a master-switch change also closes live sessions on the next
+reload.
+
+### Origin pool binding
+
+`POST /sites/{site_id}/upstream-pools` and `PUT …/upstream-pools/{pool_id}`
+accept `tunnel_id` (UUID or `null`). On update, **absent leaves the binding
+alone** and an empty string clears it. An unknown tunnel id is a `400`; the
+pool's node addresses are then resolved by the connector inside the private
+network instead of by the edge. `GET …/upstream-pools` returns `tunnel_id` on
+each pool.
+
 
 ## WAF Settings
 
@@ -2111,8 +2418,11 @@ Patch semantics: omitted fields keep their current value.
 ```
 
 `waf_enabled` is the explicit engine switch (`true` default). With it off the
-data plane skips WAF evaluation for the site entirely — custom rules, managed
-rules, CC and bot checks included. `advanced_mode` raises the managed ruleset
+data plane skips the WAF rule engine for the site — managed rules, custom
+rules and the monitor downgrades. It is not a master switch for the site's
+other protections: IP / geo access rules, bot protection, AI crawl control, CC
+challenges, rate limiting, mTLS and basic auth are built independently and
+keep enforcing. `advanced_mode` raises the managed ruleset
 to the Strict level with body deep inspection. The three `monitor_*` lists
 downgrade matching managed rules to observe-only, described in
 [Monitoring downgrades](#waf-rules).
@@ -2367,6 +2677,11 @@ Update a rule group.
 
 Delete a rule group and its rules.
 
+A group that holds a row linked to a built-in managed rule is rejected with a
+`400`: the delete would cascade to that row and drop its override (see
+[DELETE /sites/{site_id}/rules/{rule_id}](#delete-sitessite_idrulesrule_id)).
+Disable the group or the individual rules instead.
+
 ### GET /sites/{site_id}/rules
 
 List rules.
@@ -2417,6 +2732,17 @@ Update a rule.
 
 Delete a rule.
 
+A seeded row linked to a built-in managed rule (`managed_rule_id` set) cannot
+be deleted. The row is the only record of that rule's `enabled` / `mode`
+override, and the data plane always loads the managed rule itself, so removing
+the row would put a disabled or log-only rule back in blocking mode. The
+request is rejected with a `400`:
+
+```
+400 this rule controls a built-in managed rule and cannot be deleted; disable
+it or set its mode to monitor instead
+```
+
 ---
 
 ## Path Exceptions
@@ -2433,9 +2759,7 @@ exception is consulted: a paused site (maintenance page), a fail-closed edge
 ### Agent capability requirements
 
 Path scopes are interpreted by the edge agent, so what the control plane may
-accept depends on the agent versions serving the site. An agent is bound to a
-site either explicitly (`agents.site_id`) or — when unbound — to every site
-owned by the user its API key belongs to. A site with **no serving agent is
+accept depends on the agent versions serving the site. An agent receives either every site owned by its API key (`site_scope = "all"`) or the explicit set in `agent_sites` (`site_scope = "selected"`). A site with **no serving agent is
 not gated** (there is nothing to push to), and an agent whose reported version
 cannot be parsed counts as *not* supporting the capability (fail-closed).
 
@@ -2867,10 +3191,10 @@ Purge cached content.
 }
 ```
 
-**Delivery scope (D09).** `site_id` is required. The command reaches the
-agents **bound to that site plus the global (unbound) agents** (the latter
-serve the site through their key's owner). An agent bound to *another* site
-is never included, so one tenant's purge cannot spill onto another tenant's
+**Delivery scope (D09).** `site_id` is required. The command reaches every agent
+whose configured scope includes the site: selected-scope agents assigned to it,
+and all-scope agents whose API key owns it. An agent restricted to another set
+of sites is excluded, so one tenant's purge cannot spill onto another tenant's
 edges.
 
 There is no request form that purges "everything on every edge": the
@@ -2920,7 +3244,10 @@ Request and response bodies are prefixes: the agent stores at most
 `max_body_log_size` bytes per direction (8 KiB by default, 64 KiB ceiling,
 `capture_response_body` can switch response capture off). Both directions report
 the real size and a `*_truncated` flag, so a short body is never mistaken for a
-complete one.
+complete one. A node holds at most 32 MiB of these prefixes for its in-flight
+requests and another 32 MiB in its log queue; the default limit fits exactly,
+while a raised one can leave a busy node's entries without a body — truncated
+flag set, real size kept.
 
 Repeated header names are folded into the single value the stored map accepts:
 most headers join with `, ` (the way HTTP prescribes), while `Set-Cookie`
@@ -3265,6 +3592,14 @@ Time-series request data.
 
 **Query Parameters:** `site_id`, `from`, `to`, `interval` (`minute`, `hour` (default), `day` or `week`), `limit`
 
+**Response (200):** one object per bucket with `bucket`, `requests`,
+`cache_hits`, `cache_saved_bytes`, `client_errors`, `server_errors`,
+`avg_latency_ms`, `blocked`, and the total-latency percentiles
+`p50_latency_ms` / `p90_latency_ms` / `p99_latency_ms`
+(`PERCENTILE_CONT` over the rows in the bucket). The latency chart plots the
+three percentiles because a mean hides the tail users actually feel; a bucket
+with no rows reports `0` for each.
+
 ### GET /analytics/traffic
 
 Egress bandwidth per fixed-width bucket — response bytes streamed to clients only; origin-pull traffic is never counted. Without `site_id` the call covers every site the caller may see.
@@ -3327,6 +3662,68 @@ rather than silently falling back to `false`, so a typo cannot quietly change
 the ranking. A present-but-empty value (`?blocked_only=`) is rejected too; omit
 the parameter for the default. `blocked_only=false` is byte-for-byte the statement the endpoint
 served before the parameter existed.
+
+**Response:** one row per client IP — `client_ip`, `country_code` (nullable),
+`requests`, `blocked`, `top_site_id` (nullable; the site the address last hit,
+which the console uses as the target of its one-click block/challenge) and the
+network the address belongs to: `asn` (nullable AS number) plus `asn_name`, the
+organization the control plane's ASN table maps it to (`Unknown (AS<n>)` when it
+has no entry). `asn` is `NULL` for private addresses, for deployments whose
+agents carry no GeoIP ASN data and for rows written before the column existed —
+the dashboard then shows `—` instead of guessing a network.
+
+### GET /analytics/top-asns
+
+Networks ranked by request count — the ASN table on the traffic and
+site-detail pages. Same window and tenant scoping as every other analytics
+endpoint: `site_id` scopes one site (the caller must be able to read it);
+without it an administrator sees every site, while a non-administrator is
+scoped to their own sites (their single site automatically, several sites
+requires naming one).
+
+**Query Parameters:** `site_id`, `from`, `to`, `range` (`24h` | `7d` | `30d`),
+`interval`, `limit` (default 10, capped at 100; the cap applies to networks
+that have a resolved ASN, so a window that also holds unresolved rows still
+returns up to `limit` ranked networks). Rows are ordered by `requests`
+descending with the AS number as the tie-break, so polling the same window
+twice returns the same order.
+
+**Response (200):**
+```json
+[
+  {"asn": 13335, "asn_name": "Cloudflare, Inc.", "requests": 1520},
+  {"asn": 64512, "asn_name": "Unknown (AS64512)", "requests": 12}
+]
+```
+
+`asn_name` is resolved by the control plane, not by a lookup service: a
+bundled snapshot of ASN → organization names
+(`wafred-server/assets/asn_names.tsv`, the major CDN / hyperscaler / ISP /
+hosting networks) is compiled into the binary and read once per process. An AS
+number with no entry is returned as `Unknown (AS<number>)` — never as a bare
+number — so the number stays visible and a missing name cannot be mistaken for
+a name.
+
+To extend or correct the names, export a two-column TSV
+(`<asn><TAB><organization>`; an `AS` prefix, blank lines and `#` comments are
+accepted) and point **`WAFRED_ASN_NAMES_FILE`** at it. The file is read once,
+on first use, so restart the control plane after replacing it; its entries
+override the bundled ones. A missing, unreadable or oversized file only logs a
+warning and the bundled snapshot keeps serving, and an unparsable line is
+skipped with a warning that names the line — never a startup failure.
+
+Rows whose client address has no known AS number are **excluded** from the
+ranking rather than bucketed under an "unknown" network: a request written
+before the `asn` column existed, a private or reserved address, and a request
+whose address no database could map all store NULL. A window with no resolved
+network therefore answers `[]`, not an error.
+
+`access_logs.asn` is filled from the AS number the agent reports with each log
+entry (`LogEntry.asn`, field 82). The edge's GeoIP snapshot carries country
+ranges only, so an agent normally reports `0`; the control plane then fills the
+number from a local MaxMind ASN database — see [ASN data source](#asn-data-source).
+Without such a database the column stays NULL and the ranking is empty, which is
+the documented behaviour rather than a guessed value.
 
 ### GET /analytics/top-paths
 
@@ -3391,6 +3788,89 @@ zero.
   "desktop_share": 0.6897, "mobile_share": 0.2759, "ai_bots_share": 0.0207,
   "other_share": 0.0138 }
 ```
+
+---
+
+## ASN data source
+
+The ASN ranking needs the client's autonomous system number, and the edge's
+embedded GeoIP data does not carry ASN ranges. The control plane therefore
+enriches `access_logs.asn` at ingestion from a **MaxMind ASN database** it
+reads locally: a lookup is a binary search in process memory, so no request
+performs a network call, and nothing is downloaded at runtime.
+
+Accepted databases: `GeoLite2-ASN`, `GeoIP2-ISP` and `GeoIP2-Enterprise` (all
+carry `autonomous_system_number`). A country or city database is rejected with
+`400` rather than silently producing an empty ranking.
+
+**Two ways to install one — pick either:**
+
+| Source | How | Persists across restarts |
+|--------|-----|--------------------------|
+| Upload | `POST /api/v1/asn/database` (administrator) | Yes — written to `/var/lib/wafred/asn.mmdb`, the `wafred-data` volume of the shipped compose file |
+| Configured path | Set `WAFRED_ASN_MMDB=/path/to/GeoLite2-ASN.mmdb` (mounted into the container) | Yes, the file is the operator's |
+
+An upload wins over the configured path only in the sense that it writes to
+`WAFRED_ASN_MMDB` when that variable is set (the upload refuses to write a
+read-only mount with a `500`). With neither, the ranking stays empty.
+
+**Licensing and where to get the file.** MaxMind's GeoLite2 databases are free
+of charge but require a (free) MaxMind account and acceptance of the GeoLite2
+End User License Agreement; the download is licensed under CC BY-SA 4.0 and
+must be attributed to MaxMind. WAFred does **not** download or redistribute
+the database: the operator fetches it once (`https://www.maxmind.com/en/geolite2/signup`,
+then *Download Databases → GeoLite2 ASN → MaxMind DB binary (.mmdb.gz)*),
+decompresses it, and installs it through one of the two rows above. Re-download
+monthly to pick up reallocated networks; re-upload (or restart) after replacing
+the file.
+
+### GET /asn/database
+
+Status of the data source. Administrators only. When no database is active
+but the configured file exists, this call loads it, so a database copied in
+after startup becomes visible without a restart (and without waiting for
+traffic).
+
+```json
+{
+  "path": "/var/lib/wafred/asn.mmdb",
+  "path_from_env": false,
+  "configured": true,
+  "active": true,
+  "database_type": "GeoLite2-ASN",
+  "build_time": "2026-11-15T00:00:00Z",
+  "error": null
+}
+```
+
+`active` is the flag that matters: when it is `false`, `error` says why (no
+file, unreadable, not a MaxMind database, wrong database type) and the ASN
+ranking is empty. `path_from_env` distinguishes an operator-mounted file from
+the upload default.
+
+### POST /asn/database
+
+Upload a database. Administrators only; `multipart/form-data` with a field
+named `file`. The file is validated (MaxMind format **and** ASN type) before it
+replaces the previous database, so a wrong or truncated download answers `400`
+and the working database keeps serving. Body limit: 64 MiB.
+
+```bash
+curl -X POST https://waf.example.com:9080/api/v1/asn/database \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@GeoLite2-ASN.mmdb"
+```
+
+**Response (200):** the same object `GET /asn/database` returns, with
+`active: true` and the new `database_type` / `build_time`.
+
+### DELETE /asn/database
+
+Remove the uploaded database and clear the in-memory copy; the ranking returns
+to empty. Administrators only. Answers `409` when `WAFRED_ASN_MMDB` names the
+file — that path belongs to the operator, so delete it on the host instead.
+
+**Response (200):** the status object with `active: false`.
 
 ---
 
@@ -3609,7 +4089,7 @@ Create an IP rule. Set either `ip_ranges` (manual mode) or `group_id` (reference
 }
 ```
 
-`action` is `block`, `allow`, `challenge`, `js_challenge` or `basic_auth`. Sending `group_id` instead of `ip_ranges` makes the rule track the group's latest ranges. A `basic_auth` rule challenges the matched clients and continues to the remaining checks once they authenticate; configure the credentials under [Basic Auth](#basic-auth) first.
+`action` is `block`, `allow`, `challenge`, `js_challenge` or `basic_auth`. Every `ip_ranges` entry must be a valid IP address or CIDR (up to 1000 per rule, trimmed and deduplicated); an invalid entry — e.g. `10.0.0.0/33` or `10.0.0.0/abc` — is rejected with `400` and a message naming the value. The same check applies to `PUT` and to the bulk-import endpoint below. Sending `group_id` instead of `ip_ranges` makes the rule track the group's latest ranges. A `basic_auth` rule challenges the matched clients and continues to the remaining checks once they authenticate; configure the credentials under [Basic Auth](#basic-auth) first.
 
 **Path scope (`path`, `match_type`):** every rule also accepts an optional
 path scope — empty `path` = the whole site; a non-empty scope applies the
@@ -3783,7 +4263,7 @@ groups ship with the control plane — Google, Yandex, DuckDuckGo and Cloudflare
 verifier/CDN ranges as static snapshots, seeded on first start — and `url`
 groups pull a plain-text or CIDR list over HTTP. Both are refreshed
 automatically by a daily background job (`subscription_enabled: false` opts
-out); `last_synced_at` and `last_sync_error` report the last run. Range
+out); `last_synced_at` and `last_sync_error` report the last run. Fetched lines that are not a valid IP address or CIDR are skipped during a sync instead of being stored. Range
 changes propagate: sites that use the group for access rules, route gating,
 bot verification or proxy trust get their configuration re-pushed
 immediately.
@@ -3860,6 +4340,8 @@ List IP groups (paginated), each with a `site_count`.
 ### POST /ip-groups
 
 Create an IP group (up to 10000 ranges). Requires write access (`admin`).
+
+Every `ip_ranges` entry is trimmed, deduplicated and must be a valid IP address or CIDR (e.g. `203.0.113.7` or `198.51.100.0/24`); anything else — `10.0.0.0/33`, `2001:db8::/129`, `10.0.0.0/abc` — is rejected with `400` and a message naming the offending value. The same validation applies to `PUT /ip-groups/{group_id}`.
 
 **Request:**
 ```json
@@ -3968,8 +4450,8 @@ Requests per country over the last 24 hours (up to 20 countries), for the bar ch
 **Response (200):**
 ```json
 [
-  {"country_code": "CN", "requests": 5210},
-  {"country_code": "US", "requests": 1240}
+  {"country_code": "CN", "requests": 5210, "blocked": 610},
+  {"country_code": "US", "requests": 1240, "blocked": 12}
 ]
 ```
 
@@ -3977,8 +4459,8 @@ Requests per country over the last 24 hours (up to 20 countries), for the bar ch
 
 Requests per country aggregated across every site the caller may see
 (administrators: all sites; other accounts: the sites they own) — drives the
-world map on the global traffic page. Traffic whose country could not be
-resolved is skipped.
+globe and the country ranking on the traffic pages. Traffic whose country could
+not be resolved is skipped.
 
 **Query Parameters:**
 | Param | Type | Description |
@@ -3987,11 +4469,13 @@ resolved is skipped.
 | `limit` | int | Maximum countries returned (default: 100, clamped to 1-250) |
 
 **Response (200):** the same shape as the per-site stats, sorted by requests
-descending:
+descending (`blocked` is the number of requests the WAF refused in the same
+window — HTTP 403/429, the same definition `/analytics/top-ips` uses — which is
+what the globe's red threat bubbles are sized and shaded by). Rows:
 ```json
 [
-  {"country_code": "CN", "requests": 5210},
-  {"country_code": "US", "requests": 1240}
+  {"country_code": "CN", "requests": 5210, "blocked": 610},
+  {"country_code": "US", "requests": 1240, "blocked": 12}
 ]
 ```
 
@@ -4310,7 +4794,7 @@ Update bot protection.
 }
 ```
 
-`action` is `block`, `challenge`, `js_challenge`, `log` or `allow` and is applied to traffic classified as a bot (non-browser user agents). `known_bots_whitelist` is a JSON array of case-insensitive User-Agent substrings that always pass.
+`action` is `block`, `challenge`, `js_challenge`, `log` or `allow` and is applied to traffic classified as a bot (non-browser user agents). `allow` lets that traffic through without recording an event — the same as bot protection being disabled. `known_bots_whitelist` is a JSON array of case-insensitive User-Agent substrings that always pass.
 
 Beyond the user agent — trivially spoofed — two stronger signals exist.
 `ip_verification_enabled` plus `verified_ip_group_id` treats client IPs inside
@@ -4346,6 +4830,10 @@ saved one.
   "exempt_paths": [],
   "browser_integrity_check": true,
   "tls_fingerprint_check": false,
+  "base_difficulty": 20,
+  "max_difficulty": 24,
+  "issue_limit_per_min": 120,
+  "verify_limit_per_min": 300,
   "updated_at": "2026-09-30T09:00:00Z"
 }
 ```
@@ -4369,7 +4857,11 @@ plain-text rejection into the unified JSON error envelope with the
   "rate_threshold": 100,
   "exempt_paths": ["/health", "/static/"],
   "browser_integrity_check": true,
-  "tls_fingerprint_check": false
+  "tls_fingerprint_check": false,
+  "base_difficulty": 20,
+  "max_difficulty": 24,
+  "issue_limit_per_min": 120,
+  "verify_limit_per_min": 300
 }
 ```
 
@@ -4383,6 +4875,19 @@ plain-text rejection into the unified JSON error envelope with the
 | `exempt_paths` | Bypass list; see validation rules below |
 | `browser_integrity_check` | Browser fingerprint heuristic |
 | `tls_fingerprint_check` | TLS fingerprint check |
+| `base_difficulty` | Proof-of-work difficulty (leading zero bits) a quiet visitor solves, 4–28; default `20` |
+| `max_difficulty` | Ceiling the difficulty rises to under request/failure pressure, 4–28 and `>= base_difficulty`; default `24` |
+| `issue_limit_per_min` | Challenge pages issued per host+IP per 60-second window, 1–1000000; default `120`. Over it the edge answers `429` with `x-pingwaf-mitigated: block` |
+| `verify_limit_per_min` | Solution submissions accepted per host+IP per 60-second window, 1–1000000; default `300`. Over it verification fails closed with `429` and the pending nonce is left untouched |
+
+`base_difficulty`/`max_difficulty` drive adaptive proof of work: the difficulty
+starts at the base and rises per host+IP with failed verifications and with
+request volume above `rate_threshold`, capped at the max and reset by a
+successful verification. The difficulty issued with a challenge is stored with
+it and is the value the submission is verified against, so a settings change
+never invalidates pages already in flight. Difficulty values outside 4–28, a
+`max_difficulty` below `base_difficulty`, or a limit outside 1–1000000 are
+rejected with `400`.
 
 `exempt_paths` is an optional bypass list of path prefixes served without a
 challenge. Each entry must start with `/`, contain no whitespace or control
@@ -4460,9 +4965,9 @@ Delete a rewrite rule.
 
 ---
 
-## Error Pages
+## Custom Pages
 
-A custom error page replaces the body of any response with a matching status
+A custom page replaces the body of any response with a matching status
 code — including responses the edge itself produces (a WAF block, a rate limit,
 a paused site), not only ones that came from the origin. At most one page per
 `(scope, status_code)` combination, and the pages are global: every site is
@@ -4472,6 +4977,9 @@ the dashboard.
 A write pushes the new templates to every registered agent's next configuration
 update, so no per-site publish is involved.
 
+The API and database keep the historical `error-pages` / `error_pages` names
+for compatibility; the console calls the feature **Custom Pages**.
+
 ### Scopes
 
 Every error page carries a `scope`:
@@ -4480,10 +4988,11 @@ Every error page carries a `scope`:
 |-------|--------|--------------|
 | `site` (default) | Error responses of **matched** sites — WAF blocks, rate limits, paused sites, origin errors | 400–599 |
 | `unmatched_host` | Requests whose `Host` header matches **no** configured site, e.g. someone reaching the gateway by bare IP + port, or an unknown/expired hostname | 404, 421, 503 only (the dashboard defaults to 404) |
+| `challenge` | The JS / managed / interactive challenge page. Presentation only: the compiled challenge scripts are injected by the edge. This is a separate scope from the site/unmatched-host 503 error pages; editing it does not change them | 503 only |
 
-The two scopes serve disjoint request paths, so a `site` 404 page and an
-`unmatched_host` 404 page can coexist; creating a second page with the same
-`(scope, status_code)` answers `409 conflict`.
+The scopes serve disjoint request paths, so a `site` 404 page, an
+`unmatched_host` 404 page and the `challenge` 503 page can coexist; creating a
+second page with the same `(scope, status_code)` answers `409 conflict`.
 
 `site` pages render with `request_id`, `error_code`, `error_message`,
 `site_name`, `client_ip`, `timestamp`, `method`, `path` (aliased as
@@ -4491,6 +5000,15 @@ The two scopes serve disjoint request paths, so a `site` 404 page and an
 `unmatched_host` pages render with only `{{ host }}` (HTML-escaped before it
 enters the template, so it is always safe to interpolate) and
 `{{ request_id }}` — no request header is ever reflected into the template.
+`challenge` pages render with `challenge_scripts` (the compiled fingerprint,
+proof-of-work, verification and redirect scripts; use
+`{{ challenge_scripts | safe }}`), `brand_name`, `request_id`, `difficulty`,
+`verify_endpoint` and `original_url`. The page must keep the DOM ids
+`countdown`, `title`, `subtitle`, `status`, `spinnerWrap`, `progressBar` and
+`progressFill`, and must not contain its own `<script>` tags. A template that
+omits the safe filter, loses an id or contains a script tag falls back to the
+built-in challenge page.
+
 A template that fails to render (or renders past 256 KiB) falls back to a
 plain-text body, so a typo cannot turn an error page into a `500`. Fallback
 responses carry `Cache-Control: no-store`.
@@ -4504,7 +5022,7 @@ With no `unmatched_host` page configured the edge keeps its plain default 404.
 ### GET /error-pages
 
 List custom error pages (paginated), ordered by scope, then status code.
-Optional `?scope=site|unmatched_host` filters by scope.
+Optional `?scope=site|unmatched_host|challenge` filters by scope.
 
 ### POST /error-pages
 
@@ -4524,8 +5042,8 @@ Create a custom error page.
 
 | Field | Description |
 |-------|-------------|
-| `status_code` | 400-599; for `unmatched_host` only 404, 421, 503 (otherwise `400 bad_request`) |
-| `scope` | `site` (default) or `unmatched_host`; anything else answers `400` |
+| `status_code` | 400-599; `unmatched_host` only 404/421/503; `challenge` only 503 (otherwise `400 bad_request`) |
+| `scope` | `site` (default), `unmatched_host` or `challenge`; anything else answers `400` |
 | `name` | 1-200 characters |
 | `content_type` | Defaults to `text/html` |
 | `body_template` | Tera template, must not be empty |
@@ -5776,10 +6294,11 @@ is the fleet" in one call.
       "cpu_percent": 23.4,
       "cpu_source": "probe",
       "memory_bytes": 1073741824,
+      "process_rss_bytes": 268435456,
       "connections": 128,
       "rps": null,
       "sites": 1,
-      "version": "0.32.22",
+      "version": "1.0.5",
       "last_seen": "2024-01-01T12:00:00Z"
     }
   ],
@@ -5831,9 +6350,10 @@ table does not reshuffle between polls:
 | `cpu_percent` | CPU load of the node, percent; `null` = no reading from either source |
 | `cpu_source` | Where `cpu_percent` came from: `probe` = the agent host probe's ~5 s delta sample, comparable across agent versions (values can move sharply between polls); `heartbeat` = no probe sample available, so the live heartbeat's value is used — for agents that have not reported a probe sample yet that figure can be an **average since boot**, a different measure; `none` = neither source carried a reading |
 | `memory_bytes` | Memory in use on the node, bytes; `null` = no sample retained yet |
+| `process_rss_bytes` | RSS of the agent process itself — the binary's own memory, distinct from the node's `memory_bytes` — in bytes; `null` = never reported (an agent build older than the field), not zero |
 | `connections` | Connections currently handled by the edge process; `null` = never reported (e.g. metric shipping disabled) |
 | `rps` | Requests per second handled by the edge; **`null` for every node today** — the heartbeat carries the counter but the control plane retains no per-agent copy, so the field has no data source. It stays in the contract because it is the figure operators ask for first |
-| `sites` | Sites this agent serves: `1` for a bound agent; for a global (unbound) agent, every site of its API key's owner — the same visibility the config push uses |
+| `sites` | Number of sites this agent serves: its explicit `site_ids` when `site_scope` is `selected`, or every site of its API key owner when `site_scope` is `all` |
 | `last_seen` | Last heartbeat, server time; `null` = never heard from |
 
 Fields the control plane does not know yet are `null` rather than `0`: a

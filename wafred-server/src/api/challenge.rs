@@ -61,6 +61,18 @@ pub struct UpdateChallengeRequest {
     pub browser_integrity_check: Option<bool>,
     #[serde(default)]
     pub tls_fingerprint_check: Option<bool>,
+    /// Proof-of-work difficulty a quiet visitor solves (leading zero bits).
+    #[serde(default)]
+    pub base_difficulty: Option<i32>,
+    /// Ceiling adaptive difficulty may rise to under pressure.
+    #[serde(default)]
+    pub max_difficulty: Option<i32>,
+    /// Challenge pages issued per host+IP per 60-second window.
+    #[serde(default)]
+    pub issue_limit_per_min: Option<i32>,
+    /// Solution submissions accepted per host+IP per 60-second window.
+    #[serde(default)]
+    pub verify_limit_per_min: Option<i32>,
 }
 
 /// Routes contributed to `/api/v1`.
@@ -95,6 +107,9 @@ async fn update_challenge(
     load_site_write(&state.db, id, &current).await?;
 
     let row = find_or_create(&state, id).await?;
+    // The current row is kept for cross-field validation: a partial update
+    // must be checked against the values it does not touch.
+    let existing = row.clone();
     let mut active: challenge_settings::ActiveModel = row.into();
 
     if let Some(enabled) = payload.enabled {
@@ -144,6 +159,28 @@ async fn update_challenge(
     if let Some(tls) = payload.tls_fingerprint_check {
         active.tls_fingerprint_check = Set(tls);
     }
+    if let Some(base) = payload.base_difficulty {
+        validate_difficulty("base_difficulty", base)?;
+        active.base_difficulty = Set(base);
+    }
+    if let Some(max) = payload.max_difficulty {
+        validate_difficulty("max_difficulty", max)?;
+        active.max_difficulty = Set(max);
+    }
+    if payload.base_difficulty.is_some() || payload.max_difficulty.is_some() {
+        validate_difficulty_pair(
+            payload.base_difficulty.unwrap_or(existing.base_difficulty),
+            payload.max_difficulty.unwrap_or(existing.max_difficulty),
+        )?;
+    }
+    if let Some(limit) = payload.issue_limit_per_min {
+        validate_limit_per_min("issue_limit_per_min", limit)?;
+        active.issue_limit_per_min = Set(limit);
+    }
+    if let Some(limit) = payload.verify_limit_per_min {
+        validate_limit_per_min("verify_limit_per_min", limit)?;
+        active.verify_limit_per_min = Set(limit);
+    }
     active.updated_at = Set(chrono::Utc::now());
 
     let updated = active.update(&state.db).await?;
@@ -152,6 +189,50 @@ async fn update_challenge(
     notify_config_changed(&state, id, Some(&current.email)).await;
 
     Ok(Json(updated))
+}
+
+/// Smallest proof-of-work difficulty the API accepts. Below this the work is
+/// decorative; the historical default is 20.
+const MIN_DIFFICULTY: i32 = 4;
+/// Largest proof-of-work difficulty the API accepts. A browser must still be
+/// able to finish the work, so even an explicit request is bounded.
+const MAX_DIFFICULTY: i32 = 28;
+/// Bounds for the per host+IP per-minute limits. Zero is rejected on purpose:
+/// "unlimited" is not a value an operator should be able to store by accident,
+/// and the data plane reads a stored 0 as "unset, use the default".
+const MIN_LIMIT_PER_MIN: i32 = 1;
+const MAX_LIMIT_PER_MIN: i32 = 1_000_000;
+
+/// Validates one difficulty setting.
+fn validate_difficulty(field: &str, value: i32) -> Result<(), ApiError> {
+    if !(MIN_DIFFICULTY..=MAX_DIFFICULTY).contains(&value) {
+        return Err(ApiError::BadRequest(format!(
+            "{field} must be between {MIN_DIFFICULTY} and {MAX_DIFFICULTY}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validates the adaptive range as a pair. A max below the base would make the
+/// adaptive step meaningless, so the two are checked together against the
+/// values the update leaves in place.
+fn validate_difficulty_pair(base: i32, max: i32) -> Result<(), ApiError> {
+    if max < base {
+        return Err(ApiError::BadRequest(format!(
+            "max_difficulty ({max}) must be greater than or equal to base_difficulty ({base})"
+        )));
+    }
+    Ok(())
+}
+
+/// Validates one per-minute per-IP limit.
+fn validate_limit_per_min(field: &str, value: i32) -> Result<(), ApiError> {
+    if !(MIN_LIMIT_PER_MIN..=MAX_LIMIT_PER_MIN).contains(&value) {
+        return Err(ApiError::BadRequest(format!(
+            "{field} must be between {MIN_LIMIT_PER_MIN} and {MAX_LIMIT_PER_MIN}"
+        )));
+    }
+    Ok(())
 }
 
 /// Upper bounds for `exempt_paths`: a path-bypass list is small by nature,
@@ -222,6 +303,10 @@ async fn find_or_create(
         exempt_paths: Set(Vec::new()),
         browser_integrity_check: Set(true),
         tls_fingerprint_check: Set(false),
+        base_difficulty: Set(20),
+        max_difficulty: Set(24),
+        issue_limit_per_min: Set(120),
+        verify_limit_per_min: Set(300),
         updated_at: Set(now),
     }
     .insert(&state.db)
@@ -260,6 +345,41 @@ mod tests {
             validate_exempt_paths(&["/a\u{7}b".to_string()]).is_err(),
             "control characters are refused"
         );
+    }
+
+    #[test]
+    fn difficulty_bounds_are_enforced() {
+        assert!(validate_difficulty("base_difficulty", 4).is_ok());
+        assert!(validate_difficulty("base_difficulty", 20).is_ok());
+        assert!(validate_difficulty("max_difficulty", 28).is_ok());
+        assert!(validate_difficulty("base_difficulty", 3).is_err());
+        assert!(validate_difficulty("max_difficulty", 29).is_err());
+        assert!(validate_difficulty("base_difficulty", -1).is_err());
+    }
+
+    #[test]
+    fn max_difficulty_must_not_undercut_the_base() {
+        assert!(validate_difficulty_pair(20, 24).is_ok());
+        assert!(validate_difficulty_pair(20, 20).is_ok());
+        assert!(validate_difficulty_pair(24, 20).is_err());
+    }
+
+    #[test]
+    fn per_minute_limits_must_be_positive_and_bounded() {
+        assert!(validate_limit_per_min("issue_limit_per_min", 1).is_ok());
+        assert!(validate_limit_per_min("issue_limit_per_min", 120).is_ok());
+        assert!(validate_limit_per_min(
+            "verify_limit_per_min",
+            MAX_LIMIT_PER_MIN
+        )
+        .is_ok());
+        // Zero is the data plane's "unset" marker, not an operator value.
+        assert!(validate_limit_per_min("issue_limit_per_min", 0).is_err());
+        assert!(validate_limit_per_min(
+            "verify_limit_per_min",
+            MAX_LIMIT_PER_MIN + 1
+        )
+        .is_err());
     }
 
     #[test]

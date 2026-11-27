@@ -37,7 +37,7 @@ const quickstart = {
       {
         label: "PostgreSQL",
         value: "14+（推荐 16）",
-        note: "控制面用它保存站点、规则与版本。",
+        note: "控制面用它保存站点、规则与版本。本机安装的包名随发行版而异（Ubuntu 24.04 是 postgresql-16，26.04 是 postgresql-18）——用 apt-cache search --names-only '^postgresql-[0-9]+$' 查询。",
       },
       {
         label: "端口",
@@ -67,15 +67,15 @@ const quickstart = {
         },
         {
           title: "启动服务",
-          body: "如果这台主机可被他人访问，请先设置 JWT_SECRET 与 ADMIN_PASSWORD。",
+          body: "如果这台主机可被他人访问，请先设置 JWT_SECRET 与 ADMIN_PASSWORD。不加 sudo（且不在 docker 组）时 compose 会报 permission denied … docker.sock；已在 docker 组的用户可以去掉 sudo。",
           code: {
             lang: "bash",
-            code: "export JWT_SECRET=\"$(openssl rand -hex 32)\"\nexport ADMIN_PASSWORD=\"$(openssl rand -hex 16)\"\ndocker compose up -d",
+            code: "export JWT_SECRET=\"$(openssl rand -hex 32)\"\nexport ADMIN_PASSWORD=\"$(openssl rand -hex 16)\"\n# 已在 docker 组的用户可以去掉 sudo\nsudo docker compose up -d",
           },
         },
         {
           title: "打开控制台",
-          body: "控制台使用首次启动生成的自签证书提供 HTTPS，浏览器会告警，直到你在设置中信任或上传自己的证书。",
+          body: "控制台使用首次启动生成的自签证书提供 HTTPS，浏览器会告警，直到你在设置中信任或上传自己的证书。新数据库上登录会成功，但在修改初始密码之前，任何写操作都会返回 403 password_change_required——可在控制台「设置 → 账户」修改，或调用 PUT /api/v1/auth/password（传入 current_password / new_password，成功返回 204 并吊销当前 token，之后需用新密码重新登录）。",
           code: {
             lang: "bash",
             code: "curl --connect-timeout 2 --max-time 3 http://localhost:9080/healthz\n# {\"status\":\"ok\",\"database\":\"up\"}",
@@ -142,7 +142,7 @@ const quickstart = {
   },
   credentials: {
     title: "首次登录",
-    lead: "控制面首次启动会创建管理员账号，控制台会在可用前强制要求修改密码。",
+    lead: "控制面首次启动会创建管理员账号，控制台会在可用前强制要求修改密码——可在「设置 → 账户」操作，或调用 PUT /api/v1/auth/password（传入 current_password / new_password，成功返回 204 并吊销当前 token，之后需用新密码重新登录）。改密之前，任何写操作都会返回 403 password_change_required。",
     rows: [
       { label: "控制台", value: "https://localhost:9080" },
       { label: "邮箱", value: "admin@wafred.local" },
@@ -200,6 +200,10 @@ const quickstart = {
       {
         q: "浏览器不信任控制台证书",
         a: "控制台默认使用自签证书提供 HTTPS。信任下载的证书，或在设置 → 控制面 HTTPS 上传自己的证书；用 WAFRED_TLS_SANS 指定实际访问的主机名。",
+      },
+      {
+        q: "Compose 报 \"failed to bind host port 127.0.0.1:5432/tcp: address already in use\"",
+        a: "本机已有 PostgreSQL 占用 5432。用 POSTGRES_PORT=55432 把 compose 栈映射到其他宿主机端口再启动（compose 安装器也可传 --db-port 55432，它会自动从 55432 起选择空闲端口）。",
       },
       {
         q: "Agent 一直不出现在集群里",

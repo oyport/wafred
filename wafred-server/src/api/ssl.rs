@@ -24,7 +24,7 @@ use crate::api::common::{
 };
 use crate::api::error::ApiError;
 use crate::api::sites::{
-    load_tls_posture, save_tls_posture, touch_site, TlsPosture,
+    load_tls_posture, save_tls_posture, touch_site, CertSource, TlsPosture,
     TlsPostureRequest,
 };
 use crate::api::state::AppState;
@@ -32,7 +32,7 @@ use crate::api::validation::{validate_certificate_and_key, validate_pem_pair};
 use crate::auth::{AdminUser, AuthUser};
 use crate::grpc::notify_config_changed;
 use crate::models::{
-    acme_challenge, certificate_events, certificate_links, site,
+    acme_challenge, agent, certificate_events, certificate_links, site,
     site_certificates, site_ssl,
 };
 
@@ -64,6 +64,7 @@ struct CertificateListRow {
     acme_challenge_type: String,
     acme_dns_provider: Option<String>,
     acme_dns_config: Option<serde_json::Value>,
+    acme_issuer_agent_id: Option<Uuid>,
     status: String,
     failure_reason: Option<String>,
     has_certificate: bool,
@@ -86,6 +87,7 @@ impl From<CertificateListRow> for CertificateResponse {
             acme_challenge_type: row.acme_challenge_type,
             acme_dns_provider: row.acme_dns_provider,
             acme_dns_config: row.acme_dns_config,
+            acme_issuer_agent_id: row.acme_issuer_agent_id,
             status: row.status,
             relation: owner_relation(),
             bound_sites: Vec::new(),
@@ -116,6 +118,7 @@ fn certificate_list_query() -> Select<site_certificates::Entity> {
             site_certificates::Column::AcmeChallengeType,
             site_certificates::Column::AcmeDnsProvider,
             site_certificates::Column::AcmeDnsConfig,
+            site_certificates::Column::AcmeIssuerAgentId,
             site_certificates::Column::Status,
             site_certificates::Column::FailureReason,
             site_certificates::Column::CreatedAt,
@@ -145,6 +148,9 @@ pub struct CertificateResponse {
     pub acme_challenge_type: String,
     pub acme_dns_provider: Option<String>,
     pub acme_dns_config: Option<serde_json::Value>,
+    /// Agent allowed to issue this certificate; `null` keeps the agent-level
+    /// issuer scope.
+    pub acme_issuer_agent_id: Option<Uuid>,
     pub status: String,
     /// `owner` when this site owns the certificate row, `linked` when it uses
     /// one shared by another site. Lets the console group the picker.
@@ -215,6 +221,7 @@ impl From<site_certificates::Model> for CertificateResponse {
             acme_challenge_type: m.acme_challenge_type,
             acme_dns_provider: m.acme_dns_provider,
             acme_dns_config: m.acme_dns_config,
+            acme_issuer_agent_id: m.acme_issuer_agent_id,
             status: m.status,
             relation: owner_relation(),
             // Filled in by `attach_bindings` on every read path; a freshly
@@ -300,6 +307,10 @@ pub struct CreateCertificateRequest {
     pub acme_dns_provider: Option<String>,
     #[serde(default)]
     pub acme_dns_config: Option<serde_json::Value>,
+    /// Agent allowed to issue this certificate. It must already be marked as
+    /// an ACME issuer and must serve the certificate's site.
+    #[serde(default)]
+    pub acme_issuer_agent_id: Option<Uuid>,
     /// Site the certificate is uploaded for, when it is not created through the
     /// site's own certificate list.
     #[serde(default)]
@@ -333,6 +344,13 @@ pub struct UpdateCertificateRequest {
     pub acme_dns_provider: Option<String>,
     #[serde(default)]
     pub acme_dns_config: Option<serde_json::Value>,
+    /// Tri-state: absent leaves the designation alone, `null` clears it (back
+    /// to the agent-level issuer scope), an agent id sets it.
+    #[serde(
+        default,
+        deserialize_with = "crate::api::agents::deserialize_present_nullable"
+    )]
+    pub acme_issuer_agent_id: Option<Option<Uuid>>,
     #[serde(default)]
     pub status: Option<String>,
 }
@@ -1291,6 +1309,9 @@ async fn create_certificate(
 ) -> Result<Response, ApiError> {
     let id = parse_uuid(&site_id, "site id")?;
     let site = load_site_write(&state.db, id, &current).await?;
+    if let Some(agent_id) = payload.acme_issuer_agent_id {
+        validate_acme_issuer_agent(&state.db, Some(&site), agent_id).await?;
+    }
 
     let model = insert_certificate(&state.db, Some(&site), payload).await?;
     announce_certificate_created(&state, &model, Some(&current.email)).await;
@@ -1300,6 +1321,39 @@ async fn create_certificate(
     let mut response = CertificateResponse::from(model);
     response.warnings = Some(warnings);
     Ok((StatusCode::CREATED, Json(response)).into_response())
+}
+
+/// Checks a per-certificate issuer designation.
+///
+/// The agent must exist, be marked as an ACME issuer, and (when the
+/// certificate belongs to a site) actually serve that site; otherwise the
+/// designation would hand the credential to a node that can never publish.
+async fn validate_acme_issuer_agent(
+    db: &sea_orm::DatabaseConnection,
+    site: Option<&site::Model>,
+    agent_id: Uuid,
+) -> Result<(), ApiError> {
+    let Some(agent) = agent::Entity::find_by_id(agent_id).one(db).await? else {
+        return Err(ApiError::BadRequest(
+            "acme_issuer_agent_id does not name a known agent".to_string(),
+        ));
+    };
+    if !agent.acme_issuer {
+        return Err(ApiError::BadRequest(
+            "the selected agent is not an ACME issuer; mark it with PATCH /api/v1/agents/{id} first"
+                .to_string(),
+        ));
+    }
+    if let Some(site) = site {
+        let visible = crate::grpc::agent_visible_site_ids(db, &agent).await?;
+        if !visible.contains(&site.id) {
+            return Err(ApiError::BadRequest(
+                "the selected agent does not serve this certificate's site"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Validates and stores one certificate row.
@@ -1315,6 +1369,11 @@ async fn insert_certificate<C: ConnectionTrait>(
     site: Option<&site::Model>,
     payload: CreateCertificateRequest,
 ) -> Result<site_certificates::Model, ApiError> {
+    super::common::validate_acme_dns_provider(
+        payload.acme_dns_provider.as_deref(),
+        Some(&payload.acme_challenge_type),
+        payload.acme_dns_config.as_ref(),
+    )?;
     let domain = validate_cert_domain_list(&payload.domain)?;
     if !acme_challenge::is_valid(&payload.acme_challenge_type) {
         return Err(ApiError::BadRequest(format!(
@@ -1413,6 +1472,7 @@ async fn insert_certificate<C: ConnectionTrait>(
         acme_challenge_type: Set(payload.acme_challenge_type),
         acme_dns_provider: Set(payload.acme_dns_provider),
         acme_dns_config: Set(payload.acme_dns_config),
+        acme_issuer_agent_id: Set(payload.acme_issuer_agent_id),
         status: Set(status.to_string()),
         failure_reason: Set(None),
         created_at: Set(timestamp),
@@ -1632,6 +1692,19 @@ async fn apply_certificate_update(
         }
     }
 
+    super::common::validate_acme_dns_provider(
+        payload
+            .acme_dns_provider
+            .as_deref()
+            .or(row.acme_dns_provider.as_deref()),
+        non_empty(&payload.acme_challenge_type)
+            .as_deref()
+            .or(Some(&row.acme_challenge_type)),
+        payload
+            .acme_dns_config
+            .as_ref()
+            .or(row.acme_dns_config.as_ref()),
+    )?;
     let mut active: site_certificates::ActiveModel = row.into();
 
     if let Some(domain) = next_domain {
@@ -1671,6 +1744,12 @@ async fn apply_certificate_update(
     }
     if let Some(config) = payload.acme_dns_config {
         active.acme_dns_config = Set(Some(config));
+    }
+    if let Some(issuer) = payload.acme_issuer_agent_id {
+        if let Some(agent_id) = issuer {
+            validate_acme_issuer_agent(&state.db, site, agent_id).await?;
+        }
+        active.acme_issuer_agent_id = Set(issuer);
     }
     if let Some(status) = non_empty(&payload.status) {
         if !cert_status::is_valid(&status) {
@@ -1893,7 +1972,7 @@ async fn renew_certificate(
     notify_config_changed(&state, id, Some(&current.email)).await;
 
     Ok(Json(serde_json::json!({
-        "message": "renewal initiated",
+        "message": "Renewal requested. The issuer checks certificate expiry and hostnames on its scheduled cycle.",
         "certificate_id": target,
         "status": cert_status::PENDING,
     })))
@@ -1926,7 +2005,9 @@ async fn update_ssl_settings(
     let id = parse_uuid(&site_id, "site id")?;
     let site = load_site_write(&state.db, id, &current).await?;
 
-    let posture = save_tls_posture(&state.db, &site, &payload).await?;
+    let posture =
+        save_tls_posture(&state.db, &site, &payload, CertSource::default())
+            .await?;
     tracing::info!(site_id = %id, "SSL settings updated");
     touch_site(&state, id).await?;
     notify_config_changed(&state, id, Some(&current.email)).await;
@@ -2115,6 +2196,9 @@ async fn create_unbound_certificate(
         ));
     }
 
+    if let Some(agent_id) = payload.acme_issuer_agent_id {
+        validate_acme_issuer_agent(&state.db, None, agent_id).await?;
+    }
     let model = insert_certificate(&state.db, None, payload).await?;
     announce_certificate_created(state, &model, Some(&current.email)).await;
     // Coverage is measured against a site's hostnames, and nothing is bound
@@ -2146,6 +2230,9 @@ async fn create_global_certificate(
     let site_id = parse_uuid(&raw_site.to_string(), "site id")?;
     let site = load_site_write(&state.db, site_id, &current).await?;
     let activate = payload.activate;
+    if let Some(agent_id) = payload.acme_issuer_agent_id {
+        validate_acme_issuer_agent(&state.db, Some(&site), agent_id).await?;
+    }
 
     // The row and the activated posture commit together: a posture failure
     // (bad TLS bounds, a certificate id from another site) must not leave a
@@ -2159,7 +2246,7 @@ async fn create_global_certificate(
             certificate_id: Some(model.id),
             ..Default::default()
         };
-        save_tls_posture(&txn, &site, &posture).await?;
+        save_tls_posture(&txn, &site, &posture, CertSource::default()).await?;
     }
     txn.commit().await?;
 
@@ -3305,6 +3392,7 @@ mod tests {
             acme_challenge_type: acme_challenge::HTTP_01.to_string(),
             acme_dns_provider: None,
             acme_dns_config: None,
+            acme_issuer_agent_id: None,
             status: cert_status::ACTIVE.to_string(),
             failure_reason: None,
             created_at: Utc::now(),

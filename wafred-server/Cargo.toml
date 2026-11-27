@@ -6,8 +6,10 @@ description = "WAFred control plane: REST API for the dashboard, gRPC control pl
 license = "Apache-2.0"
 
 [dependencies]
+pingap-config = { workspace = true }
 regex = { workspace = true, features = ["std", "unicode-case", "unicode-perl"] }
 pingwaf-proto = { path = "../wafred-proto" }
+wafred-tunnel = { workspace = true }
 # The control plane validates the built-in rule expressions with the same
 # parser the data plane evaluates them with.
 pingwaf-waf = { path = "../wafred-waf" }
@@ -33,6 +35,8 @@ chrono-tz = { workspace = true }
 # Drives the provider response streams and the SSE chat endpoint.
 futures-util = { workspace = true }
 hex = { workspace = true }
+# 32-byte pairing tokens and connector credentials.
+rand = { workspace = true }
 # HMAC-SHA256 signing of DingTalk webhook payloads.
 hmac = { workspace = true }
 # AES-256-GCM at-rest sealing of notification channel secrets.
@@ -65,6 +69,8 @@ sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Parses the embedded data plane's acme_state.toml for certificate sync.
+toml = { workspace = true }
 # Certificate generation and parsing for the managed mTLS CAs. `rcgen` carries
 # its own crypto backend, so no TLS stack is pulled into the control plane.
 # WebAuthn (passkey) ceremony handling. Pure Rust (p256/coset/ciborium), so the

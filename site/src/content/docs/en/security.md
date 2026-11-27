@@ -36,6 +36,12 @@ Only the current release line is guaranteed to receive security patches;
 security fixes ship in patch releases and are listed under `### Security` in
 the [changelog](https://github.com/shuaiZend/WAFred/blob/main/CHANGELOG.md).
 
+## Tunnels and the trust boundary
+
+A tunnel connector never hands its credential to an edge: the control plane mints a short-lived Ed25519 **session token** (key derived from `jwt_secret`, one hour by default) and the edge verifies the signature, the tunnel id and the expiry against the public key in its rule bundle. A captured token expires and cannot be replayed against another tunnel. The connector pins the edge's certificate.
+
+One tunnel is one trust domain: every edge that serves a site bound to it can ask the connector for any of that tunnel's targets, so split network segments across separate tunnels. Revocation converges while the edge can reach the control plane — the next rule bundle drops the tunnel's key; a partitioned edge keeps the last policy it received, exactly like the deployment's fail-open rule cache. Deleting a tunnel that origin pools still reference is refused (`409`) unless `?force=true`, because the pools would otherwise start dialing the internal addresses directly.
+
 ## Hardening before exposure
 
 The console ships with development-friendly defaults. Before exposing an

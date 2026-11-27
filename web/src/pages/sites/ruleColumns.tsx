@@ -183,15 +183,18 @@ export function buildRuleColumns(deps: RuleColumnsDeps): Column<Rule>[] {
             onClick={() => onEdit(r)}
             icon={<PencilSimple weight="duotone" className="h-4 w-4" />}
           />
-          <Button
-            size="icon"
-            variant="ghost"
-            className="hover:text-fg-danger"
-            aria-label={t('common.delete')}
-            disabled={!canWrite}
-            onClick={() => onDelete(r)}
-            icon={<Trash weight="duotone" className="h-4 w-4" />}
-          />
+          {/* Deleting an override row would put its built-in rule back in blocking mode. */}
+          {!r.managed_rule_id && (
+            <Button
+              size="icon"
+              variant="ghost"
+              className="hover:text-fg-danger"
+              aria-label={t('common.delete')}
+              disabled={!canWrite}
+              onClick={() => onDelete(r)}
+              icon={<Trash weight="duotone" className="h-4 w-4" />}
+            />
+          )}
         </div>
       ),
     },

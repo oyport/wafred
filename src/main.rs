@@ -64,10 +64,12 @@ use pingap_upstream::new_upstream_health_check_task;
 use pingora::server;
 use pingora::server::configuration::Opt;
 use pingora::services::background::background_service;
-use process::{
-    get_admin_addr, get_start_time, new_auto_restart_service,
-    new_observer_service, set_admin_addr,
-};
+#[cfg(not(feature = "edge"))]
+use process::get_admin_addr;
+use process::{get_start_time, set_admin_addr};
+#[cfg(not(feature = "edge"))]
+use process::{new_auto_restart_service, new_observer_service};
+#[cfg(not(feature = "edge"))]
 use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::OsString;
@@ -78,6 +80,9 @@ use sysinfo::System;
 
 use tracing::{error, info, warn};
 
+// The control-plane maintenance commands are server-only: an edge-agent build
+// has no database and no admin surface, so it compiles them out entirely.
+#[cfg(not(feature = "edge"))]
 mod admin;
 #[cfg(not(feature = "dhat"))]
 mod allocator_tune;
@@ -135,8 +140,6 @@ locations = ["httpLocation"]
 addrs = ["127.0.0.1:5000"]
 "###;
 
-use std::sync::LazyLock;
-
 static LOG_TARGET: &str = "main";
 
 /// The commit this binary was built from, or "unknown" when the tree had no
@@ -171,7 +174,7 @@ pub(crate) fn version_banner() -> &'static str {
     author,
     version,
     about,
-    long_version = LONG_VERSION.as_str(),
+    long_version = version::LONG_VERSION.as_str(),
     long_about = None
 )]
 struct Args {
@@ -484,6 +487,7 @@ fn new_access_logger(
     r
 }
 
+#[cfg(not(feature = "edge"))]
 fn run_admin_node(args: Args) -> Result<(), Box<dyn Error>> {
     pingap_logger::logger_try_init(pingap_logger::LoggerParams {
         ..Default::default()
@@ -650,8 +654,17 @@ fn run() -> Result<(), Box<dyn Error>> {
     if let Some(admin) = &args.admin {
         set_admin_addr(admin);
     }
+    #[cfg(not(feature = "edge"))]
     if args.cp && args.admin.is_some() {
         return run_admin_node(args);
+    }
+    #[cfg(feature = "edge")]
+    if args.cp {
+        return Err(
+            "the agent-only edge build has no pingap admin console; use the \
+             all-in-one pingwaf binary for --cp"
+                .into(),
+        );
     }
 
     match System::new() {
@@ -965,6 +978,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let mut server_conf_list: Vec<ServerConf> = parse_from_conf(config.clone());
 
+    #[cfg(not(feature = "edge"))]
     if let Some(addr) = &get_admin_addr() {
         let (server_conf, _, plugin_conf) = plugin::parse_admin_plugin(addr)?;
         let path = if let Some(path) = plugin_conf.get("path") {
@@ -1150,6 +1164,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         simple_background_service.add_task("log_flush", task);
     }
 
+    // The edge build compiles the auto-restart/observer services out (they
+    // belong to the pingap-mode runtime, not to the agent); the root binary is
+    // never shipped in that configuration, so skipping the setup is fine.
+    #[cfg(not(feature = "edge"))]
     if args.autorestart || args.autoreload {
         let only_hot_reload = !args.autorestart;
         if config_manager.support_observer() {

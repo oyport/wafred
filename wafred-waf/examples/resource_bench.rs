@@ -1497,6 +1497,9 @@ fn mixed_configs(sites: usize) -> Vec<WafEngineConfig> {
                 level,
                 stacks,
                 rules,
+                // Measure the whole scan, not the first 20 ms of it: this
+                // benchmark exists to price Stage-1 detection.
+                inspection_deadline: std::time::Duration::ZERO,
                 ..WafEngineConfig::default()
             }
         })
@@ -1507,6 +1510,7 @@ fn profile_config(level: WafLevel, stacks: StackSet) -> WafEngineConfig {
     WafEngineConfig {
         level,
         stacks,
+        inspection_deadline: std::time::Duration::ZERO,
         ..WafEngineConfig::default()
     }
 }

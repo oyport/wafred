@@ -16,7 +16,10 @@ cookie to visitors that solve it.
 | `under_attack_mode` | bool | `false` | When `true`, challenge **every** request regardless of rate. |
 | `clearance_duration_secs` | int | `1800` | Lifetime of the clearance cookie (seconds). |
 | `rate_threshold` | int | `100` | Requests per 60-second window above which a visitor is challenged. |
-| `pow_difficulty` | int | `20` | Proof-of-work difficulty (leading zero bits). Higher = harder for bots, slower for users. |
+| `pow_difficulty` | int | `20` | Base proof-of-work difficulty (leading zero bits). Higher = harder for bots, slower for users. |
+| `pow_max_difficulty` | int | `24` | Ceiling adaptive difficulty may raise the work to for a host+IP under pressure. Clamped up to `pow_difficulty`. |
+| `pow_issue_limit_per_min` | int | `120` | Challenge pages issued per host+IP per 60-second window, shared with the WAF plugin's rule/access/rate-limit challenges. Over it the visitor gets a `429` rate-limit page. |
+| `pow_verify_limit_per_min` | int | `300` | Solution submissions accepted per host+IP per 60-second window. Over it verification fails closed without spending the pending nonce. |
 | `cookie_secret` | string | *(generated)* | HMAC key used to sign clearance cookies. Leave it unset (or set to the legacy `change-me`) and the process generates a random key instead — set it explicitly only if the secret must survive restarts. |
 | `cookie_name` | string | `__pingwaf_clearance` | Name of the clearance cookie. |
 | `exempt_paths` | string[] | `[]` | Paths that bypass the challenge (health checks, APIs). |
@@ -49,6 +52,48 @@ cookie to visitors that solve it.
 | `InteractiveChallenge` | `503` interactive challenge page (user action). |
 | `Block` | `403` hard block page. |
 
+## Adaptive difficulty and per-IP limits
+
+Every challenge carries its own difficulty. The page states it, the edge
+records it with the pending challenge, and the verifier checks the submission
+against **that** value — never against the plugin's current setting, and never
+against anything the client sent.
+
+The difficulty starts at `pow_difficulty` and rises per host+IP with:
+
+* **verification failures** — one step per failed submission (a wrong proof, a
+  mismatched User-Agent/fingerprint, or a submission from another address),
+  forgotten one step per minute without a new failure;
+* **request volume** — one step for each `rate_threshold`-worth of requests
+  above the threshold (at most four steps).
+
+It is capped at `pow_max_difficulty`, and a successful verification resets the
+record to the base. The state is per process, keyed by host + client address
+and bounded: past the table ceiling new clients keep the base difficulty
+rather than the table growing with an attacker's address space.
+
+Two per-host+IP budgets sit next to it, both on a fixed 60-second window:
+
+| Budget | Over the limit |
+| --- | --- |
+| `pow_issue_limit_per_min` challenge pages | `429` rate-limit page (`x-pingwaf-mitigated: block`, `Retry-After`), and the request is logged as mitigated. The page is never minted, so the challenge loop cannot be used as an amplifier. |
+| `pow_verify_limit_per_min` submissions | `429` rate-limit page, also logged as mitigated. The check runs **before** any verification work, so an over-limit flood cannot spend a legitimate visitor's nonce. |
+
+Both counters are per process: behind N edge instances the effective allowance
+is N × the configured value. Set `pow_max_difficulty = pow_difficulty` to pin
+the difficulty, or raise the limits for sites whose visitors share one NAT
+address.
+
+The two budgets differ deliberately when their table is full of *other* clients
+(the bounded table is 8192 keys per window):
+
+* **issuance keeps working** — the page is minted without a budget entry. A
+  many-source flood must not turn the burst guard into an outage for every new
+  visitor;
+* **verification fails closed** — a full table must not become an unmetered
+  guessing channel. The pending challenge is left intact, so the visitor can
+  retry once the window rolls over.
+
 ## Examples
 
 Standard CC protection:
@@ -79,15 +124,22 @@ plugins = ["underAttack"]
 
 ## Interaction with the WAF plugin
 
-The [`waf`](waf.md) plugin may issue a `Challenge` verdict. When it does, the
-challenge page is rendered by shared code in this module and the pending nonce is
-stored in a process-wide map. The `challenge` plugin's verify endpoint resolves
-that nonce and completes the proof-of-work flow.
+The [`waf`](waf.md) plugin may answer with a `Challenge` verdict (a rule match,
+an IP/geo access rule, bot protection or a rate-limit rule). Every such page is
+minted through the same guarded path as this plugin's CC gate, so:
 
-Both plugins share the same verify endpoint and pending store, so they work
-together transparently. Keep `pow_difficulty` and `cookie_secret` **consistent**
-across the two plugins to ensure challenges issued by the WAF can be verified by
-the challenge plugin.
+* it carries the **site's** `base_difficulty`/`max_difficulty` and adaptive
+  pressure, not a static plugin value;
+* it costs the same per-host+IP `pow_issue_limit_per_min` budget, so a rule
+  challenge cannot be used to bypass the limit;
+* the difficulty it states is recorded with the pending entry and is the value
+  the verify endpoint checks.
+
+The WAF plugin's own `pow_difficulty`/`pow_max_difficulty`/
+`pow_issue_limit_per_min` only apply when the site carries no challenge settings
+(standalone mode). Both plugins share the verify endpoint and the pending store,
+so keep `cookie_secret` **consistent** across the two plugins to ensure
+challenges issued by the WAF can be verified here.
 
 ## Usage notes
 

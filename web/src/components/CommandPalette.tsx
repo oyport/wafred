@@ -23,6 +23,7 @@ import {
   type Icon,
 } from '@phosphor-icons/react'
 import { cn } from '@/lib/utils'
+import { hasAdminViewAccess } from '@/lib/permissions'
 import { useSitesList } from '@/hooks'
 import { useAuthStore } from '@/stores/authStore'
 import { useThemeStore } from '@/stores/themeStore'
@@ -126,7 +127,8 @@ export function CommandPalette({ onClose }: { onClose: () => void }) {
   const navigate = useNavigate()
   const toggleTheme = useThemeStore((s) => s.toggle)
   // Must mirror router/index.tsx's RequireAdmin, matching the Sidebar.
-  const isAdmin = useAuthStore((s) => s.user?.role) === 'admin'
+  const user = useAuthStore((s) => s.user)
+  const isAdmin = hasAdminViewAccess(user)
   const [query, setQuery] = useState('')
   const [active, setActive] = useState(0)
   const [recentIds, setRecentIds] = useState<string[]>(readRecent)

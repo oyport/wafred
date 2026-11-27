@@ -257,8 +257,12 @@ fn valid_range(line: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    let base = trimmed.split('/').next().unwrap_or(trimmed);
-    if base.parse::<std::net::IpAddr>().is_err() {
+    // The whole entry must parse as a CIDR network or a bare address:
+    // validating only the `/` prefix accepted malformed entries such as
+    // `10.0.0.0/33` that the data plane would silently drop.
+    if trimmed.parse::<ipnet::IpNet>().is_err()
+        && trimmed.parse::<std::net::IpAddr>().is_err()
+    {
         return None;
     }
     Some(trimmed.to_string())
@@ -665,13 +669,31 @@ mod tests {
     }
 
     #[test]
+    fn valid_range_requires_whole_entry_to_parse() {
+        assert_eq!(valid_range("10.0.0.1").as_deref(), Some("10.0.0.1"));
+        assert_eq!(
+            valid_range(" 10.0.0.0/24 ").as_deref(),
+            Some("10.0.0.0/24")
+        );
+        assert_eq!(
+            valid_range("2001:db8::/32").as_deref(),
+            Some("2001:db8::/32")
+        );
+        // Previously only the part before `/` was parsed, so these were
+        // accepted and later dropped silently by the data plane.
+        for bad in ["10.0.0.0/33", "2001:db8::/129", "10.0.0.0/abc"] {
+            assert!(valid_range(bad).is_none(), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
     fn builtin_snapshots_are_non_empty_and_valid() {
         for snapshot in BUILTIN_SNAPSHOTS {
             assert!(!snapshot.ranges.is_empty(), "{}", snapshot.name);
             for range in snapshot.ranges {
-                let base = range.split('/').next().unwrap_or(range);
                 assert!(
-                    base.parse::<std::net::IpAddr>().is_ok(),
+                    range.parse::<ipnet::IpNet>().is_ok()
+                        || range.parse::<std::net::IpAddr>().is_ok(),
                     "{}: invalid range {range}",
                     snapshot.name
                 );

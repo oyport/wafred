@@ -29,6 +29,14 @@ const docs = {
       topics: ["docker", "systemd", "ports", "environment"],
     },
     {
+      slug: "tunnel",
+      icon: "route",
+      title: "Tunnels",
+      lead: "Serve an internal service through the WAF without an inbound port: pairing, the edge listener, pool binding, SOCKS5 egress and operations.",
+      minutes: 12,
+      topics: ['pairing', 'edge listener', 'SOCKS5', 'NAT'],
+    },
+    {
       slug: "waf-engine",
       icon: "shield",
       title: "WAF engine",

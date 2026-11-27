@@ -54,6 +54,35 @@ for) with `WAFRED_CONFIG=/etc/wafred/wafred.toml` set in the unit;
 `systemctl restart wafred` applies any configuration change, and
 `journalctl -u wafred -e` shows the legacy-named service logs.
 
+### The agent-only build (`wafred-agent`)
+
+Releases also ship `wafred-agent`, built from the same source with the
+control plane compiled out (`--bin wafred-agent --features edge`). It is the
+data plane and nothing else: no PostgreSQL, no REST API, no embedded
+dashboard, so an edge node downloads and maps far less code. `install.sh
+--mode agent` fetches that archive and installs it as `/usr/local/bin/pingwaf`,
+so the unit and every command below stay unchanged; `pingwaf --version` marks
+it with `edge`. Both spellings work:
+
+```bash
+wafred-agent agent --server-url https://control-plane:9090 --api-key KEY
+wafred-agent --server-url https://control-plane:9090 --api-key KEY
+```
+
+The `agent` subcommand is accepted because a self-upgrade replaces the file
+with the control plane's all-in-one build, which still needs it. That also
+means `auto_upgrade` trades the smaller build for the full one: it follows the
+control plane's executable, so re-run the installer in agent mode to get the
+agent-only artifact back. The agent-only build has no
+`server`/`all-in-one`/maintenance subcommands; run those from the full
+`pingwaf` binary.
+
+> Agent scope defaults to **All sites** owned by its API key. Use **Agents →
+> [node] → Site scope** to select only the sites that edge should serve. For
+> ACME, use the same WAFred release on the control plane and the issuing agent.
+> See [deployment.md → Edge Agent](deployment.md#edge-agent) for the CA and
+> `server_tls_name` setup.
+
 ## Global options
 
 `server` and `all-in-one` accept these options (the `agent` has its own set,
@@ -100,6 +129,56 @@ Agent-only options (`agent` / the agent half of `all-in-one`): `--server-url`
 (`WAFRED_HEARTBEAT_INTERVAL`, default `30`), `--metrics-ship-interval`
 (`WAFRED_METRICS_SHIP_INTERVAL`, default `30`), plus `--log-batch-size`,
 `--log-flush-interval-secs` and `--max-body-log-size` (command line only).
+
+The connector can reach both the control plane and the edge ingresses through a
+SOCKS5 proxy, for a host with no direct egress: `--socks5-proxy <host:port>`
+(`WAFRED_TUNNEL_SOCKS5_PROXY`), plus `--socks5-username` /
+`--socks5-password` (prefer `WAFRED_TUNNEL_SOCKS5_PASSWORD` over the flag, which
+`ps` can read). The same keys live in `/etc/wafred/tunnel.toml` as
+`socks5_proxy`, `socks5_username` and `socks5_password`. Target names are
+resolved by the proxy (SOCKS5 ATYP 3), and the handshake has its own timeout.
+
+The tunnel listener is an agent/all-in-one option as well: `--tunnel-addr`
+(`WAFRED_TUNNEL_ADDR`, default empty = off) binds the address a
+`wafred-tunnel` connector dials. Only an edge that terminates tunnels sets it;
+see [user-guide.md](user-guide.md#tunnels-internal-services-without-an-inbound-port).
+
+The standalone connector is its own binary, `wafred-tunnel`:
+
+```
+wafred-tunnel pair   --token <pairing-token> --server-url https://cp:9090 [--config PATH]
+wafred-tunnel run    [--config PATH]
+wafred-tunnel status [--config PATH]
+```
+
+`pair` redeems the one-time token (from **Agents → Tunnels**) for a long-lived
+credential and writes `/etc/wafred/tunnel.toml` (`0600`); `run` serves until
+SIGTERM (or until the tunnel is revoked); `status` prints the stored
+configuration plus the live state `run` publishes to
+`/var/lib/wafred/tunnel/status.json` — the connected ingress endpoints, the
+targets in force, the SOCKS5 proxy when one is configured, and the last
+revocation reason. `status` never opens a control-plane stream: doing so would
+take the session slot of the connector that is actually serving traffic.
+
+`pair` and `run` take the same global flags; anything not on the command line is
+read from the config file:
+
+| Flag | Env | Meaning |
+| --- | --- | --- |
+| `--config PATH` | — | `tunnel.toml` (default `/etc/wafred/tunnel.toml`) |
+| `--token`, `--token-file` | `WAFRED_TUNNEL_TOKEN`, `WAFRED_TUNNEL_TOKEN_FILE` | the one-time pairing token |
+| `--server-url` | `WAFRED_TUNNEL_SERVER_URL` | control-plane gRPC URL (`https://…:9090`) |
+| `--server-ca-cert` | `WAFRED_TUNNEL_SERVER_CA_CERT` | CA bundle for a self-signed control plane |
+| `--server-tls-name` | `WAFRED_TUNNEL_SERVER_TLS_NAME` | override the TLS server name |
+| `--ingress` | `WAFRED_TUNNEL_INGRESS` | pin edge endpoints (`host:port[=sha256],…`) |
+| `--allowed-targets` | `WAFRED_TUNNEL_ALLOWED_TARGETS` | local allowlist, intersected with the policy |
+| `--socks5-proxy`, `--socks5-username`, `--socks5-password` | `WAFRED_TUNNEL_SOCKS5_*` | egress through a SOCKS5 proxy |
+
+The config file carries the same keys in snake_case (`server_url`,
+`server_ca_cert`, `server_tls_name`, `ingress`, `allowed_targets`,
+`socks5_proxy`, `socks5_username`, `socks5_password`, plus the `tunnel_id`,
+`credential` and `session_token` that `pair` writes). A malformed value is an
+error, never a silent fallback to a direct dial.
 
 ### Passing secrets safely
 

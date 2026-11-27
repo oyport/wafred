@@ -111,6 +111,14 @@ pub mod access_logs {
         /// OIDC session's `sub`. NULL for an anonymous request and for rows
         /// written before migration 000071.
         pub user_identity: Option<String>,
+        /// Autonomous system number of the client address (migration 000102).
+        ///
+        /// BIGINT because AS numbers are unsigned 32-bit. NULL means "not
+        /// known": a row written before the column existed, an address the
+        /// agent's GeoIP database could not map, or a private/reserved
+        /// address. The top-ASN ranking ignores NULL rows rather than
+        /// inventing a bucket for them.
+        pub asn: Option<i64>,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

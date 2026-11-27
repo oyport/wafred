@@ -48,9 +48,9 @@ const intro = {
       note: "Bidirectional streams, no process restarts.",
     },
     {
-      value: "96.6%",
-      label: "Attack interception (effective)",
-      note: "638 decidable samples; 0.06 % benign affected.",
+      value: "96.05%",
+      label: "Attack interception · Strict + body",
+      note: "632/658 full-corpus attacks; 19/33,219 benign affected (0.057%).",
     },
   ],
   architecture: {

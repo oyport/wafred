@@ -251,6 +251,7 @@ while [[ $# -gt 0 ]]; do
         --https-port) require_value "$1" "${2:-}"; HTTPS_PORT="$2"; shift 2 ;;
         --admin-port) require_value "$1" "${2:-}"; ADMIN_PORT="$2"; shift 2 ;;
         --grpc-port) require_value "$1" "${2:-}"; GRPC_PORT="$2"; shift 2 ;;
+        --db-port) require_value "$1" "${2:-}"; DB_PORT="$2"; shift 2 ;;
         --force) FORCE=true; shift ;;
         --no-install-docker) AUTO_INSTALL_DOCKER=false; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
@@ -268,6 +269,7 @@ validate_port "--http-port" "$HTTP_PORT"
 validate_port "--https-port" "$HTTPS_PORT"
 validate_port "--admin-port" "$ADMIN_PORT"
 validate_port "--grpc-port" "$GRPC_PORT"
+[[ -n "$DB_PORT" ]] && validate_port "--db-port" "$DB_PORT"
 
 if [[ -z "$REF" ]]; then
     if [[ "$TAG" == "main" ]]; then
@@ -431,6 +433,10 @@ WAFred is starting.
   Console : https://localhost:${ADMIN_PORT}  (self-signed certificate)
   Account : $([[ "$ENV_PRESERVED" == "true" ]] && echo "see $(pwd)/.env" || echo "$ADMIN_EMAIL")
   Password: $([[ "$ENV_PRESERVED" == "true" ]] && echo "see $(pwd)/.env" || { [[ "$ADMIN_PASSWORD" == "wafred123" ]] && echo "wafred123 (forced change at first sign-in)" || echo "the value you supplied (stored in $(pwd)/.env)"; })
+
+Before creating a site or a rule, sign in and change this password: a fresh
+database answers every write with 403 password_change_required until it is
+changed (PUT /api/v1/auth/password, or Settings -> Account in the console).
 
 The first boot pulls the image and initialises PostgreSQL; the console can take
 a minute to answer. Follow it with:

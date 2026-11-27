@@ -64,8 +64,13 @@ http.request.method in {"TRACE" "TRACK"}
 | `rate_threshold` | 100 リクエスト/分/IP |
 | `exempt_paths` | `/health`、`/ping` |
 | `pow_difficulty` | `20` |
+| `pow_max_difficulty` | `24` |
+| `pow_issue_limit_per_min` | `120` |
+| `pow_verify_limit_per_min` | `300` |
 
 レベルは `None`、`NonInteractive`、`Managed`（リスクに応じて選択）、`Interactive` です。Proof of Work は SHA-256 の先頭ゼロ目標を使います。通過結果は `__pingwaf_clearance` に保存され、値は `base64(payload).base64(HMAC-SHA256)` で発行サイトに紐づくため、別ドメインへ再利用できません。
+
+難易度は適応型です。`pow_difficulty` から開始し、同一クライアントの検証失敗や `rate_threshold` を超えるリクエスト量に応じて `pow_max_difficulty` まで引き上げ、成功すると基本値に戻ります。発行と検証には IP ごとの毎分上限（`pow_issue_limit_per_min`、`pow_verify_limit_per_min`）もあり、発行上限を超えると `429` ページ、検証上限を超えると保留中のチャレンジを消費せずに拒否します。
 
 ## ボットポリシー
 
