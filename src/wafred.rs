@@ -1728,7 +1728,9 @@ fn convert_cached_rules(
     let mut prototype_locations: HashMap<String, LocationConf> = HashMap::new();
     let mut legacy_default_sites = BTreeSet::new();
     for (site_id, site) in &cached.sites {
-        let Some(prototypes) = location_prototypes_by_site.get(site_id.as_ref()) else {
+        let Some(prototypes) =
+            location_prototypes_by_site.get(site_id.as_ref())
+        else {
             continue;
         };
         let expected: BTreeSet<String> =
@@ -1741,7 +1743,9 @@ fn convert_cached_rules(
                 .collect();
         let default_bindings: Vec<HostPortBinding> =
             std::iter::once(site.domain.as_ref())
-                .chain(site.alternate_domains.iter().map(|domain| domain.as_ref()))
+                .chain(
+                    site.alternate_domains.iter().map(|domain| domain.as_ref()),
+                )
                 .map(|hostname| HostPortBinding {
                     hostname: hostname.to_string(),
                     http_port: Some(80),
@@ -1780,12 +1784,16 @@ fn convert_cached_rules(
     let mut https_locations: BTreeMap<u16, Vec<String>> =
         BTreeMap::from([(443, Vec::new())]);
     for (site_id, site) in &cached.sites {
-        let Some(prototypes) = location_prototypes_by_site.get(site_id.as_ref()) else {
+        let Some(prototypes) =
+            location_prototypes_by_site.get(site_id.as_ref())
+        else {
             continue;
         };
         let default_bindings: Vec<HostPortBinding> =
             std::iter::once(site.domain.as_ref())
-                .chain(site.alternate_domains.iter().map(|domain| domain.as_ref()))
+                .chain(
+                    site.alternate_domains.iter().map(|domain| domain.as_ref()),
+                )
                 .map(|hostname| HostPortBinding {
                     hostname: hostname.to_string(),
                     http_port: Some(80),
