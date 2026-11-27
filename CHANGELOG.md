@@ -2,12 +2,15 @@
 
 ## [Unreleased]
 
-## [WAFred 1.0.5] - 2026-11-27
+## [WAFred 1.0.5] - 2026-11-28
 
 ### Security and stability
 
 - Integrated upstream fixes for request-body truncation handling, WAF rule
   evaluation, backup validation, challenge limits and agent configuration sync.
+- Restored shared IP-rule compilation, bounded pending-body logging, and
+  challenge fallback handling; clarified installer restart commands for each
+  operating mode.
 - Improved agent health reporting, scoped site delivery and controlled
   self-upgrade status.
 
