@@ -96,6 +96,7 @@ mod process;
 mod quick_start;
 mod server_locations;
 mod upstreams;
+mod version;
 mod wafred;
 mod webhook;
 
@@ -142,29 +143,9 @@ addrs = ["127.0.0.1:5000"]
 
 static LOG_TARGET: &str = "main";
 
-/// The commit this binary was built from, or "unknown" when the tree had no
-/// git metadata (a source export or a crates.io tarball; see build.rs).
-pub(crate) fn git_hash() -> &'static str {
-    match env!("VERGEN_GIT_SHA") {
-        "VERGEN_IDEMPOTENT_OUTPUT" => "unknown",
-        sha => sha,
-    }
-}
-
-static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "{} ({}, tls={})",
-        env!("CARGO_PKG_VERSION"),
-        git_hash(),
-        pingap_certificate::TLS_BACKEND,
-    )
-});
-
-/// The version banner: crate version, build commit and TLS backend. Shared
-/// by `--version` and the WAFred-mode CLI, which answers the flag itself.
-pub(crate) fn version_banner() -> &'static str {
-    &LONG_VERSION
-}
+#[cfg(not(feature = "edge"))]
+pub(crate) use version::git_hash;
+pub(crate) use version::version_banner;
 
 /// Command line arguments structure for the pingap.
 /// A reverse proxy like nginx.
