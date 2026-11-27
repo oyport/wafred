@@ -1936,7 +1936,7 @@ pub async fn build_rule_bundle(
         path_exceptions: path_exceptions_to_proto(&path_exceptions),
         path_restrictions: path_restrictions_to_proto(&path_restrictions),
         tunnels,
-        tunnel_settings,
+        tunnel_settings: Some(tunnel_settings),
     };
 
     bundle.config_hash = fingerprint(&bundle);

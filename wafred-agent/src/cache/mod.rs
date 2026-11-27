@@ -2208,7 +2208,7 @@ impl RuleCache {
                 updated.tunnels = Arc::clone(tunnels);
             }
             if let Some(settings) = &tunnel_settings {
-                updated.tunnel_settings = Some(settings.clone());
+                updated.tunnel_settings = Some(*settings);
             }
 
             // A full site config is authoritative: replace both maps with
