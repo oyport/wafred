@@ -29,7 +29,7 @@ use crate::certificates::{new_certificate_provider, try_update_certificates};
 use crate::cli::AgentOpts;
 #[cfg(not(feature = "edge"))]
 use crate::cli::{
-    AgentOpts, AllInOneOpts, CommonOpts, ServerOpts, WafredCli, WafredCommand,
+    AllInOneOpts, CommonOpts, ServerOpts, WafredCli, WafredCommand,
 };
 use crate::config_manager::try_init_memory_config_manager;
 use crate::locations::{new_location_provider, try_init_locations};
@@ -337,6 +337,7 @@ pub(crate) fn env_flag_is_true(value: Option<&str>) -> bool {
 /// deliberately exhaustive: a new subcommand has to be classified here, which
 /// keeps it from falling through to [`build_run_mode`]'s `unreachable!`
 /// arm at runtime.
+#[cfg(not(feature = "edge"))]
 fn is_maintenance_command(command: &WafredCommand) -> bool {
     match command {
         WafredCommand::Server(_)
@@ -354,6 +355,7 @@ fn is_maintenance_command(command: &WafredCommand) -> bool {
 /// The maintenance commands never reach this: [`main`] routes them to
 /// [`crate::admin::run`] before a run mode is built, and a panic here means
 /// that routing was broken.
+#[cfg(not(feature = "edge"))]
 pub fn build_run_mode(cli: WafredCli) -> RunMode {
     match cli.command {
         WafredCommand::Server(ref opts) => {
@@ -2813,6 +2815,7 @@ async fn shutdown_signal() {
 }
 
 /// Entry point called from main.rs when WAFred mode is detected.
+#[cfg(not(feature = "edge"))]
 pub fn main() {
     // The dependency graph enables BOTH rustls crypto providers (ring via
     // wafred-server's rustls/tonic, aws-lc-rs via instant-acme/reqwest), so
@@ -2849,6 +2852,24 @@ pub fn main() {
     if let Err(e) = result {
         error!(error = %e, "WAFred exited with error");
         eprintln!("WAFred error: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Entry point for the agent-only binary, which has no control-plane CLI.
+#[cfg(feature = "edge")]
+pub fn edge_main() {
+    init_tracing();
+
+    let opts = crate::cli::parse_agent_cli();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to create tokio runtime");
+
+    if let Err(e) = rt.block_on(run_agent(agent_config_from_opts(&opts))) {
+        error!(error = %e, "WAFred agent exited with error");
+        eprintln!("WAFred agent error: {e}");
         std::process::exit(1);
     }
 }

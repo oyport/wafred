@@ -7,15 +7,15 @@
 
 use std::time::Duration;
 
+use ring::signature::{Ed25519KeyPair, KeyPair};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use wafred_tunnel::client::{Connector, ConnectorConfig, IngressEndpoint};
 use wafred_tunnel::protocol::TunnelSettings;
 use wafred_tunnel::registry::{TunnelPolicy, TunnelRegistry};
 use wafred_tunnel::socks5::Socks5Proxy;
 use wafred_tunnel::token::{self, SessionTokenClaims};
 use wafred_tunnel::{TunnelAcceptor, TunnelCertificate};
-use ring::signature::{Ed25519KeyPair, KeyPair};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 
 /// A TCP echo server standing in for the internal origin.
 async fn spawn_origin() -> std::net::SocketAddr {
