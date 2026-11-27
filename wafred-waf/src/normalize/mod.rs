@@ -282,6 +282,7 @@ pub fn normalize_request<'a>(
                 name: Cow::Borrowed(""),
                 decoded: Cow::Owned(decoded.into_owned()),
                 field: true,
+                text: true,
             });
         }
     }
@@ -391,6 +392,7 @@ pub fn normalize_request<'a>(
             {
                 let delimiter = format!("--{boundary}");
                 let mut parts = text.split(&delimiter);
+                let mut uncovered_part = false;
                 // A part we cannot read as text is not "covered" by a typed
                 // member: its bytes only exist in the blob below, so the blob
                 // must score normally when it is textual. Skipping the part
