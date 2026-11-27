@@ -799,8 +799,8 @@ if [[ "$MODE" == "tunnel" ]]; then
     SERVICE_NAME="wafred-tunnel"
 fi
 
-# Agent mode installs the data-plane-only build; the binary keeps the name
-# `pingwaf` on disk so the unit and upgrade path do not change.
+# Agent mode installs the data-plane-only build under the standard WAFred
+# binary name so its unit and upgrade path match the full installation.
 ASSET_PREFIX="$(asset_prefix "$MODE")"
 ARCHIVE_BINARY="$ASSET_PREFIX"
 
@@ -947,7 +947,7 @@ verify_checksum() {
 # Rejects an archive that would write outside the temp directory (absolute
 # paths, `..` components) or that is not the expected single release directory.
 verify_archive_members() {
-    local archive="$1" list="${TMPDIR}/members.txt" prefix="wafred-${OS}-${ARCH}/"
+    local archive="$1" asset_dir="$2" list="${TMPDIR}/members.txt" prefix="${asset_dir}/"
     case "$archive" in
         *.tar.xz) tar -tJf "$archive" > "$list" ;;
         *.tar.gz) tar -tzf "$archive" > "$list" ;;
@@ -965,25 +965,24 @@ verify_archive_members() {
 }
 
 fetch_asset() {
-    local ext url checksum_url expected downloaded
+    local ext url source_url checksum_url expected downloaded prefix
+    local -a candidate_prefixes=("$ASSET_PREFIX")
+    # Agent releases are published separately. Older or partial releases may
+    # not have that archive, so use the full binary as a compatible fallback.
+    if [[ "$MODE" == "agent" ]]; then
+        candidate_prefixes+=("wafred")
+    fi
+
     for ext in tar.xz tar.gz; do
         if [[ "$ext" == "tar.xz" ]] && ! has xz; then
             info "xz(1) not found — falling back to the .tar.gz asset."
             continue
         fi
-        ASSET_NAME="wafred-${OS}-${ARCH}.${ext}"
-        url="$(mirror_url "https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET_NAME}")"
-        info "Downloading ${ASSET_NAME}..."
-        info "URL: ${url}"
-        downloaded=false
-        if has curl; then
-            if curl -fsSL --proto '=https' "$url" -o "${TMPDIR}/${ASSET_NAME}" \
-                && curl -fsSL --proto '=https' "$checksum_url" -o "${TMPDIR}/${ASSET_NAME}.sha256"; then
-                downloaded=true
-            fi
+        for prefix in "${candidate_prefixes[@]}"; do
             ASSET_NAME="${prefix}-${OS}-${ARCH}.${ext}"
-            url="https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET_NAME}"
-            checksum_url="${url}.sha256"
+            source_url="https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET_NAME}"
+            url="$(mirror_url "$source_url")"
+            checksum_url="$(mirror_url "${source_url}.sha256")"
             info "Downloading ${ASSET_NAME}..."
             info "URL: ${url}"
             downloaded=false
@@ -1001,7 +1000,8 @@ fetch_asset() {
                 fatal "Neither curl nor wget found. Please install one of them."
             fi
             if [[ "$downloaded" != "true" ]]; then
-                warn "Download failed for ${ASSET_NAME} (asset or its .sha256) — trying the next format."
+                warn "Download failed for ${ASSET_NAME} (asset or its .sha256) — trying the next available build."
+                rm -f "${TMPDIR}/${ASSET_NAME}" "${TMPDIR}/${ASSET_NAME}.sha256"
                 continue
             fi
             # Every release ships a .sha256 sidecar; a missing, malformed or
@@ -1025,6 +1025,8 @@ fetch_asset() {
             success "Verified the sha256 of ${ASSET_NAME}."
             return 0
         done
+        # All build candidates were unavailable in this format; try the next
+        # archive format before reporting a failed download.
     done
     fatal "Download failed. Check that version v${VERSION} exists and has a wafred-${OS}-${ARCH} asset."
 }
@@ -1038,7 +1040,7 @@ fetch_asset
 # ─── Extract & Install Binary ─────────────────────────────────────────────────
 # The checksum has already been verified; still refuse archives whose member
 # paths could escape the temp directory before tar touches the filesystem.
-verify_archive_members "${TMPDIR}/${ASSET_NAME}"
+verify_archive_members "${TMPDIR}/${ASSET_NAME}" "${ASSET_PREFIX}-${OS}-${ARCH}"
 
 info "Extracting..."
 case "$ASSET_NAME" in
@@ -1050,7 +1052,7 @@ esac
 # The release archive contains exactly one binary with this name. There is no
 # "first executable" fallback: an unexpected archive layout is an error, not an
 # invitation to install an arbitrary file.
-BINARY_PATH="$(find "${TMPDIR}/wafred-${OS}-${ARCH}" -name "$BINARY_NAME" -type f | head -n1)"
+BINARY_PATH="$(find "${TMPDIR}/${ASSET_PREFIX}-${OS}-${ARCH}" -name "$BINARY_NAME" -type f | head -n1)"
 if [[ -z "$BINARY_PATH" ]]; then
     fatal "Binary '${ARCHIVE_BINARY}' not found in the verified archive."
 fi
