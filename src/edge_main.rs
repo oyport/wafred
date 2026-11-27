@@ -48,12 +48,12 @@ mod cli;
 mod config_file;
 mod config_manager;
 mod locations;
-mod wafred;
 mod plugin;
 mod process;
 mod server_locations;
 mod upstreams;
 mod version;
+mod wafred;
 mod webhook;
 
 pub(crate) use version::version_banner;
