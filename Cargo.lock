@@ -5758,7 +5758,6 @@ dependencies = [
  "pingap-upstream",
  "pingwaf-profiler",
  "pingwaf-proto",
- "wafred-tunnel",
  "prost-types",
  "rand 0.10.4",
  "reqwest 0.13.5",
@@ -5773,6 +5772,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wafred-tunnel",
 ]
 
 [[package]]
@@ -5838,7 +5838,6 @@ dependencies = [
  "pingwaf-profiler",
  "pingwaf-proto",
  "pingwaf-system",
- "wafred-tunnel",
  "pingwaf-waf",
  "pretty_assertions",
  "prost",
@@ -5870,6 +5869,7 @@ dependencies = [
  "tracing",
  "urlencoding",
  "uuid",
+ "wafred-tunnel",
  "x509-parser 0.18.1",
  "zstd",
 ]
@@ -5884,39 +5884,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
-]
-
-[[package]]
-name = "wafred-tunnel"
-version = "1.0.5"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "futures",
- "hex",
- "hyper-util",
- "pingwaf-proto",
- "rand 0.10.4",
- "rcgen",
- "ring",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "tempfile",
- "time",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "toml",
- "tonic",
- "tower",
- "tracing",
- "tracing-subscriber",
- "x509-parser 0.18.1",
- "yamux",
 ]
 
 [[package]]
@@ -9113,16 +9080,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "wafred-tunnel"
+version = "1.0.5"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "futures",
+ "hex",
+ "hyper-util",
+ "pingwaf-proto",
+ "rand 0.10.4",
+ "rcgen",
+ "ring",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "toml",
+ "tonic",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "x509-parser 0.18.1",
+ "yamux",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
-
-[[package]]
-name = "walkdir"
-version = "2.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b42e295b7452c4604982280d8586001fcad9b8b201cac67bca9771e7a7475403"
 dependencies = [
  "same-file",
  "winapi-util",
