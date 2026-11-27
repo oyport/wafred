@@ -387,12 +387,12 @@ pub fn normalize_request<'a>(
             // Textual parts become typed fields; without that the whole body
             // stayed one `field: false` blob and a single SQLi/XSS hit only
             // scored 2.
+            let mut uncovered_part = false;
             if let Some(boundary) =
                 multipart_boundary(content_type).or(sniffed_multipart_boundary)
             {
                 let delimiter = format!("--{boundary}");
                 let mut parts = text.split(&delimiter);
-                let mut uncovered_part = false;
                 // A part we cannot read as text is not "covered" by a typed
                 // member: its bytes only exist in the blob below, so the blob
                 // must score normally when it is textual. Skipping the part
