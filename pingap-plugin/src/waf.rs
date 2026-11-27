@@ -1297,7 +1297,8 @@ fn shared_ip_rules(ranges: &[String]) -> Arc<IpRules> {
 }
 
 fn ranges_cache_key(ranges: &[String]) -> String {
-    let mut trimmed: Vec<&str> = ranges.iter().map(|range| range.trim()).collect();
+    let mut trimmed: Vec<&str> =
+        ranges.iter().map(|range| range.trim()).collect();
     trimmed.sort_unstable();
     trimmed.join("\u{0}")
 }
