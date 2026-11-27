@@ -4552,6 +4552,7 @@ mod tests {
                     name: "site".to_string(),
                     domain: "example.com".to_string(),
                     alternate_domains: vec!["alt.example.com".to_string()],
+                    host_bindings: Vec::new(),
                     status: 0,
                     rules: Some(proto::RuleBundle {
                         site_id: "site-1".to_string(),

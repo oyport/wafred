@@ -31,9 +31,7 @@ use crate::api::validation::{
     RuleRowFix,
 };
 use crate::auth::AuthUser;
-use crate::grpc::{
-    agents_serving_site, notify_config_changed, notify_site_deleted,
-};
+use crate::grpc::notify_config_changed;
 use crate::models::{
     acme_challenge, agent, bot_protection, cache_rules, certificate_links,
     challenge_settings, geo_rules, ip_access_rules, ip_group_sites, ip_groups,
