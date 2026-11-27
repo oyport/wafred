@@ -2453,7 +2453,7 @@ pub async fn start_data_plane(
                 .as_deref(),
         ) {
             ps.site_proxy_trust = Some(|host| {
-                let Some(site) = pingwaf_agent::PingWafAgent::instance()
+                let Some(site) = pingwaf_agent::WafredAgent::instance()
                     .and_then(|agent| agent.get_rules_for_domain(host))
                 else {
                     return pingap_core::ProxyTrust::default();

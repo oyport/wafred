@@ -1276,6 +1276,47 @@ impl PolicyOutcome {
     }
 }
 
+/// Compiled IP rules shared between sites that carry the same normalized
+/// range list. The cache is bounded to avoid retaining configuration churn.
+static IP_RULES_CACHE: LazyLock<DashMap<String, Arc<IpRules>>> =
+    LazyLock::new(DashMap::new);
+
+fn shared_ip_rules(ranges: &[String]) -> Arc<IpRules> {
+    let key = ranges_cache_key(ranges);
+    if let Some(cached) = IP_RULES_CACHE.get(&key) {
+        return Arc::clone(&cached);
+    }
+    if IP_RULES_CACHE.len() > 1024 {
+        IP_RULES_CACHE.clear();
+    }
+    Arc::clone(
+        &IP_RULES_CACHE
+            .entry(key)
+            .or_insert_with(|| Arc::new(IpRules::new(ranges))),
+    )
+}
+
+fn ranges_cache_key(ranges: &[String]) -> String {
+    let mut trimmed: Vec<&str> = ranges.iter().map(|range| range.trim()).collect();
+    trimmed.sort_unstable();
+    trimmed.join("\u{0}")
+}
+
+fn shared_ip_rules_parsed(ranges: &[String], parsed: IpRules) -> Arc<IpRules> {
+    let key = ranges_cache_key(ranges);
+    if let Some(cached) = IP_RULES_CACHE.get(&key) {
+        return Arc::clone(&cached);
+    }
+    if IP_RULES_CACHE.len() > 1024 {
+        IP_RULES_CACHE.clear();
+    }
+    Arc::clone(
+        &IP_RULES_CACHE
+            .entry(key)
+            .or_insert_with(|| Arc::new(parsed)),
+    )
+}
+
 /// Access restrictions of one site: IP rules plus the geo policy.
 ///
 /// IP rules are evaluated first-match-wins in the order the control plane sent
@@ -2956,6 +2997,45 @@ const PENDING_ACCESS_MAX_ENTRIES: usize = 2048;
 
 static PENDING_ACCESS: LazyLock<DashMap<String, PendingAccess>> =
     LazyLock::new(DashMap::new);
+
+/// Body prefixes held by the entries of [`PENDING_ACCESS`]. The entry cap
+/// bounds the pool at 2048 exchanges; this bounds the bytes their request and
+/// response prefixes pin. An entry whose prefix does not fit keeps its facts
+/// and logs the body as truncated.
+static PENDING_BODIES: BodyBudget = BodyBudget::new(LOG_BODY_BUDGET_BYTES);
+
+/// Per-entry accounting for request and response body prefixes retained while
+/// an access-log entry is pending. Dropping the entry returns its reservation.
+struct BodyCharge {
+    budget: &'static BodyBudget,
+    held: usize,
+}
+
+impl BodyCharge {
+    fn new(budget: &'static BodyBudget) -> Self {
+        Self { budget, held: 0 }
+    }
+
+    fn try_add(&mut self, bytes: usize) -> bool {
+        let fits = self.budget.try_reserve(bytes);
+        if fits {
+            self.held += bytes;
+        }
+        fits
+    }
+
+    fn release(&mut self, bytes: usize) {
+        let released = bytes.min(self.held);
+        self.held -= released;
+        self.budget.release(released);
+    }
+}
+
+impl Drop for BodyCharge {
+    fn drop(&mut self) {
+        self.budget.release(self.held);
+    }
+}
 
 fn register_pending_access(request_id: &str, pending: PendingAccess) -> bool {
     if PENDING_ACCESS.len() >= PENDING_ACCESS_MAX_ENTRIES {
@@ -5476,7 +5556,7 @@ impl Plugin for WafPlugin {
                         &request_data,
                         &denial,
                         &original_url,
-                        self.pow_difficulty,
+                        self.mint_fallback,
                         false,
                         "path_restriction",
                     ));
@@ -5510,7 +5590,7 @@ impl Plugin for WafPlugin {
                             &request_data,
                             &denial,
                             &original_url,
-                            self.pow_difficulty,
+                            self.mint_fallback,
                             false,
                             "path_restriction",
                         ));

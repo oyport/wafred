@@ -326,7 +326,9 @@ Examples:
     --admin-email ops@example.com --tls-sans waf.example.com
 
 After installation:
-  Config: /etc/wafred/wafred.toml   (edit it, then: systemctl restart wafred)
+  Config: /etc/wafred/wafred.toml
+  Restart: systemctl restart wafred (control plane or agent)
+           systemctl restart wafred-tunnel (tunnel mode)
   Data:   /var/lib/wafred
 EOF
 }

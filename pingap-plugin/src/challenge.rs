@@ -307,7 +307,7 @@ pub(crate) enum ChallengeKind {
 /// it is delivered in every site bundle; the challenge page is rendered only
 /// when the request's site has it enabled.
 fn challenge_page_template(site_id: &str) -> Option<String> {
-    let agent = PingWafAgent::instance()?;
+    let agent = WafredAgent::instance()?;
     let rules = agent.get_rules_for_domain(site_id)?;
     rules
         .error_pages
@@ -884,7 +884,7 @@ fn sweep_pressure(now: i64) {
 /// "no site configuration" (standalone, or no row), so the caller's own
 /// configuration applies.
 fn site_mint_config(host: &str) -> Option<(ChallengeLimits, u32)> {
-    let agent = PingWafAgent::instance()?;
+    let agent = WafredAgent::instance()?;
     let rules = agent.get_rules_for_domain(host)?;
     let cfg = rules.challenge_config.as_ref()?;
     Some((site_limits(cfg), effective_rate_threshold(cfg)))
@@ -1205,9 +1205,12 @@ impl ChallengePlugin {
     /// Resolves the decision engine for `host`: the per-site engine built
     /// from agent rules in control-plane mode, the statically configured
     /// engine in standalone mode. `None` means pass everything through.
-    fn decision_engine(&self, host: &str) -> Option<Arc<ChallengeEngine>> {
+    fn site_challenge(
+        &self,
+        host: &str,
+    ) -> Option<(Arc<ChallengeEngine>, ChallengeLimits)> {
         if WafredAgent::instance().is_none() {
-            return Some(Arc::clone(&self.engine));
+            return Some((Arc::clone(&self.engine), self.standalone_limits));
         }
         if host.is_empty() {
             return None;
