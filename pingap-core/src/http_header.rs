@@ -882,7 +882,7 @@ pub fn get_req_header_value<'a>(
 /// fields (RFC 9113 §8.2.3), and Chromium does exactly that once the jar grows
 /// past its per-field budget. Reading only the first field therefore hides
 /// every cookie the client sent after the split point — that is how a valid
-/// `__pingwaf_clearance` cookie became invisible and the JS challenge was
+/// `__wafred_clearance` cookie became invisible and the JS challenge was
 /// re-issued on every request (2026-11-24, issue #108). Every field is parsed
 /// here, in wire order, so a caller never has to know how many arrived.
 ///
@@ -1980,13 +1980,13 @@ mod tests {
         req.append_header("Cookie", "app_id=12345; preferences=A=1|B=1")
             .unwrap();
         req.append_header("Cookie", "session_id=98765").unwrap();
-        req.append_header("Cookie", "__pingwaf_clearance=signed-token")
+        req.append_header("Cookie", "__wafred_clearance=signed-token")
             .unwrap();
 
         // The first field still resolves, and so does the last one.
         assert_eq!(get_cookie_value(&req, "app_id").as_deref(), Some("12345"));
         assert_eq!(
-            get_cookie_value(&req, "__pingwaf_clearance").as_deref(),
+            get_cookie_value(&req, "__wafred_clearance").as_deref(),
             Some("signed-token")
         );
         assert_eq!(

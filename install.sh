@@ -1118,8 +1118,8 @@ install_tunnel_connector() {
         fatal "Cannot write ${CONFIG_DIR} without sudo."
     fi
     $cmd mkdir -p "$CONFIG_DIR" "${DATA_DIR}/tunnel"
-    if [[ "$OS" == "linux" ]] && ! id -u pingwaf >/dev/null 2>&1; then
-        $cmd useradd -r -m -d "$DATA_DIR" -s /usr/sbin/nologin pingwaf 2>/dev/null || true
+    if [[ "$OS" == "linux" ]] && ! id -u wafred >/dev/null 2>&1; then
+        $cmd useradd -r -m -d "$DATA_DIR" -s /usr/sbin/nologin wafred 2>/dev/null || true
     fi
     if [[ "$OS" == "linux" ]]; then
         $cmd chown -R wafred:wafred "${DATA_DIR}/tunnel" 2>/dev/null || true
@@ -1165,7 +1165,7 @@ install_tunnel_connector() {
         ${tls_args[@]+"${tls_args[@]}"}; then
         fatal "Pairing failed. Check --server-url/--server-ca-cert, and mint a fresh token in Edge Agents -> Tunnels."
     fi
-    $cmd chown root:pingwaf "$config_file" 2>/dev/null || true
+    $cmd chown root:wafred "$config_file" 2>/dev/null || true
     $cmd chmod 0640 "$config_file" 2>/dev/null || true
     success "Paired; configuration written to ${config_file}"
 
@@ -1187,8 +1187,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pingwaf
-Group=pingwaf
+User=wafred
+Group=wafred
 ExecStart=${INSTALL_DIR}/${BINARY_NAME} run --config ${config_file}
 # The connector retries network and control-plane failures internally, so it
 # only exits when it was revoked or told to stop. `on-failure` keeps a revoked
@@ -1306,7 +1306,7 @@ install_agent_ca() {
     $cmd cp "$SERVER_CA_CERT" "$dest" || \
         fatal "Could not copy the control-plane CA to ${dest}."
     $cmd chmod 0644 "$dest" 2>/dev/null || true
-    $cmd chown root:pingwaf "$dest" 2>/dev/null || true
+    $cmd chown root:wafred "$dest" 2>/dev/null || true
     SERVER_CA_CERT="$dest"
     success "Control-plane CA installed at ${dest}"
 }

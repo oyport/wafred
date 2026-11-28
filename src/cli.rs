@@ -109,7 +109,7 @@ pub struct CommonOpts {
     /// serves the configured certificate or, absent one, the self-signed
     /// control-plane certificate; `off` serves plaintext (degraded).
     #[arg(long, env = "WAFRED_GRPC_TLS_MODE", default_value = "tls")]
-    pub grpc_tls_mode: pingwaf_server::config::GrpcTlsMode,
+    pub grpc_tls_mode: wafred_server::config::GrpcTlsMode,
 
     /// Serve the admin dashboard and REST API over TLS. A self-signed
     /// certificate is generated on first boot; upload a real one from

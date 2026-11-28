@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use chrono::{DateTime, Utc};
-use pingwaf_proto::control_plane::TunnelConnectorCommand;
+use wafred_proto::control_plane::TunnelConnectorCommand;
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
@@ -113,12 +113,12 @@ impl TunnelConnectorRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pingwaf_proto::control_plane::TunnelConnectorRevoked;
+    use wafred_proto::control_plane::TunnelConnectorRevoked;
 
     fn revoked(message: &str) -> TunnelConnectorCommand {
         TunnelConnectorCommand {
             kind: Some(
-                pingwaf_proto::control_plane::tunnel_connector_command::Kind::Revoked(
+                wafred_proto::control_plane::tunnel_connector_command::Kind::Revoked(
                     TunnelConnectorRevoked {
                         message: message.to_string(),
                     },
@@ -137,7 +137,7 @@ mod tests {
         let command = rx.recv().await.unwrap();
         assert!(matches!(
             command.kind,
-            Some(pingwaf_proto::control_plane::tunnel_connector_command::Kind::Revoked(_))
+            Some(wafred_proto::control_plane::tunnel_connector_command::Kind::Revoked(_))
         ));
         registry.unregister(id, generation).await;
         assert!(!registry.is_online(id).await);

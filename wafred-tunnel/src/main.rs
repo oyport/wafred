@@ -289,7 +289,7 @@ async fn run(cli: Cli) -> Result<()> {
             result.map_err(|err| anyhow::anyhow!("connector task failed: {err}"))??;
         },
         _ = shutdown_signal() => {
-            tracing::info!(target: "pingwaf::tunnel", "received a shutdown signal");
+            tracing::info!(target: "wafred::tunnel", "received a shutdown signal");
         },
     }
     status_task.abort();
@@ -467,7 +467,7 @@ async fn pair_into(file: &mut TunnelFile, cli: &Cli) -> Result<()> {
         file.ingress = outcome.ingress;
     }
     tracing::info!(
-        target: "pingwaf::tunnel",
+        target: "wafred::tunnel",
         tunnel = %file.tunnel_id,
         name = %outcome.name,
         ingress = file.ingress.len(),

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use pingwaf_proto::control_plane::SiteStatus;
+use wafred_proto::control_plane::SiteStatus;
 use serde::Serialize;
 use tokio::sync::RwLock;
 use uuid::Uuid;

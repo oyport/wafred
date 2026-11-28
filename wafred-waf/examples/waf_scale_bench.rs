@@ -8,9 +8,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use pingwaf_waf::rules::managed::default_managed_rules;
-use pingwaf_waf::rules::signatures::SignatureEngine;
-use pingwaf_waf::{
+use wafred_waf::rules::managed::default_managed_rules;
+use wafred_waf::rules::signatures::SignatureEngine;
+use wafred_waf::{
     CompiledRule, RuleAction, StackSet, WafEngine, WafEngineConfig, WafLevel,
 };
 

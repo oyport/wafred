@@ -52,8 +52,8 @@ use pingap_core::{
 };
 use pingora::http::ResponseHeader;
 use pingora::proxy::Session;
-use pingwaf_agent::WafredAgent;
-use pingwaf_agent::cache::{
+use wafred_agent::WafredAgent;
+use wafred_agent::cache::{
     RewriteDirection as CacheRewriteDirection,
     RewriteOperation as CacheRewriteOperation, RewriteRule as CacheRewriteRule,
 };
@@ -1612,10 +1612,10 @@ impl Plugin for RewritePlugin {
         if step != self.plugin_step {
             return Ok(RequestPluginResult::Skipped);
         }
-        // Method attribution (see pingwaf-profiler): the timer books the
+        // Method attribution (see wafred-profiler): the timer books the
         // `plugin` module row as well.
-        let _profile = pingwaf_profiler::timed_method(
-            pingwaf_profiler::Method::PluginRewrite,
+        let _profile = wafred_profiler::timed_method(
+            wafred_profiler::Method::PluginRewrite,
         );
         let host = get_host(session.req_header())
             .unwrap_or_default()
@@ -2084,7 +2084,7 @@ rules = '[{"id":"zeros","direction":"request","operations":[{"type":"regex_repla
     mod agent_mode {
         use super::*;
         use crate::waf::tests::install_test_agent;
-        use pingwaf_proto::control_plane as proto;
+        use wafred_proto::control_plane as proto;
         use pretty_assertions::assert_eq;
 
         fn site_config(

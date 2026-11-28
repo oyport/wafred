@@ -48,9 +48,9 @@ use pingap_core::{
 };
 use pingora::http::ResponseHeader;
 use pingora::proxy::Session;
-use pingwaf_agent::WafredAgent;
-use pingwaf_agent::cache::CustomErrorPage;
-use pingwaf_challenge::generate_request_id;
+use wafred_agent::WafredAgent;
+use wafred_agent::cache::CustomErrorPage;
+use wafred_challenge::generate_request_id;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -929,7 +929,7 @@ template = '{"error":"rate_limit_exceeded","request_id":"{{ request_id }}"}'
     mod agent_mode {
         use super::*;
         use crate::waf::tests::install_test_agent;
-        use pingwaf_proto::control_plane as proto;
+        use wafred_proto::control_plane as proto;
         use pretty_assertions::assert_eq;
 
         /// Agent-supplied pages replace responses for their host, take

@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use pingwaf_proto::control_plane::{
+use wafred_proto::control_plane::{
     self as proto, control_plane_client::ControlPlaneClient as ProtoClient,
 };
 use tokio::sync::mpsc;

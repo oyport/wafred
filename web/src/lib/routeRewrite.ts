@@ -1,6 +1,6 @@
 /**
  * Shared rewrite / upstream-host validators — the single front-end copy of
- * the server's rules (`pingwaf-server` route payload validation).
+ * the server's rules (`wafred-server` route payload validation).
  *
  * RouteDialog and the contract tests import from here;
  * `pages/sites/basic/types.ts` re-exports the same names for compatibility.

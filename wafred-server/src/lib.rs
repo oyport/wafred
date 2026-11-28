@@ -42,7 +42,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pingwaf_proto::control_plane::control_plane_server::ControlPlaneServer;
+use wafred_proto::control_plane::control_plane_server::ControlPlaneServer;
 use sea_orm::{ConnectOptions, Database};
 use sea_orm_migration::MigratorTrait;
 use tokio::net::TcpListener;

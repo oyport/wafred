@@ -16,7 +16,7 @@
 //!
 //! # Why the challenge is the WAF's
 //!
-//! The proof of work is [`pingwaf_challenge::POW_JS`], the same block the WAF
+//! The proof of work is [`wafred_challenge::POW_JS`], the same block the WAF
 //! challenge page runs, and the control plane verifies with the same
 //! `verify_proof_of_work`. Sharing both halves is what keeps the answer and the
 //! check in step; a private copy on either side would fail every login with a
@@ -44,7 +44,7 @@ use pingap_core::{
     get_host,
 };
 use pingora::proxy::Session;
-use pingwaf_agent::WafredAgent;
+use wafred_agent::WafredAgent;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
@@ -65,26 +65,26 @@ const CATEGORY: &str = "visitor_auth";
 /// Where the login form lives. Absolute so a rewrite cannot move it out from
 /// under the plugin, the same reason the OIDC callback path is checked against
 /// the original URI.
-pub(crate) const LOGIN_PATH: &str = "/_pingwaf/login";
+pub(crate) const LOGIN_PATH: &str = "/_wafred/login";
 
 /// Ends the session and returns to the login page.
-pub(crate) const LOGOUT_PATH: &str = "/_pingwaf/logout";
+pub(crate) const LOGOUT_PATH: &str = "/_wafred/logout";
 
 /// The portal a visitor lands on after signing in.
-pub(crate) const PORTAL_PATH: &str = "/_pingwaf/portal";
+pub(crate) const PORTAL_PATH: &str = "/_wafred/portal";
 
 /// The portal's per-site visibility switch.
-pub(crate) const VISIBILITY_PATH: &str = "/_pingwaf/portal/visibility";
+pub(crate) const VISIBILITY_PATH: &str = "/_wafred/portal/visibility";
 
 /// The portal's password form.
-pub(crate) const PASSWORD_PATH: &str = "/_pingwaf/portal/password";
+pub(crate) const PASSWORD_PATH: &str = "/_wafred/portal/password";
 
 /// Starts and finishes a passkey registration.
 pub(crate) const PASSKEY_REGISTER_PATH: &str =
-    "/_pingwaf/portal/passkey/register";
+    "/_wafred/portal/passkey/register";
 
 /// Starts and finishes a passkey sign-in.
-pub(crate) const PASSKEY_LOGIN_PATH: &str = "/_pingwaf/passkey/login";
+pub(crate) const PASSKEY_LOGIN_PATH: &str = "/_wafred/passkey/login";
 
 /// Every path this plugin answers itself.
 ///
@@ -108,7 +108,7 @@ pub(crate) fn owns_path(path: &str) -> bool {
 ///
 /// The WAF needs this: it runs first in the chain and must step aside for the
 /// login page, but only for the endpoints themselves — a prefix test would hand
-/// `/_pingwaf/<anything>`, `..` included, to the upstream unevaluated.
+/// `/_wafred/<anything>`, `..` included, to the upstream unevaluated.
 pub(crate) fn is_owned_path(path: &str) -> bool {
     owns_path(path)
 }
@@ -141,7 +141,7 @@ const MAX_FORM_BODY: usize = 8 * 1024;
 const SESSION_TTL_SECONDS: i64 = 43_200;
 
 /// The cookie the session lives in.
-const SESSION_COOKIE: &str = "pingwaf_visitor";
+const SESSION_COOKIE: &str = "wafred_visitor";
 
 /// A signed-in visitor, as carried in the cookie.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1611,7 +1611,7 @@ fn session_cookie(
         HeaderValue::from_str(&header).unwrap_or_else(|_| {
             // Only reachable if the value carried a control character, which
             // `seal` cannot produce; an empty cookie is the safe fallback.
-            HeaderValue::from_static("pingwaf_visitor=; Path=/; Max-Age=0")
+            HeaderValue::from_static("wafred_visitor=; Path=/; Max-Age=0")
         }),
     )
 }
@@ -1711,7 +1711,7 @@ if (pkBtn) pkBtn.addEventListener('click', async function () {
     };
     var finish = await fetch('{login}', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     var done = await finish.json();
-    if (finish.ok && done.ok) { location.href = done.redirect || '/_pingwaf/portal'; }
+    if (finish.ok && done.ok) { location.href = done.redirect || '/_wafred/portal'; }
     else { passkeyAlert(done.error || 'That passkey could not be verified.'); }
   } catch (e) {
     passkeyAlert(e && e.name === 'NotAllowedError' ? 'Cancelled.' : 'That passkey could not be verified.');
@@ -2000,7 +2000,7 @@ input:checked + .slider:before{transform:translateX(18px);background:#fff}
 
 /// The proof-of-work block, shared verbatim with the WAF challenge page.
 fn pow_script() -> &'static str {
-    pingwaf_challenge::POW_JS
+    wafred_challenge::POW_JS
 }
 
 /// How long a "is this session still good" verdict is trusted.
@@ -2160,7 +2160,7 @@ mod tests {
         assert!(owns_path(PASSWORD_PATH));
         assert!(!owns_path("/"));
         assert!(!owns_path("/dashboard"));
-        assert!(!owns_path("/_pingwaf/login/extra"));
+        assert!(!owns_path("/_wafred/login/extra"));
     }
 
     /// A sealed session round-trips, and a tampered one does not: the
@@ -2414,7 +2414,7 @@ mod tests {
     #[test]
     fn only_the_endpoints_are_owned() {
         // The WAF steps aside for exactly these paths, so a path that is not
-        // one of them must not be reported as owned — `/_pingwaf/anything`
+        // one of them must not be reported as owned — `/_wafred/anything`
         // reaching the origin unevaluated is a way around the WAF.
         for path in [
             LOGIN_PATH,
@@ -2427,17 +2427,17 @@ mod tests {
         ] {
             assert!(is_owned_path(path), "{path} is an endpoint");
             assert!(
-                path.starts_with("/_pingwaf/"),
+                path.starts_with("/_wafred/"),
                 "{path} must sit under the reserved prefix, or the WAF's \
                  step-aside covers a path someone else serves"
             );
         }
         for path in [
-            "/_pingwaf",
-            "/_pingwaf/",
-            "/_pingwaf/anything",
-            "/_pingwaf/../admin",
-            "/_pingwaf/login/extra",
+            "/_wafred",
+            "/_wafred/",
+            "/_wafred/anything",
+            "/_wafred/../admin",
+            "/_wafred/login/extra",
             "/",
         ] {
             assert!(!is_owned_path(path), "{path} is not an endpoint");

@@ -18,13 +18,13 @@ use crate::grpc::notify_config_changed;
 use crate::models::waf_settings;
 
 /// Attack categories a site can downgrade to monitor-only. Must stay in sync
-/// with `CategorySet::parse_name` in `pingwaf-waf`.
+/// with `CategorySet::parse_name` in `wafred-waf`.
 pub const CATEGORIES: [&str; 9] = [
     "sqli", "xss", "rce", "lfi", "ssrf", "deser", "crlf", "xxe", "ssti",
 ];
 
 /// Backend stacks a site can downgrade to monitor-only. Must stay in sync
-/// with `StackSet::parse_name` in `pingwaf-waf`.
+/// with `StackSet::parse_name` in `wafred-waf`.
 pub const STACKS: [&str; 4] = ["java", "php", "python", "node"];
 
 /// Default (and maximum) number of seconds the data plane may withhold a
@@ -67,9 +67,9 @@ pub fn validate_body_stage_timeout_secs(raw: i32) -> Result<i32, ApiError> {
 }
 
 /// Built-in managed rules a site can downgrade to monitor-only, by id.
-/// Mirrors `pingwaf_waf::MANAGED_RULE_IDS` (whitelisted through the crate so
+/// Mirrors `wafred_waf::MANAGED_RULE_IDS` (whitelisted through the crate so
 /// a new managed rule cannot be configured before the engine knows it).
-pub const MANAGED_RULES: [&str; 15] = pingwaf_waf::MANAGED_RULE_IDS;
+pub const MANAGED_RULES: [&str; 15] = wafred_waf::MANAGED_RULE_IDS;
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateWafSettingsRequest {
@@ -169,7 +169,7 @@ pub fn routes() -> Router<AppState> {
 /// matches them, and the `strict_only` flag tells the dashboard.
 async fn list_managed_rules(_current: AuthUser) -> Json<Vec<ManagedRuleEntry>> {
     Json(
-        pingwaf_waf::managed_rule_catalogue(pingwaf_waf::WafLevel::Strict)
+        wafred_waf::managed_rule_catalogue(wafred_waf::WafLevel::Strict)
             .into_iter()
             .map(|rule| ManagedRuleEntry {
                 id: rule.id,
@@ -752,13 +752,13 @@ mod tests {
         // accepted by the API is never silently ignored by the data plane.
         for name in CATEGORIES {
             assert!(
-                pingwaf_waf::CategorySet::parse_name(name).is_some(),
+                wafred_waf::CategorySet::parse_name(name).is_some(),
                 "{name} not parseable by CategorySet"
             );
         }
         for name in STACKS {
             assert!(
-                pingwaf_waf::StackSet::parse_name(name).is_some(),
+                wafred_waf::StackSet::parse_name(name).is_some(),
                 "{name} not parseable by StackSet"
             );
         }

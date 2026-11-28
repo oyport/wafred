@@ -45,7 +45,7 @@ unwrap_used = "deny"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-pingwaf-system = { path = "wafred-system" }
+wafred-system = { path = "wafred-system" }
 ahash = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
@@ -86,13 +86,13 @@ pingap-sentry = { workspace = true, optional = true }
 pingap-upstream = { workspace = true }
 pingap-util = { workspace = true }
 pingap-webhook = { workspace = true }
-pingwaf-server = { path = "wafred-server" }
+wafred-server = { path = "wafred-server" }
 # TLS backend is selected by this crate's own feature chain (`openssl` /
 # `tls-rustls`), mirroring the `pingap-*` workspace convention: the
 # dependency must not drag `wafred-agent`'s default (openssl) into a
 # rustls build — the two pingora backends are mutually exclusive and
 # unify into a compile error if both end up on.
-pingwaf-agent = { path = "wafred-agent", default-features = false }
+wafred-agent = { path = "wafred-agent", default-features = false }
 wafred-tunnel = { workspace = true }
 anyhow = { workspace = true }
 pingora = { workspace = true }
@@ -142,7 +142,7 @@ openssl = [
     "pingap-plugin/openssl",
     "pingap-proxy/openssl",
     "pingap-upstream/openssl",
-    "pingwaf-agent/openssl",
+    "wafred-agent/openssl",
 ]
 tls-rustls = [
     "pingora/rustls",
@@ -152,7 +152,7 @@ tls-rustls = [
     "pingap-plugin/tls-rustls",
     "pingap-proxy/tls-rustls",
     "pingap-upstream/tls-rustls",
-    "pingwaf-agent/tls-rustls",
+    "wafred-agent/tls-rustls",
 ]
 pyro = ["pingap-pyroscope"]
 imageoptim = ["pingap-imageoptim"]
@@ -313,7 +313,7 @@ members = [
     "wafred-tunnel",
 ]
 [workspace.package]
-version = "1.0.5"
+version = "1.0.6"
 
 [workspace.dependencies]
 aes-gcm-siv = { version = "0.12.1", default-features = false, features = [
@@ -399,25 +399,25 @@ opentelemetry_sdk = { version = "0.33.0", features = [
     "trace",
 ], default-features = false }
 path-absolutize = "4.0.1"
-pingap-acme = { version = "1.0.5", path = "pingap-acme", default-features = false }
-pingap-cache = { version = "1.0.5", path = "pingap-cache" }
-pingap-certificate = { version = "1.0.5", path = "pingap-certificate", default-features = false }
-pingap-config = { version = "1.0.5", path = "pingap-config" }
-pingap-core = { version = "1.0.5", path = "pingap-core" }
-pingap-discovery = { version = "1.0.5", path = "pingap-discovery" }
-pingap-health = { version = "1.0.5", path = "pingap-health" }
-pingap-imageoptim = { version = "1.0.5", path = "pingap-imageoptim", default-features = false }
-pingap-location = { version = "1.0.5", path = "pingap-location" }
-pingap-logger = { version = "1.0.5", path = "pingap-logger" }
-pingap-otel = { version = "1.0.5", path = "pingap-otel" }
-pingap-performance = { version = "1.0.5", path = "pingap-performance", default-features = false }
-pingap-plugin = { version = "1.0.5", path = "pingap-plugin", default-features = false }
-pingap-proxy = { version = "1.0.5", path = "pingap-proxy", default-features = false }
-pingap-pyroscope = { version = "1.0.5", path = "pingap-pyroscope" }
-pingap-sentry = { version = "1.0.5", path = "pingap-sentry" }
-pingap-upstream = { version = "1.0.5", path = "pingap-upstream", default-features = false }
-pingap-util = { version = "1.0.5", path = "pingap-util" }
-pingap-webhook = { version = "1.0.5", path = "pingap-webhook" }
+pingap-acme = { version = "1.0.6", path = "pingap-acme", default-features = false }
+pingap-cache = { version = "1.0.6", path = "pingap-cache" }
+pingap-certificate = { version = "1.0.6", path = "pingap-certificate", default-features = false }
+pingap-config = { version = "1.0.6", path = "pingap-config" }
+pingap-core = { version = "1.0.6", path = "pingap-core" }
+pingap-discovery = { version = "1.0.6", path = "pingap-discovery" }
+pingap-health = { version = "1.0.6", path = "pingap-health" }
+pingap-imageoptim = { version = "1.0.6", path = "pingap-imageoptim", default-features = false }
+pingap-location = { version = "1.0.6", path = "pingap-location" }
+pingap-logger = { version = "1.0.6", path = "pingap-logger" }
+pingap-otel = { version = "1.0.6", path = "pingap-otel" }
+pingap-performance = { version = "1.0.6", path = "pingap-performance", default-features = false }
+pingap-plugin = { version = "1.0.6", path = "pingap-plugin", default-features = false }
+pingap-proxy = { version = "1.0.6", path = "pingap-proxy", default-features = false }
+pingap-pyroscope = { version = "1.0.6", path = "pingap-pyroscope" }
+pingap-sentry = { version = "1.0.6", path = "pingap-sentry" }
+pingap-upstream = { version = "1.0.6", path = "pingap-upstream", default-features = false }
+pingap-util = { version = "1.0.6", path = "pingap-util" }
+pingap-webhook = { version = "1.0.6", path = "pingap-webhook" }
 wafred-tunnel = { path = "wafred-tunnel", default-features = false }
 # Released crates.io versions; all three must stay on the same version so cargo
 # resolves one copy of pingora-core.

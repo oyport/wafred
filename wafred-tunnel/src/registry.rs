@@ -127,7 +127,7 @@ impl Bridge {
                     Ok(listener) => listener,
                     Err(error) => {
                         warn!(
-                            target: "pingwaf::tunnel",
+                            target: "wafred::tunnel",
                             tunnel = %tunnel_id,
                             target = %target,
                             error = %error,
@@ -142,7 +142,7 @@ impl Bridge {
                 Ok(listener) => listener,
                 Err(error) => {
                     warn!(
-                        target: "pingwaf::tunnel",
+                        target: "wafred::tunnel",
                         tunnel = %tunnel_id,
                         target = %target,
                         error = %error,
@@ -158,7 +158,7 @@ impl Bridge {
         };
         if let Err(error) = listener.set_nonblocking(true) {
             warn!(
-                target: "pingwaf::tunnel",
+                target: "wafred::tunnel",
                 error = %error,
                 "cannot set the tunnel bridge listener non-blocking"
             );
@@ -168,7 +168,7 @@ impl Bridge {
             Ok(handle) => handle,
             Err(_) => {
                 debug!(
-                    target: "pingwaf::tunnel",
+                    target: "wafred::tunnel",
                     "no tokio runtime, the tunnel bridge stays unbound"
                 );
                 return;
@@ -191,7 +191,7 @@ impl Bridge {
         state.task = Some(task);
         state.session = Some(session);
         debug!(
-            target: "pingwaf::tunnel",
+            target: "wafred::tunnel",
             tunnel = %tunnel_id,
             target = %target,
             port,
@@ -244,7 +244,7 @@ impl BridgeTask {
             Ok(listener) => listener,
             Err(error) => {
                 warn!(
-                    target: "pingwaf::tunnel",
+                    target: "wafred::tunnel",
                     tunnel = %self.tunnel_id,
                     error = %error,
                     "cannot adopt the tunnel bridge listener"
@@ -270,7 +270,7 @@ impl BridgeTask {
                             // bridge; a permanently broken listener would spin,
                             // so back off a little.
                             warn!(
-                                target: "pingwaf::tunnel",
+                                target: "wafred::tunnel",
                                 tunnel = %self.tunnel_id,
                                 error = %error,
                                 "tunnel bridge accept failed"
@@ -296,7 +296,7 @@ async fn forward(
         Ok(pair) => pair,
         Err(code) => {
             debug!(
-                target: "pingwaf::tunnel",
+                target: "wafred::tunnel",
                 tunnel = %tunnel_id,
                 target = %target,
                 peer = %peer,
@@ -310,7 +310,7 @@ async fn forward(
     let mut stream = stream.compat();
     if let Err(error) = write_open_target(&mut stream, &target).await {
         warn!(
-            target: "pingwaf::tunnel",
+            target: "wafred::tunnel",
             tunnel = %tunnel_id,
             target = %target,
             error = %error,
@@ -322,7 +322,7 @@ async fn forward(
     match tokio::io::copy_bidirectional(&mut socket, &mut stream).await {
         Ok((from_client, from_origin)) => {
             debug!(
-                target: "pingwaf::tunnel",
+                target: "wafred::tunnel",
                 tunnel = %tunnel_id,
                 target = %target,
                 from_client,
@@ -332,7 +332,7 @@ async fn forward(
         },
         Err(error) => {
             debug!(
-                target: "pingwaf::tunnel",
+                target: "wafred::tunnel",
                 tunnel = %tunnel_id,
                 target = %target,
                 error = %error,

@@ -13,7 +13,7 @@ use pingap_core::normalize_host;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use pingwaf_proto::control_plane as proto;
+use wafred_proto::control_plane as proto;
 
 mod persist;
 
@@ -1873,7 +1873,7 @@ impl RuleCache {
         // converting a bundle and rebuilding the domain index is accounted
         // separately from the proxy path.
         let _sync =
-            pingwaf_profiler::timed_method(pingwaf_profiler::Method::AgentSync);
+            wafred_profiler::timed_method(wafred_profiler::Method::AgentSync);
         let site_id = bundle.site_id.clone();
         let previous_timeout = self
             .inner

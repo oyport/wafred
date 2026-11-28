@@ -168,13 +168,13 @@ pub enum Method {
     /// layout is complete and a new call site has a home before it earns a
     /// variant.
     Other = 6,
-    /// `pingwaf-waf` normalization: decoding and canonicalisation.
+    /// `wafred-waf` normalization: decoding and canonicalisation.
     WafNormalize = 7,
-    /// `pingwaf-waf` signature matching.
+    /// `wafred-waf` signature matching.
     WafSignature = 8,
-    /// `pingwaf-waf` expression evaluation.
+    /// `wafred-waf` expression evaluation.
     WafExpression = 9,
-    /// `pingwaf-waf` request-body read/staging.
+    /// `wafred-waf` request-body read/staging.
     WafBodyRead = 10,
     /// Cache lookup (hit path).
     CacheLookup = 11,

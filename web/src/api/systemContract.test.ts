@@ -162,7 +162,7 @@ describe('system API contract', () => {
   })
 
   it('memory metrics expose VmSize / Committed_AS contract fields', () => {
-    // 与 pingwaf-system 内存快照对齐：4 个数值字段 + 人类可读形式。
+    // 与 wafred-system 内存快照对齐：4 个数值字段 + 人类可读形式。
     expect(METRICS.memory.vm_size_bytes).toBeGreaterThan(0)
     expect(METRICS.memory.committed_as_bytes).toBeGreaterThan(0)
     expect(METRICS.memory.commit_limit_bytes).toBeGreaterThan(0)

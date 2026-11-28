@@ -36,7 +36,7 @@ use pingap_core::{
     protect_from_connection_header, resolve_scheme_with_trust,
 };
 use pingora::proxy::Session;
-use pingwaf_agent::{SecurityEvent, WafredAgent};
+use wafred_agent::{SecurityEvent, WafredAgent};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
@@ -54,7 +54,7 @@ const DEFAULT_REDIRECT_PATH: &str = "/oauth2/callback";
 /// A path of its own rather than the site root, because the site root is
 /// already the thing being gated: reaching it without a session is what sends
 /// the browser to the local login page, so linking to it would bounce back.
-pub(crate) const PROVIDER_ENTRY_PATH: &str = "/_pingwaf/oidc";
+pub(crate) const PROVIDER_ENTRY_PATH: &str = "/_wafred/oidc";
 const DEFAULT_COOKIE_NAME: &str = "pingap_oidc";
 const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 /// How long somebody has to log in at the provider: from the redirect to

@@ -53,8 +53,8 @@ use pingap_core::{
 use pingap_util::{IpRules, base64_decode};
 use pingora::http::{ResponseHeader, Version};
 use pingora::proxy::Session;
-use pingwaf_agent::body_budget::{BodyBudget, LOG_BODY_BUDGET_BYTES};
-use pingwaf_agent::cache::{
+use wafred_agent::body_budget::{BodyBudget, LOG_BODY_BUDGET_BYTES};
+use wafred_agent::cache::{
     AiCrawlConfig as CacheAiCrawlConfig,
     BasicAuthConfig as CacheBasicAuthConfig,
     BotProtectionConfig as CacheBotProtection, GeoConfig as CacheGeoConfig,
@@ -66,14 +66,14 @@ use pingwaf_agent::cache::{
     WafConfig as CacheWafConfig, WafMode as CacheWafMode,
     WafRule as CacheWafRule,
 };
-use pingwaf_agent::{AccessLogEntry, SecurityEvent, WafredAgent};
-use pingwaf_challenge::{
+use wafred_agent::{AccessLogEntry, SecurityEvent, WafredAgent};
+use wafred_challenge::{
     CLEARANCE_COOKIE_NAME, CookieManager, generate_request_id,
 };
-use pingwaf_waf::rules::{
+use wafred_waf::rules::{
     EvalContext, Expression, evaluate as evaluate_expression, parse_expression,
 };
-use pingwaf_waf::{
+use wafred_waf::{
     CategorySet, CompiledRule, RequestData, RuleAction, ScoreBreakdown,
     StackSet, WafAction, WafEngine, WafEngineConfig, WafLevel, WafMode,
     WafVerdict,
@@ -279,7 +279,7 @@ impl BasicAuthGate {
     }
 }
 
-/// Whether this site's chain carries a plugin that serves `/_pingwaf/*`.
+/// Whether this site's chain carries a plugin that serves `/_wafred/*`.
 ///
 /// `visitor_auth` is registered only for `local` and `both` sites (the OIDC
 /// plugin covers the rest), so on any other site those paths are not an
@@ -459,7 +459,7 @@ fn cache_timing_desc(session: &Session) -> &'static str {
 }
 
 /// Request-phase time the WAF plugin spent on this request, as recorded by the
-/// proxy's plugin runner (`pingwaf:waf`).
+/// proxy's plugin runner (`wafred:waf`).
 fn waf_processing_ms(ctx: &Ctx) -> u64 {
     ctx.features
         .as_ref()
@@ -2927,8 +2927,8 @@ impl LogBodyPrefix {
         }
         let after = self.body.as_ref().map_or(0, Vec::len);
         if after > before {
-            pingwaf_profiler::add_memory(
-                pingwaf_profiler::Module::Log,
+            wafred_profiler::add_memory(
+                wafred_profiler::Module::Log,
                 (after - before) as i64,
             );
         }
@@ -2942,8 +2942,8 @@ impl LogBodyPrefix {
             buf.truncate(self.limit);
             self.truncated = true;
             if removed > 0 {
-                pingwaf_profiler::add_memory(
-                    pingwaf_profiler::Module::Log,
+                wafred_profiler::add_memory(
+                    wafred_profiler::Module::Log,
                     -(removed as i64),
                 );
             }
@@ -2953,8 +2953,8 @@ impl LogBodyPrefix {
         // `Drop` still runs on the remaining value).
         let held = self.body.as_ref().map_or(0, Vec::len);
         if held > 0 {
-            pingwaf_profiler::add_memory(
-                pingwaf_profiler::Module::Log,
+            wafred_profiler::add_memory(
+                wafred_profiler::Module::Log,
                 -(held as i64),
             );
         }
@@ -2968,8 +2968,8 @@ impl Drop for LogBodyPrefix {
         // has to give its bytes back to the module gauge.
         let held = self.body.as_ref().map_or(0, Vec::len);
         if held > 0 {
-            pingwaf_profiler::add_memory(
-                pingwaf_profiler::Module::Log,
+            wafred_profiler::add_memory(
+                wafred_profiler::Module::Log,
                 -(held as i64),
             );
         }
@@ -3713,7 +3713,7 @@ pub(crate) fn emit_challenge_access(
 /// generated, so a visitor (or the site owner reading a report) can tell a
 /// WAFred block from an upstream 403 that happens to carry the same status
 /// code. Mirrors Cloudflare's `cf-mitigated`.
-const MITIGATED_HEADER: &str = "x-pingwaf-mitigated";
+const MITIGATED_HEADER: &str = "x-wafred-mitigated";
 
 /// Adds the mitigation marker to a response the WAF itself produced.
 ///
@@ -4031,7 +4031,7 @@ fn parse_monitor_stacks(names: &[String]) -> StackSet {
 /// warning (the rule may have been removed from the engine since the setting
 /// was written).
 fn parse_monitor_managed_rules(names: &[String]) -> HashSet<String> {
-    let known = pingwaf_waf::MANAGED_RULE_IDS
+    let known = wafred_waf::MANAGED_RULE_IDS
         .iter()
         .copied()
         .collect::<HashSet<&str>>();
@@ -4164,7 +4164,7 @@ fn build_site_engine(cfg: &CacheWafConfig) -> WafEngine {
         rules,
         enable_managed_rules: true,
         fast_path_block_on_critical: true,
-        inspection_deadline: pingwaf_waf::engine::DEFAULT_INSPECTION_DEADLINE,
+        inspection_deadline: wafred_waf::engine::DEFAULT_INSPECTION_DEADLINE,
     };
     WafEngine::new(&engine_config)
 }
@@ -5046,7 +5046,7 @@ impl TryFrom<&PluginConf> for WafPlugin {
             get_int_conf_or_default(
                 value,
                 "pow_max_difficulty",
-                i64::from(pingwaf_challenge::DEFAULT_MAX_DIFFICULTY),
+                i64::from(wafred_challenge::DEFAULT_MAX_DIFFICULTY),
             )
             .clamp(0, i64::from(u32::MAX)) as u32,
             get_int_conf_or_default(
@@ -5113,7 +5113,7 @@ impl TryFrom<&PluginConf> for WafPlugin {
             enable_managed_rules: true,
             fast_path_block_on_critical: true,
             inspection_deadline:
-                pingwaf_waf::engine::DEFAULT_INSPECTION_DEADLINE,
+                wafred_waf::engine::DEFAULT_INSPECTION_DEADLINE,
         };
 
         Ok(Self {
@@ -5171,10 +5171,10 @@ impl Plugin for WafPlugin {
             return Ok(RequestPluginResult::Skipped);
         }
         // The clearance endpoint is served by the challenge plugin. A rule
-        // that matches every path (or `/_pingwaf/...`) must not challenge the
+        // that matches every path (or `/_wafred/...`) must not challenge the
         // verification POST itself — that turns the challenge page into a
         // loop with no way to obtain a cookie. Exact path and method only, so
-        // `/_pingwaf/challenge/verify/../admin` is not exempted.
+        // `/_wafred/challenge/verify/../admin` is not exempted.
         if session.req_header().method == http::Method::POST
             && session.req_header().uri.path() == VERIFY_ENDPOINT
         {
@@ -5184,12 +5184,12 @@ impl Plugin for WafPlugin {
         // *after* this plugin in the chain — so a rule that matched them would
         // answer the login page with a block page, and the visitor would have
         // no way in at all. Found by driving the flow: a burst of sign-ins
-        // tripped a rule and every subsequent visit to `/_pingwaf/login`
+        // tripped a rule and every subsequent visit to `/_wafred/login`
         // returned 403 "Request Blocked" until the IP was unblocked by hand.
         //
         // Only the endpoints themselves are skipped, and only when the chain
         // actually carries the plugin that serves them. A prefix test would
-        // hand `/_pingwaf/<anything>` — including `/_pingwaf/../admin`, which
+        // hand `/_wafred/<anything>` — including `/_wafred/../admin`, which
         // most origins normalise back — to the upstream with no rule
         // evaluation at all, on every site, whether or not it has a login page.
         // That is a way *around* the WAF, which is the opposite of what a
@@ -5203,11 +5203,11 @@ impl Plugin for WafPlugin {
         {
             return Ok(RequestPluginResult::Skipped);
         }
-        // Method attribution (see pingwaf-profiler): the timer books the
+        // Method attribution (see wafred-profiler): the timer books the
         // `waf` module row as well, so there is no second timer to keep in
         // sync.
-        let _profile = pingwaf_profiler::timed_method(
-            pingwaf_profiler::Method::WafHandleRequest,
+        let _profile = wafred_profiler::timed_method(
+            wafred_profiler::Method::WafHandleRequest,
         );
 
         // ── Extract immutable request facts (all borrowed data is cloned) ──
@@ -6374,13 +6374,13 @@ impl Plugin for WafPlugin {
         };
         // Body staging is the one WAF stage that can hold megabytes per
         // in-flight request, so it gets its own module and method row.
-        let _body_timer = pingwaf_profiler::timed_method(
-            pingwaf_profiler::Method::WafBodyRead,
+        let _body_timer = wafred_profiler::timed_method(
+            wafred_profiler::Method::WafBodyRead,
         );
         let staged_bytes =
             entry.buffer.len() + body.as_ref().map_or(0, |chunk| chunk.len());
-        let _body_memory = pingwaf_profiler::track_method_memory(
-            pingwaf_profiler::Method::WafBodyRead,
+        let _body_memory = wafred_profiler::track_method_memory(
+            wafred_profiler::Method::WafBodyRead,
             staged_bytes as u64,
         );
         // Fail-open deadline: while still withholding bytes, an entry past
@@ -6879,13 +6879,13 @@ pub(crate) mod tests {
     use pingap_core::PluginStep;
     use pingap_util::base64_encode;
     use pingora::proxy::Session;
-    use pingwaf_agent::cache::RuleCache;
-    use pingwaf_agent::cache::WafRule;
-    use pingwaf_agent::client::ControlPlaneClient;
-    use pingwaf_agent::config::AgentConfig;
-    use pingwaf_agent::heartbeat::MetricsCollector;
-    use pingwaf_challenge::ClearanceLevel;
-    use pingwaf_proto::control_plane as proto;
+    use wafred_agent::cache::RuleCache;
+    use wafred_agent::cache::WafRule;
+    use wafred_agent::client::ControlPlaneClient;
+    use wafred_agent::config::AgentConfig;
+    use wafred_agent::heartbeat::MetricsCollector;
+    use wafred_challenge::ClearanceLevel;
+    use wafred_proto::control_plane as proto;
     use tokio_test::io::Builder;
 
     #[test]
@@ -7196,7 +7196,7 @@ ml_threshold = 0.75
             site_id: "site-1".into(),
             domain: "example.com".into(),
             alternate_domains: Vec::new(),
-            status: pingwaf_agent::cache::SiteStatus::Active,
+            status: wafred_agent::cache::SiteStatus::Active,
             downstream_timeout_secs: 60,
             waf_config: waf,
             rate_limit_rules: Vec::new(),
@@ -7213,7 +7213,7 @@ ml_threshold = 0.75
             basic_auth: None,
             observation_mode: false,
             cache_settings: None,
-            proxy_trust: pingwaf_agent::cache::ProxyTrustConfig {
+            proxy_trust: wafred_agent::cache::ProxyTrustConfig {
                 enabled: false,
                 header: String::new(),
                 last_hop_only: true,
@@ -7631,7 +7631,7 @@ advanced_mode = true
         resp.headers.as_ref().and_then(|headers| {
             headers
                 .iter()
-                .find(|(name, _)| name.as_str() == "x-pingwaf-mitigated")
+                .find(|(name, _)| name.as_str() == "x-wafred-mitigated")
                 .map(|(_, value)| {
                     value.to_str().unwrap_or_default().to_string()
                 })
@@ -7717,14 +7717,14 @@ advanced_mode = true
             let headers = response.headers.as_ref().expect("headers");
             let marker_values: Vec<&str> = headers
                 .iter()
-                .filter(|(name, _)| name.as_str() == "x-pingwaf-mitigated")
+                .filter(|(name, _)| name.as_str() == "x-wafred-mitigated")
                 .map(|(_, value)| value.to_str().unwrap_or_default())
                 .collect();
             // Exactly one marker, and never a rule identifier in it.
             assert_eq!(marker_values.len(), 1);
             let value = marker_values[0];
             assert!(matches!(value, "block" | "challenge"), "{value}");
-            assert!(!value.contains("PINGWAF"), "{value}");
+            assert!(!value.contains("WAFRED"), "{value}");
             assert!(!value.contains("1002"), "{value}");
         }
     }
@@ -7740,7 +7740,7 @@ advanced_mode = true
             .as_ref()
             .expect("headers")
             .iter()
-            .filter(|(name, _)| name.as_str() == "x-pingwaf-mitigated")
+            .filter(|(name, _)| name.as_str() == "x-wafred-mitigated")
             .count();
         assert_eq!(markers, 1);
     }
@@ -7881,7 +7881,7 @@ inspect_body = true"###,
     /// The visitor-auth pages are skipped by the WAF, whatever any rule says.
     ///
     /// Regression: the visitor plugin runs *after* this one, so a rule that
-    /// matched `/_pingwaf/login` answered the site's own front door with a
+    /// matched `/_wafred/login` answered the site's own front door with a
     /// block page. Found by driving the flow against a live deployment — a
     /// burst of sign-ins tripped a rule and every later visit to the login
     /// page returned 403 until the IP was unblocked by hand, which is a
@@ -7921,16 +7921,16 @@ inspect_body = true"###,
         }
 
         // Nothing else under the prefix is skipped. A prefix test would hand
-        // `/_pingwaf/anything` — and `/_pingwaf/../admin`, which most origins
+        // `/_wafred/anything` — and `/_wafred/../admin`, which most origins
         // normalise back — to the upstream with no rule evaluation, on every
         // site. Found by driving the login flow against a live deployment: on a
-        // site with no login page, `/_pingwaf/anything` reached the origin
+        // site with no login page, `/_wafred/anything` reached the origin
         // while `/.env` was still blocked.
         for path in [
-            "/_pingwaf/anything",
-            "/_pingwaf/../admin",
-            "/_pingwaf/",
-            "/_pingwaf",
+            "/_wafred/anything",
+            "/_wafred/../admin",
+            "/_wafred/",
+            "/_wafred",
         ] {
             let input_header =
                 format!("GET {path} HTTP/1.1\r\nHost: example.com\r\n\r\n");
@@ -9233,7 +9233,7 @@ inspect_body = true"###,
 
     /// The access-log request facts an early-answer path must still carry.
     fn assert_access_request_facts(
-        entry: &pingwaf_agent::client::LogEntry,
+        entry: &wafred_agent::client::LogEntry,
         client_ip: &str,
     ) {
         assert_eq!("GET", entry.method);
@@ -9468,7 +9468,7 @@ inspect_body = true"###,
         let gate = BasicAuthGate::build(&CacheBasicAuthConfig {
             enabled: true,
             realm: "Restricted".to_string(),
-            credentials: vec![pingwaf_agent::cache::BasicAuthCredential {
+            credentials: vec![wafred_agent::cache::BasicAuthCredential {
                 username: "alice".to_string(),
                 authorization: base64_encode("alice:pw"),
             }],
@@ -11440,7 +11440,7 @@ inspect_body = true"###,
         let split = headers(&[
             ("cookie", "app_id=12345; preferences=A=1|B=1"),
             ("cookie", "session_id=98765"),
-            ("cookie", "__pingwaf_clearance=signed-token"),
+            ("cookie", "__wafred_clearance=signed-token"),
         ]);
         let names: Vec<String> = parse_cookies(&split)
             .into_iter()
@@ -11448,17 +11448,17 @@ inspect_body = true"###,
             .collect();
         assert_eq!(
             names,
-            ["app_id", "preferences", "session_id", "__pingwaf_clearance"]
+            ["app_id", "preferences", "session_id", "__wafred_clearance"]
         );
         assert_eq!(clearance_cookie(&split).as_deref(), Some("signed-token"));
 
         // The layout must not matter: one joined field and a clearance in the
         // first field both resolve to the same value.
         let joined =
-            headers(&[("Cookie", "app_id=1; __pingwaf_clearance=t; b=2")]);
+            headers(&[("Cookie", "app_id=1; __wafred_clearance=t; b=2")]);
         assert_eq!(clearance_cookie(&joined).as_deref(), Some("t"));
         let first = headers(&[
-            ("Cookie", "__pingwaf_clearance=t2"),
+            ("Cookie", "__wafred_clearance=t2"),
             ("cookie", "app_id=1"),
         ]);
         assert_eq!(clearance_cookie(&first).as_deref(), Some("t2"));
@@ -12362,7 +12362,7 @@ inspect_body = true"###,
         );
         assert_eq!(
             Some("challenge".to_string()),
-            response_header(&resp, "x-pingwaf-mitigated")
+            response_header(&resp, "x-wafred-mitigated")
         );
         // The page states the difficulty the verifier will demand.
         let pending = crate::challenge::peek_pending("req-waf-mint-1")
@@ -12389,7 +12389,7 @@ inspect_body = true"###,
         assert_eq!(http::StatusCode::TOO_MANY_REQUESTS, resp.status);
         assert_eq!(
             Some("block".to_string()),
-            response_header(&resp, "x-pingwaf-mitigated")
+            response_header(&resp, "x-wafred-mitigated")
         );
         assert!(
             crate::challenge::peek_pending("req-waf-mint-2").is_none(),
@@ -12463,7 +12463,7 @@ inspect_body = true"###,
             &toml::from_str::<PluginConf>(r###"mode = "block""###).unwrap(),
         )
         .unwrap();
-        let input = "POST /_pingwaf/challenge/verify HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
+        let input = "POST /_wafred/challenge/verify HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
         let mock_io = Builder::new().read(input.as_bytes()).build();
         let mut session = Session::new_h1(Box::new(mock_io));
         session.read_request().await.unwrap();

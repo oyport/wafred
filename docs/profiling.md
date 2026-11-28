@@ -122,7 +122,7 @@ endpoint that works in every build.
 ## `GET /api/v1/system/profile`
 
 Wall-clock time and memory attribution by module and method. This is **not**
-a sampled profile — it is pure Rust instrumentation (`pingwaf-profiler`): the
+a sampled profile — it is pure Rust instrumentation (`wafred-profiler`): the
 code that knows what it is doing accounts for itself.
 
 ```bash

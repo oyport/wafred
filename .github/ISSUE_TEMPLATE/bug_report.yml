@@ -43,11 +43,11 @@ body:
       label: Component / 受影响组件
       multiple: true
       options:
-        - Control plane (pingwaf-server)
-        - Detection engine (pingwaf-waf)
-        - Challenge (pingwaf-challenge)
-        - Agent (pingwaf-agent)
-        - gRPC / proto (pingwaf-proto)
+        - Control plane (wafred-server)
+        - Detection engine (wafred-waf)
+        - Challenge (wafred-challenge)
+        - Agent (wafred-agent)
+        - gRPC / proto (wafred-proto)
         - Web dashboard (web/)
         - Reverse proxy (pingap-*)
         - Install / packaging

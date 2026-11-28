@@ -4,7 +4,7 @@
 # Cargo keeps one copy of every artifact per (crate, feature set, profile) and
 # never garbage-collects them, so a checkout that has been built with
 # `--features=full`, `--no-default-features --features=tls-rustls,full` and
-# `-p pingap-plugin --features=geo` carries several ~195 MB `pingwaf-server`
+# `-p pingap-plugin --features=geo` carries several ~195 MB `wafred-server`
 # rlibs at once. A sweep of this repo in October 2026 found 47 GB of target/
 # holding 2055 rlibs for only 583 distinct crates - `pingap_core` alone had 41
 # copies - plus 21000 object files. None of that was incremental cache: it was

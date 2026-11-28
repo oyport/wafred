@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use chrono::{DateTime, TimeZone, Utc};
-use pingwaf_proto::control_plane::{
+use wafred_proto::control_plane::{
     AiBotPolicy, AiCrawlConfig, BasicAuthConfig, BasicAuthCredential,
     BotProtectionConfig, CacheRule, CacheTypeCategory, CacheTypePolicy,
     ChallengeConfig, CustomErrorPage, FailoverMode, GeoConfig,

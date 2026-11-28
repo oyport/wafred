@@ -194,7 +194,7 @@ impl Connector {
     /// Runs until the tunnel is revoked or the process is stopped.
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!(
-            target: "pingwaf::tunnel",
+            target: "wafred::tunnel",
             tunnel = %self.config.tunnel_id,
             ingress = self.state().ingress.len(),
             "tunnel connector starting"
@@ -206,7 +206,7 @@ impl Connector {
             let state = self.state();
             if let Some(reason) = &state.revoked {
                 warn!(
-                    target: "pingwaf::tunnel",
+                    target: "wafred::tunnel",
                     tunnel = %self.config.tunnel_id,
                     reason = %reason,
                     "tunnel was revoked; stopping"
@@ -223,7 +223,7 @@ impl Connector {
                 // ingress list and the config file carries none. Say so once
                 // per wait instead of looking healthy while doing nothing.
                 warn!(
-                    target: "pingwaf::tunnel",
+                    target: "wafred::tunnel",
                     tunnel = %self.config.tunnel_id,
                     "no tunnel ingress configured or advertised yet; \
                      set an ingress address on an edge or pass --ingress"
@@ -278,7 +278,7 @@ impl Connector {
                     // the next push instead (the control plane notifies on a
                     // settings change).
                     info!(
-                        target: "pingwaf::tunnel",
+                        target: "wafred::tunnel",
                         endpoint = %ingress.endpoint,
                         "tunnel support is disabled deployment-wide; waiting for it to be re-enabled"
                     );
@@ -292,14 +292,14 @@ impl Connector {
                 Ok(()) => {
                     backoff = BACKOFF_MIN;
                     info!(
-                        target: "pingwaf::tunnel",
+                        target: "wafred::tunnel",
                         endpoint = %ingress.endpoint,
                         "tunnel session closed by the edge, reconnecting"
                     );
                 },
                 Err(error) => {
                     warn!(
-                        target: "pingwaf::tunnel",
+                        target: "wafred::tunnel",
                         endpoint = %ingress.endpoint,
                         error = %error,
                         retry_in_secs = backoff.as_secs(),
@@ -397,7 +397,7 @@ impl Connector {
         self.live_sessions.fetch_add(1, Ordering::SeqCst);
         self.note_connected(&ingress.endpoint, true);
         info!(
-            target: "pingwaf::tunnel",
+            target: "wafred::tunnel",
             endpoint = %ingress.endpoint,
             tunnel = %self.config.tunnel_id,
             targets = allowed.len(),
@@ -539,7 +539,7 @@ impl Connector {
         if active > limit {
             self.active_streams.fetch_sub(1, Ordering::SeqCst);
             debug!(
-                target: "pingwaf::tunnel",
+                target: "wafred::tunnel",
                 limit,
                 "refusing a tunnel data stream: concurrency limit"
             );
@@ -551,7 +551,7 @@ impl Connector {
             Ok(target) => target,
             Err(error) => {
                 debug!(
-                    target: "pingwaf::tunnel",
+                    target: "wafred::tunnel",
                     error = %error,
                     "malformed tunnel data stream"
                 );
@@ -561,7 +561,7 @@ impl Connector {
         };
         if !self.state().allows(&target) {
             warn!(
-                target: "pingwaf::tunnel",
+                target: "wafred::tunnel",
                 target = %target,
                 "refusing a tunnel target that is not in the policy"
             );
@@ -577,7 +577,7 @@ impl Connector {
             Ok(Ok(socket)) => socket,
             Ok(Err(error)) => {
                 warn!(
-                    target: "pingwaf::tunnel",
+                    target: "wafred::tunnel",
                     target = %target,
                     error = %error,
                     "tunnel target is unreachable"
@@ -587,7 +587,7 @@ impl Connector {
             },
             Err(_) => {
                 warn!(
-                    target: "pingwaf::tunnel",
+                    target: "wafred::tunnel",
                     target = %target,
                     "tunnel target connection timed out"
                 );
@@ -601,14 +601,14 @@ impl Connector {
         self.active_streams.fetch_sub(1, Ordering::SeqCst);
         match result {
             Ok((from_edge, from_target)) => debug!(
-                target: "pingwaf::tunnel",
+                target: "wafred::tunnel",
                 target = %target,
                 from_edge,
                 from_target,
                 "tunnel data stream closed"
             ),
             Err(error) => debug!(
-                target: "pingwaf::tunnel",
+                target: "wafred::tunnel",
                 target = %target,
                 error = %error,
                 "tunnel data stream ended with an error"
@@ -633,7 +633,7 @@ impl Connector {
                     // in `journalctl -u wafred-tunnel`, and the backoff keeps
                     // the line at most once a minute.
                     warn!(
-                        target: "pingwaf::tunnel",
+                        target: "wafred::tunnel",
                         error = %error,
                         retry_in_secs = backoff.as_secs(),
                         "cannot reach the control plane"
@@ -651,9 +651,9 @@ impl Connector {
     async fn control_once(self: Arc<Self>) -> Result<()> {
         let mut client = pair::connect(self.config.as_ref()).await?;
         let (tx, rx) = mpsc::channel(8);
-        tx.send(pingwaf_proto::control_plane::TunnelConnectorMessage {
-            kind: Some(pingwaf_proto::control_plane::tunnel_connector_message::Kind::Hello(
-                pingwaf_proto::control_plane::TunnelConnectorHello {
+        tx.send(wafred_proto::control_plane::TunnelConnectorMessage {
+            kind: Some(wafred_proto::control_plane::tunnel_connector_message::Kind::Hello(
+                wafred_proto::control_plane::TunnelConnectorHello {
                     tunnel_id: self.config.tunnel_id.clone(),
                     credential: self.config.credential.clone(),
                     version: self.config.version.clone(),
@@ -672,9 +672,9 @@ impl Connector {
             tokio::select! {
                 _ = heartbeat.tick() => {
                     let state = self.state();
-                    let message = pingwaf_proto::control_plane::TunnelConnectorMessage {
-                        kind: Some(pingwaf_proto::control_plane::tunnel_connector_message::Kind::Heartbeat(
-                            pingwaf_proto::control_plane::TunnelConnectorHeartbeat {
+                    let message = wafred_proto::control_plane::TunnelConnectorMessage {
+                        kind: Some(wafred_proto::control_plane::tunnel_connector_message::Kind::Heartbeat(
+                            wafred_proto::control_plane::TunnelConnectorHeartbeat {
                                 sessions: self.live_sessions.load(Ordering::SeqCst),
                                 streams_active: self.active_streams.load(Ordering::SeqCst),
                                 connected_ingress: state.ingress.iter().map(|i| i.endpoint.clone()).collect(),
@@ -697,9 +697,9 @@ impl Connector {
     /// Applies a command pushed by the control plane.
     fn apply_command(
         &self,
-        command: pingwaf_proto::control_plane::TunnelConnectorCommand,
+        command: wafred_proto::control_plane::TunnelConnectorCommand,
     ) {
-        use pingwaf_proto::control_plane::tunnel_connector_command::Kind;
+        use wafred_proto::control_plane::tunnel_connector_command::Kind;
         match command.kind {
             Some(Kind::Config(config)) => {
                 let ingress: Vec<IngressEndpoint> = config
@@ -788,7 +788,7 @@ async fn control_loop(
                     Ok(frame) => frame,
                     Err(_) => {
                         warn!(
-                            target: "pingwaf::tunnel",
+                            target: "wafred::tunnel",
                             timeout_secs = liveness.as_secs(),
                             "the edge stopped answering, reconnecting"
                         );
@@ -814,20 +814,20 @@ async fn control_loop(
                     },
                     Ok(ControlFrame::Drain { grace_secs }) => {
                         info!(
-                            target: "pingwaf::tunnel",
+                            target: "wafred::tunnel",
                             grace_secs,
                             "the edge is draining the tunnel session"
                         );
                         break;
                     },
                     Ok(other) => debug!(
-                        target: "pingwaf::tunnel",
+                        target: "wafred::tunnel",
                         frame = other.kind(),
                         "unexpected control frame from the edge"
                     ),
                     Err(error) => {
                         debug!(
-                            target: "pingwaf::tunnel",
+                            target: "wafred::tunnel",
                             error = %error,
                             "tunnel control stream ended"
                         );

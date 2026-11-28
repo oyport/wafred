@@ -1,5 +1,5 @@
 [package]
-name = "pingwaf-challenge"
+name = "wafred-challenge"
 version.workspace = true
 edition = "2021"
 license = "Apache-2.0"
@@ -15,5 +15,5 @@ hmac = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
-pingwaf-waf = { path = "../wafred-waf" }
+wafred-waf = { path = "../wafred-waf" }
 hex = { workspace = true }

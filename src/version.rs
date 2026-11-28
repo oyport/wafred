@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Version banner shared by the `pingwaf`/`pingap` binaries and the
+//! Version banner shared by the `wafred`/`pingap` binaries and the
 //! agent-only `wafred-agent` build.
 //!
 //! Both binaries answer `--version` themselves (the WAFred CLI intercepts the

@@ -244,7 +244,7 @@ async fn github_request(
         .request(method, url)
         .header("authorization", format!("Bearer {token}"))
         .header("accept", "application/vnd.github+json")
-        .header("user-agent", "pingwaf-config-backup")
+        .header("user-agent", "wafred-config-backup")
         .header("x-github-api-version", "2022-11-28");
     if let Some(body) = body {
         request = request.json(&body);

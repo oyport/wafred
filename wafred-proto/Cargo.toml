@@ -1,5 +1,5 @@
 [package]
-name = "pingwaf-proto"
+name = "wafred-proto"
 version.workspace = true
 edition = "2021"
 license = "Apache-2.0"

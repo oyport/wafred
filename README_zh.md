@@ -160,18 +160,19 @@ WAFred 行是 2026-11-22 修正 framing 后的本地实测。PingWAF 早期 P13 
 
 | Crate | 职责 |
 | --- | --- |
-| [`pingwaf-proto`](./wafred-proto) | 控制面 gRPC 协议定义（单一来源：`control_plane.proto`） |
-| [`pingwaf-server`](./wafred-server) | 控制面：Axum REST + tonic gRPC + SeaORM/PostgreSQL + ES 日志 + 内嵌前端 + Agent 健康监控 |
+| [`wafred-proto`](./wafred-proto) | 控制面 gRPC 协议定义（单一来源：`control_plane.proto`） |
+| [`wafred-server`](./wafred-server) | 控制面：Axum REST + tonic gRPC + SeaORM/PostgreSQL + ES 日志 + 内嵌前端 + Agent 健康监控 |
 | [`wafred-agent`](./wafred-agent) | 数据面 Agent：连接控制面、规则缓存 + 磁盘持久化、回传日志/指标、接收命令 |
-| [`pingwaf-waf`](./wafred-waf) | 检测引擎：归一化 → 签名 → 表达式 → 异常评分 |
-| [`pingwaf-challenge`](./wafred-challenge) | 动态挑战子系统：JS 5 秒盾、交互式挑战、PoW、浏览器指纹、HMAC 签名 clearance cookie |
-| `pingwaf-profiler` / `pingwaf-system`（无 README） | 进程内 CPU/内存归因与快照，经 `/api/v1/system/profile` 与 `/api/v1/system/metrics` 提供 |
+| [`wafred-waf`](./wafred-waf) | 检测引擎：归一化 → 签名 → 表达式 → 异常评分 |
+| [`wafred-challenge`](./wafred-challenge) | 动态挑战子系统：JS 5 秒盾、交互式挑战、PoW、浏览器指纹、HMAC 签名 clearance cookie |
+| `wafred-profiler` / `wafred-system`（无 README） | 进程内 CPU/内存归因与快照，经 `/api/v1/system/profile` 与 `/api/v1/system/metrics` 提供 |
 
 WAFred 的操作入口使用 `wafred` 命令、`WAFRED_*` 环境变量、`wafred.service`、
 `/etc/wafred` 与 `/var/lib/wafred` 路径、`wafred` PostgreSQL 用户/数据库和
 `wafred` ES 索引前缀和 `WAFRED-*` 托管规则 ID。旧 PingWAF 部署不会自动迁移；
 例如需将 `PINGWAF_*` 改为 `WAFRED_*`、将 `PINGWAF-1001` 改为 `WAFRED-1001`。
-内部 Rust crate 名称与 gRPC 协议字段仍保留其来源标识。
+WAFred 自有 Rust crate 名称和目录已统一为 `wafred-*`；继承自 PingAP 的代理底座保留
+`pingap-*` 命名。旧 PingWAF 运行标识不会作为兼容别名读取。
 
 ---
 
@@ -291,7 +292,7 @@ WAFRED_CONFIG=/etc/wafred/wafred.toml wafred all-in-one   # 等价写法
 
 ## 🤝 参与贡献
 
-欢迎贡献代码！在提交 Pull Request 前，请先阅读 **[CONTRIBUTING.md](./CONTRIBUTING.md)**；如需负责任地报告安全漏洞，请见 **[SECURITY.md](./SECURITY.md)**——请通过 [GitHub 私密漏洞报告](https://github.com/shuaiZend/PingWAF/security/advisories/new) 或 `security@pingwaf.com` 私密提交，切勿在公开 Issue 中披露漏洞细节。
+欢迎贡献代码！在提交 Pull Request 前，请先阅读 **[CONTRIBUTING.md](./CONTRIBUTING.md)**；如需负责任地报告安全漏洞，请见 **[SECURITY.md](./SECURITY.md)**，并通过 [WAFred GitHub 私密漏洞报告](https://github.com/oyport/wafred/security/advisories/new) 私密提交，切勿在公开 Issue 中披露漏洞细节。
 
 ---
 

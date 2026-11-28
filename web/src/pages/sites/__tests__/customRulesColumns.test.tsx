@@ -75,7 +75,7 @@ describe('CustomRulesPanel rule table layout', () => {
 
   it('offers no delete button on a row that overrides a built-in rule', () => {
     expect(render()).toContain('aria-label="common.delete"')
-    const managed = render([{ ...rule, managed_rule_id: 'PINGWAF-1010' }])
+    const managed = render([{ ...rule, managed_rule_id: 'WAFRED-1010' }])
     expect(managed).toContain('aria-label="common.edit"')
     expect(managed).not.toContain('aria-label="common.delete"')
   })

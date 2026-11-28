@@ -69,7 +69,7 @@ command -v curl >/dev/null || fail "curl is required"
 if [[ "${SMOKE_SCHEMA_CHECK:-1}" == "1" ]] && command -v cargo >/dev/null 2>&1; then
     info "checking that every model matches the migrated schema"
     ( cd "$ROOT" && WAFRED_TEST_DB_URL="$WAFRED_DB_URL" \
-        cargo test -q -p pingwaf-server --test schema_matches_models -- --ignored ) \
+        cargo test -q -p wafred-server --test schema_matches_models -- --ignored ) \
         || fail "a model does not match the migrated schema (see the test output above)"
 fi
 

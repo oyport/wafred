@@ -15,7 +15,7 @@
 //! Challenge plugin — CC protection / "5-second shield".
 //!
 //! Runs at [`PluginStep::EarlyRequest`]. For every request it either:
-//! * serves the `/_pingwaf/challenge/verify` endpoint (solution submission), or
+//! * serves the `/_wafred/challenge/verify` endpoint (solution submission), or
 //! * asks the [`ChallengeEngine`] whether the visitor should be challenged and,
 //!   if so, returns the JS challenge page (503) or a hard block (403).
 //!
@@ -39,17 +39,17 @@ use pingap_core::{
     get_host, get_req_header_value, resolve_client_ip_with_trust,
 };
 use pingora::proxy::Session;
-use pingwaf_agent::WafredAgent;
-use pingwaf_agent::cache::{
+use wafred_agent::WafredAgent;
+use wafred_agent::cache::{
     ChallengeConfig as CacheChallengeConfig,
     ChallengeLevel as CacheChallengeLevel,
 };
-use pingwaf_challenge::js_challenge::page::{
+use wafred_challenge::js_challenge::page::{
     ChallengePageParams, REQUIRED_DOM_IDS, challenge_scripts,
     generate_interactive_challenge_html, generate_js_challenge_html,
     generate_managed_challenge_html,
 };
-use pingwaf_challenge::{
+use wafred_challenge::{
     AdaptiveDifficulty, BrowserFingerprint, ChallengeConfig, ChallengeDecision,
     ChallengeEngine, ChallengeRequest, ChallengeSubmission, ClearanceLevel,
     DEFAULT_MAX_TRACKED_KEYS, DIFFICULTY_DECAY_SECS, DifficultyState,
@@ -69,7 +69,7 @@ use crate::host_cache::{HostCacheSweep, touch};
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Endpoint the challenge page POSTs its proof-of-work solution to.
-pub(crate) const VERIFY_ENDPOINT: &str = "/_pingwaf/challenge/verify";
+pub(crate) const VERIFY_ENDPOINT: &str = "/_wafred/challenge/verify";
 
 /// Maximum request-body size accepted on the verify endpoint (64 KiB).
 const MAX_VERIFY_BODY: usize = 64 * 1024;
@@ -476,7 +476,7 @@ fn mitigated_header(
     mitigation: Mitigation,
 ) -> (header::HeaderName, HeaderValue) {
     (
-        header::HeaderName::from_static("x-pingwaf-mitigated"),
+        header::HeaderName::from_static("x-wafred-mitigated"),
         HeaderValue::from_static(mitigation.value()),
     )
 }
@@ -920,7 +920,7 @@ pub(crate) enum MintOutcome {
 
 impl MintOutcome {
     /// Whether the response is a challenge page (as opposed to a rate-limit
-    /// refusal), which decides the `x-pingwaf-mitigated` value.
+    /// refusal), which decides the `x-wafred-mitigated` value.
     pub(crate) fn is_challenge(&self) -> bool {
         matches!(self, Self::Challenge(_))
     }
@@ -1001,12 +1001,12 @@ pub(crate) fn mint_challenge(request: MintRequest<'_>) -> MintOutcome {
 /// behaviour (difficulty 20) instead of issuing difficulty-0 challenges.
 fn site_limits(cfg: &CacheChallengeConfig) -> ChallengeLimits {
     let base = if cfg.base_difficulty == 0 {
-        pingwaf_challenge::DEFAULT_BASE_DIFFICULTY
+        wafred_challenge::DEFAULT_BASE_DIFFICULTY
     } else {
         cfg.base_difficulty
     };
     let max = if cfg.max_difficulty == 0 {
-        pingwaf_challenge::DEFAULT_MAX_DIFFICULTY
+        wafred_challenge::DEFAULT_MAX_DIFFICULTY
     } else {
         cfg.max_difficulty
     };
@@ -1547,7 +1547,7 @@ impl TryFrom<&PluginConf> for ChallengePlugin {
         let pow_max_difficulty = get_int_conf_or_default(
             value,
             "pow_max_difficulty",
-            i64::from(pingwaf_challenge::DEFAULT_MAX_DIFFICULTY),
+            i64::from(wafred_challenge::DEFAULT_MAX_DIFFICULTY),
         ) as u32;
         let standalone_limits = ChallengeLimits {
             adaptive: AdaptiveDifficulty::new(
@@ -1577,7 +1577,7 @@ impl TryFrom<&PluginConf> for ChallengePlugin {
         }
         let mut cookie_name = get_str_conf(value, "cookie_name");
         if cookie_name.is_empty() {
-            cookie_name = "__pingwaf_clearance".to_string();
+            cookie_name = "__wafred_clearance".to_string();
         }
         let exempt_paths = get_str_slice_conf(value, "exempt_paths");
         let exempt_user_agents =
@@ -2002,7 +2002,7 @@ pub(crate) mod tests {
         assert_eq!(Some("wafred"), header_value(&resp, "server").as_deref());
         assert_eq!(
             Some("block"),
-            header_value(&resp, "x-pingwaf-mitigated").as_deref()
+            header_value(&resp, "x-wafred-mitigated").as_deref()
         );
     }
 
@@ -2029,7 +2029,7 @@ pub(crate) mod tests {
         assert_eq!(Some("wafred"), header_value(&resp, "server").as_deref());
         assert_eq!(
             Some("challenge"),
-            header_value(&resp, "x-pingwaf-mitigated").as_deref()
+            header_value(&resp, "x-wafred-mitigated").as_deref()
         );
     }
 
@@ -2042,7 +2042,7 @@ pub(crate) mod tests {
         assert_eq!(Some("wafred"), header_value(&paused, "server").as_deref());
         // A paused site is a site-owner action, not a security mitigation:
         // no mitigated header, or dashboards would read it as a block.
-        assert_eq!(None, header_value(&paused, "x-pingwaf-mitigated"));
+        assert_eq!(None, header_value(&paused, "x-wafred-mitigated"));
 
         let rate = rate_limit_page("req-r", "over threshold", 30);
         assert_eq!(StatusCode::TOO_MANY_REQUESTS, rate.status);
@@ -2050,7 +2050,7 @@ pub(crate) mod tests {
         assert!(body.contains("Rate Limit Exceeded"), "body: {body}");
         assert_eq!(
             Some("block"),
-            header_value(&rate, "x-pingwaf-mitigated").as_deref()
+            header_value(&rate, "x-wafred-mitigated").as_deref()
         );
 
         let auth = basic_auth_page("req-a", "restricted", "login required");
@@ -2271,11 +2271,11 @@ cookie_secret = "test-secret"
     use pingora::proxy::Session as TestSession;
 
     use crate::waf::tests::lock_agent;
-    use pingwaf_agent::cache::RuleCache;
-    use pingwaf_agent::client::ControlPlaneClient;
-    use pingwaf_agent::config::AgentConfig;
-    use pingwaf_agent::heartbeat::MetricsCollector;
-    use pingwaf_proto::control_plane as proto;
+    use wafred_agent::cache::RuleCache;
+    use wafred_agent::client::ControlPlaneClient;
+    use wafred_agent::config::AgentConfig;
+    use wafred_agent::heartbeat::MetricsCollector;
+    use wafred_proto::control_plane as proto;
 
     /// Installs an agent whose site carries the given challenge config, plus
     /// a second site with none, to exercise per-site resolution.
@@ -2565,7 +2565,7 @@ cookie_secret = "test-secret"
         .unwrap();
         // Same secret the plugin signs with, so both cookies below verify.
         let manager =
-            pingwaf_challenge::CookieManager::new(b"test-secret", 1800);
+            wafred_challenge::CookieManager::new(b"test-secret", 1800);
 
         let mine = manager.issue_clearance(
             ClearanceLevel::NonInteractive,
@@ -2625,7 +2625,7 @@ cookie_secret = "test-secret"
 
         // The verify endpoint answers (403 for a malformed body) instead of
         // falling through to the upstream.
-        let input_header = "POST /_pingwaf/challenge/verify HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\n\r\nbody";
+        let input_header = "POST /_wafred/challenge/verify HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\n\r\nbody";
         let mock_io = Builder::new().read(input_header.as_bytes()).build();
         let mut session = TestSession::new_h1(Box::new(mock_io));
         session.read_request().await.unwrap();
@@ -2751,7 +2751,7 @@ cookie_secret = "test-secret"
         (0u32..)
             .map(|candidate| candidate.to_string())
             .find(|candidate| {
-                pingwaf_challenge::js_challenge::verify::verify_proof_of_work(
+                wafred_challenge::js_challenge::verify::verify_proof_of_work(
                     nonce, candidate, difficulty,
                 )
             })
@@ -2763,7 +2763,7 @@ cookie_secret = "test-secret"
         (0u32..)
             .map(|candidate| candidate.to_string())
             .find(|candidate| {
-                !pingwaf_challenge::js_challenge::verify::verify_proof_of_work(
+                !wafred_challenge::js_challenge::verify::verify_proof_of_work(
                     nonce, candidate, difficulty,
                 )
             })
@@ -2866,7 +2866,7 @@ cookie_secret = "test-secret"
         assert!(body.contains("Rate Limit Exceeded"), "body: {body}");
         assert_eq!(
             Some("block"),
-            header_value(&resp, "x-pingwaf-mitigated").as_deref()
+            header_value(&resp, "x-wafred-mitigated").as_deref()
         );
         assert_eq!(Some("wafred"), header_value(&resp, "server").as_deref());
     }

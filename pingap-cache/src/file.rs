@@ -80,7 +80,7 @@ pub struct FileCache {
     /// decide when to evict, and the profiler reads it to report the cache's
     /// **disk** footprint (which used to be published as memory).
     current_size: AtomicU64,
-    /// Byte gauges mirrored into `pingwaf_profiler::Module::Cache`: index
+    /// Byte gauges mirrored into `wafred_profiler::Module::Cache`: index
     /// metadata, in-flight read buffers and the on-disk footprint, each
     /// attributed separately. `Arc` because an in-flight read is released by
     /// a guard that outlives the borrow of this backend.
@@ -1760,7 +1760,7 @@ mod tests {
         // The module row the profile endpoint serialises reports memory only:
         // the on-disk gauge stays on this backend (asserted above) and is no
         // longer part of the wire shape.
-        let snapshot = pingwaf_profiler::ProfileSnapshot::collect();
+        let snapshot = wafred_profiler::ProfileSnapshot::collect();
         let row = snapshot
             .modules
             .iter()

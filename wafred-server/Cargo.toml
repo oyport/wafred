@@ -1,5 +1,5 @@
 [package]
-name = "pingwaf-server"
+name = "wafred-server"
 version.workspace = true
 edition = "2021"
 description = "WAFred control plane: REST API for the dashboard, gRPC control plane for agents"
@@ -8,18 +8,18 @@ license = "Apache-2.0"
 [dependencies]
 pingap-config = { workspace = true }
 regex = { workspace = true, features = ["std", "unicode-case", "unicode-perl"] }
-pingwaf-proto = { path = "../wafred-proto" }
+wafred-proto = { path = "../wafred-proto" }
 wafred-tunnel = { workspace = true }
 # The control plane validates the built-in rule expressions with the same
 # parser the data plane evaluates them with.
-pingwaf-waf = { path = "../wafred-waf" }
-pingwaf-system = { path = "../wafred-system" }
-pingwaf-profiler = { path = "../wafred-profiler" }
+wafred-waf = { path = "../wafred-waf" }
+wafred-system = { path = "../wafred-system" }
+wafred-profiler = { path = "../wafred-profiler" }
 # The visitor login challenge is verified with the same proof-of-work the WAF
 # challenge uses. Sharing the function rather than reimplementing it is a
 # correctness requirement, not tidiness: two implementations that drift by one
 # bit would fail every login with no error to explain it.
-pingwaf-challenge = { path = "../wafred-challenge" }
+wafred-challenge = { path = "../wafred-challenge" }
 anyhow = { workspace = true }
 # Lock-free policy swap for the control plane's self-protection middlewares,
 # which reload their settings without blocking the request path.

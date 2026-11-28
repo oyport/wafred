@@ -194,7 +194,7 @@ const quickstart = {
     title: "If something does not start",
     items: [
       {
-        q: "The build fails in pingwaf-proto",
+        q: "The build fails in wafred-proto",
         a: "protoc is missing. Install protobuf-compiler (or brew install protobuf) and rebuild — the crate silently falls back to placeholder files without it.",
       },
       {

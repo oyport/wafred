@@ -454,7 +454,7 @@ HugePages_Total:       0
     #[test]
     fn status_parses_vm_size() {
         let status = "\
-Name:\tpingwaf
+Name:\twafred
 State:\tS (sleeping)
 VmPeak:\t 4212340 kB
 VmSize:\t 4193300 kB
@@ -466,7 +466,7 @@ VmRSS:\t  120044 kB
         assert_eq!(parse_vm_size(status), 4_193_300 * 1024);
         assert_eq!(parse_vm_hwm(status), 178_932 * 1024);
         // Absent off Linux: zero, not a failure.
-        assert_eq!(parse_vm_size("Name:\tpingwaf\n"), 0);
+        assert_eq!(parse_vm_size("Name:\twafred\n"), 0);
         assert_eq!(parse_vm_size("VmSize:\tgarbage kB\n"), 0);
         assert_eq!(parse_vm_size(""), 0);
     }
@@ -536,7 +536,7 @@ VmRSS:\t  120044 kB
     #[test]
     fn status_parses_vmhwm() {
         let status = "\
-Name:\tpingwaf
+Name:\twafred
 State:\tS (sleeping)
 VmPeak:\t  812345 kB
 VmHWM:\t  178932 kB
@@ -544,7 +544,7 @@ VmRSS:\t  120044 kB
 ";
         assert_eq!(parse_vm_hwm(status), 178_932 * 1024);
         // The counter is absent off Linux: zero, not a failure.
-        assert_eq!(parse_vm_hwm("Name:\tpingwaf\n"), 0);
+        assert_eq!(parse_vm_hwm("Name:\twafred\n"), 0);
         assert_eq!(parse_vm_hwm("VmHWM:\tgarbage kB\n"), 0);
     }
 

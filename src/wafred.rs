@@ -52,23 +52,23 @@ use pingap_upstream::new_upstream_health_check_task;
 use pingora::server;
 use pingora::server::configuration::Opt;
 use pingora::services::background::background_service;
-use pingwaf_agent::cache::{
+use wafred_agent::cache::{
     CachedRules, CustomErrorPage, HealthCheckConfig, HostPortBinding,
     OidcConfig, ResponseReplaceConfig, RuleCache, SslConfig,
 };
-use pingwaf_agent::config::AgentConfig;
+use wafred_agent::config::AgentConfig;
 #[cfg(not(feature = "edge"))]
-use pingwaf_server::ServerConfig;
+use wafred_server::ServerConfig;
 use tracing::{debug, error, info, warn};
 
 /// Stable tracing target for the shared startup and data-plane logs.
 ///
 /// Without an explicit target, tracing uses the module path: the full binary
-/// reports `pingwaf::pingwaf`, while the agent-only binary (whose crate is
-/// `pingwaf_agent`) would report `pingwaf_agent::pingwaf`. That breaks log
-/// filters, alerts and dashboards keyed on `pingwaf::`, so both builds use the
+/// reports `wafred::wafred`, while the agent-only binary (whose crate is
+/// `wafred_agent`) would report `wafred_agent::wafred`. That breaks log
+/// filters, alerts and dashboards keyed on `wafred::`, so both builds use the
 /// full binary's target.
-const LOG_TARGET: &str = "pingwaf::pingwaf";
+const LOG_TARGET: &str = "wafred::wafred";
 
 /// The operating mode for WAFred.
 pub enum RunMode {
@@ -85,7 +85,7 @@ pub enum RunMode {
 static AGENT_RESTART_NOTIFY: tokio::sync::Notify =
     tokio::sync::Notify::const_new();
 
-async fn install_agent_restart_handler(agent: &pingwaf_agent::WafredAgent) {
+async fn install_agent_restart_handler(agent: &wafred_agent::WafredAgent) {
     agent
         .set_restart_handler(|graceful| {
             info!(graceful, "agent process restart requested by control plane");
@@ -174,7 +174,7 @@ pub(crate) fn agent_config_from_opts(opts: &AgentOpts) -> AgentConfig {
         reconnect_initial_delay_ms: 1000,
         reconnect_max_delay_ms: 60000,
         fail_open: opts.fail_open,
-        probe_interval_secs: pingwaf_agent::probe::DEFAULT_INTERVAL_SECS,
+        probe_interval_secs: wafred_agent::probe::DEFAULT_INTERVAL_SECS,
         probe_disk_path: "/".to_string(),
         metrics_ship_interval_secs: opts.metrics_ship_interval_secs,
         auto_upgrade: opts.auto_upgrade,
@@ -206,10 +206,10 @@ fn agent_config_from_all_in_one(opts: &AllInOneOpts) -> AgentConfig {
                 (format!("https://127.0.0.1:{port}"), Some(cert.clone()))
             },
             _ => match opts.common.grpc_tls_mode {
-                pingwaf_server::config::GrpcTlsMode::Off => {
+                wafred_server::config::GrpcTlsMode::Off => {
                     (format!("http://127.0.0.1:{port}"), None)
                 },
-                pingwaf_server::config::GrpcTlsMode::Tls => {
+                wafred_server::config::GrpcTlsMode::Tls => {
                     (format!("https://127.0.0.1:{port}"), None)
                 },
             },
@@ -232,7 +232,7 @@ fn agent_config_from_all_in_one(opts: &AllInOneOpts) -> AgentConfig {
         reconnect_initial_delay_ms: 1000,
         reconnect_max_delay_ms: 60000,
         fail_open: opts.fail_open,
-        probe_interval_secs: pingwaf_agent::probe::DEFAULT_INTERVAL_SECS,
+        probe_interval_secs: wafred_agent::probe::DEFAULT_INTERVAL_SECS,
         probe_disk_path: "/".to_string(),
         metrics_ship_interval_secs: opts.metrics_ship_interval_secs,
         // Never: the embedded agent shares the control plane's process, so an
@@ -511,7 +511,7 @@ fn site_posture_plugins(
 /// serve the file" and register nothing.
 fn site_ai_file_plugins(
     site_id: &str,
-    ai: Option<&pingwaf_agent::cache::AiCrawlConfig>,
+    ai: Option<&wafred_agent::cache::AiCrawlConfig>,
     plugins: &mut HashMap<String, PluginConf>,
 ) -> Vec<String> {
     let Some(ai) = ai else {
@@ -914,7 +914,7 @@ fn waf_body_stage_timeout_secs(site_read_timeout: Option<Duration>) -> i64 {
 /// or an enabled extension-based category. The category alone must enable the
 /// plugin — it compiles into rules of its own, and the old check ignored it, so
 /// a site configured only through the classification presets never cached.
-fn site_has_cache_policy(site: &pingwaf_agent::cache::SiteRules) -> bool {
+fn site_has_cache_policy(site: &wafred_agent::cache::SiteRules) -> bool {
     if site.cache_rules.iter().any(|rule| rule.enabled) {
         return true;
     }
@@ -2421,7 +2421,7 @@ pub async fn start_data_plane(
     // back to its site.
     {
         let provider = cert_provider.clone();
-        pingwaf_agent::cert_status::set_snapshot(Some(Arc::new(move || {
+        wafred_agent::cert_status::set_snapshot(Some(Arc::new(move || {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_secs() as i64)
@@ -2452,7 +2452,7 @@ pub async fn start_data_plane(
                 // One certificate is listed under every domain it serves; the
                 // entries agree, so the first one wins.
                 statuses.entry(site_id.to_string()).or_insert(
-                    pingwaf_agent::cert_status::CertStatus {
+                    wafred_agent::cert_status::CertStatus {
                         status,
                         expires_at: info.not_after,
                     },
@@ -2565,7 +2565,7 @@ pub async fn start_data_plane(
                 .as_deref(),
         ) {
             ps.site_proxy_trust = Some(|host| {
-                let Some(site) = pingwaf_agent::WafredAgent::instance()
+                let Some(site) = wafred_agent::WafredAgent::instance()
                     .and_then(|agent| agent.get_rules_for_domain(host))
                 else {
                     return pingap_core::ProxyTrust::default();
@@ -2930,7 +2930,7 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
                 grpc_addr = %config.grpc_addr,
                 "starting WAFred in Server mode (control plane only)"
             );
-            pingwaf_server::start_server(*config).await
+            wafred_server::start_server(*config).await
         },
         RunMode::Agent(config) => {
             info!(
@@ -2938,9 +2938,9 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
                 cache_dir = %config.cache_dir,
                 "starting WAFred in Agent mode (data plane only)"
             );
-            let agent = pingwaf_agent::start_agent(*config).await?;
+            let agent = wafred_agent::start_agent(*config).await?;
             install_agent_restart_handler(&agent).await;
-            let upgrade = pingwaf_agent::upgrade::spawn(Arc::clone(&agent));
+            let upgrade = wafred_agent::upgrade::spawn(Arc::clone(&agent));
             info!("WAFred agent is running, starting data plane proxy");
 
             // Start the data plane proxy in the background
@@ -2987,7 +2987,7 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
             // Pin the gRPC listener certificate: all-in-one serves TLS by
             // default, so the embedded agent needs the console certificate
             // (or the explicitly configured one) as its trust anchor.
-            match pingwaf_server::embedded_agent_ca_pem(&server_config).await {
+            match wafred_server::embedded_agent_ca_pem(&server_config).await {
                 Ok(Some(pem)) => {
                     agent_config.server_ca_pem = Some(pem);
                 },
@@ -3012,7 +3012,7 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
 
             // Start the agent in the background first.
             // It will retry connecting to the server until it comes up.
-            let agent = match pingwaf_agent::start_agent(*agent_config).await {
+            let agent = match wafred_agent::start_agent(*agent_config).await {
                 Ok(agent) => {
                     install_agent_restart_handler(&agent).await;
                     Some(agent)
@@ -3036,7 +3036,7 @@ pub async fn run(mode: RunMode) -> anyhow::Result<()> {
             };
 
             // Run the server (blocks until shutdown signal)
-            let server = pingwaf_server::start_server(*server_config);
+            let server = wafred_server::start_server(*server_config);
             let result = tokio::select! {
                 result = server => result,
                 _ = AGENT_RESTART_NOTIFY.notified() => {
@@ -3075,10 +3075,10 @@ pub(crate) async fn run_agent(config: AgentConfig) -> anyhow::Result<()> {
     if let Some(addr) = config.tunnel_addr.clone() {
         let _ = start_tunnel_listener(&addr, &config.cache_dir).await;
     }
-    let agent = pingwaf_agent::start_agent(config).await?;
+    let agent = wafred_agent::start_agent(config).await?;
     // Opt-in self-upgrade: follows the control plane's build, then re-execs
-    // this process (see `pingwaf_agent::upgrade`).
-    let upgrade = pingwaf_agent::upgrade::spawn(Arc::clone(&agent));
+    // this process (see `wafred_agent::upgrade`).
+    let upgrade = wafred_agent::upgrade::spawn(Arc::clone(&agent));
     info!(target: LOG_TARGET, "WAFred agent is running, starting data plane proxy");
 
     // Start the data plane proxy in the background
@@ -3101,9 +3101,9 @@ pub(crate) async fn run_agent(config: AgentConfig) -> anyhow::Result<()> {
 /// for the embedded agent in all-in-one mode.
 #[cfg(not(feature = "edge"))]
 async fn bootstrap_agent_key(
-    config: &pingwaf_server::ServerConfig,
+    config: &wafred_server::ServerConfig,
 ) -> anyhow::Result<String> {
-    pingwaf_server::bootstrap_and_seed_api_key(config).await
+    wafred_server::bootstrap_and_seed_api_key(config).await
 }
 
 /// Wait for SIGINT or SIGTERM.
@@ -3268,7 +3268,7 @@ fn init_tracing() {
                 .with_target(true)
                 .with_filter(DropPingoraBodyWarning),
         )
-        .with(pingwaf_agent::cert_events::AcmeCaptureLayer)
+        .with(wafred_agent::cert_events::AcmeCaptureLayer)
         .init();
 }
 
@@ -3320,7 +3320,7 @@ mod tests {
     fn expected_ipv6_only(addr: &str) -> Option<bool> {
         all_addrs_ipv6(addr).then_some(false)
     }
-    use pingwaf_agent::cache::{
+    use wafred_agent::cache::{
         CacheRule as AgentCacheRule, CachedRules, GlobalCacheSettings,
         OidcAccessRule, OidcHeaderClaim, ProxyTrustConfig, ResponseReplaceRule,
         RouteConfig, SiteRules, UpstreamConfig, UpstreamPeer,
@@ -3469,7 +3469,7 @@ mod tests {
             site_id: site_id.to_string().into(),
             domain: domain.to_string().into(),
             alternate_domains: vec![],
-            status: pingwaf_agent::cache::SiteStatus::Active,
+            status: wafred_agent::cache::SiteStatus::Active,
             downstream_timeout_secs: 60,
             waf_config: None,
             rate_limit_rules: vec![],
@@ -3636,7 +3636,7 @@ mod tests {
         let mut cached = one_site_cache(site);
         let base = tunnel_policy_fingerprint(&cached);
 
-        let tunnel = |key: &str| pingwaf_agent::cache::TunnelConfig {
+        let tunnel = |key: &str| wafred_agent::cache::TunnelConfig {
             tunnel_id: "tunnel-1".to_string(),
             name: "branch".to_string(),
             session_public_key: key.to_string(),
@@ -4781,7 +4781,7 @@ mod tests {
     fn reload_of_an_empty_cache_unloads_every_site() {
         let config = convert_cached_rules(
             &CachedRules::default(),
-            Path::new("/tmp/pingwaf-test-cache"),
+            Path::new("/tmp/wafred-test-cache"),
         );
         assert!(config.upstreams.is_empty());
         assert!(config.locations.is_empty());
@@ -4832,7 +4832,7 @@ mod tests {
         let manager = pingap_config::new_memory_config_manager("", None);
         let mut config = convert_cached_rules(
             &CachedRules::default(),
-            Path::new("/tmp/pingwaf-test-cache"),
+            Path::new("/tmp/wafred-test-cache"),
         );
         assert!(apply_reload(&manager, config.clone()).await.is_empty());
 
@@ -5009,8 +5009,8 @@ mod tests {
         );
     }
 
-    fn cache_rule(enabled: bool) -> pingwaf_agent::cache::CacheRule {
-        pingwaf_agent::cache::CacheRule {
+    fn cache_rule(enabled: bool) -> wafred_agent::cache::CacheRule {
+        wafred_agent::cache::CacheRule {
             id: "cr1".to_string(),
             name: "static assets".to_string(),
             match_expression: r#"path starts_with "/assets/""#.to_string(),
@@ -5192,10 +5192,10 @@ mod tests {
             .iter()
             .map(|domain| domain.to_string())
             .collect();
-        let issued = pingwaf_server::site_cert::issue(
+        let issued = wafred_server::site_cert::issue(
             &site.domain,
             &alternates,
-            pingwaf_server::site_cert::SITE_CERT_DAYS,
+            wafred_server::site_cert::SITE_CERT_DAYS,
         )
         .expect("a site certificate must be issuable");
         let mut ssl = acme_ssl();
@@ -5207,7 +5207,7 @@ mod tests {
 
         let config = cached_rules_to_pingap_config(
             &one_site_cache(site),
-            Path::new("/tmp/pingwaf-test-cache"),
+            Path::new("/tmp/wafred-test-cache"),
         )
         .expect("config should build");
 
@@ -5790,9 +5790,9 @@ tls_key = \"NEWKEY\"
     fn cache_plugin_is_wired_by_the_type_policy_alone() {
         let mut site = site_rules("site1", "a.example.com");
         site.upstreams = vec![pool("", vec![peer("10.0.0.1:8080")])];
-        site.cache_settings = Some(pingwaf_agent::cache::SiteCacheSettings {
-            type_policy: Some(pingwaf_agent::cache::CacheTypePolicy {
-                web_assets: Some(pingwaf_agent::cache::CacheTypeCategory {
+        site.cache_settings = Some(wafred_agent::cache::SiteCacheSettings {
+            type_policy: Some(wafred_agent::cache::CacheTypePolicy {
+                web_assets: Some(wafred_agent::cache::CacheTypeCategory {
                     enabled: true,
                     edge_ttl_seconds: 3600,
                     browser_ttl_seconds: 60,
@@ -5817,9 +5817,9 @@ tls_key = \"NEWKEY\"
     fn cache_plugin_is_absent_when_every_policy_category_is_disabled() {
         let mut site = site_rules("site1", "a.example.com");
         site.upstreams = vec![pool("", vec![peer("10.0.0.1:8080")])];
-        site.cache_settings = Some(pingwaf_agent::cache::SiteCacheSettings {
-            type_policy: Some(pingwaf_agent::cache::CacheTypePolicy {
-                web_assets: Some(pingwaf_agent::cache::CacheTypeCategory {
+        site.cache_settings = Some(wafred_agent::cache::SiteCacheSettings {
+            type_policy: Some(wafred_agent::cache::CacheTypePolicy {
+                web_assets: Some(wafred_agent::cache::CacheTypeCategory {
                     enabled: false,
                     edge_ttl_seconds: 3600,
                     browser_ttl_seconds: 60,

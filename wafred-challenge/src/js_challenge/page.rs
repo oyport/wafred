@@ -149,7 +149,7 @@ impl Default for ChallengePageParams {
             request_id: String::new(),
             challenge_nonce: String::new(),
             difficulty: 20,
-            verify_endpoint: "/_pingwaf/challenge/verify".to_string(),
+            verify_endpoint: "/_wafred/challenge/verify".to_string(),
             original_url: "/".to_string(),
             brand_name: "WAFred".to_string(),
         }
@@ -339,8 +339,8 @@ h1{{font-size:20px;font-weight:600;margin-bottom:12px;color:var(--text)}}
   // Collect fingerprint data
   function collectFingerprint() {{
     try {{
-      if (window.__pingwaf_fingerprint) {{
-        fingerprint = window.__pingwaf_fingerprint();
+      if (window.__wafred_fingerprint) {{
+        fingerprint = window.__wafred_fingerprint();
       }} else {{
         fingerprint = JSON.stringify({{ user_agent: navigator.userAgent }});
       }}
@@ -500,7 +500,7 @@ mod tests {
             request_id: "test-ray-id-123".to_string(),
             challenge_nonce: "abc123def456".to_string(),
             difficulty: 20,
-            verify_endpoint: "/_pingwaf/challenge/verify".to_string(),
+            verify_endpoint: "/_wafred/challenge/verify".to_string(),
             original_url: "/dashboard".to_string(),
             brand_name: "WAFred".to_string(),
         };
@@ -529,7 +529,7 @@ mod tests {
         assert!(html.contains("/dashboard"));
         assert!(html.contains("WAFred"));
         assert!(html.contains("sha256"));
-        assert!(html.contains("__pingwaf_fingerprint"));
+        assert!(html.contains("__wafred_fingerprint"));
         assert!(html.contains("Checking your browser"));
     }
 
@@ -539,7 +539,7 @@ mod tests {
             request_id: "ray-456".to_string(),
             challenge_nonce: "nonce".to_string(),
             difficulty: 20,
-            verify_endpoint: "/_pingwaf/challenge/verify".to_string(),
+            verify_endpoint: "/_wafred/challenge/verify".to_string(),
             original_url: "/".to_string(),
             brand_name: "WAFred".to_string(),
         };
@@ -592,7 +592,7 @@ mod tests {
         let scripts = challenge_scripts(&ChallengePageParams::default());
         assert!(scripts.contains("<script>"));
         assert!(scripts.contains("computeProofOfWork"));
-        assert!(scripts.contains("__pingwaf_fingerprint"));
+        assert!(scripts.contains("__wafred_fingerprint"));
     }
 
     #[test]

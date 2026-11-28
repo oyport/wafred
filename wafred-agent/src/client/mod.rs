@@ -9,7 +9,7 @@ use tokio::task::JoinHandle;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use tracing::{debug, error, info, warn};
 
-use pingwaf_proto::control_plane::{
+use wafred_proto::control_plane::{
     self as proto, control_plane_client::ControlPlaneClient as ProtoClient,
 };
 
@@ -825,19 +825,19 @@ impl ControlPlaneClient {
         let metrics = &self.metrics;
         let mut metrics_list = vec![
             proto::Metric {
-                name: "pingwaf_requests_total".to_string(),
+                name: "wafred_requests_total".to_string(),
                 labels: HashMap::new(),
                 value: metrics.requests_total() as f64,
                 r#type: proto::MetricType::MetricCounter as i32,
             },
             proto::Metric {
-                name: "pingwaf_blocked_requests_total".to_string(),
+                name: "wafred_blocked_requests_total".to_string(),
                 labels: HashMap::new(),
                 value: metrics.blocked_requests_total() as f64,
                 r#type: proto::MetricType::MetricCounter as i32,
             },
             proto::Metric {
-                name: "pingwaf_active_connections".to_string(),
+                name: "wafred_active_connections".to_string(),
                 labels: HashMap::new(),
                 value: metrics.active_connections() as f64,
                 r#type: proto::MetricType::MetricGauge as i32,
@@ -845,7 +845,7 @@ impl ControlPlaneClient {
         ];
         for status in self.rule_cache.cache_statuses() {
             metrics_list.push(proto::Metric {
-                name: "pingwaf_site_cache_used_bytes".to_string(),
+                name: "wafred_site_cache_used_bytes".to_string(),
                 labels: HashMap::from([(
                     "site".to_string(),
                     status.domain.clone(),
@@ -3150,9 +3150,9 @@ mod tests {
 
         let names: Vec<&str> =
             batch.metrics.iter().map(|m| m.name.as_str()).collect();
-        assert!(names.contains(&"pingwaf_requests_total"));
-        assert!(names.contains(&"pingwaf_blocked_requests_total"));
-        assert!(names.contains(&"pingwaf_active_connections"));
+        assert!(names.contains(&"wafred_requests_total"));
+        assert!(names.contains(&"wafred_blocked_requests_total"));
+        assert!(names.contains(&"wafred_active_connections"));
         for metric in &batch.metrics {
             assert!(
                 metric.labels.is_empty(),

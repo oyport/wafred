@@ -24,7 +24,7 @@ WAFred 的数据面是基于 [Pingora](https://github.com/cloudflare/pingora) �
 ┌─ early_request ──────────────────────────────────────────────────────────┐
 │  location 匹配（host + path）· 请求 ID · OpenTelemetry                    │
 │  ▶ wafred:waf        站点策略、IP/地域、Basic Auth、Bot、限流、WAF 引擎  │
-│  ▶ wafred:challenge  质询校验端点 /_pingwaf/challenge/verify             │
+│  ▶ wafred:challenge  质询校验端点 /_wafred/challenge/verify             │
 └──────────────────────────────────────────────────────────────────────────┘
   ▼
 ┌─ request ────────────────────────────────────────────────────────────────┐
@@ -133,7 +133,7 @@ WAF 引擎（第 7 步）的结论由**模式**决定，站点级与规则级使
 `wafred:challenge` 与 WAF 插件共用一个待质询存储：
 
 - 拦截/质询结论返回 JS 质询页（`503`）或硬拦截（`403`）；
-- 质询页把工作量证明提交到 `/_pingwaf/challenge/verify`，该端点由质询插件在
+- 质询页把工作量证明提交到 `/_wafred/challenge/verify`，该端点由质询插件在
   `early_request` 阶段提供；
 - 校验通过后访客获得签名的 clearance cookie，之后的请求在过期前跳过质询；
 - 难度、放行时长与质询级别是站点级设置（站点 → 安全 → CC 防护）。

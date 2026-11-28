@@ -16,7 +16,7 @@ use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 
-use pingwaf_proto::control_plane as proto;
+use wafred_proto::control_plane as proto;
 
 /// Maximum number of buffered events. Oldest entries are dropped once full so
 /// a stalled shipper can never block the tracing hot path or grow memory.

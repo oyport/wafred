@@ -21,7 +21,7 @@ cookie to visitors that solve it.
 | `pow_issue_limit_per_min` | int | `120` | Challenge pages issued per host+IP per 60-second window, shared with the WAF plugin's rule/access/rate-limit challenges. Over it the visitor gets a `429` rate-limit page. |
 | `pow_verify_limit_per_min` | int | `300` | Solution submissions accepted per host+IP per 60-second window. Over it verification fails closed without spending the pending nonce. |
 | `cookie_secret` | string | *(generated)* | HMAC key used to sign clearance cookies. Leave it unset (or set to the legacy `change-me`) and the process generates a random key instead — set it explicitly only if the secret must survive restarts. |
-| `cookie_name` | string | `__pingwaf_clearance` | Name of the clearance cookie. |
+| `cookie_name` | string | `__wafred_clearance` | Name of the clearance cookie. |
 | `exempt_paths` | string[] | `[]` | Paths that bypass the challenge (health checks, APIs). |
 | `exempt_user_agents` | string[] | `[]` | User-agent substrings that bypass the challenge. |
 | `browser_integrity_check` | bool | `true` | Validate browser fingerprint consistency during verification. |
@@ -30,7 +30,7 @@ cookie to visitors that solve it.
 
 ## Request flow
 
-1. **Verify endpoint** — if the path is `/_pingwaf/challenge/verify` and method
+1. **Verify endpoint** — if the path is `/_wafred/challenge/verify` and method
    is `POST`, the plugin parses the proof-of-work submission, validates it, and
    either sets the clearance cookie and returns a redirect to the original URL,
    or returns a `403` block page.
@@ -76,7 +76,7 @@ Two per-host+IP budgets sit next to it, both on a fixed 60-second window:
 
 | Budget | Over the limit |
 | --- | --- |
-| `pow_issue_limit_per_min` challenge pages | `429` rate-limit page (`x-pingwaf-mitigated: block`, `Retry-After`), and the request is logged as mitigated. The page is never minted, so the challenge loop cannot be used as an amplifier. |
+| `pow_issue_limit_per_min` challenge pages | `429` rate-limit page (`x-wafred-mitigated: block`, `Retry-After`), and the request is logged as mitigated. The page is never minted, so the challenge loop cannot be used as an amplifier. |
 | `pow_verify_limit_per_min` submissions | `429` rate-limit page, also logged as mitigated. The check runs **before** any verification work, so an over-limit flood cannot spend a legitimate visitor's nonce. |
 
 Both counters are per process: behind N edge instances the effective allowance

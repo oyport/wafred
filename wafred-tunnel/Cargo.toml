@@ -13,7 +13,7 @@ description = "WAFred tunnel: an outbound-only connector and the edge-side accep
 default = ["connector"]
 connector = [
     "dep:clap",
-    "dep:pingwaf-proto",
+    "dep:wafred-proto",
     "dep:toml",
     "dep:tracing-subscriber",
     "dep:tonic",
@@ -81,7 +81,7 @@ clap = { version = "4.6.6", features = [
     "usage",
     "env",
 ], default-features = false, optional = true }
-pingwaf-proto = { path = "../wafred-proto", optional = true }
+wafred-proto = { path = "../wafred-proto", optional = true }
 # The connector's configuration file and its logging setup are CLI concerns,
 # so they stay behind the same feature.
 toml = { workspace = true, optional = true }

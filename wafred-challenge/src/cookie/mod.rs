@@ -9,7 +9,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Cookie holding a solved challenge's clearance. Consumers outside this
 /// crate (e.g. the WAF plugin's rate limiter) validate it by name.
-pub const CLEARANCE_COOKIE_NAME: &str = "__pingwaf_clearance";
+pub const CLEARANCE_COOKIE_NAME: &str = "__wafred_clearance";
 
 /// Challenge clearance levels (higher level bypasses lower)
 #[derive(
@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn test_cookie_name() {
         let manager = CookieManager::new(b"test-secret", 1800);
-        assert_eq!(manager.cookie_name(), "__pingwaf_clearance");
+        assert_eq!(manager.cookie_name(), "__wafred_clearance");
 
         let manager2 =
             CookieManager::with_name(b"test-secret", 1800, "my_cookie");

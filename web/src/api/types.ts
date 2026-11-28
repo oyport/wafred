@@ -626,7 +626,7 @@ export interface DerivedWafConfig {
   total_rules: number
 }
 
-/** Attack families a site can downgrade to monitor-only (`pingwaf-waf::CategorySet`). */
+/** Attack families a site can downgrade to monitor-only (`wafred-waf::CategorySet`). */
 export type WafCategory =
   | 'sqli'
   | 'xss'
@@ -638,7 +638,7 @@ export type WafCategory =
   | 'xxe'
   | 'ssti'
 
-/** Backend stacks a site can downgrade to monitor-only (`pingwaf-waf::StackSet`). */
+/** Backend stacks a site can downgrade to monitor-only (`wafred-waf::StackSet`). */
 export type WafStack = 'java' | 'php' | 'python' | 'node'
 
 export const WAF_CATEGORIES: WafCategory[] = [
@@ -1919,7 +1919,7 @@ export const PATH_MATCH_TYPES: PathMatchType[] = ['prefix', 'exact', 'wildcard',
 
 /**
  * Protection layers a path exception can bypass. `*` bypasses everything;
- * the rest name the data-plane layers (`pingwaf-agent` enforcement stages).
+ * the rest name the data-plane layers (`wafred-agent` enforcement stages).
  */
 export type PathSkipLayer =
   | '*'

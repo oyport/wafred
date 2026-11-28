@@ -34,14 +34,14 @@ use sea_orm::{
 };
 use uuid::Uuid;
 
-use pingwaf_server::api::defense;
-use pingwaf_server::api::self_protection::{self, effective_allowlist};
-use pingwaf_server::auth::password::{
+use wafred_server::api::defense;
+use wafred_server::api::self_protection::{self, effective_allowlist};
+use wafred_server::auth::password::{
     MAX_PASSWORD_BYTES, hash_password, validate_password,
 };
-use pingwaf_server::config_catalog::sanitize_snapshot_for_output;
-use pingwaf_server::config_history::{self, VersionScope};
-use pingwaf_server::models::{
+use wafred_server::config_catalog::sanitize_snapshot_for_output;
+use wafred_server::config_history::{self, VersionScope};
+use wafred_server::models::{
     api_protection_setting, config_version, defense_settings, ip_groups, role,
     site, user,
 };

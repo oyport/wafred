@@ -131,7 +131,7 @@ pub struct AccessLogEntry {
 /// # Usage
 ///
 /// ```no_run
-/// use pingwaf_agent::{WafredAgent, config::AgentConfig};
+/// use wafred_agent::{WafredAgent, config::AgentConfig};
 ///
 /// # async fn example() -> anyhow::Result<()> {
 /// // Start the agent (connects to control plane in background)
@@ -537,7 +537,7 @@ fn tunnel_upstream_label(addr: &str) -> String {
 mod tests {
     use super::combine_headers;
     use super::*;
-    use pingwaf_proto::control_plane as proto;
+    use wafred_proto::control_plane as proto;
 
     /// Builds an offline agent whose cache carries the given failover
     /// registry and global default.

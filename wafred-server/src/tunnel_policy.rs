@@ -23,7 +23,7 @@ use sea_orm::{
 };
 use uuid::Uuid;
 
-use pingwaf_proto::control_plane as proto;
+use wafred_proto::control_plane as proto;
 
 use crate::models::{
     agent as agents, site_upstream_pools, site_upstreams,

@@ -45,7 +45,7 @@ El compose arranca `ghcr.io/oyport/wafred:latest` en modo all-in-one junto a `po
 | `cmake` | reciente | Backend TLS |
 | PostgreSQL | 14+ (16 recomendado) | Almacén del plano de control |
 
-Sin `protoc`, `pingwaf-proto` escribe marcadores de posición y los crates posteriores no compilan.
+Sin `protoc`, `wafred-proto` escribe marcadores de posición y los crates posteriores no compilan.
 
 ```bash
 cd web && npm ci && npm run build && cd ..

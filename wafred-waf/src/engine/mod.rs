@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use pingwaf_profiler::{record_method, track_memory, Method, Module};
+use wafred_profiler::{record_method, track_memory, Method, Module};
 use serde::{Deserialize, Serialize};
 
 use crate::normalize::ValueSource;

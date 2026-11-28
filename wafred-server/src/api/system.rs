@@ -7,7 +7,7 @@
 //! * Nothing here samples stacks or writes profile files. `/system/metrics`
 //!   reads counters the OS already keeps; `/system/profile` reads the
 //!   accounting tables the data plane and control plane maintain themselves
-//!   (`pingwaf-profiler`).
+//!   (`wafred-profiler`).
 //! * Both are ordinary admin endpoints, so they work on every platform and
 //!   in every build — there is no diagnostic-only image to deploy.
 //!
@@ -41,9 +41,9 @@ use crate::models::{agent, agent_sites, api_key, control_plane_boot, site};
 #[derive(Debug, Serialize)]
 pub struct SystemMetrics {
     /// Process and machine CPU usage.
-    pub cpu: pingwaf_system::CpuLiveStats,
+    pub cpu: wafred_system::CpuLiveStats,
     /// Process RSS, host RAM and container memory accounting.
-    pub memory: pingwaf_system::MemorySnapshot,
+    pub memory: wafred_system::MemorySnapshot,
 }
 
 /// `GET /api/v1/system/status` — degraded-mode flags for the dashboard.
@@ -73,8 +73,8 @@ async fn metrics(_admin: AdminUser) -> Result<Json<SystemMetrics>, ApiError> {
     // the async workers.
     let (cpu, memory) = tokio::task::spawn_blocking(|| {
         (
-            pingwaf_system::cpu_snapshot(),
-            pingwaf_system::memory_snapshot(),
+            wafred_system::cpu_snapshot(),
+            wafred_system::memory_snapshot(),
         )
     })
     .await
@@ -85,13 +85,13 @@ async fn metrics(_admin: AdminUser) -> Result<Json<SystemMetrics>, ApiError> {
 /// `GET /api/v1/system/profile` — module and method CPU/memory attribution.
 ///
 /// The response is bounded (seven module rows, at most
-/// [`pingwaf_profiler::ProfileSnapshot::MAX_METHODS`] method rows) and
+/// [`wafred_profiler::ProfileSnapshot::MAX_METHODS`] method rows) and
 /// computed from atomics, so polling it is cheap.
 async fn profile(
     _admin: AdminUser,
     State(_state): State<AppState>,
-) -> Json<pingwaf_profiler::ProfileSnapshot> {
-    Json(pingwaf_profiler::ProfileSnapshot::collect())
+) -> Json<wafred_profiler::ProfileSnapshot> {
+    Json(wafred_profiler::ProfileSnapshot::collect())
 }
 
 /// `GET /api/v1/system/nodes` — this process plus every registered agent.
@@ -167,7 +167,7 @@ pub struct ControlNode {
     pub commit_limit_bytes: u64,
     /// `committed_as_bytes / commit_limit_bytes * 100`, one decimal; `0.0`
     /// when there is no limit. Above 100 is reported as measured — see
-    /// `pingwaf_system::MemorySnapshot::commit_percent`.
+    /// `wafred_system::MemorySnapshot::commit_percent`.
     pub commit_percent: f64,
     /// Requests the profiler attributed to the `control` module.
     pub requests: u64,
@@ -250,7 +250,7 @@ pub struct AgentNode {
 ///    the stream is open — at most one heartbeat interval old, and the only
 ///    source of `rps` (the heartbeat message itself is consumed and dropped);
 /// 2. the newest stored samples — `host_samples` for CPU/memory, the
-///    `pingwaf_active_connections` gauge in `agent_metrics` for the connection
+///    `wafred_active_connections` gauge in `agent_metrics` for the connection
 ///    count — which is all an offline agent has.
 ///
 /// The live report is preferred field by field with one deliberate exception:
@@ -300,13 +300,13 @@ async fn nodes(
     // as `/system/metrics`).
     let (cpu, memory) = tokio::task::spawn_blocking(|| {
         (
-            pingwaf_system::cpu_snapshot(),
-            pingwaf_system::memory_snapshot(),
+            wafred_system::cpu_snapshot(),
+            wafred_system::memory_snapshot(),
         )
     })
     .await
     .map_err(|err| ApiError::Internal(err.to_string()))?;
-    let profile = pingwaf_profiler::ProfileSnapshot::collect();
+    let profile = wafred_profiler::ProfileSnapshot::collect();
     // A failed read must not take the whole node view down: the control card
     // and the agent table are still worth showing, so the history degrades to
     // empty and the reason is logged.
@@ -331,9 +331,9 @@ async fn nodes(
 
 /// Projects the OS snapshots and the profiler's `control` row.
 fn control_node(
-    cpu: &pingwaf_system::CpuLiveStats,
-    memory: &pingwaf_system::MemorySnapshot,
-    profile: &pingwaf_profiler::ProfileSnapshot,
+    cpu: &wafred_system::CpuLiveStats,
+    memory: &wafred_system::MemorySnapshot,
+    profile: &wafred_profiler::ProfileSnapshot,
 ) -> ControlNode {
     // `ProfileSnapshot::collect` emits one row per module (`Module::ALL`), so
     // the `control` row exists even before the first request; the fallback
@@ -592,9 +592,9 @@ async fn latest_samples(
 /// Gauge the agent publishes as `active_connections`. Bound as `$2` rather than
 /// written into the statement: the query text then depends only on the shape,
 /// so the planner sees one prepared statement for every poll.
-const ACTIVE_CONNECTIONS_METRIC: &str = "pingwaf_active_connections";
+const ACTIVE_CONNECTIONS_METRIC: &str = "wafred_active_connections";
 
-/// Newest `pingwaf_active_connections` gauge per agent, as one ordered index
+/// Newest `wafred_active_connections` gauge per agent, as one ordered index
 /// scan on `idx_agent_metrics_agent_name_time_desc` (migration
 /// `m20240101_000061`).
 ///
@@ -834,10 +834,10 @@ mod tests {
     /// rows keyed by name and a bounded method list.
     #[test]
     fn profile_snapshot_shape() {
-        let snapshot = pingwaf_profiler::ProfileSnapshot::collect();
+        let snapshot = wafred_profiler::ProfileSnapshot::collect();
         assert_eq!(
             snapshot.modules.len(),
-            pingwaf_profiler::Module::ALL.len(),
+            wafred_profiler::Module::ALL.len(),
             "one row per module, even before instrumentation runs"
         );
         assert!(
@@ -850,20 +850,20 @@ mod tests {
         );
         assert!(
             snapshot.methods.len()
-                <= pingwaf_profiler::ProfileSnapshot::MAX_METHODS
+                <= wafred_profiler::ProfileSnapshot::MAX_METHODS
         );
         assert!(snapshot.collected_at_ms > 0);
     }
 
     /// `/system/metrics` hands `MemorySnapshot` to serde as-is, so the commit
     /// accounting the console reads *is* that struct field set. Pinned here as
-    /// well as in `pingwaf-system`, because a field renamed there has to fail
+    /// well as in `wafred-system`, because a field renamed there has to fail
     /// an API test rather than silently empty a panel on the dashboard.
     #[test]
     fn metrics_memory_carries_the_commit_accounting() {
         let json = serde_json::to_value(SystemMetrics {
-            cpu: pingwaf_system::cpu_snapshot(),
-            memory: pingwaf_system::memory_snapshot(),
+            cpu: wafred_system::cpu_snapshot(),
+            memory: wafred_system::memory_snapshot(),
         })
         .expect("serialises");
         let memory = json
@@ -940,9 +940,9 @@ mod tests {
     fn nodes_view_without_agents_serialises_an_empty_list() {
         let view = NodesView {
             control: control_node(
-                &pingwaf_system::cpu_snapshot(),
-                &pingwaf_system::memory_snapshot(),
-                &pingwaf_profiler::ProfileSnapshot::collect(),
+                &wafred_system::cpu_snapshot(),
+                &wafred_system::memory_snapshot(),
+                &wafred_profiler::ProfileSnapshot::collect(),
             ),
             agents: Vec::new(),
             boots: Vec::new(),
@@ -997,10 +997,10 @@ mod tests {
     /// request figures come from the profiler's `control` row.
     #[test]
     fn control_block_reflects_the_profiler_and_the_process() {
-        let snapshot = pingwaf_profiler::ProfileSnapshot::collect();
+        let snapshot = wafred_profiler::ProfileSnapshot::collect();
         let control = control_node(
-            &pingwaf_system::cpu_snapshot(),
-            &pingwaf_system::memory_snapshot(),
+            &wafred_system::cpu_snapshot(),
+            &wafred_system::memory_snapshot(),
             &snapshot,
         );
         let row = snapshot
@@ -1297,9 +1297,9 @@ mod tests {
     #[test]
     fn node_json_matches_the_console_contract() {
         let control = serde_json::to_value(control_node(
-            &pingwaf_system::cpu_snapshot(),
-            &pingwaf_system::memory_snapshot(),
-            &pingwaf_profiler::ProfileSnapshot::collect(),
+            &wafred_system::cpu_snapshot(),
+            &wafred_system::memory_snapshot(),
+            &wafred_profiler::ProfileSnapshot::collect(),
         ))
         .expect("serialises");
         let control_fields = [

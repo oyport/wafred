@@ -1,6 +1,6 @@
 use std::env;
 
-use pingwaf_waf::{WafEngine, WafEngineConfig, WafLevel, WafMode};
+use wafred_waf::{WafEngine, WafEngineConfig, WafLevel, WafMode};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -40,12 +40,12 @@ fn main() {
         } else {
             Some(body)
         };
-        let req = pingwaf_waf::RequestData {
+        let req = wafred_waf::RequestData {
             path: reqpath,
             query,
             headers,
             body: body.map(Into::into),
-            ..pingwaf_waf::RequestData::new(method, "/")
+            ..wafred_waf::RequestData::new(method, "/")
         };
         let verdict = engine.inspect(&req);
         println!(

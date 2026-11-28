@@ -878,9 +878,16 @@ function TunnelSettingsForm({
   onChange: (next: TunnelSettings) => void
 }) {
   const { t } = useTranslation()
-  const number = (key: keyof TunnelSettings, label: string, min: number, max: number) => (
+  const number = (
+    key: keyof TunnelSettings,
+    label: string,
+    hint: string,
+    min: number,
+    max: number,
+  ) => (
     <Input
       label={label}
+      hint={hint}
       type="number"
       min={min}
       max={max}
@@ -905,14 +912,45 @@ function TunnelSettingsForm({
         {t('pages.tunnels.settingsEnabled')}
       </label>
       <div className="grid grid-cols-2 gap-3">
-        {number('pairing_ttl_seconds', t('pages.tunnels.settingsPairingTtl'), 60, 86400)}
-        {number('max_streams_per_session', t('pages.tunnels.settingsMaxStreams'), 1, 4096)}
-        {number('max_targets_per_tunnel', t('pages.tunnels.settingsMaxTargets'), 1, 4096)}
-        {number('idle_timeout_seconds', t('pages.tunnels.settingsIdleTimeout'), 10, 86400)}
-        {number('heartbeat_seconds', t('pages.tunnels.settingsHeartbeat'), 5, 300)}
+        {number(
+          'pairing_ttl_seconds',
+          t('pages.tunnels.settingsPairingTtl'),
+          t('pages.tunnels.settingsPairingTtlHint'),
+          60,
+          86400,
+        )}
+        {number(
+          'max_streams_per_session',
+          t('pages.tunnels.settingsMaxStreams'),
+          t('pages.tunnels.settingsMaxStreamsHint'),
+          1,
+          4096,
+        )}
+        {number(
+          'max_targets_per_tunnel',
+          t('pages.tunnels.settingsMaxTargets'),
+          t('pages.tunnels.settingsMaxTargetsHint'),
+          1,
+          4096,
+        )}
+        {number(
+          'idle_timeout_seconds',
+          t('pages.tunnels.settingsIdleTimeout'),
+          t('pages.tunnels.settingsIdleTimeoutHint'),
+          10,
+          86400,
+        )}
+        {number(
+          'heartbeat_seconds',
+          t('pages.tunnels.settingsHeartbeat'),
+          t('pages.tunnels.settingsHeartbeatHint'),
+          5,
+          300,
+        )}
         {number(
           'session_token_ttl_seconds',
           t('pages.tunnels.settingsTokenTtl'),
+          t('pages.tunnels.settingsTokenTtlHint'),
           60,
           86400,
         )}

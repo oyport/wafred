@@ -90,7 +90,7 @@ export const CHALLENGE_PAGE_SAMPLE: Record<string, string> = {
   brand_name: 'WAFred',
   request_id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
   difficulty: '20',
-  verify_endpoint: '/_pingwaf/challenge/verify',
+  verify_endpoint: '/_wafred/challenge/verify',
   original_url: '/',
   challenge_scripts:
     '<script>/* compiled challenge scripts are injected here at runtime */</script>',

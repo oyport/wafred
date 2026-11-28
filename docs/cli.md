@@ -52,7 +52,7 @@ instead of a subcommand, and `wafred --version` (long banner) / `wafred -V`
 `ExecStart=/usr/local/bin/wafred <mode>` (the mode `install.sh` was asked
 for) with `WAFRED_CONFIG=/etc/wafred/wafred.toml` set in the unit;
 `systemctl restart wafred` applies any configuration change, and
-`journalctl -u wafred -e` shows the legacy-named service logs.
+`journalctl -u wafred -e` shows the WAFred service logs.
 
 ### The agent-only build (`wafred-agent`)
 
@@ -60,9 +60,9 @@ Releases also ship `wafred-agent`, built from the same source with the
 control plane compiled out (`--bin wafred-agent --features edge`). It is the
 data plane and nothing else: no PostgreSQL, no REST API, no embedded
 dashboard, so an edge node downloads and maps far less code. `install.sh
---mode agent` fetches that archive and installs it as `/usr/local/bin/pingwaf`,
-so the unit and every command below stay unchanged; `pingwaf --version` marks
-it with `edge`. Both spellings work:
+--mode agent` fetches that archive and installs it as `/usr/local/bin/wafred`;
+the unit and installed command remain `wafred`, and `wafred --version` marks
+the edge build. The release archive's `wafred-agent` binary accepts both forms:
 
 ```bash
 wafred-agent agent --server-url https://control-plane:9090 --api-key KEY
@@ -75,7 +75,7 @@ means `auto_upgrade` trades the smaller build for the full one: it follows the
 control plane's executable, so re-run the installer in agent mode to get the
 agent-only artifact back. The agent-only build has no
 `server`/`all-in-one`/maintenance subcommands; run those from the full
-`pingwaf` binary.
+`wafred` binary.
 
 > Agent scope defaults to **All sites** owned by its API key. Use **Agents →
 > [node] → Site scope** to select only the sites that edge should serve. For
@@ -356,7 +356,7 @@ propagates it immediately.
 ### Service will not start or logs look wrong
 
 ```bash
-journalctl -u wafred -e       # last log lines of the legacy-named unit
+journalctl -u wafred -e       # last log lines of the WAFred service
 systemctl status wafred
 ```
 

@@ -124,7 +124,7 @@ impl TunnelAcceptor {
     /// Accepts connections until the process exits.
     pub async fn run(self) {
         info!(
-            target: "pingwaf::tunnel",
+            target: "wafred::tunnel",
             addr = %self.local_addr,
             fingerprint = %self.fingerprint,
             "tunnel listener started"
@@ -134,7 +134,7 @@ impl TunnelAcceptor {
                 Ok(accepted) => accepted,
                 Err(error) => {
                     warn!(
-                        target: "pingwaf::tunnel",
+                        target: "wafred::tunnel",
                         error = %error,
                         "tunnel listener accept failed"
                     );
@@ -144,7 +144,7 @@ impl TunnelAcceptor {
             };
             if !self.limiter.allow(peer.ip()) {
                 debug!(
-                    target: "pingwaf::tunnel",
+                    target: "wafred::tunnel",
                     peer = %peer,
                     "refusing a tunnel handshake: rate limit"
                 );
@@ -154,7 +154,7 @@ impl TunnelAcceptor {
             let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned()
             else {
                 debug!(
-                    target: "pingwaf::tunnel",
+                    target: "wafred::tunnel",
                     peer = %peer,
                     "refusing a tunnel handshake: too many in flight"
                 );
@@ -169,7 +169,7 @@ impl TunnelAcceptor {
                 if let Err(error) = handshake(socket, peer, tls, registry).await
                 {
                     warn!(
-                        target: "pingwaf::tunnel",
+                        target: "wafred::tunnel",
                         peer = %peer,
                         error = %error,
                         "tunnel handshake failed"
@@ -329,7 +329,7 @@ async fn handshake(
     registry.attach_session(Arc::clone(&session));
 
     info!(
-        target: "pingwaf::tunnel",
+        target: "wafred::tunnel",
         tunnel = %tunnel_id,
         connector = %session.hostname,
         version = %session.connector_version,
@@ -344,7 +344,7 @@ async fn handshake(
     let _ = driver.await;
     registry.detach_session(&tunnel_id, &session);
     info!(
-        target: "pingwaf::tunnel",
+        target: "wafred::tunnel",
         tunnel = %tunnel_id,
         "tunnel session closed"
     );
@@ -372,7 +372,7 @@ async fn reject(
     message: String,
 ) -> Result<()> {
     debug!(
-        target: "pingwaf::tunnel",
+        target: "wafred::tunnel",
         code = code.as_str(),
         message = %message,
         "refusing a tunnel session"
@@ -425,7 +425,7 @@ async fn control_loop(
                     Ok(frame) => frame,
                     Err(_) => {
                         warn!(
-                            target: "pingwaf::tunnel",
+                            target: "wafred::tunnel",
                             timeout_secs = liveness.as_secs(),
                             "tunnel control stream went silent, closing the session"
                         );
@@ -448,14 +448,14 @@ async fn control_loop(
                     },
                     Ok(other) => {
                         debug!(
-                            target: "pingwaf::tunnel",
+                            target: "wafred::tunnel",
                             frame = other.kind(),
                             "unexpected control frame from the connector"
                         );
                     },
                     Err(error) => {
                         debug!(
-                            target: "pingwaf::tunnel",
+                            target: "wafred::tunnel",
                             error = %error,
                             "tunnel control stream ended"
                         );
@@ -522,7 +522,7 @@ async fn drive_connection(
                             let _ = waiter.send(Err(ErrorCode::StreamLimit));
                         }
                         debug!(
-                            target: "pingwaf::tunnel",
+                            target: "wafred::tunnel",
                             error = %error,
                             "tunnel session cannot open another stream"
                         );
@@ -540,7 +540,7 @@ async fn drive_connection(
                         // Only one inbound stream is expected; a second one is
                         // a protocol violation, dropped silently.
                         debug!(
-                            target: "pingwaf::tunnel",
+                            target: "wafred::tunnel",
                             "dropping an unexpected inbound tunnel stream"
                         );
                         drop(stream);
@@ -548,7 +548,7 @@ async fn drive_connection(
                 },
                 Poll::Ready(Some(Err(error))) => {
                     debug!(
-                        target: "pingwaf::tunnel",
+                        target: "wafred::tunnel",
                         error = %error,
                         "tunnel session ended"
                     );

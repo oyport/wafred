@@ -476,7 +476,7 @@ async fn ensure_waf_group(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pingwaf_waf::rules::{CompiledRule, RuleAction};
+    use wafred_waf::rules::{CompiledRule, RuleAction};
 
     fn action_of(value: &str) -> RuleAction {
         match value {
@@ -527,7 +527,7 @@ mod tests {
     #[test]
     fn built_in_cache_rules_compile() {
         for spec in cache_rules_defaults() {
-            pingwaf_waf::rules::parse_expression(spec.match_expression)
+            wafred_waf::rules::parse_expression(spec.match_expression)
                 .unwrap_or_else(|err| {
                     panic!(
                         "cache rule '{}' has a bad expression: {err}",
@@ -620,7 +620,7 @@ mod tests {
         // A seeded row may only claim a managed id the data plane actually
         // ships: an unknown id would make the override target nothing, and
         // the mirrored detection would silently disappear from the site.
-        let known: &[&str] = &pingwaf_waf::MANAGED_RULE_IDS;
+        let known: &[&str] = &wafred_waf::MANAGED_RULE_IDS;
         let mut ids: Vec<&str> = Vec::new();
         for spec in waf_rules() {
             let Some(mid) = spec.managed_rule_id else {

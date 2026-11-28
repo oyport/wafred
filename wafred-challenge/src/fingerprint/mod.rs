@@ -116,7 +116,7 @@ pub fn fingerprint_collection_js() -> &'static str {
     return JSON.stringify(data);
   }
 
-  window.__pingwaf_fingerprint = collect;
+  window.__wafred_fingerprint = collect;
 })();"#
 }
 
@@ -181,7 +181,7 @@ mod tests {
     fn test_fingerprint_js_not_empty() {
         let js = fingerprint_collection_js();
         assert!(!js.is_empty());
-        assert!(js.contains("__pingwaf_fingerprint"));
+        assert!(js.contains("__wafred_fingerprint"));
         assert!(js.contains("canvas"));
         assert!(js.contains("webgl"));
     }

@@ -1,5 +1,5 @@
 [package]
-name = "pingwaf-waf"
+name = "wafred-waf"
 version.workspace = true
 edition = "2021"
 description = "WAFred detection engine: normalization, signature matching, rule evaluation and anomaly scoring"
@@ -8,7 +8,7 @@ license = "Apache-2.0"
 [dependencies]
 # Self-accounting only (module/method timers and memory gauges); no allocator
 # hook, no sampling, so it is safe on the detection hot path.
-pingwaf-profiler = { path = "../wafred-profiler" }
+wafred-profiler = { path = "../wafred-profiler" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -18,7 +18,7 @@ anyhow = { workspace = true }
 #
 # `perf` is spelled out on purpose: without it the regex crate falls back to
 # the PikeVM (no lazy DFA, no literal prefilter), which measured 17-49x slower
-# on this crate's detector battery. The shipped `pingwaf` binary happened to
+# on this crate's detector battery. The shipped `wafred` binary happened to
 # enable it through feature unification with `pingora-cache`'s default regex
 # dependency, so a waf-only build (tests, examples, downstream users) silently
 # ran the slow path, and any upstream change to that dependency would have

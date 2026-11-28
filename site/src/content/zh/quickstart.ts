@@ -194,7 +194,7 @@ const quickstart = {
     title: "启动不顺利时",
     items: [
       {
-        q: "构建在 pingwaf-proto 阶段失败",
+        q: "构建在 wafred-proto 阶段失败",
         a: "缺少 protoc。安装 protobuf-compiler（或 brew install protobuf）后重新构建——没有它时该 crate 会静默退化为占位文件。",
       },
       {

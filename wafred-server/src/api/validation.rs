@@ -62,7 +62,7 @@ pub(crate) fn validate_expression(expression: &str) -> Result<(), ApiError> {
         ))
         .with_code(EXPRESSION_INVALID_CODE));
     }
-    let parsed = pingwaf_waf::rules::expression::parse_expression(expression)
+    let parsed = wafred_waf::rules::expression::parse_expression(expression)
         .map_err(|err| {
         ApiError::BadRequest(format!("expression is not valid: {err}"))
             .with_code(EXPRESSION_INVALID_CODE)

@@ -194,7 +194,7 @@ const quickstart = {
     title: "起動しないとき",
     items: [
       {
-        q: "pingwaf-proto でビルドが失敗する",
+        q: "wafred-proto でビルドが失敗する",
         a: "protoc がありません。protobuf-compiler（または brew install protobuf）を導入して再ビルドしてください。無い場合はプレースホルダに退避します。",
       },
       {

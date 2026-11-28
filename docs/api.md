@@ -4877,7 +4877,7 @@ plain-text rejection into the unified JSON error envelope with the
 | `tls_fingerprint_check` | TLS fingerprint check |
 | `base_difficulty` | Proof-of-work difficulty (leading zero bits) a quiet visitor solves, 4–28; default `20` |
 | `max_difficulty` | Ceiling the difficulty rises to under request/failure pressure, 4–28 and `>= base_difficulty`; default `24` |
-| `issue_limit_per_min` | Challenge pages issued per host+IP per 60-second window, 1–1000000; default `120`. Over it the edge answers `429` with `x-pingwaf-mitigated: block` |
+| `issue_limit_per_min` | Challenge pages issued per host+IP per 60-second window, 1–1000000; default `120`. Over it the edge answers `429` with `x-wafred-mitigated: block` |
 | `verify_limit_per_min` | Solution submissions accepted per host+IP per 60-second window, 1–1000000; default `300`. Over it verification fails closed with `429` and the pending nonce is left untouched |
 
 `base_difficulty`/`max_difficulty` drive adaptive proof of work: the difficulty
@@ -6477,7 +6477,7 @@ curl -k -H "Authorization: Bearer $TOKEN" \
 ### GET /system/profile
 
 Wall-clock time and memory attribution by module and method — pure Rust
-instrumentation (`pingwaf-profiler`), not a sampled profile: module-level
+instrumentation (`wafred-profiler`), not a sampled profile: module-level
 atomic counters plus compile-time-registered method timers on instrumented
 hot paths. No sampling, no stack unwinding, no allocator hook, no external
 tool or image. Counters are cumulative since process start; take two

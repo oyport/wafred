@@ -110,7 +110,7 @@ impl PathFilter {
 /// the raw path could hide a different path (`%`, `..`, `//`, `/.`), so the
 /// common case stays an allocation-free borrow.
 fn canonical_path(path: &str) -> Option<Cow<'_, str>> {
-    pingwaf_waf::normalize::canonical_scope_path(path)
+    wafred_waf::normalize::canonical_scope_path(path)
 }
 
 /// The same automaton budget the WAF expression engine uses: one pathological

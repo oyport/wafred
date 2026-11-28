@@ -194,7 +194,7 @@ const quickstart = {
     title: "Si algo no arranca",
     items: [
       {
-        q: "La compilación falla en pingwaf-proto",
+        q: "La compilación falla en wafred-proto",
         a: "Falta protoc. Instala protobuf-compiler (o brew install protobuf) y recompila: sin él el crate usa marcadores de posición.",
       },
       {

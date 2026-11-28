@@ -22,7 +22,7 @@ pub use registry::{
 };
 pub use tunnel_registry::TUNNEL_CONNECTORS;
 
-use pingwaf_proto::control_plane::{
+use wafred_proto::control_plane::{
     server_command::Payload, ServerCommand, SiteConfig, UpdateSiteCommand,
 };
 use sea_orm::{
@@ -466,7 +466,7 @@ pub async fn notify_tunnel_connectors(
     tunnel_id: Uuid,
     revoked: Option<String>,
 ) -> bool {
-    use pingwaf_proto::control_plane::{
+    use wafred_proto::control_plane::{
         tunnel_connector_command, TunnelConnectorCommand,
         TunnelConnectorRevoked,
     };
@@ -630,11 +630,11 @@ pub async fn notify_site_deleted(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pingwaf_proto::control_plane::{RuleBundle, SslConfig};
+    use wafred_proto::control_plane::{RuleBundle, SslConfig};
 
     fn bundle(acme: bool) -> SiteConfig {
         SiteConfig {
-            sites: vec![pingwaf_proto::control_plane::Site {
+            sites: vec![wafred_proto::control_plane::Site {
                 id: "site-1".to_string(),
                 rules: Some(RuleBundle {
                     ssl: Some(SslConfig {

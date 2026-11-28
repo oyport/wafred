@@ -53,7 +53,7 @@ BlazeHTTP 原始夹具中有请求体但未携带 framing 头的样本。原 `re
 - 对 Base64 编码的独立 URI 路径段，整条路径前导 `/` 会令整值 Base64 解码失败。现在在长度上限内逐段解码并加入普通规则扫描。
 - Strict 新增关键级 `alert.call(` 和 `prompt.call(` 签名，便于将单个已解码 JavaScript 调用判为高风险；规则在 Normal 档不装配。
 
-针对根因加了回归测试：未声明类型的 URL-encoded/multipart 表单、Base64 路径段、无害表单、HTTP body framing 和 `Content-Length` 尾字节。回放器单元测试 4/4 通过。`cargo test -p pingwaf-waf` 为 271/271 通过，`cargo fmt --all -- --check` 通过。
+针对根因加了回归测试：未声明类型的 URL-encoded/multipart 表单、Base64 路径段、无害表单、HTTP body framing 和 `Content-Length` 尾字节。回放器单元测试 4/4 通过。`cargo test -p wafred-waf` 为 271/271 通过，`cargo fmt --all -- --check` 通过。
 
 ## 全量语料测试
 

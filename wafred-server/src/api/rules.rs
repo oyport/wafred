@@ -760,7 +760,7 @@ mod tests {
 
         // Even a disabled override: removing it re-enables the managed rule.
         let managed = rule::Model {
-            managed_rule_id: Some("PINGWAF-1010".to_string()),
+            managed_rule_id: Some("WAFRED-1010".to_string()),
             ..custom
         };
         assert!(matches!(

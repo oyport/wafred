@@ -167,10 +167,10 @@ async fn attach_request_id(request: Request, next: Next) -> Response {
 }
 
 async fn record_control_module(request: Request, next: Next) -> Response {
-    // Method attribution (see pingwaf-profiler): the timer books the
+    // Method attribution (see wafred-profiler): the timer books the
     // `control` module row as well.
     let _profile =
-        pingwaf_profiler::timed_method(pingwaf_profiler::Method::ControlHttp);
+        wafred_profiler::timed_method(wafred_profiler::Method::ControlHttp);
     next.run(request).await
 }
 

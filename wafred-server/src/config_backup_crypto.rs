@@ -152,8 +152,8 @@ fn seal_instance_secrets(snapshot: &mut Value) -> Result<(), BackupError> {
 static KDF_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(2)));
 
-const AAD: &[u8] = b"pingwaf-config-backup-v1";
-const FORMAT: &str = "pingwaf-config-backup";
+const AAD: &[u8] = b"wafred-config-backup-v1";
+const FORMAT: &str = "wafred-config-backup";
 const KDF_M_COST: u32 = 19 * 1024;
 const KDF_T_COST: u32 = 2;
 const KDF_P_COST: u32 = 1;

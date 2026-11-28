@@ -27,7 +27,7 @@ Client
 ┌─ early_request ──────────────────────────────────────────────────────────┐
 │  location match (host + path) · request-id · OpenTelemetry                │
 │  ▶ wafred:waf      站点策略、IP/地域、Basic Auth、Bot、限流、WAF 引擎    │
-│  ▶ wafred:challenge  质询校验端点 /_pingwaf/challenge/verify             │
+│  ▶ wafred:challenge  质询校验端点 /_wafred/challenge/verify             │
 └──────────────────────────────────────────────────────────────────────────┘
   ▼
 ┌─ request ────────────────────────────────────────────────────────────────┐
@@ -145,7 +145,7 @@ Two cross-cutting behaviours are worth remembering:
 
 - a block/challenge verdict returns the JS challenge page (`503`) or a hard
   block (`403`);
-- the page posts its proof-of-work solution to `/_pingwaf/challenge/verify`,
+- the page posts its proof-of-work solution to `/_wafred/challenge/verify`,
   which the challenge plugin serves at the `early_request` phase;
 - on success the visitor receives a signed clearance cookie, so later requests
   skip the challenge until it expires;

@@ -65,7 +65,7 @@ impl Default for ChallengeConfig {
             browser_integrity_check: true,
             tls_fingerprint_check: false,
             cookie_secret: "change-me".to_string(),
-            cookie_name: "__pingwaf_clearance".to_string(),
+            cookie_name: "__wafred_clearance".to_string(),
             pow_difficulty: 20,
             submission_max_age_secs: 300, // 5 minutes
         }
@@ -167,7 +167,7 @@ impl ChallengeEngine {
             request_id: request_id.to_string(),
             challenge_nonce,
             difficulty: self.config.pow_difficulty,
-            verify_endpoint: "/_pingwaf/challenge/verify".to_string(),
+            verify_endpoint: "/_wafred/challenge/verify".to_string(),
             original_url: original_url.to_string(),
             brand_name: "WAFred".to_string(),
         };
@@ -186,7 +186,7 @@ impl ChallengeEngine {
                 ("Pragma".to_string(), "no-cache".to_string()),
                 ("X-Frame-Options".to_string(), "DENY".to_string()),
                 ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
-                ("X-PingWAF-Ray".to_string(), request_id.to_string()),
+                ("X-WAFred-Ray".to_string(), request_id.to_string()),
             ],
         }
     }
@@ -202,7 +202,7 @@ impl ChallengeEngine {
             request_id: request_id.to_string(),
             challenge_nonce,
             difficulty: self.config.pow_difficulty,
-            verify_endpoint: "/_pingwaf/challenge/verify".to_string(),
+            verify_endpoint: "/_wafred/challenge/verify".to_string(),
             original_url: original_url.to_string(),
             brand_name: "WAFred".to_string(),
         };
@@ -221,7 +221,7 @@ impl ChallengeEngine {
                 ("Pragma".to_string(), "no-cache".to_string()),
                 ("X-Frame-Options".to_string(), "DENY".to_string()),
                 ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
-                ("X-PingWAF-Ray".to_string(), request_id.to_string()),
+                ("X-WAFred-Ray".to_string(), request_id.to_string()),
             ],
         }
     }
@@ -425,7 +425,7 @@ impl ChallengeEngine {
         if self.config.exempt_paths.is_empty() {
             return false;
         }
-        let Some(path) = pingwaf_waf::normalize::canonical_scope_path(path)
+        let Some(path) = wafred_waf::normalize::canonical_scope_path(path)
         else {
             return false;
         };
@@ -785,7 +785,7 @@ mod tests {
 
         let mut request = test_request();
         request.cookies =
-            vec![("__pingwaf_clearance".to_string(), cookie_value)];
+            vec![("__wafred_clearance".to_string(), cookie_value)];
         request.request_rate = 1000; // Even with high rate, valid cookie should pass
 
         let decision = engine.should_challenge(&request);
@@ -808,7 +808,7 @@ mod tests {
 
         let mut request = test_request();
         request.cookies =
-            vec![("__pingwaf_clearance".to_string(), cookie_value)];
+            vec![("__wafred_clearance".to_string(), cookie_value)];
         request.request_rate = 1000;
 
         assert_ne!(
@@ -828,7 +828,7 @@ mod tests {
         let mut request = test_request();
         request.site_id = String::new();
         request.cookies =
-            vec![("__pingwaf_clearance".to_string(), cookie_value)];
+            vec![("__wafred_clearance".to_string(), cookie_value)];
         request.request_rate = 1000;
 
         assert_eq!(engine.should_challenge(&request), ChallengeDecision::Pass);

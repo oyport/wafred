@@ -54,7 +54,7 @@ npm run verify       # content contract + type check + build + link audit
   is missing, an array length differs, a placeholder (`TODO:`) survives, or a
   screenshot key/link points nowhere.
 - Facts must be verifiable in the repository (`README*.md`, `docs/**`,
-  `pingwaf-*/src`). Do not invent defaults, ports or endpoints.
+  `wafred-*/src`). Do not invent defaults, ports or endpoints.
 - Keep commands, code samples, URLs, screenshot keys and `slug`/`id` values
   untranslated — the checker treats them as machine identifiers.
 - Showcase imagery comes in two shapes: `Shot` (a key from `SCREENSHOT_KEYS`,

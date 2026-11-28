@@ -2,9 +2,9 @@
 
 > WAFred's workspace contains the upstream `pingap-*` crates below **plus**
 > seven WAF-specific crates. The two are listed separately in
-> [docs/README.md](README.md#-crate-documentation): `pingwaf-proto`,
-> `pingwaf-server`, `wafred-agent`, `pingwaf-waf`, `pingwaf-challenge`,
-> `pingwaf-profiler`, `pingwaf-system` and `wafred-tunnel`.
+> [docs/README.md](README.md#-crate-documentation): `wafred-proto`,
+> `wafred-server`, `wafred-agent`, `wafred-waf`, `wafred-challenge`,
+> `wafred-profiler`, `wafred-system` and `wafred-tunnel`.
 
 ## Trust boundaries
 
@@ -13,7 +13,7 @@ model rests on the boundaries below; a change that lets one side reach the
 other's data is a security regression, not a feature. The hardening steps for
 each boundary are in [`SECURITY.md`](../SECURITY.md#hardening-checklist).
 
-### Control plane (`pingwaf-server`)
+### Control plane (`wafred-server`)
 
 Holds PostgreSQL, every tenant's configuration and logs, administrator
 credentials, the JWT signing secret and the `WAFRED_SECRET_KEY` used to seal
@@ -42,7 +42,7 @@ hosts without a synced bundle), configurable per site and globally.
 The data plane also ships as its own binary, `wafred-agent`
 (`src/edge_main.rs`, `--features edge`): the same agent and proxy with the
 control-plane modules and the dashboard-embedding admin plugin compiled out.
-`install.sh --mode agent` installs it; it never links `pingwaf-server`.
+`install.sh --mode agent` installs it; it never links `wafred-server`.
 
 ### Tunnel connector (`wafred-tunnel`)
 

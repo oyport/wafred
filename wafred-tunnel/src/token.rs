@@ -11,7 +11,7 @@
 //! the same bytes without a canonicalisation step, and no JSON field order can
 //! change the signed content.
 //!
-//! Signing lives in the control plane (`pingwaf-server`); verification lives
+//! Signing lives in the control plane (`wafred-server`); verification lives
 //! here so the edge and the control plane cannot drift apart.
 
 use anyhow::{Result, anyhow, bail};

@@ -3,7 +3,7 @@
 debug/
 target/
 
-# Cargo.lock IS tracked: PingWAF ships executables (wafred / pingap), so the
+# Cargo.lock IS tracked: WAFred ships executables (wafred / pingap), so the
 # lock file is committed for reproducible builds. Do NOT ignore it.
 # https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html
 

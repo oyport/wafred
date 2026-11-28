@@ -22,7 +22,7 @@ WAF 返回 403 拦截或 503 质询均计作攻击命中；正常流量出现这
 ## 可重复检查
 
 - 回放 framing 单测：python tools/waf-bench/test_replay.py
-- Rust WAF 测试：cargo test -p pingwaf-waf
+- Rust WAF 测试：cargo test -p wafred-waf
 - 格式检查：cargo fmt --all -- --check
 - 站点内容、构建和站内链接：在 site/ 目录运行 npm run verify
 

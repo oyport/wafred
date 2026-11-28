@@ -13,7 +13,7 @@
 //! There is deliberately no sampling, no flamegraph, no heap dump and no
 //! dependency on an external profiler here: this crate only reads counters
 //! the operating system already keeps. CPU/memory attribution by module and
-//! method lives in `pingwaf-profiler`.
+//! method lives in `wafred-profiler`.
 
 pub mod cgroup;
 pub mod cpu;

@@ -64,7 +64,7 @@ Two failures account for most first-run compose errors:
 | `cmake` | recent | TLS backend build |
 | PostgreSQL | 14+; native installs use the distribution's package name (`postgresql-16` on Ubuntu 24.04, `postgresql-18` on 26.04) | Control-plane datastore; the role needs DDL rights |
 
-Without `protoc`, `pingwaf-proto` silently writes placeholder files and the downstream crates fail to compile — install it before you build.
+Without `protoc`, `wafred-proto` silently writes placeholder files and the downstream crates fail to compile — install it before you build.
 
 ```bash
 cd web && npm ci && npm run build && cd ..

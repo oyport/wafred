@@ -784,7 +784,7 @@ pub fn spawn(
 ) {
     let interval = Duration::from_secs(interval_secs.max(1));
     let spawned = std::thread::Builder::new()
-        .name("pingwaf-probe".to_string())
+        .name("wafred-probe".to_string())
         .spawn(move || {
             let mut sampler = Sampler::new(disk_path);
             let mut refreshed: Option<Instant> = None;

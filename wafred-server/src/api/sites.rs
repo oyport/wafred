@@ -2429,7 +2429,7 @@ fn clone_rule_row(
     node.id = Set(Uuid::new_v4());
     node.site_id = Set(new_id);
     // The clone has its own seed rows; carrying a managed link over would
-    // create duplicate override-only rows for the same PINGWAF id.
+    // create duplicate override-only rows for the same WAFRED id.
     node.managed_rule_id = Set(None);
     // A group the map does not know belongs to another site (or was deleted
     // between the two reads). Carrying its id over would attach the clone's

@@ -194,7 +194,7 @@ const quickstart = {
     title: "Si le démarrage échoue",
     items: [
       {
-        q: "La compilation échoue dans pingwaf-proto",
+        q: "La compilation échoue dans wafred-proto",
         a: "protoc manque. Installez protobuf-compiler (ou brew install protobuf) puis recompilez : sans lui le crate utilise des fichiers factices.",
       },
       {

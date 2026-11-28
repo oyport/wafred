@@ -26,15 +26,16 @@ Web 控制台是 `:9080` 控制面的 HTTP 客户端。当控制面本身出问�
 | All-in-one | `wafred all-in-one` | 上述两者同进程运行（Agent 经回环连接本地 Server）。 |
 
 也可以用 `WAFRED_MODE` 环境变量代替子命令选择模式；`wafred --version`（长横幅）/ `wafred -V`（纯版本号）打印版本后退出。systemd 安装的
-`ExecStart=/usr/local/bin/wafred <mode>`（模式取决于 `install.sh` 收到的参数），并在单元中设置 `WAFRED_CONFIG=/etc/wafred/wafred.toml`；systemd 单元暂保留旧名 `wafred`，`systemctl restart wafred` 应用任何配置变更，`journalctl -u wafred -e` 查看服务日志。
+`ExecStart=/usr/local/bin/wafred <mode>`（模式取决于 `install.sh` 收到的参数），并在单元中设置 `WAFRED_CONFIG=/etc/wafred/wafred.toml`；systemd 服务单元名为 `wafred.service`，`systemctl restart wafred` 应用任何配置变更，`journalctl -u wafred -e` 查看 WAFred 服务日志。
 
 ### 仅数据面构建（`wafred-agent`）
 
 发布包还提供 `wafred-agent`：与 `wafred` 同源，但编译时裁掉控制面
 （`--bin wafred-agent --features edge`），只有数据面——没有 PostgreSQL、REST API
 和内嵌控制台，边缘节点下载与映射的代码明显更少。`install.sh --mode agent`
-会下载该归档并以 `/usr/local/bin/pingwaf` 名称安装，因此 systemd 单元与下文所有命令
-保持不变；`pingwaf --version` 会带 `edge` 标记。两种写法都可用：
+会下载该归档并安装为 `/usr/local/bin/wafred`，因此服务单元和安装后的命令仍为
+`wafred`；`wafred --version` 会标记 edge 构建。发布归档中的二进制名称为
+`wafred-agent`，支持以下两种调用方式：
 
 ```bash
 wafred-agent agent --server-url https://control-plane:9090 --api-key KEY
@@ -44,7 +45,7 @@ wafred-agent --server-url https://control-plane:9090 --api-key KEY
 之所以仍接受 `agent` 子命令：自升级会用控制面的 all-in-one 二进制替换当前文件，
 而该二进制需要这个子命令。这也意味着 `auto_upgrade` 会把小体积构建换回完整构建——
 它跟随控制面自身的可执行文件；需要恢复仅数据面构建时重新以 agent 模式运行安装器。
-仅数据面构建不提供 `server`/`all-in-one`/运维子命令，这些请使用完整的 `pingwaf` 二进制。
+仅数据面构建不提供 `server`/`all-in-one`/运维子命令，这些请使用完整的 `wafred` 二进制。
 
 ## 公共参数
 

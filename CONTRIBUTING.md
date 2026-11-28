@@ -47,7 +47,7 @@ Use [GitHub Issues](https://github.com/oyport/wafred/issues).
 [`docs/quick-start.md` → Troubleshooting](./docs/quick-start.md#troubleshooting)
 and [`docs/deployment.md` → Troubleshooting](./docs/deployment.md#troubleshooting).
 Many reported problems (missing `protoc`, ports 80/443 not listening until a
-site exists, stale `pingwaf-proto` build cache) are already documented there.
+site exists, stale `wafred-proto` build cache) are already documented there.
 
 **For a bug report, include:**
 
@@ -90,7 +90,7 @@ business days and coordinate disclosure after the fix ships (or at 90 days).
 | --- | --- | --- |
 | Rust | **1.96+** (MSRV; CI also runs 1.97 and stable) | Everything |
 | Node.js | **26.12.1+** | Building/linting the dashboard — lower versions fail `npm ci` (`engine-strict`) |
-| protoc | any recent release | Generating `pingwaf-proto` gRPC stubs |
+| protoc | any recent release | Generating `wafred-proto` gRPC stubs |
 | cmake, clang/libclang | — | Native dependencies (e.g. TLS/ML crates) |
 | pkg-config, OpenSSL dev headers | — | The default `openssl` TLS backend |
 | nasm | — | Assembling optimised TLS/crypto code |
@@ -122,11 +122,11 @@ cargo install cargo-msrv --version 0.18.4
 > ⚠️ **Install `protoc` before your first `cargo build`.** If it is missing,
 > [`wafred-proto/build.rs`](./wafred-proto/build.rs) writes a placeholder
 > instead of the real gRPC code and only emits a `cargo:warning`. The failure
-> surfaces later as baffling "cannot find type" errors in `pingwaf-server` and
-> `pingwaf-agent`. Recover with:
+> surfaces later as baffling "cannot find type" errors in `wafred-server` and
+> `wafred-agent`. Recover with:
 >
 > ```bash
-> cargo clean -p pingwaf-proto
+> cargo clean -p wafred-proto
 > ```
 
 ### Get the code
@@ -253,7 +253,7 @@ npm run build   # tsc -b && vite build (strict TypeScript)
 make test            # cargo test --workspace --features=full
 make test-rustls     # same suite on the rustls TLS backend
 make cov             # cargo llvm-cov --workspace --html --open
-cargo test -p pingwaf-server        # a single crate
+cargo test -p wafred-server        # a single crate
 ```
 
 - CI runs the suite on Rust **1.96.0**, **1.97.0** and **stable** (one matrix
@@ -356,7 +356,7 @@ skipped:
    in `[workspace.package]`, in every `pingap-*` requirement and in
    `Cargo.lock`.
 1b. **Run the schema gate** against a throwaway database:
-   `WAFRED_TEST_DB_URL=… cargo test -p pingwaf-server --test schema_matches_models -- --ignored`
+   `WAFRED_TEST_DB_URL=… cargo test -p wafred-server --test schema_matches_models -- --ignored`
    (or `scripts/tunnel-smoke.sh`, which runs it as its first step). It applies
    every migration and then reads every model, which is the only check that
    catches a model column no migration creates — the 0.33.0 regression, where
@@ -461,7 +461,7 @@ the standard Apache-2.0 header used throughout the workspace.
 欢迎贡献 WAFred！
 
 1. **环境**：Rust ≥ 1.96、Node 26.12.1+、`protoc`（**必装**，缺失会静默生成占位文件导致
-   `pingwaf-server` / `pingwaf-agent` 编译失败，需 `cargo clean -p pingwaf-proto`
+   `wafred-server` / `wafred-agent` 编译失败，需 `cargo clean -p wafred-proto`
    重新生成）、cmake、clang、pkg-config、libssl-dev、nasm、PostgreSQL ≥ 14。
 2. **构建**：先 `cd web && npm ci && npm run build`（前端资源在编译期通过
    rust-embed 打进二进制），再 `cargo build --bin wafred --features full`。

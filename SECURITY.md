@@ -64,14 +64,12 @@ from which it inherits the proxy data plane.
 | Version | Status | Receives security fixes |
 | --- | --- | --- |
 | `main` | Active development | Yes — but expect breaking changes |
-| `0.32.x` (current release line, latest `0.32.27`) | Supported | **Yes** |
-| `0.31.x` | Critical security fixes only | On request, best effort |
-| `0.30.x` and older | End of life | No |
+| `1.0.x` (current WAFred release line, latest `1.0.6`) | Supported | **Yes** |
+| `1.0.0`–`1.0.4` | Superseded; upgrade to the latest `1.0.x` patch | No separate backports |
 
-Only the latest release line is guaranteed to receive security patches. The
-previous minor line receives critical fixes on request only, and only while an
-upgrade path exists; everything older is end-of-life and should be upgraded.
-Security fixes ship in patch releases of the current line and are listed under
+Only the latest WAFred release line is guaranteed to receive security patches;
+older patch versions should be upgraded to the latest release. Security fixes
+ship in patch releases of the current line and are listed under
 `### Security` in [`CHANGELOG.md`](./CHANGELOG.md). If you run an older version,
 please upgrade — see
 [`docs/deployment.md` → Upgrade Procedure](./docs/deployment.md#upgrade-procedure).
@@ -86,7 +84,7 @@ please upgrade — see
 The following are in scope for this policy:
 
 - **WAF bypass** — payloads that evade normalisation, signature matching or the
-  rule engine (`pingwaf-waf`) and reach the origin unblocked.
+  rule engine (`wafred-waf`) and reach the origin unblocked.
 - **Authentication and authorisation** — JWT issuance/validation, session and
   refresh-token handling, role checks, user registration controls in the
   control-plane REST API (`/api/v1`), and the MCP endpoint's credential

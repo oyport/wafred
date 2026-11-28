@@ -1,6 +1,6 @@
 /**
  * Client-side mirror of the server's adaptive proof-of-work validation
- * (`pingwaf-server/src/api/challenge.rs`). The server is authoritative; this
+ * (`wafred-server/src/api/challenge.rs`). The server is authoritative; this
  * only keeps an out-of-range value from being submitted and explains why.
  *
  * The bounds are deliberately duplicated rather than fetched: the API returns

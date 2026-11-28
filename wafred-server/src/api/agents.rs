@@ -8,7 +8,7 @@ use axum::routing::{get, post};
 use axum::Json;
 use axum::Router;
 use chrono::{DateTime, Utc};
-use pingwaf_proto::control_plane::{
+use wafred_proto::control_plane::{
     BlockIpCommand, FlushLogsCommand, PurgeCacheCommand, RestartAgentCommand,
     ServerCommand,
 };
@@ -1224,7 +1224,7 @@ pub fn build_command(
             (
                 command_type::UNBLOCK_IP,
                 Some(server_command_payload::UnblockIp(
-                    pingwaf_proto::control_plane::UnblockIpCommand {
+                    wafred_proto::control_plane::UnblockIpCommand {
                         site_id: site.clone(),
                         ip_addresses: normalized,
                     },
@@ -1249,7 +1249,7 @@ pub fn build_command(
 
 /// The generated `oneof payload` module of `ServerCommand`.
 mod server_command_payload {
-    pub use pingwaf_proto::control_plane::server_command::Payload::{
+    pub use wafred_proto::control_plane::server_command::Payload::{
         BlockIp, FlushLogs, PurgeCache, RestartAgent, UnblockIp,
     };
 }

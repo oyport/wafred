@@ -58,7 +58,7 @@ impl TunnelCertificate {
                     return Ok(cert);
                 }
                 tracing::info!(
-                    target: "pingwaf::tunnel",
+                    target: "wafred::tunnel",
                     not_after = %cert.not_after,
                     "tunnel certificate is near expiry, regenerating"
                 );
@@ -66,7 +66,7 @@ impl TunnelCertificate {
             Ok(None) => {},
             Err(error) => {
                 tracing::warn!(
-                    target: "pingwaf::tunnel",
+                    target: "wafred::tunnel",
                     error = %error,
                     "stored tunnel certificate is unusable, regenerating"
                 );

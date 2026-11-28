@@ -167,7 +167,7 @@ pub const INLINE_MAX_BYTES: usize = 256 * 1024;
 pub const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Byte gauges of one storage backend, mirrored into the process-wide
-/// `pingwaf_profiler::Module::Cache` row.
+/// `wafred_profiler::Module::Cache` row.
 ///
 /// The attribution row is per process while one process can host several file
 /// backends (one per configured directory). Each backend therefore keeps its
@@ -205,12 +205,12 @@ static GLOBAL_DISK_BYTES: AtomicI64 = AtomicI64::new(0);
 fn publish_cache_row() {
     let index = GLOBAL_INDEX_BYTES.load(Ordering::Relaxed).max(0);
     let in_flight = GLOBAL_IN_FLIGHT_BYTES.load(Ordering::Relaxed).max(0);
-    pingwaf_profiler::set_memory(
-        pingwaf_profiler::Module::Cache,
+    wafred_profiler::set_memory(
+        wafred_profiler::Module::Cache,
         index.saturating_add(in_flight) as u64,
     );
-    pingwaf_profiler::set_disk_bytes(
-        pingwaf_profiler::Module::Cache,
+    wafred_profiler::set_disk_bytes(
+        wafred_profiler::Module::Cache,
         GLOBAL_DISK_BYTES.load(Ordering::Relaxed).max(0) as u64,
     );
 }

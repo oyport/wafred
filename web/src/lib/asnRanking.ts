@@ -13,7 +13,7 @@ export interface AsnTrafficRow {
 
 /**
  * The control plane's "no mapping" fallback is `Unknown (AS<number>)`
- * (`pingwaf_server::asn::display_name`). The UI localises it instead of showing
+ * (`wafred_server::asn::display_name`). The UI localises it instead of showing
  * the English sentence in the middle of a translated table, so the pattern has
  * to be recognised here.
  */

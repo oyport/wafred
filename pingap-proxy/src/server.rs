@@ -1958,11 +1958,11 @@ impl ProxyHttp for Server {
     {
         debug!(target: LOG_TARGET, "--> request filter");
         defer!(debug!(target: LOG_TARGET, "<-- request filter"););
-        // Method attribution (see pingwaf-profiler): four relaxed adds on
+        // Method attribution (see wafred-profiler): four relaxed adds on
         // drop, no hash, no lock. The module row (`proxy`) is booked by the
         // same timer, so one instrumentation point covers both tables.
-        let _profile = pingwaf_profiler::timed_method(
-            pingwaf_profiler::Method::ProxyRequestFilter,
+        let _profile = wafred_profiler::timed_method(
+            wafred_profiler::Method::ProxyRequestFilter,
         );
         // pingora cannot stop after early_request_filter, so a plugin that
         // answered at the EarlyRequest step arrives here with its response

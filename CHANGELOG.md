@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [WAFred 1.0.6] - 2026-11-28
+
+### Changed
+
+- Complete the WAFred naming migration for project-owned Rust crates, tunnel
+  and visitor routes, challenge cookies, mitigation headers, metrics and log
+  targets. Old PingWAF runtime names are absent from active identifiers;
+  references remain in migration guidance, source attribution, historical
+  release/benchmark records and retained copyright notices.
+- Correct agent installation and service documentation to use the WAFred
+  binary and systemd unit names.
+
 ## [WAFred 1.0.5] - 2026-11-28
 
 ### Security and stability

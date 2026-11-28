@@ -11,7 +11,7 @@
 use std::sync::{Arc, OnceLock};
 
 use pingap_upstream::UpstreamProvider;
-use pingwaf_proto::control_plane as proto;
+use wafred_proto::control_plane as proto;
 
 /// Process-wide upstream provider, installed by the host binary.
 static UPSTREAM_PROVIDER: OnceLock<Arc<dyn UpstreamProvider>> = OnceLock::new();

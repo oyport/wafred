@@ -64,7 +64,7 @@ curl -fsSL https://gh-proxy.org/https://raw.githubusercontent.com/oyport/wafred/
 | `cmake` | 较新版本 | 构建 TLS 后端 |
 | PostgreSQL | 14+；本机安装以发行版包名为准（Ubuntu 24.04 是 `postgresql-16`，26.04 是 `postgresql-18`） | 控制面存储，角色需要建表权限 |
 
-缺少 `protoc` 时 `pingwaf-proto` 会静默写入占位文件，随后下游 crate 编译失败——构建前先安装它。
+缺少 `protoc` 时 `wafred-proto` 会静默写入占位文件，随后下游 crate 编译失败——构建前先安装它。
 
 ```bash
 cd web && npm ci && npm run build && cd ..

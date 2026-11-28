@@ -1,10 +1,10 @@
 //! Per-request allocation / latency baseline plus engine resident-memory
-//! measurement for the PingWAF detection engine (`pingwaf-waf`).
+//! measurement for the WAFred detection engine, derived from PingWAF (`wafred-waf`).
 //!
 //! Run with the shipped profile:
 //!
 //! ```bash
-//! cargo run --release -p pingwaf-waf --example resource_bench
+//! cargo run --release -p wafred-waf --example resource_bench
 //! ```
 //!
 //! What it measures, all single-threaded:
@@ -16,7 +16,7 @@
 //! * `Instant` around `WafEngine::inspect` gives p50/p95/p99. The request
 //!   objects are built *before* the timed region and reused; `RequestData`
 //!   clone cost is measured separately so the reuse is not hiding a cost.
-//! * `pingwaf-profiler` is used to split each inspection into the normalize /
+//! * `wafred-profiler` is used to split each inspection into the normalize /
 //!   signature (Stage 1) / expression (Stage 2) scopes the engine itself
 //!   records, plus the residual the engine does not attribute.
 //! * Engine resident memory: shared-base cost, per-site incremental cost for
@@ -35,14 +35,14 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use pingwaf_profiler::ProfileSnapshot;
-use pingwaf_waf::normalize::{normalize_request, ValueSource};
-use pingwaf_waf::rules::managed::default_managed_rules;
-use pingwaf_waf::rules::signatures::{
+use wafred_profiler::ProfileSnapshot;
+use wafred_waf::normalize::{normalize_request, ValueSource};
+use wafred_waf::rules::managed::default_managed_rules;
+use wafred_waf::rules::signatures::{
     ci_backtick_interleaved, ci_chr_chain, detect_deser_shape, detect_sqli,
     detect_xss, pt_remote_backslash_include, SignatureEngine,
 };
-use pingwaf_waf::{
+use wafred_waf::{
     CompiledRule, RequestData, RuleAction, StackSet, WafEngine,
     WafEngineConfig, WafLevel,
 };
@@ -1520,7 +1520,7 @@ fn profile_config(level: WafLevel, stacks: StackSet) -> WafEngineConfig {
 // ---------------------------------------------------------------------------
 
 fn print_environment() {
-    println!("== pingwaf-waf resource_bench ==");
+    println!("== wafred-waf resource_bench ==");
     println!(
         "profile: release (opt-level=\"z\", lto=true, codegen-units=1, \
          panic=\"abort\"), debug_assertions={}",

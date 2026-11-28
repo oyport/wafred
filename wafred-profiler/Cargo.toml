@@ -1,5 +1,5 @@
 [package]
-name = "pingwaf-profiler"
+name = "wafred-profiler"
 version.workspace = true
 edition = "2021"
 license = "Apache-2.0"

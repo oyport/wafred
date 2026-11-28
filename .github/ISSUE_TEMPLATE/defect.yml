@@ -7,11 +7,11 @@ body:
     attributes:
       value: |
         Use this form for findings produced by the quality patrol
-        ([docs/quality-patrol.md](https://github.com/shuaiZend/PingWAF/blob/main/docs/quality-patrol.md)).
+        ([docs/quality-patrol.md](https://github.com/oyport/wafred/blob/main/docs/quality-patrol.md)).
         Every field below maps to the record format in §5 of that document — a
         record that cannot be reproduced from this form alone is not triaged.
         Security vulnerabilities do **not** belong here: follow
-        [SECURITY.md](https://github.com/shuaiZend/PingWAF/blob/main/SECURITY.md).
+        [SECURITY.md](https://github.com/oyport/wafred/blob/main/SECURITY.md).
 
   - type: dropdown
     id: defect_type

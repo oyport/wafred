@@ -23,8 +23,8 @@ geo = []
 # Workspace builds strip this default and enable exactly one backend via
 # the root's own feature chain.
 default = ["openssl"]
-openssl = ["pingwaf-agent/openssl"]
-tls-rustls = ["pingwaf-agent/tls-rustls"]
+openssl = ["wafred-agent/openssl"]
+tls-rustls = ["wafred-agent/tls-rustls"]
 
 [dependencies]
 # 0.46's MSRV is 1.91; pingap's floor is 1.96 so this is fine.
@@ -61,13 +61,13 @@ pingap-cache = { workspace = true }
 pingap-config = { workspace = true }
 pingap-core = { workspace = true }
 pingap-util = { workspace = true }
-pingwaf-waf = { path = "../wafred-waf" }
-pingwaf-challenge = { path = "../wafred-challenge" }
+wafred-waf = { path = "../wafred-waf" }
+wafred-challenge = { path = "../wafred-challenge" }
 # `default-features = false` keeps the TLS backend exclusive: the agent's
 # default forwards openssl to pingap-upstream, which must never unify with
 # a rustls build of the workspace (the two pingora backends are mutually
 # exclusive). The binary's feature chain enables exactly one backend.
-pingwaf-agent = { path = "../wafred-agent", default-features = false }
+wafred-agent = { path = "../wafred-agent", default-features = false }
 pingora = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
@@ -89,18 +89,18 @@ uuid = { workspace = true }
 zstd = { workspace = true }
 
 
-pingwaf-profiler = { path = "../wafred-profiler" }
+wafred-profiler = { path = "../wafred-profiler" }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 tokio-test = { workspace = true }
 # Rule bundles are pushed to the test agent through the proto types.
-pingwaf-proto = { path = "../wafred-proto" }
+wafred-proto = { path = "../wafred-proto" }
 # Enables the test-util feature (agent instance installer + log introspection)
 # for the waf plugin access-log tests. Default features stay off for the
 # same TLS-backend exclusivity as the regular dependency above.
-pingwaf-agent = { path = "../wafred-agent", default-features = false, features = ["test-util"] }
+wafred-agent = { path = "../wafred-agent", default-features = false, features = ["test-util"] }
 
 [lints.clippy]
 # Set the unwrap_used lint level to deny

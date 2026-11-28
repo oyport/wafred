@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Value placed in the `iss` claim of every token minted here.
-pub const ISSUER: &str = "pingwaf-server";
+pub const ISSUER: &str = "wafred-server";
 
 /// `typ` claim for dashboard (human) sessions.
 pub const TOKEN_TYPE_DASHBOARD: &str = "dashboard";

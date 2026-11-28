@@ -3,8 +3,8 @@
 Two independent patrol agents look for defects on a cadence, not because
 someone filed a task. This document defines when they run, what they look at,
 how a finding is written down, and where it is tracked. It is the contract the
-agent role files (`.codebuddy/agents/pingwaf-e2e-patrol.md`,
-`.codebuddy/agents/pingwaf-design-review.md`) implement.
+agent role files (`.codebuddy/agents/wafred-e2e-patrol.md`,
+`.codebuddy/agents/wafred-design-review.md`) implement.
 
 Companion material: [e2e-test-plan.md](./e2e-test-plan.md) (scenarios,
 environments, acceptance gates), [api.md](./api.md) (contract surface),
@@ -30,7 +30,7 @@ self-certified.
 
 | | E2E patrol | Design review |
 |---|---|---|
-| Role file | `pingwaf-e2e-patrol.md` | `pingwaf-design-review.md` |
+| Role file | `wafred-e2e-patrol.md` | `wafred-design-review.md` |
 | Question | Does the product do what it claims, end to end? | Is the code shaped so it can keep doing it? |
 | Works on | a running deployment (demo or a disposable stack) + the API/edge | a commit range / working tree |
 | Finds | functional defects: wrong behaviour, wrong status, silent no-op, regression | design defects: coupling, missing extension point, duplicated policy, unrepresentable state |
@@ -38,8 +38,8 @@ self-certified.
 | Never | edits code, edits the deployment config to make a case pass, files a finding it could not reproduce | reports style preferences, files "add tests" as a defect, reviews its own author's changes |
 
 Both are **cadence-driven**: they run on the schedule in §3 even when nobody
-asked. Task-driven work still goes to the existing `pingwaf-test` (write and
-run the tests a change needs) and `pingwaf-reviewer` (review the change before
+asked. Task-driven work still goes to the existing `wafred-test` (write and
+run the tests a change needs) and `wafred-reviewer` (review the change before
 merge) roles — the patrol agents exist for what those two miss when nobody is
 looking.
 
@@ -206,7 +206,7 @@ Rules:
 |---|---|---|
 | Discover | reproduces, writes the record | — |
 | Triage | proposes severity + type | confirms or adjusts within one working day; a Blocker/High needs the Tech Lead's agreement |
-| Fix | does not fix | implements, or delegates to `pingwaf-rust-waf` / `pingwaf-frontend` |
+| Fix | does not fix | implements, or delegates to `wafred-rust-waf` / `wafred-frontend` |
 | Verify | re-runs the reproduction and the neighbouring negative cases | runs the acceptance assertion independently; two humans for a Blocker, neither of them the author |
 | Close | — | closes the issue, quoting the verifying command |
 
@@ -231,7 +231,7 @@ Rules:
 
 ## 9. Adoption checklist
 
-- [ ] `.codebuddy/agents/pingwaf-e2e-patrol.md` and `pingwaf-design-review.md`
+- [ ] `.codebuddy/agents/wafred-e2e-patrol.md` and `wafred-design-review.md`
       exist and are referenced from `CODEBUDDY.md`.
 - [ ] `.github/ISSUE_TEMPLATE/defect.yml` exists and its fields match §5.
 - [ ] The T1 hook is wired where merges are decided (CI stays green; the

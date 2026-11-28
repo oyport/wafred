@@ -9,7 +9,7 @@
 //! 2. [`ip_allowlist`] — refuses callers outside the configured ranges and
 //!    the referenced `ip_groups` row.
 //! 3. [`waf_guard`] — inspects the request with the embedded
-//!    [`pingwaf_waf`] engine and blocks (or only records, in `monitor` mode).
+//!    [`wafred_waf`] engine and blocks (or only records, in `monitor` mode).
 //!
 //! Health probes (`/healthz`, `/api/v1/health`) are exempt from all three so
 //! container and load balancer probes keep working. The policy is loaded from
@@ -45,7 +45,7 @@ use sea_orm::{
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use pingwaf_waf::{
+use wafred_waf::{
     CategorySet, RequestData, StackSet, WafAction, WafEngine, WafEngineConfig,
     WafLevel, WafMode,
 };
@@ -426,7 +426,7 @@ fn control_plane_waf(blocking: bool) -> Arc<WafEngine> {
         // The control plane's own listener gets the same safety valve as
         // the data plane: a request the engine did not finish must not read
         // as a clean pass.
-        inspection_deadline: pingwaf_waf::engine::DEFAULT_INSPECTION_DEADLINE,
+        inspection_deadline: wafred_waf::engine::DEFAULT_INSPECTION_DEADLINE,
     }));
     cache.insert(blocking, Arc::clone(&engine));
     engine

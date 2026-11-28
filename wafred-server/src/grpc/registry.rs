@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use pingwaf_proto::control_plane::{server_command::Payload, ServerCommand};
+use wafred_proto::control_plane::{server_command::Payload, ServerCommand};
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
@@ -571,14 +571,14 @@ impl AgentRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pingwaf_proto::control_plane::RestartAgentCommand;
+    use wafred_proto::control_plane::RestartAgentCommand;
 
     fn restart(reason: &str) -> ServerCommand {
         ServerCommand {
             command_id: Uuid::new_v4().to_string(),
             r#type: 7, // COMMAND_RESTART_AGENT
             issued_at: None,
-            payload: Some(pingwaf_proto::control_plane::server_command::Payload::RestartAgent(
+            payload: Some(wafred_proto::control_plane::server_command::Payload::RestartAgent(
                 RestartAgentCommand {
                     reason: reason.to_string(),
                     graceful: true,
@@ -629,7 +629,7 @@ mod tests {
     }
 
     fn update_site(hash: &str) -> ServerCommand {
-        use pingwaf_proto::control_plane::{SiteConfig, UpdateSiteCommand};
+        use wafred_proto::control_plane::{SiteConfig, UpdateSiteCommand};
         ServerCommand {
             command_id: Uuid::new_v4().to_string(),
             r#type: 2, // COMMAND_UPDATE_SITE

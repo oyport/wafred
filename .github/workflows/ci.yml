@@ -124,7 +124,7 @@ jobs:
           # matrix legs' differing metadata.
           key: ${{ matrix.toolchain }}
 
-      # pingwaf-server embeds ../web/dist/ at compile time via rust-embed. The
+      # wafred-server embeds ../web/dist/ at compile time via rust-embed. The
       # folder has to exist for the crate to build; the `web` job below verifies
       # the real bundle, so an empty placeholder is enough here.
       - name: Ensure embedded frontend directory exists

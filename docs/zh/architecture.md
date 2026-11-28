@@ -9,7 +9,7 @@
 浏览器 / 外部 MCP 客户端 / AI 助手
         │ HTTPS（Bearer JWT / API key）
         ▼
-控制面 pingwaf-server（:9080 控制台+API，:9090 gRPC）──► PostgreSQL（状态与密钥）
+控制面 wafred-server（:9080 控制台+API，:9090 gRPC）──► PostgreSQL（状态与密钥）
         │ gRPC over TLS（下发规则包 / 上报日志·事件·指标）
         ▼
 数据面 agent（:80/:443 代理流量）──► 源站

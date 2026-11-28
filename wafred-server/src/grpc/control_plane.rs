@@ -12,7 +12,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use pingwaf_proto::control_plane::{
+use wafred_proto::control_plane::{
     control_plane_server::ControlPlane as ControlPlaneTrait, AgentHeartbeat,
     BlockedIp, CertEventAck, CertEventEntry, GetSiteConfigRequest, HostSample,
     LogAck, LogEntry, Metric, MetricAck, MetricBatch, PairTunnelRequest,
@@ -866,7 +866,7 @@ impl ControlPlaneTrait for ControlPlaneService {
             credential,
             ingress,
             targets,
-            settings: Some(pingwaf_proto::control_plane::TunnelSettings {
+            settings: Some(wafred_proto::control_plane::TunnelSettings {
                 max_streams: settings.max_streams_per_session.max(1) as u32,
                 idle_timeout_secs: settings.idle_timeout_seconds.max(10) as u32,
                 heartbeat_secs: settings.heartbeat_seconds.max(5) as u32,
@@ -883,7 +883,7 @@ impl ControlPlaneTrait for ControlPlaneService {
         &self,
         request: Request<Streaming<TunnelConnectorMessage>>,
     ) -> Result<Response<Self::TunnelControlStream>, Status> {
-        use pingwaf_proto::control_plane::tunnel_connector_message;
+        use wafred_proto::control_plane::tunnel_connector_message;
 
         let mut inbound = request.into_inner();
         let first = inbound.next().await.ok_or_else(|| {
@@ -940,7 +940,7 @@ impl ControlPlaneTrait for ControlPlaneService {
                 let _ = tx
                     .send(Ok(TunnelConnectorCommand {
                         kind: Some(
-                            pingwaf_proto::control_plane::tunnel_connector_command::Kind::Config(
+                            wafred_proto::control_plane::tunnel_connector_command::Kind::Config(
                                 config,
                             ),
                         ),
@@ -951,8 +951,8 @@ impl ControlPlaneTrait for ControlPlaneService {
                 let _ = tx
                     .send(Ok(TunnelConnectorCommand {
                         kind: Some(
-                            pingwaf_proto::control_plane::tunnel_connector_command::Kind::Revoked(
-                                pingwaf_proto::control_plane::TunnelConnectorRevoked {
+                            wafred_proto::control_plane::tunnel_connector_command::Kind::Revoked(
+                                wafred_proto::control_plane::TunnelConnectorRevoked {
                                     message: "the tunnel was deleted".to_string(),
                                 },
                             ),
@@ -2006,10 +2006,10 @@ async fn persist_heartbeat(
     message: &AgentHeartbeat,
     registry: &AgentRegistry,
 ) {
-    // Method attribution (see pingwaf-profiler): the timer books the `db`
+    // Method attribution (see wafred-profiler): the timer books the `db`
     // module row as well.
-    let _profile = pingwaf_profiler::timed_method(
-        pingwaf_profiler::Method::DbPersistHeartbeat,
+    let _profile = wafred_profiler::timed_method(
+        wafred_profiler::Method::DbPersistHeartbeat,
     );
     // Server time, not the agent's clock: liveness thresholds compare
     // `last_heartbeat` against Utc::now(), so trusting the reported timestamp
@@ -3345,15 +3345,15 @@ async fn flush(
 ) -> Result<(), Status> {
     if !access.is_empty() {
         let rows = std::mem::take(access);
-        let _timer = pingwaf_profiler::timed_method(
-            pingwaf_profiler::Method::DbPersistLogs,
+        let _timer = wafred_profiler::timed_method(
+            wafred_profiler::Method::DbPersistLogs,
         );
         insert_access_chunks(db, rows).await?;
     }
     if !events.is_empty() {
         let rows = std::mem::take(events);
-        let _timer = pingwaf_profiler::timed_method(
-            pingwaf_profiler::Method::DbPersistEvents,
+        let _timer = wafred_profiler::timed_method(
+            wafred_profiler::Method::DbPersistEvents,
         );
         insert_event_chunks(db, rows).await?;
     }

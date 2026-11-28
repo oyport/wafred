@@ -50,7 +50,7 @@ compose は `ghcr.io/oyport/wafred:latest` を all-in-one モードで `postgres
 | `cmake` | 比較的新しいもの | TLS バックエンド |
 | PostgreSQL | 14+。ネイティブインストールはディストリビューションのパッケージ名に従う（Ubuntu 24.04 は `postgresql-16`、26.04 は `postgresql-18`） | コントロールプレーンの保存先 |
 
-`protoc` がないと `pingwaf-proto` がプレースホルダを書き出し、後続のクレートがビルドできません。
+`protoc` がないと `wafred-proto` がプレースホルダを書き出し、後続のクレートがビルドできません。
 
 ```bash
 cd web && npm ci && npm run build && cd ..

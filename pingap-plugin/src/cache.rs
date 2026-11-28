@@ -39,11 +39,11 @@ use pingora::cache::predictor::{CacheablePredictor, Predictor};
 use pingora::http::RequestHeader;
 use pingora::http::ResponseHeader;
 use pingora::proxy::Session;
-use pingwaf_agent::WafredAgent;
-use pingwaf_agent::cache::{
+use wafred_agent::WafredAgent;
+use wafred_agent::cache::{
     CacheRule as AgentCacheRule, CacheTypeCategory, SiteRules as AgentSiteRules,
 };
-use pingwaf_waf::rules::{
+use wafred_waf::rules::{
     EvalContext, Expression, FieldKind, evaluate, parse_expression,
 };
 use std::borrow::Cow;
@@ -839,11 +839,11 @@ impl Plugin for Cache {
         if step != self.plugin_step {
             return Ok(RequestPluginResult::Skipped);
         }
-        // Method attribution (see pingwaf-profiler): the timer books the
+        // Method attribution (see wafred-profiler): the timer books the
         // `cache` module row as well. Fully qualified because `Method` here
         // is `http::Method`.
-        let _profile = pingwaf_profiler::timed_method(
-            pingwaf_profiler::Method::CacheHandleRequest,
+        let _profile = wafred_profiler::timed_method(
+            wafred_profiler::Method::CacheHandleRequest,
         );
 
         // Cache operations only support GET/HEAD for retrieval and PURGE for invalidation
@@ -1156,7 +1156,7 @@ mod tests {
     use pingap_config::PluginConf;
     use pingap_core::{Ctx, PluginStep};
     use pingora::proxy::Session;
-    use pingwaf_proto::control_plane as proto;
+    use wafred_proto::control_plane as proto;
     use pretty_assertions::assert_eq;
     use tokio_test::io::Builder;
 
@@ -1626,7 +1626,7 @@ purge_ip_list = ["192.168.1.1"]
             site_id: "site-1".into(),
             domain: "example.com".into(),
             alternate_domains: vec![],
-            status: pingwaf_agent::cache::SiteStatus::Active,
+            status: wafred_agent::cache::SiteStatus::Active,
             downstream_timeout_secs: 60,
             waf_config: None,
             rate_limit_rules: vec![],
@@ -1642,7 +1642,7 @@ purge_ip_list = ["192.168.1.1"]
             bot_protection: None,
             basic_auth: None,
             observation_mode: false,
-            proxy_trust: pingwaf_agent::cache::ProxyTrustConfig::default(),
+            proxy_trust: wafred_agent::cache::ProxyTrustConfig::default(),
             cache_settings: None,
             response_replace: None,
             ai_crawl: None,
@@ -1729,7 +1729,7 @@ purge_ip_list = ["192.168.1.1"]
         assert_eq!(None, compiled.max_file_size);
         assert!(compiled.type_limits.is_empty());
 
-        site.cache_settings = Some(pingwaf_agent::cache::SiteCacheSettings {
+        site.cache_settings = Some(wafred_agent::cache::SiteCacheSettings {
             max_file_size_mb: Some(8),
             type_max_file_size_mb: [
                 ("image".to_string(), 20),
@@ -1751,7 +1751,7 @@ purge_ip_list = ["192.168.1.1"]
 
     #[test]
     fn test_policy_category_compilation() {
-        use pingwaf_agent::cache::{CacheTypeCategory, CacheTypePolicy};
+        use wafred_agent::cache::{CacheTypeCategory, CacheTypePolicy};
 
         let policy = CacheTypePolicy {
             web_assets: Some(CacheTypeCategory {
@@ -1775,7 +1775,7 @@ purge_ip_list = ["192.168.1.1"]
         };
         let site = agent_site_rules(Vec::new());
         let mut site = site;
-        site.cache_settings = Some(pingwaf_agent::cache::SiteCacheSettings {
+        site.cache_settings = Some(wafred_agent::cache::SiteCacheSettings {
             max_file_size_mb: None,
             type_max_file_size_mb: HashMap::new(),
             type_policy: Some(policy),

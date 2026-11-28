@@ -393,7 +393,7 @@ fn wildcard_covers(cert: &str, host: &str) -> bool {
 }
 
 /// Multi-label wildcard suffix check, mirroring the data-plane
-/// `lookup_with_wildcard` (pingwaf-agent cache): a site wildcard
+/// `lookup_with_wildcard` (wafred-agent cache): a site wildcard
 /// `*.example.com` covers any depth of subdomain (`a.example.com`,
 /// `a.b.example.com`) but not the parent `example.com` itself.
 fn site_wildcard_covers(site: &str, cert: &str) -> bool {

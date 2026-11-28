@@ -319,7 +319,7 @@ pub fn apply() {
 
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let total = pingwaf_system::total_bytes();
+        let total = wafred_system::total_bytes();
         // Below 1 GiB, `reserve_os_memory` is pure risk — it is a second
         // reservation on top of the arena — so it is forced to 0 there even if
         // an operator asked for it. Its default is already 0 (v3 options.c:76),

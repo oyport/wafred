@@ -160,18 +160,19 @@ The separate three-minute Strict + body soak at 256 concurrent requests complete
 
 | Crate | Responsibility |
 | --- | --- |
-| [`pingwaf-proto`](./wafred-proto) | Control-plane gRPC protocol definitions (single source: `control_plane.proto`) |
-| [`pingwaf-server`](./wafred-server) | Control plane: Axum REST + tonic gRPC + SeaORM/PostgreSQL + ES logs + embedded frontend + agent health monitoring |
+| [`wafred-proto`](./wafred-proto) | Control-plane gRPC protocol definitions (single source: `control_plane.proto`) |
+| [`wafred-server`](./wafred-server) | Control plane: Axum REST + tonic gRPC + SeaORM/PostgreSQL + ES logs + embedded frontend + agent health monitoring |
 | [`wafred-agent`](./wafred-agent) | Data-plane agent: connects to the control plane, caches rules with disk persistence, ships logs/metrics, receives commands |
-| [`pingwaf-waf`](./wafred-waf) | Detection engine: normalize → signatures → expression → anomaly score |
-| [`pingwaf-challenge`](./wafred-challenge) | Dynamic challenges: JS 5-second shield, interactive challenge, PoW, fingerprinting, HMAC clearance cookies |
-| `pingwaf-profiler` / `pingwaf-system` (no README) | In-process CPU/memory attribution and snapshots served at `/api/v1/system/profile` and `/api/v1/system/metrics` |
+| [`wafred-waf`](./wafred-waf) | Detection engine: normalize → signatures → expression → anomaly score |
+| [`wafred-challenge`](./wafred-challenge) | Dynamic challenges: JS 5-second shield, interactive challenge, PoW, fingerprinting, HMAC clearance cookies |
+| `wafred-profiler` / `wafred-system` (no README) | In-process CPU/memory attribution and snapshots served at `/api/v1/system/profile` and `/api/v1/system/metrics` |
 
-The `pingwaf-*` crate names and source paths remain as inherited internal
-structure. Runtime identifiers have moved to WAFred: command and environment
-names, service/account names, configuration and data paths, database/index
+WAFred-owned Rust crates and source directories use the `wafred-*` namespace.
+The proxy stack retains its `pingap-*` namespace because it derives from the
+PingAP codebase. Runtime identifiers use WAFred names: commands and environment
+variables, service/account names, configuration and data paths, database/index
 identifiers, and managed rule IDs. Existing PingWAF installations require a
-manual migration; the old runtime identifiers are not read automatically.
+manual migration; old runtime identifiers are not read automatically.
 
 ---
 
@@ -294,7 +295,7 @@ WAFRED_CONFIG=/etc/wafred/wafred.toml wafred all-in-one   # equivalent
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please read **[CONTRIBUTING.md](./CONTRIBUTING.md)** before opening a pull request, and **[SECURITY.md](./SECURITY.md)** for how to responsibly report a vulnerability — privately, via [GitHub private vulnerability reporting](https://github.com/shuaiZend/PingWAF/security/advisories/new) or `security@pingwaf.com`. Never report a vulnerability in a public issue.
+Contributions are welcome! Please read **[CONTRIBUTING.md](./CONTRIBUTING.md)** before opening a pull request, and **[SECURITY.md](./SECURITY.md)** for how to responsibly report a vulnerability — privately, via [WAFred's GitHub private vulnerability reporting](https://github.com/oyport/wafred/security/advisories/new). Never report a vulnerability in a public issue.
 
 ---
 

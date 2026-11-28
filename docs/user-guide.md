@@ -474,7 +474,7 @@ Both limits are per host+IP over a 60-second window, and both apply to every
 challenge the site can mint — the CC gate and a WAF rule / IP-geo rule / bot /
 rate-limit challenge alike, which all use the site's difficulty and the same
 budget. Above the issuance limit the visitor gets a `429` rate-limit page
-instead of a challenge page (it carries `x-pingwaf-mitigated: block`), so the
+instead of a challenge page (it carries `x-wafred-mitigated: block`), so the
 challenge endpoint cannot be used as an amplifier. Above the verification limit
 the submission is refused with `429` before any work is done, and the pending
 challenge is left intact — a legitimate visitor can still complete it once the

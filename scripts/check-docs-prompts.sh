@@ -79,12 +79,12 @@ check_rules() {
     [ -e "$rule" ] || continue
     grep -q '^description:' "$rule" || fail "$rule: missing description"
     grep -q '^enabled:' "$rule" || fail "$rule: missing enabled flag"
-    if [ "$(basename "$(dirname "$rule")")" = "pingwaf-multi-agent" ]; then
+    if [ "$(basename "$(dirname "$rule")")" = "wafred-multi-agent" ]; then
       # Roster rows reference agent files and model names.
       local ref model
       while read -r ref; do
         [ -e ".codebuddy/agents/$ref" ] || fail "$rule: roster references missing agent file '$ref'"
-      done < <(grep -o '`pingwaf-[a-z-]*\.md`' "$rule" | tr -d '`' | sort -u)
+      done < <(grep -o '`wafred-[a-z-]*\.md`' "$rule" | tr -d '`' | sort -u)
       while read -r model; do
         grep -qw "$model" <<<"$ALLOWED_MODELS" || fail "$rule: roster model '$model' not in ($ALLOWED_MODELS)"
       done < <(grep -Eo '(DeepSeek-V4\.1-Flash|GLM-5\.3-FlashX|GLM-5\.3-Flash)' "$rule" | sort -u)
@@ -136,7 +136,7 @@ else
 fi
 
 echo "== agent frontmatter =="
-for f in .codebuddy/agents/pingwaf-*.md; do
+for f in .codebuddy/agents/wafred-*.md; do
   [ -e "$f" ] && check_agent "$f"
 done
 echo "== rules =="

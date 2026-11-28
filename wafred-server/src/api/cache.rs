@@ -9,8 +9,8 @@ use axum::routing::{get, post, put};
 use axum::Json;
 use axum::Router;
 use chrono::{DateTime, Utc};
-use pingwaf_proto::control_plane::server_command::Payload as CommandPayload;
-use pingwaf_proto::control_plane::{PurgeCacheCommand, ServerCommand};
+use wafred_proto::control_plane::server_command::Payload as CommandPayload;
+use wafred_proto::control_plane::{PurgeCacheCommand, ServerCommand};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait,
     QueryFilter, QueryOrder, Set,

@@ -18,7 +18,7 @@
 //! heartbeat/log shipping and the pingap proxy that enforces the synced rules.
 //! It deliberately does **not** declare `admin` (the PostgreSQL maintenance
 //! commands) or the pingap admin plugin (which embeds the dashboard), and the
-//! server-only branches of `cli`/`pingwaf` are compiled out by the `edge`
+//! server-only branches of `cli`/`wafred` are compiled out by the `edge`
 //! feature. The release pipeline builds it as a separate archive so an edge
 //! node never downloads or maps the control plane's code and assets.
 //!

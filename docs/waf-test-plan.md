@@ -22,7 +22,7 @@ A WAF block (403) or challenge (503) counts as intercepted. The same responses o
 ## Repeatable checks
 
 - Replayer framing tests: python tools/waf-bench/test_replay.py
-- Rust WAF tests: cargo test -p pingwaf-waf
+- Rust WAF tests: cargo test -p wafred-waf
 - Formatting: cargo fmt --all -- --check
 - Site content, build and internal links: run npm run verify from site/
 

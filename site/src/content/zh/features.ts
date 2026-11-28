@@ -123,7 +123,7 @@ const features = {
       scene: {
         id: "agents",
         caption: "隧道与边缘节点在同一页管理：配对、会话与限制。",
-        alt: "PingWAF 控制台中的隧道标签页",
+        alt: "WAFred 控制台中的隧道标签页",
       },
     },
     {

@@ -45,7 +45,7 @@ Le compose démarre `ghcr.io/oyport/wafred:latest` en all-in-one à côté de `p
 | `cmake` | récent | Backend TLS |
 | PostgreSQL | 14+ (16 recommandé) | Stockage du plan de contrôle |
 
-Sans `protoc`, `pingwaf-proto` écrit des fichiers factices et les crates suivants ne compilent pas.
+Sans `protoc`, `wafred-proto` écrit des fichiers factices et les crates suivants ne compilent pas.
 
 ```bash
 cd web && npm ci && npm run build && cd ..

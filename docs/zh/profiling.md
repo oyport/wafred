@@ -101,7 +101,7 @@ curl -k -H "Authorization: Bearer $TOKEN" \
 
 ## `GET /api/v1/system/profile`
 
-按模块与方法的墙钟耗时/内存归因。这**不是**采样剖析——它是纯 Rust 插桩（`pingwaf-profiler`）：了解自己在做什么的代码，自己记账。
+按模块与方法的墙钟耗时/内存归因。这**不是**采样剖析——它是纯 Rust 插桩（`wafred-profiler`）：了解自己在做什么的代码，自己记账。
 
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \

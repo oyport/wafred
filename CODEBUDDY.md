@@ -6,11 +6,11 @@
 
 WAFred：基于 `pingap`（Cloudflare Pingora 反向代理）的分布式、集中管控 Web 应用防火墙。
 
-- **控制面** `pingwaf-server`：Axum REST API + tonic gRPC + SeaORM/PostgreSQL，内嵌 `web/` 控制台（rust-embed）
+- **控制面** `wafred-server`：Axum REST API + tonic gRPC + SeaORM/PostgreSQL，内嵌 `web/` 控制台（rust-embed）
 - **数据面** `wafred-agent`：gRPC 双向流同步规则（arc-swap 热更新）
-- **WAF 引擎** `pingwaf-waf`：normalize → 签名（libinjection/Aho-Corasick）→ 表达式 → 异常评分
+- **WAF 引擎** `wafred-waf`：normalize → 签名（libinjection/Aho-Corasick）→ 表达式 → 异常评分
 - **协议真源** `wafred-proto/proto/control_plane.proto`
-- `pingap-*` 系列 crate 是真实存在的代理底座（**不是**过时名称）；`pingwaf-*` 是 WAF 层
+- `pingap-*` 系列 crate 是真实存在的代理底座（**不是**过时名称）；`wafred-*` 是 WAF 层
 - MSRV 1.96.0 / edition 2024；前端 React 19 + Vite + TS + Tailwind 4 + TanStack Query，i18n 三语（en/ja/zh）
 
 ## 常用命令
@@ -25,9 +25,9 @@ cd web && npx tsc -b && npx vitest run   # 前端类型检查与测试
 
 ## 多 Agent 协作（Tech Lead 必读）
 
-本项目配置了 12 角色协作团队，角色定义在 `.codebuddy/agents/`（12 个文件），协作协议见项目规则 `pingwaf-multi-agent`。其中 `pingwaf-e2e-patrol` 与 `pingwaf-design-review` 是**节奏驱动**的巡检角色（不是任务驱动）：触发时机、检查维度、缺陷记录格式与人工复核流程见 [docs/quality-patrol.md](./docs/quality-patrol.md)。要点：
+本项目配置了 12 角色协作团队，角色定义在 `.codebuddy/agents/`（12 个文件），协作协议见项目规则 `wafred-multi-agent`。其中 `wafred-e2e-patrol` 与 `wafred-design-review` 是**节奏驱动**的巡检角色（不是任务驱动）：触发时机、检查维度、缺陷记录格式与人工复核流程见 [docs/quality-patrol.md](./docs/quality-patrol.md)。要点：
 
-1. 主会话（你）= Tech Lead：拆分任务 → 只读调查可并行（批量子代理调用）→ 跨模块改动先冻结接口 → 涉及用户可见变更时按文档同步工作流委派 `pingwaf-doc-prompt`（`make check-docs` 为文档/提示词门禁）→ 集成后强制独立审查（Code Reviewer + Security Reviewer）。
+1. 主会话（你）= Tech Lead：拆分任务 → 只读调查可并行（批量子代理调用）→ 跨模块改动先冻结接口 → 涉及用户可见变更时按文档同步工作流委派 `wafred-doc-prompt`（`make check-docs` 为文档/提示词门禁）→ 集成后强制独立审查（Code Reviewer + Security Reviewer）。
 2. 子代理通过 `task` 工具调度；用 `subagent_path` 指向 `.codebuddy/agents/<role>.md` 注入角色。
 3. 模型路由意图表（会话内无法程序化指定模型，需用户在 IDE 模型选择器中为准）：
 

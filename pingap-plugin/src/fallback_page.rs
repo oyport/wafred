@@ -37,7 +37,7 @@ use pingap_core::{
     Ctx, HttpResponse, Plugin, PluginStep, RequestPluginResult, get_host,
 };
 use pingora::proxy::Session;
-use pingwaf_challenge::generate_request_id;
+use wafred_challenge::generate_request_id;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -112,7 +112,7 @@ mod webhook;
 //
 // There is exactly one allocator in every build: the diagnostic jemalloc
 // image (and with it the pprof heap-dump path) was removed on 2026-10-19.
-// CPU/memory attribution now comes from `pingwaf-profiler`, which does not
+// CPU/memory attribution now comes from `wafred-profiler`, which does not
 // depend on the allocator at all.
 #[cfg(not(feature = "dhat"))]
 #[global_allocator]
@@ -643,7 +643,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     if args.cp {
         return Err(
             "the agent-only edge build has no pingap admin console; use the \
-             all-in-one pingwaf binary for --cp"
+             all-in-one wafred binary for --cp"
                 .into(),
         );
     }
@@ -860,7 +860,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     // Wire the upstream provider into the agent so heartbeats carry
     // per-backend health; the control plane turns sustained loss into
     // site.upstream_offline / site.upstream_abnormal alerts.
-    pingwaf_agent::upstream_health::set_upstream_provider(
+    wafred_agent::upstream_health::set_upstream_provider(
         new_upstream_provider(),
     );
     // Wire upstreams into Prometheus scrapes for per-backend gauges.

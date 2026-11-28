@@ -32,7 +32,7 @@
 //! * The password and its hash never leave this module: the response carries
 //!   an identity and a token version, and nothing else.
 
-use pingwaf_proto::control_plane::{
+use wafred_proto::control_plane::{
     VisitorChallengeRequest, VisitorChallengeResponse,
     VisitorChangePasswordRequest, VisitorChangePasswordResponse, VisitorGrant,
     VisitorGrantsRequest, VisitorGrantsResponse, VisitorLoginRequest,
@@ -289,7 +289,7 @@ pub(crate) async fn visitor_login(
     let challenge =
         consume_challenge(service, &payload.challenge_id, &site_row.domain)
             .await?;
-    if !pingwaf_challenge::js_challenge::verify::verify_proof_of_work(
+    if !wafred_challenge::js_challenge::verify::verify_proof_of_work(
         &challenge.nonce,
         &payload.solution,
         challenge.difficulty,
@@ -299,7 +299,7 @@ pub(crate) async fn visitor_login(
             "Verification failed. Reload the page and try again.",
         )));
     }
-    if !pingwaf_challenge::js_challenge::verify::verify_timestamp(
+    if !wafred_challenge::js_challenge::verify::verify_timestamp(
         payload.timestamp,
         CHALLENGE_TTL_SECONDS,
     ) {
