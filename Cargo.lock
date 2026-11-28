@@ -3774,9 +3774,9 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "maxminddb"
-version = "0.32.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b43d2458d977b610b04a3858e6504f06133663d303a1a0606601b530bfc9bc6"
+checksum = "317d6b918ba3893345af072f52cb56bcfcb532a9d0ebcf861ab3c25b37a316ac"
 dependencies = [
  "ipnetwork",
  "memchr",
@@ -4986,7 +4986,6 @@ dependencies = [
  "path-absolutize",
  "pingap-core",
  "pingora",
- "wafred-profiler",
  "pretty_assertions",
  "prometheus",
  "scopeguard",
@@ -4999,6 +4998,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
+ "wafred-profiler",
  "walkdir",
 ]
 
@@ -5300,11 +5300,6 @@ dependencies = [
  "pingap-core",
  "pingap-util",
  "pingora",
- "wafred-agent",
- "wafred-challenge",
- "wafred-profiler",
- "wafred-proto",
- "wafred-waf",
  "pretty_assertions",
  "rand 0.10.4",
  "regex",
@@ -5325,6 +5320,11 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "wafred-agent",
+ "wafred-challenge",
+ "wafred-profiler",
+ "wafred-proto",
+ "wafred-waf",
  "zstd",
 ]
 
@@ -5354,7 +5354,6 @@ dependencies = [
  "pingap-upstream",
  "pingap-util",
  "pingora",
- "wafred-profiler",
  "pretty_assertions",
  "scopeguard",
  "snafu",
@@ -5362,6 +5361,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
+ "wafred-profiler",
 ]
 
 [[package]]
@@ -5741,168 +5741,6 @@ dependencies = [
  "pin-project-lite",
  "thread_local",
  "tokio",
-]
-
-[[package]]
-name = "wafred-agent"
-version = "1.0.7"
-dependencies = [
- "anyhow",
- "arc-swap",
- "chrono",
- "crc32fast",
- "dashmap 6.2.1",
- "ipnet",
- "pingap-cache",
- "pingap-core",
- "pingap-upstream",
- "wafred-profiler",
- "wafred-proto",
- "prost-types",
- "rand 0.10.4",
- "reqwest 0.13.5",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "tempfile",
- "tokio",
- "tokio-stream",
- "toml",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "wafred-tunnel",
-]
-
-[[package]]
-name = "wafred-challenge"
-version = "1.0.7"
-dependencies = [
- "anyhow",
- "base64 0.23.1",
- "chrono",
- "hex",
- "hmac 0.13.0",
- "wafred-waf",
- "rand 0.10.4",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "tracing",
-]
-
-[[package]]
-name = "wafred-profiler"
-version = "1.0.7"
-dependencies = [
- "pretty_assertions",
- "serde",
- "tracing",
-]
-
-[[package]]
-name = "wafred-proto"
-version = "1.0.7"
-dependencies = [
- "prost",
- "prost-types",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
-]
-
-[[package]]
-name = "wafred-server"
-version = "1.0.7"
-dependencies = [
- "anyhow",
- "arc-swap",
- "argon2",
- "async-trait",
- "axum",
- "base64 0.23.1",
- "bcrypt",
- "chrono",
- "chrono-tz",
- "futures-util",
- "hex",
- "hmac 0.13.0",
- "ipnet",
- "jsonwebtoken",
- "lettre",
- "maxminddb",
- "passkey-server",
- "pingap-config",
- "wafred-challenge",
- "wafred-profiler",
- "wafred-proto",
- "wafred-system",
- "wafred-waf",
- "pretty_assertions",
- "prost",
- "prost-types",
- "rand 0.10.4",
- "rcgen",
- "regex",
- "reqwest 0.13.5",
- "ring",
- "rust-embed",
- "rustls",
- "rustls-pemfile",
- "sea-orm",
- "sea-orm-migration",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "sysinfo",
- "tempfile",
- "thiserror 2.0.21",
- "time",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "toml",
- "tonic",
- "tower",
- "tower-http 0.7.1",
- "tracing",
- "urlencoding",
- "uuid",
- "wafred-tunnel",
- "x509-parser 0.18.1",
- "zstd",
-]
-
-[[package]]
-name = "wafred-system"
-version = "1.0.7"
-dependencies = [
- "bytesize",
- "memory-stats",
- "pretty_assertions",
- "serde",
- "serde_json",
- "sysinfo",
-]
-
-[[package]]
-name = "wafred-waf"
-version = "1.0.7"
-dependencies = [
- "ahash",
- "aho-corasick",
- "anyhow",
- "base64 0.23.1",
- "bytes",
- "flate2",
- "ipnet",
- "once_cell",
- "wafred-profiler",
- "regex",
- "serde",
- "serde_json",
- "tracing",
 ]
 
 [[package]]
@@ -9049,9 +8887,6 @@ dependencies = [
  "pingap-util",
  "pingap-webhook",
  "pingora",
- "wafred-agent",
- "wafred-server",
- "wafred-system",
  "pretty_assertions",
  "rcgen",
  "regex",
@@ -9076,7 +8911,153 @@ dependencies = [
  "uuid",
  "vergen",
  "vergen-git2",
+ "wafred-agent",
+ "wafred-server",
+ "wafred-system",
  "wafred-tunnel",
+]
+
+[[package]]
+name = "wafred-agent"
+version = "1.0.7"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "chrono",
+ "crc32fast",
+ "dashmap 6.2.1",
+ "ipnet",
+ "pingap-cache",
+ "pingap-core",
+ "pingap-upstream",
+ "prost-types",
+ "rand 0.10.4",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "wafred-profiler",
+ "wafred-proto",
+ "wafred-tunnel",
+]
+
+[[package]]
+name = "wafred-challenge"
+version = "1.0.7"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "chrono",
+ "hex",
+ "hmac 0.13.0",
+ "rand 0.10.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tracing",
+ "wafred-waf",
+]
+
+[[package]]
+name = "wafred-profiler"
+version = "1.0.7"
+dependencies = [
+ "pretty_assertions",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "wafred-proto"
+version = "1.0.7"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
+name = "wafred-server"
+version = "1.0.7"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "argon2",
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "bcrypt",
+ "chrono",
+ "chrono-tz",
+ "futures-util",
+ "hex",
+ "hmac 0.13.0",
+ "ipnet",
+ "jsonwebtoken",
+ "lettre",
+ "maxminddb",
+ "passkey-server",
+ "pingap-config",
+ "pretty_assertions",
+ "prost",
+ "prost-types",
+ "rand 0.10.4",
+ "rcgen",
+ "regex",
+ "reqwest 0.13.5",
+ "ring",
+ "rust-embed",
+ "rustls",
+ "rustls-pemfile",
+ "sea-orm",
+ "sea-orm-migration",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "sysinfo",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "toml",
+ "tonic",
+ "tower",
+ "tower-http 0.7.1",
+ "tracing",
+ "urlencoding",
+ "uuid",
+ "wafred-challenge",
+ "wafred-profiler",
+ "wafred-proto",
+ "wafred-system",
+ "wafred-tunnel",
+ "wafred-waf",
+ "x509-parser 0.18.1",
+ "zstd",
+]
+
+[[package]]
+name = "wafred-system"
+version = "1.0.7"
+dependencies = [
+ "bytesize",
+ "memory-stats",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sysinfo",
 ]
 
 [[package]]
@@ -9089,7 +9070,6 @@ dependencies = [
  "futures",
  "hex",
  "hyper-util",
- "wafred-proto",
  "rand 0.10.4",
  "rcgen",
  "ring",
@@ -9108,8 +9088,28 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "wafred-proto",
  "x509-parser 0.18.1",
  "yamux",
+]
+
+[[package]]
+name = "wafred-waf"
+version = "1.0.7"
+dependencies = [
+ "ahash",
+ "aho-corasick",
+ "anyhow",
+ "base64 0.23.1",
+ "bytes",
+ "flate2",
+ "ipnet",
+ "once_cell",
+ "regex",
+ "serde",
+ "serde_json",
+ "tracing",
+ "wafred-profiler",
 ]
 
 [[package]]
