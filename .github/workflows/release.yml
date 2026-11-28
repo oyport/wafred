@@ -356,7 +356,7 @@ jobs:
       # Signed SLSA provenance for both archives: consumers can verify with
       # `gh attestation verify wafred-linux-amd64.tar.gz --repo <repo>`.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             wafred-${{ matrix.plat }}-${{ matrix.arch }}.tar.xz
