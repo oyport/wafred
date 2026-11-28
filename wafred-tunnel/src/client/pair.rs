@@ -7,11 +7,11 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use tokio::sync::mpsc;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use wafred_proto::control_plane::{
     self as proto, control_plane_client::ControlPlaneClient as ProtoClient,
 };
-use tokio::sync::mpsc;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 use crate::socks5::Socks5Proxy;
 

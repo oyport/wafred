@@ -35,6 +35,7 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
+use regex::Regex;
 use wafred_profiler::ProfileSnapshot;
 use wafred_waf::normalize::{normalize_request, ValueSource};
 use wafred_waf::rules::managed::default_managed_rules;
@@ -46,7 +47,6 @@ use wafred_waf::{
     CompiledRule, RequestData, RuleAction, StackSet, WafEngine,
     WafEngineConfig, WafLevel,
 };
-use regex::Regex;
 
 // ---------------------------------------------------------------------------
 // Counting global allocator

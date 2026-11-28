@@ -36,13 +36,13 @@ use pingap_core::{
     protect_from_connection_header, resolve_scheme_with_trust,
 };
 use pingora::proxy::Session;
-use wafred_agent::{SecurityEvent, WafredAgent};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
+use wafred_agent::{SecurityEvent, WafredAgent};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 

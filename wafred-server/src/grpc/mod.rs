@@ -22,14 +22,14 @@ pub use registry::{
 };
 pub use tunnel_registry::TUNNEL_CONNECTORS;
 
-use wafred_proto::control_plane::{
-    server_command::Payload, ServerCommand, SiteConfig, UpdateSiteCommand,
-};
 use sea_orm::{
     ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter,
 };
 use std::collections::HashMap;
 use uuid::Uuid;
+use wafred_proto::control_plane::{
+    server_command::Payload, ServerCommand, SiteConfig, UpdateSiteCommand,
+};
 
 use crate::api::agents::command_type;
 use crate::api::state::AppState;

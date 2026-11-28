@@ -44,13 +44,13 @@ use pingap_core::{
     get_host,
 };
 use pingora::proxy::Session;
-use wafred_agent::WafredAgent;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
+use wafred_agent::WafredAgent;
 
 use super::{
     Error, get_hash_key, get_step_conf, get_str_conf, get_str_slice_conf,

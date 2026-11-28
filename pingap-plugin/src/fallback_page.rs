@@ -37,12 +37,12 @@ use pingap_core::{
     Ctx, HttpResponse, Plugin, PluginStep, RequestPluginResult, get_host,
 };
 use pingora::proxy::Session;
-use wafred_challenge::generate_request_id;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tera::{Context, Tera};
 use tracing::{debug, warn};
+use wafred_challenge::generate_request_id;
 
 /// Plugin category name used in error messages and factory registration.
 pub const CATEGORY: &str = "fallback_page";

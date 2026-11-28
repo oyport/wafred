@@ -53,6 +53,15 @@ use pingap_core::{
 use pingap_util::{IpRules, base64_decode};
 use pingora::http::{ResponseHeader, Version};
 use pingora::proxy::Session;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::time::{Duration, Instant};
+use tor_geoip::GeoipDb;
+use tracing::{debug, warn};
 use wafred_agent::body_budget::{BodyBudget, LOG_BODY_BUDGET_BYTES};
 use wafred_agent::cache::{
     AiCrawlConfig as CacheAiCrawlConfig,
@@ -78,15 +87,6 @@ use wafred_waf::{
     StackSet, WafAction, WafEngine, WafEngineConfig, WafLevel, WafMode,
     WafVerdict,
 };
-use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
-use std::time::{Duration, Instant};
-use tor_geoip::GeoipDb;
-use tracing::{debug, warn};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -6374,9 +6374,8 @@ impl Plugin for WafPlugin {
         };
         // Body staging is the one WAF stage that can hold megabytes per
         // in-flight request, so it gets its own module and method row.
-        let _body_timer = wafred_profiler::timed_method(
-            wafred_profiler::Method::WafBodyRead,
-        );
+        let _body_timer =
+            wafred_profiler::timed_method(wafred_profiler::Method::WafBodyRead);
         let staged_bytes =
             entry.buffer.len() + body.as_ref().map_or(0, |chunk| chunk.len());
         let _body_memory = wafred_profiler::track_method_memory(
@@ -6879,6 +6878,7 @@ pub(crate) mod tests {
     use pingap_core::PluginStep;
     use pingap_util::base64_encode;
     use pingora::proxy::Session;
+    use tokio_test::io::Builder;
     use wafred_agent::cache::RuleCache;
     use wafred_agent::cache::WafRule;
     use wafred_agent::client::ControlPlaneClient;
@@ -6886,7 +6886,6 @@ pub(crate) mod tests {
     use wafred_agent::heartbeat::MetricsCollector;
     use wafred_challenge::ClearanceLevel;
     use wafred_proto::control_plane as proto;
-    use tokio_test::io::Builder;
 
     #[test]
     fn path_restrictions_use_canonical_paths_and_enforce_thresholds() {

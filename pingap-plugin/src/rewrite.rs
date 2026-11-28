@@ -52,11 +52,6 @@ use pingap_core::{
 };
 use pingora::http::ResponseHeader;
 use pingora::proxy::Session;
-use wafred_agent::WafredAgent;
-use wafred_agent::cache::{
-    RewriteDirection as CacheRewriteDirection,
-    RewriteOperation as CacheRewriteOperation, RewriteRule as CacheRewriteRule,
-};
 use regex::Regex;
 use serde::Deserialize;
 use std::borrow::Cow;
@@ -64,6 +59,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tracing::{debug, warn};
+use wafred_agent::WafredAgent;
+use wafred_agent::cache::{
+    RewriteDirection as CacheRewriteDirection,
+    RewriteOperation as CacheRewriteOperation, RewriteRule as CacheRewriteRule,
+};
 
 use crate::host_cache::{HostCacheSweep, touch};
 
@@ -2084,8 +2084,8 @@ rules = '[{"id":"zeros","direction":"request","operations":[{"type":"regex_repla
     mod agent_mode {
         use super::*;
         use crate::waf::tests::install_test_agent;
-        use wafred_proto::control_plane as proto;
         use pretty_assertions::assert_eq;
+        use wafred_proto::control_plane as proto;
 
         fn site_config(
             rewrite_rules: Vec<proto::RewriteRule>,

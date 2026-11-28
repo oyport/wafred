@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [WAFred 1.0.7] - 2026-11-28
+
+### Fixed
+
+- Run the Rust formatter across the WAFred crate-name migration so import
+  ordering and formatted expressions pass the stable-toolchain CI check.
+
 ## [WAFred 1.0.6] - 2026-11-28
 
 ### Changed

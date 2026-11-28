@@ -15,10 +15,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use wafred_proto::control_plane::SiteStatus;
 use serde::Serialize;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+use wafred_proto::control_plane::SiteStatus;
 
 /// Aggregated cache usage of one site across every edge that reported it.
 #[derive(Debug, Clone, Serialize, PartialEq)]

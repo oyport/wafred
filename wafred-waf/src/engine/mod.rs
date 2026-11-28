@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use wafred_profiler::{record_method, track_memory, Method, Module};
 use serde::{Deserialize, Serialize};
+use wafred_profiler::{record_method, track_memory, Method, Module};
 
 use crate::normalize::ValueSource;
 use crate::normalize::{normalize_request, NormalizedRequest};

@@ -64,9 +64,9 @@ pub(crate) fn validate_expression(expression: &str) -> Result<(), ApiError> {
     }
     let parsed = wafred_waf::rules::expression::parse_expression(expression)
         .map_err(|err| {
-        ApiError::BadRequest(format!("expression is not valid: {err}"))
-            .with_code(EXPRESSION_INVALID_CODE)
-    })?;
+            ApiError::BadRequest(format!("expression is not valid: {err}"))
+                .with_code(EXPRESSION_INVALID_CODE)
+        })?;
     // The parser keeps unknown field names so the edge still loads old rows,
     // but a comparison on one is constant — never true, or always true under
     // a negated operator. Neither is what the operator wrote.

@@ -39,6 +39,13 @@ use pingap_core::{
     get_host, get_req_header_value, resolve_client_ip_with_trust,
 };
 use pingora::proxy::Session;
+use std::borrow::Cow;
+use std::path::Path;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tera::{Context, Tera};
+use tracing::{debug, warn};
 use wafred_agent::WafredAgent;
 use wafred_agent::cache::{
     ChallengeConfig as CacheChallengeConfig,
@@ -56,13 +63,6 @@ use wafred_challenge::{
     FixedWindowLimiter, LIMIT_WINDOW_SECS, LimitDecision, MAX_FAILURE_STEPS,
     VerifyResult, generate_request_id,
 };
-use std::borrow::Cow;
-use std::path::Path;
-use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tera::{Context, Tera};
-use tracing::{debug, warn};
 
 use crate::host_cache::{HostCacheSweep, touch};
 

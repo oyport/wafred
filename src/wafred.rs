@@ -52,6 +52,7 @@ use pingap_upstream::new_upstream_health_check_task;
 use pingora::server;
 use pingora::server::configuration::Opt;
 use pingora::services::background::background_service;
+use tracing::{debug, error, info, warn};
 use wafred_agent::cache::{
     CachedRules, CustomErrorPage, HealthCheckConfig, HostPortBinding,
     OidcConfig, ResponseReplaceConfig, RuleCache, SslConfig,
@@ -59,7 +60,6 @@ use wafred_agent::cache::{
 use wafred_agent::config::AgentConfig;
 #[cfg(not(feature = "edge"))]
 use wafred_server::ServerConfig;
-use tracing::{debug, error, info, warn};
 
 /// Stable tracing target for the shared startup and data-plane logs.
 ///

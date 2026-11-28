@@ -12,6 +12,15 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use sea_orm::sea_query::Expr;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait,
+    QueryFilter, QuerySelect, Set, TransactionTrait, UpdateMany,
+};
+use tokio::sync::mpsc;
+use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
+use tonic::{Request, Response, Status, Streaming};
+use uuid::Uuid;
 use wafred_proto::control_plane::{
     control_plane_server::ControlPlane as ControlPlaneTrait, AgentHeartbeat,
     BlockedIp, CertEventAck, CertEventEntry, GetSiteConfigRequest, HostSample,
@@ -29,15 +38,6 @@ use wafred_proto::control_plane::{
     VisitorSetVisibleRequest, VisitorSetVisibleResponse,
     VisitorValidateRequest, VisitorValidateResponse,
 };
-use sea_orm::sea_query::Expr;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait,
-    QueryFilter, QuerySelect, Set, TransactionTrait, UpdateMany,
-};
-use tokio::sync::mpsc;
-use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
-use tonic::{Request, Response, Status, Streaming};
-use uuid::Uuid;
 
 use crate::api::capabilities::{
     attached_scope_requirements, path_exception_requirements, version_supports,

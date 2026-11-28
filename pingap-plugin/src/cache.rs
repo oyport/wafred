@@ -39,13 +39,6 @@ use pingora::cache::predictor::{CacheablePredictor, Predictor};
 use pingora::http::RequestHeader;
 use pingora::http::ResponseHeader;
 use pingora::proxy::Session;
-use wafred_agent::WafredAgent;
-use wafred_agent::cache::{
-    CacheRule as AgentCacheRule, CacheTypeCategory, SiteRules as AgentSiteRules,
-};
-use wafred_waf::rules::{
-    EvalContext, Expression, FieldKind, evaluate, parse_expression,
-};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -57,6 +50,13 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 use tracing::{debug, error, info};
+use wafred_agent::WafredAgent;
+use wafred_agent::cache::{
+    CacheRule as AgentCacheRule, CacheTypeCategory, SiteRules as AgentSiteRules,
+};
+use wafred_waf::rules::{
+    EvalContext, Expression, FieldKind, evaluate, parse_expression,
+};
 
 use crate::host_cache::{HostCacheSweep, touch};
 
@@ -1156,9 +1156,9 @@ mod tests {
     use pingap_config::PluginConf;
     use pingap_core::{Ctx, PluginStep};
     use pingora::proxy::Session;
-    use wafred_proto::control_plane as proto;
     use pretty_assertions::assert_eq;
     use tokio_test::io::Builder;
+    use wafred_proto::control_plane as proto;
 
     /// A site whose cache rules don't match the request must NOT fall back
     /// to the static config and cache the traffic anyway: the plugin is

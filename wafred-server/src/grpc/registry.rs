@@ -25,9 +25,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use wafred_proto::control_plane::{server_command::Payload, ServerCommand};
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
+use wafred_proto::control_plane::{server_command::Payload, ServerCommand};
 
 /// Buffer depth of the per-agent command channel.
 pub const COMMAND_CHANNEL_CAPACITY: usize = 64;

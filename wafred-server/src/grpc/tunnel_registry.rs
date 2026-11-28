@@ -14,9 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use chrono::{DateTime, Utc};
-use wafred_proto::control_plane::TunnelConnectorCommand;
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
+use wafred_proto::control_plane::TunnelConnectorCommand;
 
 /// Buffer depth of the per-connector command channel.
 pub const TUNNEL_COMMAND_CAPACITY: usize = 16;

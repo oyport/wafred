@@ -18,9 +18,9 @@
 //!
 //! `scripts/tunnel-smoke.sh` runs it as part of its setup.
 
-use wafred_server::migration::Migrator;
 use sea_orm::{Database, EntityTrait, QuerySelect};
 use sea_orm_migration::MigratorTrait;
+use wafred_server::migration::Migrator;
 
 /// Reads one row from every entity: any column the migrations did not create
 /// makes the query fail at prepare time.

@@ -32,6 +32,13 @@
 //! * The password and its hash never leave this module: the response carries
 //!   an identity and a token version, and nothing else.
 
+use sea_orm::DatabaseConnection;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set,
+};
+use tonic::{Request, Response, Status};
+use tracing::debug;
+use uuid::Uuid;
 use wafred_proto::control_plane::{
     VisitorChallengeRequest, VisitorChallengeResponse,
     VisitorChangePasswordRequest, VisitorChangePasswordResponse, VisitorGrant,
@@ -42,13 +49,6 @@ use wafred_proto::control_plane::{
     VisitorPasskeyOptionsResponse, VisitorSetVisibleRequest,
     VisitorSetVisibleResponse, VisitorValidateRequest, VisitorValidateResponse,
 };
-use sea_orm::DatabaseConnection;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set,
-};
-use tonic::{Request, Response, Status};
-use tracing::debug;
-use uuid::Uuid;
 
 use crate::auth::password::{
     hash_password, hash_password_offloaded, verify_password_offloaded,

@@ -48,9 +48,6 @@ use pingap_core::{
 };
 use pingora::http::ResponseHeader;
 use pingora::proxy::Session;
-use wafred_agent::WafredAgent;
-use wafred_agent::cache::CustomErrorPage;
-use wafred_challenge::generate_request_id;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -58,6 +55,9 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 use tera::{Context, Tera};
 use tracing::{debug, warn};
+use wafred_agent::WafredAgent;
+use wafred_agent::cache::CustomErrorPage;
+use wafred_challenge::generate_request_id;
 
 use crate::host_cache::{HostCacheSweep, touch};
 
@@ -929,8 +929,8 @@ template = '{"error":"rate_limit_exceeded","request_id":"{{ request_id }}"}'
     mod agent_mode {
         use super::*;
         use crate::waf::tests::install_test_agent;
-        use wafred_proto::control_plane as proto;
         use pretty_assertions::assert_eq;
+        use wafred_proto::control_plane as proto;
 
         /// Agent-supplied pages replace responses for their host, take
         /// precedence over the built-in defaults and expose the variables the

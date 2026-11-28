@@ -64,7 +64,7 @@ from which it inherits the proxy data plane.
 | Version | Status | Receives security fixes |
 | --- | --- | --- |
 | `main` | Active development | Yes — but expect breaking changes |
-| `1.0.x` (current WAFred release line, latest `1.0.6`) | Supported | **Yes** |
+| `1.0.x` (current WAFred release line, latest `1.0.7`) | Supported | **Yes** |
 | `1.0.0`–`1.0.4` | Superseded; upgrade to the latest `1.0.x` patch | No separate backports |
 
 Only the latest WAFred release line is guaranteed to receive security patches;

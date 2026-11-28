@@ -8,16 +8,16 @@ use axum::routing::{get, post};
 use axum::Json;
 use axum::Router;
 use chrono::{DateTime, Utc};
-use wafred_proto::control_plane::{
-    BlockIpCommand, FlushLogsCommand, PurgeCacheCommand, RestartAgentCommand,
-    ServerCommand,
-};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait,
     QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use wafred_proto::control_plane::{
+    BlockIpCommand, FlushLogsCommand, PurgeCacheCommand, RestartAgentCommand,
+    ServerCommand,
+};
 
 use crate::api::common::{
     load_site_read, non_empty, parse_optional_datetime, parse_uuid,
