@@ -380,7 +380,7 @@ itoa = "1.0.18"
 # jsonwebtoken >= 10 ships no crypto backend by default and panics at the
 # first verification without one. aws-lc-rs is already in the tree via
 # rustls, so it costs no extra dependency.
-jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "12.0.0", features = ["aws_lc_rs"] }
 local-ip-address = "0.6.13"
 memory-stats = { version = "1.2.0", features = ["always_use_statm"] }
 mime_guess = "2.0.5"
