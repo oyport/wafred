@@ -212,6 +212,7 @@ async fn add_admin(opts: AddAdminOpts) -> anyhow::Result<()> {
         role: Set(role::ADMIN.to_string()),
         disabled: Set(false),
         must_change_password: Set(true),
+        is_demo: Set(false),
         token_version: Set(0),
         created_at: Set(now),
         updated_at: Set(now),
